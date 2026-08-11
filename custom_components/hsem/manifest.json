@@ -1,6 +1,6 @@
 {
     "domain": "hsem",
-    "name": "Huawei Solar Energy Management – PowMr Fork",
+    "name": "Huawei Solar Energy Management \u2013 PowMr Fork",
     "after_dependencies": [
         "huawei_solar",
         "lovelace",
