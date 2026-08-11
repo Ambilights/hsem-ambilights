@@ -1,6 +1,6 @@
 {
     "domain": "hsem",
-    "name": "Huawei Solar Energy Management",
+    "name": "Huawei Solar Energy Management – PowMr Fork",
     "after_dependencies": [
         "huawei_solar",
         "lovelace",
@@ -15,8 +15,8 @@
         "@heinoskov"
     ],
     "config_flow": true,
-    "documentation": "https://github.com/woopstar/hsem/blob/main/README.md",
+    "documentation": "https://github.com/Ambilights/hsem-PowMr/blob/main/README.md",
     "iot_class": "cloud_polling",
-    "issue_tracker": "https://github.com/woopstar/hsem/issues",
+    "issue_tracker": "https://github.com/Ambilights/hsem-PowMr/issues",
     "version": "6.2.1"
 }
