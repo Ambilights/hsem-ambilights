@@ -23,6 +23,7 @@
       "price_out_of_range": "Prisværdien er uden for det tilladte område.",
       "required": "Dette felt er påkrævet.",
       "secondary_storage_invalid_charge_range": "Ladestrømmen skal bruge trin på 10 A mellem 10 A og 80 A, og minimum må ikke overstige maksimum.",
+      "secondary_storage_invalid_grid_phase": "Det sekundære lagers netfase skal være 1, 2 eller 3.",
       "secondary_storage_invalid_soc_range": "SoC-grænserne for det sekundære lager skal opfylde 0 ≤ minimum < maksimum ≤ 100.",
       "start_time_after_end_time": "Starttidspunkt skal være før sluttidspunkt.",
       "start_time_equals_end_time": "Starttidspunkt og sluttidspunkt kan ikke være ens - dette skaber et nul-længdevindue. Deaktiver tidsplanen i stedet."
@@ -189,6 +190,8 @@
           "hsem_huawei_solar_batteries_end_of_discharge_soc": "Huawei-batterier afladningsstop SOC (%)",
           "hsem_huawei_solar_batteries_charging_cutoff_capacity": "Huawei-batterier opladningsstopkapacitet (maks. SoC %)",
           "hsem_huawei_solar_batteries_grid_charge_cutoff_soc": "Huawei-batterier netopladningsstop SOC (%)",
+          "hsem_huawei_solar_batteries_grid_charge_maximum_power": "Huawei maksimal netopladningseffekt (W)",
+          "hsem_huawei_solar_batteries_charge_discharge_power": "Huawei sensor for batteriets lade-/afladeeffekt",
           "hsem_huawei_solar_batteries_maximum_charging_power": "Huawei-batterier maks. opladningseffekt (W)",
           "hsem_huawei_solar_batteries_maximum_discharging_power": "Huawei-batterier maks. afladningseffekt (W)",
           "hsem_huawei_solar_batteries_rated_capacity": "Batteri maks. kapacitet (Watt)",
@@ -199,6 +202,9 @@
           "hsem_huawei_solar_device_id_inverter_1": "Huawei-vekselretter 1 enhed",
           "hsem_huawei_solar_device_id_inverter_2": "Huawei-vekselretter 2 enhed",
           "hsem_huawei_solar_inverter_active_power_control": "Huawei-vekselretter aktiv effektkontrolsensor",
+          "hsem_huawei_solar_power_meter_phase_a_active_power": "Sensor for aktiv effekt på netfase A",
+          "hsem_huawei_solar_power_meter_phase_b_active_power": "Sensor for aktiv effekt på netfase B",
+          "hsem_huawei_solar_power_meter_phase_c_active_power": "Sensor for aktiv effekt på netfase C",
           "hsem_huawei_solar_batteries_forcible_charge": "Tvungen Opladning"
         },
         "data_description": {
@@ -211,6 +217,8 @@
           "hsem_huawei_solar_batteries_end_of_discharge_soc": "Angiv afladningsstop SOC-procent for dine Huawei-batterier. Når batteriet når dette SOC-niveau, stopper det afladning for at forhindre dybdeafladning.",
           "hsem_huawei_solar_batteries_charging_cutoff_capacity": "Vælg den enhed, der definerer den maksimale ladetilstand (SoC), batteriet må nå under opladning. Typisk 90-100%. Bruges af SoC-simuleringen som den øvre SoC-grænse.",
           "hsem_huawei_solar_batteries_grid_charge_cutoff_soc": "Angiv netopladningsstop SOC-procent for dine Huawei-batterier.",
+          "hsem_huawei_solar_batteries_grid_charge_maximum_power": "Skrivbart Huawei-tal, som begrænser tvungen netopladningseffekt, før TOU-opladning aktiveres.",
+          "hsem_huawei_solar_batteries_charge_discharge_power": "Signeret aktuel Huawei-batterieffekt i watt; positiv betyder opladning og negativ betyder afladning.",
           "hsem_huawei_solar_batteries_maximum_charging_power": "Vælg den sensor, der leverer den maksimale opladningseffekt for dine Huawei-batterier i watt (W).",
           "hsem_huawei_solar_batteries_maximum_discharging_power": "Vælg den sensor, der leverer den maksimale afladningseffekt for dine Huawei-batterier.",
           "hsem_huawei_solar_batteries_rated_capacity": "Vælg den sensor, der leverer den totale nominelle kapacitet for dine Huawei-batterier i watt (W).",
@@ -221,6 +229,9 @@
           "hsem_huawei_solar_device_id_inverter_1": "Vælg din primære Huawei-vekselretterenhed.",
           "hsem_huawei_solar_device_id_inverter_2": "Vælg din sekundære Huawei-vekselretterenhed, hvis relevant.",
           "hsem_huawei_solar_inverter_active_power_control": "Vælg den sensor, der styrer aktiv effektudgang for din Huawei-vekselretter.",
+          "hsem_huawei_solar_power_meter_phase_a_active_power": "Signeret Huawei-netmålereffekt for fase A; positiv er import og negativ er eksport.",
+          "hsem_huawei_solar_power_meter_phase_b_active_power": "Signeret Huawei-netmålereffekt for fase B; positiv er import og negativ er eksport.",
+          "hsem_huawei_solar_power_meter_phase_c_active_power": "Signeret Huawei-netmålereffekt for fase C; positiv er import og negativ er eksport.",
           "hsem_huawei_solar_batteries_forcible_charge": "Vælg sensoren der angiver om tvungen opladning er aktiv."
         },
         "description": "Konfigurer arbejdstilstanden for Huawei-solcellebatterier.",
@@ -283,6 +294,7 @@
           "hsem_house_consumption_power": "Husets forbrugseffektsensor",
           "hsem_main_fuse_amps": "Hovedsikring (Ampere)",
           "hsem_main_fuse_phases": "Hovedsikringens faseantal",
+          "hsem_phase_aware_charging_enabled": "Aktiver fasevis beskyttelse af batteriopladning",
           "hsem_max_grid_export_power_kw": "Maks. neteksporteffekt (kW)",
           "hsem_solar_production_power": "Solproduktionseffektsensor"
         },
@@ -290,6 +302,7 @@
           "hsem_house_consumption_power": "Vælg den sensor, der måler husets samlede strømforbrug.",
           "hsem_main_fuse_amps": "Husets hovedsikringsstørrelse i ampere (25, 35, osv.).  MILP-optimeringsværktøjet respekterer denne grænse ved planlægning af batteri- og elbilopladning.  Sæt til 0 for at deaktivere.",
           "hsem_main_fuse_phases": "Din elinstallations faseantal.  Enfasede installationer SKAL sættes til 1 — at indstille 3 på en enfaset installation gør sikringsbeskyttelsen 3 gange for slap og giver ingen reel sikkerhedsgrænse.  Standard er 3 (trefaset).",
+          "hsem_phase_aware_charging_enabled": "Brug signerede Huawei-faseeffektsensorer til at håndhæve den konfigurerede sikringsgrænse separat på hver fase. Huawei får først balanceret trefaset råderum; PowMr bruger kun det resterende råderum på sin valgte fase. Kræver en trefaset installation og de ekstra Huawei-enheder.",
           "hsem_max_grid_export_power_kw": "Maksimal neteksporteffekt i kW — netoperatørens/inverterens eksportloft for eksportbegrænsede tilslutninger (f.eks. 5 kW).  MILP-planlæggeren planlægger aldrig eksport over denne grænse, så batterieksport og soleksport konkurrerer korrekt om det samme loft.  Sæt til 0 for at deaktivere.",
           "hsem_solar_production_power": "Vælg den sensor, der måler strømmen genereret af dine solpaneler."
         },
@@ -312,6 +325,7 @@
           "hsem_secondary_storage_nominal_voltage_v": "Nominel batterispænding (V)",
           "hsem_secondary_storage_min_charge_current_a": "Minimum ladestrøm (A)",
           "hsem_secondary_storage_max_charge_current_a": "Maksimum ladestrøm (A)",
+          "hsem_secondary_storage_grid_phase": "Nettilslutningsfase",
           "hsem_secondary_storage_charge_efficiency_pct": "Ladeeffektivitet (%)",
           "hsem_secondary_storage_discharge_efficiency_pct": "Afladningseffektivitet (%)",
           "hsem_secondary_storage_inverter_standby_power_w": "SBU-inverteroverhead (W)",
@@ -334,6 +348,7 @@
           "hsem_secondary_storage_nominal_voltage_v": "Nominel DC-spænding til omregning af planlagt kWh til ladestrøm.",
           "hsem_secondary_storage_min_charge_current_a": "Mindste understøttede netladestrøm.",
           "hsem_secondary_storage_max_charge_current_a": "Største tilladte netladestrøm.",
+          "hsem_secondary_storage_grid_phase": "Den fysiske netfase (1, 2 eller 3), som den enfasede PowMr-lader og den dedikerede belastning bruger.",
           "hsem_secondary_storage_charge_efficiency_pct": "Effektivitet fra AC til lagret batterienergi.",
           "hsem_secondary_storage_discharge_efficiency_pct": "Effektivitet fra batteri til belastning.",
           "hsem_secondary_storage_inverter_standby_power_w": "Ekstra DC-forbrug, mens SBU leverer til den dedikerede belastning.",
@@ -552,6 +567,7 @@
       "price_out_of_range": "Prisværdien er uden for det tilladte område.",
       "required": "Dette felt er påkrævet.",
       "secondary_storage_invalid_charge_range": "Ladestrømmen skal bruge trin på 10 A mellem 10 A og 80 A, og minimum må ikke overstige maksimum.",
+      "secondary_storage_invalid_grid_phase": "Det sekundære lagers netfase skal være 1, 2 eller 3.",
       "secondary_storage_invalid_soc_range": "SoC-grænserne for det sekundære lager skal opfylde 0 ≤ minimum < maksimum ≤ 100.",
       "start_time_after_end_time": "Starttidspunkt skal være før sluttidspunkt.",
       "start_time_equals_end_time": "Starttidspunkt og sluttidspunkt kan ikke være ens - dette skaber et nul-længdevindue. Deaktiver tidsplanen i stedet."
@@ -719,6 +735,8 @@
           "hsem_huawei_solar_batteries_end_of_discharge_soc": "Huawei Batteries End of Discharge SOC (%)",
           "hsem_huawei_solar_batteries_charging_cutoff_capacity": "Huawei Batteries Charging Cutoff Capacity (Max SoC %)",
           "hsem_huawei_solar_batteries_grid_charge_cutoff_soc": "Huawei Batteries Grid Charge Cutoff SOC (%)",
+          "hsem_huawei_solar_batteries_grid_charge_maximum_power": "Huawei Grid Charge Maximum Power (W)",
+          "hsem_huawei_solar_batteries_charge_discharge_power": "Huawei Battery Charge/Discharge Power Sensor",
           "hsem_huawei_solar_batteries_maximum_charging_power": "Huawei Batteries Maximum Charging Power (W)",
           "hsem_huawei_solar_batteries_maximum_discharging_power": "Huawei Batteries Maximum Discharging Power (W)",
           "hsem_huawei_solar_batteries_rated_capacity": "Battery Max Capacity (Watt)",
@@ -728,7 +746,10 @@
           "hsem_huawei_solar_device_id_batteries": "Huawei Batteries Device",
           "hsem_huawei_solar_device_id_inverter_1": "Huawei Inverter 1 Device",
           "hsem_huawei_solar_device_id_inverter_2": "Huawei Inverter 2 Device",
-          "hsem_huawei_solar_inverter_active_power_control": "Huawei Inverter Active Power Control Sensor"
+          "hsem_huawei_solar_inverter_active_power_control": "Huawei Inverter Active Power Control Sensor",
+          "hsem_huawei_solar_power_meter_phase_a_active_power": "Grid Phase A Active Power Sensor",
+          "hsem_huawei_solar_power_meter_phase_b_active_power": "Grid Phase B Active Power Sensor",
+          "hsem_huawei_solar_power_meter_phase_c_active_power": "Grid Phase C Active Power Sensor"
         },
         "data_description": {
           "hsem_batteries_charge_efficiency": "Specify the charge-side efficiency of your battery as a percentage (0–100). Energy stored in the battery equals the input energy multiplied by this factor. Typical lithium batteries achieve 95–98 %. Defaults to 98 %.",
@@ -741,6 +762,8 @@
           "hsem_huawei_solar_batteries_end_of_discharge_soc": "Specify the end of discharge SOC percentage for your Huawei batteries. When the battery reaches this SOC level, it will stop discharging to prevent deep discharge and potential damage to the battery.",
           "hsem_huawei_solar_batteries_charging_cutoff_capacity": "Select the entity that defines the maximum state of charge (SoC) the battery is allowed to reach during charging (register STORAGE_CHARGING_CUTOFF_CAPACITY). Typically 90–10 %. Used by the SoC simulation as the upper SoC ceiling so the planner never schedules charging beyond this limit.",
           "hsem_huawei_solar_batteries_grid_charge_cutoff_soc": "Specify the grid charge cutoff SOC percentage for your Huawei batteries.",
+          "hsem_huawei_solar_batteries_grid_charge_maximum_power": "Writable Huawei number used to cap forced grid-charge power before TOU charging is enabled.",
+          "hsem_huawei_solar_batteries_charge_discharge_power": "Signed live Huawei battery power in watts; positive means charging and negative means discharging.",
           "hsem_huawei_solar_batteries_maximum_charging_power": "Select the sensor that provides the maximum charging power for your Huawei batteries in kilowatts (W).",
           "hsem_huawei_solar_batteries_maximum_discharging_power": "Select the sensor that provides the maximum discharging power for your Huawei batteries.",
           "hsem_huawei_solar_batteries_rated_capacity": "Select the sensor that provides the total rated capacity of your Huawei batteries in watts (W).",
@@ -750,7 +773,10 @@
           "hsem_huawei_solar_device_id_batteries": "Select your Huawei battery device.",
           "hsem_huawei_solar_device_id_inverter_1": "Select your primary Huawei inverter device.",
           "hsem_huawei_solar_device_id_inverter_2": "Select your secondary Huawei inverter device, if applicable.",
-          "hsem_huawei_solar_inverter_active_power_control": "Select the sensor that controls the active power output of your Huawei inverter."
+          "hsem_huawei_solar_inverter_active_power_control": "Select the sensor that controls the active power output of your Huawei inverter.",
+          "hsem_huawei_solar_power_meter_phase_a_active_power": "Signed Huawei grid-meter power for phase A; positive is import and negative is export.",
+          "hsem_huawei_solar_power_meter_phase_b_active_power": "Signed Huawei grid-meter power for phase B; positive is import and negative is export.",
+          "hsem_huawei_solar_power_meter_phase_c_active_power": "Signed Huawei grid-meter power for phase C; positive is import and negative is export."
         },
         "description": "Configure the working mode for Huawei solar batteries.",
         "title": "Huawei Solar Sensors"
@@ -792,6 +818,7 @@
           "hsem_house_consumption_power": "House Consumption Power Sensor",
           "hsem_main_fuse_amps": "Main Fuse Rating (Amps)",
           "hsem_main_fuse_phases": "Main Fuse Phase Count",
+          "hsem_phase_aware_charging_enabled": "Enable Per-Phase Battery Charge Protection",
           "hsem_max_grid_export_power_kw": "Max Grid Export Power (kW)",
           "hsem_solar_production_power": "Solar Production Power Sensor"
         },
@@ -799,6 +826,7 @@
           "hsem_house_consumption_power": "Select the sensor that measures your house's total power consumption.",
           "hsem_main_fuse_amps": "Your house's main fuse/breaker rating in amps (25, 35, etc.).  The MILP optimizer will respect this limit when scheduling battery and EV charging.  Set to 0 to disable.",
           "hsem_main_fuse_phases": "Your electrical installation's phase count.  Single-phase installations MUST set this to 1 — setting 3 on a single-phase install makes the fuse protection 3x too permissive and provides no real safety limit.  Defaults to 3 (three-phase).",
+          "hsem_phase_aware_charging_enabled": "Use signed Huawei phase-power sensors to enforce the configured fuse target independently on every phase. Huawei receives balanced three-phase headroom first; PowMr uses only the remaining headroom on its configured phase. Requires a three-phase installation and the extra Huawei entities.",
           "hsem_max_grid_export_power_kw": "Maximum grid export power in kW — the DNO/inverter export cap for export-limited connections (e.g. 5 kW).  The MILP planner will never schedule export above this limit, so battery export and PV export correctly compete for the same cap.  Set to 0 to disable.",
           "hsem_solar_production_power": "Select the sensor that measures the power generated by your solar panels."
         },
@@ -821,6 +849,7 @@
           "hsem_secondary_storage_nominal_voltage_v": "Nominal Battery Voltage (V)",
           "hsem_secondary_storage_min_charge_current_a": "Minimum Charge Current (A)",
           "hsem_secondary_storage_max_charge_current_a": "Maximum Charge Current (A)",
+          "hsem_secondary_storage_grid_phase": "Grid Connection Phase",
           "hsem_secondary_storage_charge_efficiency_pct": "Charge Efficiency (%)",
           "hsem_secondary_storage_discharge_efficiency_pct": "Discharge Efficiency (%)",
           "hsem_secondary_storage_inverter_standby_power_w": "SBU Inverter Overhead (W)",
@@ -843,6 +872,7 @@
           "hsem_secondary_storage_nominal_voltage_v": "Nominal DC voltage used to convert planned kWh into a charge-current target.",
           "hsem_secondary_storage_min_charge_current_a": "Smallest supported utility charge-current setting.",
           "hsem_secondary_storage_max_charge_current_a": "Largest allowed utility charge current.",
+          "hsem_secondary_storage_grid_phase": "Physical grid phase (1, 2, or 3) used by the single-phase PowMr charger and dedicated load.",
           "hsem_secondary_storage_charge_efficiency_pct": "AC-to-battery storage efficiency.",
           "hsem_secondary_storage_discharge_efficiency_pct": "Battery-to-load conversion efficiency.",
           "hsem_secondary_storage_inverter_standby_power_w": "Additional DC draw while SBU powers the dedicated load.",

@@ -88,12 +88,15 @@ Huawei Solar inverter and battery entity configuration (device selectors and ent
 | State of capacity | `hsem_huawei_solar_batteries_state_of_capacity` | `sensor.batteries_state_of_capacity` | SoC sensor |
 | Charging cutoff capacity | `hsem_huawei_solar_batteries_charging_cutoff_capacity` | `number.batteries_end_of_charge_soc` | Max SoC during charging |
 | Grid charge cutoff SoC | `hsem_huawei_solar_batteries_grid_charge_cutoff_soc` | `number.batteries_grid_charge_cutoff_soc` | Max SoC when charging from grid |
+| Grid charge maximum power | `hsem_huawei_solar_batteries_grid_charge_maximum_power` | `number.batteries_grid_charge_maximum_power` | Runtime phase-safe Huawei charge cap |
+| Battery charge/discharge power | `hsem_huawei_solar_batteries_charge_discharge_power` | `sensor.batteries_charge_discharge_power` | Signed live battery power; positive charge |
 | Max charging power | `hsem_huawei_solar_batteries_maximum_charging_power` | `number.batteries_maximum_charging_power` | Max charge power |
 | Max discharging power | `hsem_huawei_solar_batteries_maximum_discharging_power` | `number.batteries_maximum_discharging_power` | Max discharge power |
 | Rated capacity | `hsem_huawei_solar_batteries_rated_capacity` | `sensor.batteries_rated_capacity` | Nameplate capacity sensor |
 | TOU periods | `hsem_huawei_solar_batteries_tou_charging_and_discharging_periods` | `sensor.batteries_tou_charging_and_discharging_periods` | TOU period schedule |
 | Excess PV use | `hsem_huawei_solar_batteries_excess_pv_energy_use_in_tou` | `select.batteries_excess_pv_energy_use_in_tou` | Excess PV mode in TOU |
 | Active power control | `hsem_huawei_solar_inverter_active_power_control` | `sensor.inverter_active_power_control` | Export power control mode |
+| Phase A/B/C active power | `hsem_huawei_solar_power_meter_phase_[a-c]_active_power` | `sensor.power_meter_phase_[a-c]_active_power` | Signed per-phase grid power used by phase-aware charging |
 
 ### Step: `battery_economics`
 
@@ -119,6 +122,7 @@ Power sensor configuration.
 | House includes EV | `hsem_house_power_includes_ev_charger_power` | `True` | Whether house sensor already includes EV charger |
 | Main fuse amps | `hsem_main_fuse_amps` | 25 | Main fuse/breaker rating in amps. Set to 0 to disable. The MILP optimizer will respect this limit when scheduling battery and EV charging |
 | Main fuse phases | `hsem_main_fuse_phases` | 3 | Electrical phase count (1 or 3). Single-phase installations MUST set this to 1 — setting 3 on a single-phase install makes the fuse constraint 3× too permissive |
+| Phase-aware charging | `hsem_phase_aware_charging_enabled` | `False` | Hard per-phase planner limits plus live Huawei-first/PowMr-second charging. Requires the extra Huawei phase and battery entities |
 | Max grid export power | `hsem_max_grid_export_power_kw` | 0 | DNO/inverter grid export cap in kW for export-limited connections (issue #726). The MILP planner never schedules export above this limit. Set to 0 to disable |
 
 ### Step: `secondary_storage`
@@ -142,6 +146,7 @@ default.
 | Minimum / maximum SoC | `hsem_secondary_storage_min_soc_pct`, `hsem_secondary_storage_max_soc_pct` | 20 / 100 % | Hard planning and runtime bounds |
 | Nominal voltage | `hsem_secondary_storage_nominal_voltage_v` | 24 V | Converts stored kWh to current target |
 | Minimum / maximum current | `hsem_secondary_storage_min_charge_current_a`, `hsem_secondary_storage_max_charge_current_a` | 10 / 60 A | Must be 10 A steps within the verified 10–80 A entity range |
+| Grid connection phase | `hsem_secondary_storage_grid_phase` | 3 | Physical phase used by the single-phase PowMr charger and dedicated load |
 | Charge / discharge efficiency | `hsem_secondary_storage_charge_efficiency_pct`, `hsem_secondary_storage_discharge_efficiency_pct` | 93 / 93 % | AC↔battery conversion efficiencies |
 | SBU overhead | `hsem_secondary_storage_inverter_standby_power_w` | 55 W | Additional DC draw while battery supplies the load |
 | Cycle cost | `hsem_secondary_storage_cycle_cost_per_kwh` | 0 | Optional wear cost per throughput kWh |

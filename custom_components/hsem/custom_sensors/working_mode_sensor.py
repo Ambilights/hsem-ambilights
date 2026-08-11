@@ -31,6 +31,9 @@ from custom_components.hsem.custom_sensors.applier import (
     async_apply_battery_settings,
     async_apply_inverter_power_control,
 )
+from custom_components.hsem.custom_sensors.phase_charge_limiter import (
+    build_phase_aware_charge_commands,
+)
 from custom_components.hsem.custom_sensors.recommendation_resolver import (
     resolve_current_recommendation,
 )
@@ -42,6 +45,7 @@ from custom_components.hsem.utils.degraded_mode import hardware_writes_allowed
 from custom_components.hsem.utils.inverter_verify import ApplyStatus, CycleApplySummary
 from custom_components.hsem.utils.logger import HSEM_LOGGER as _LOGGER
 from custom_components.hsem.utils.misc import calculate_recommended_threshold
+from custom_components.hsem.utils.phase_power import phase_powers_valid
 from custom_components.hsem.utils.recommendations import Recommendations
 from custom_components.hsem.utils.sensornames.diagnostics import (
     get_working_mode_sensor_entity_id,
@@ -451,7 +455,7 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         writes_safe = hardware_writes_allowed(live.degraded_mode)
         combined_summary = CycleApplySummary()
         if cfg.read_only:
-            _LOGGER.debug("Hardware writes SKIPPED — read_only=True", "warning")
+            _LOGGER.debug("Hardware writes SKIPPED — read_only=True")
         elif not writes_safe:
             _LOGGER.debug(
                 f"Hardware writes BLOCKED — degraded mode: {live.degraded_mode.value}. Missing: {live.missing_entities_list}",
@@ -460,6 +464,30 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         else:
             inv_summary = await async_apply_inverter_power_control(self, cfg, live)
             combined_summary.results.extend(inv_summary.results)
+
+            phase_commands = (
+                build_phase_aware_charge_commands(cfg, live, hourly_rec)
+                if hourly_rec is not None
+                else None
+            )
+            if phase_commands is not None and phase_commands.limits is not None:
+                limits = phase_commands.limits
+                live_phase_power_w = live.grid_phase_power_w
+                measured_phase_power_w = (
+                    live_phase_power_w
+                    if phase_powers_valid(live_phase_power_w)
+                    else (0.0, 0.0, 0.0)
+                )
+                _LOGGER.debug(
+                    "Phase-aware charge limit: measured=%sW base=%sW "
+                    "Huawei=%.0fW PowMr=%.0fA predicted=%sW target=%dA",
+                    tuple(round(value) for value in measured_phase_power_w),
+                    tuple(round(value) for value in limits.base_phase_power_w),
+                    limits.primary_charge_power_w,
+                    limits.secondary_charge_current_a,
+                    tuple(round(value) for value in limits.predicted_phase_power_w),
+                    cfg.main_fuse_amps,
+                )
 
             # Block battery writes if the inverter write already failed.
             if (
@@ -470,8 +498,15 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
                     self,
                     cfg,
                     live,
-                    hourly_rec,
+                    phase_commands.recommendation
+                    if phase_commands is not None
+                    else hourly_rec,
                     data.current_required_battery,
+                    grid_charge_power_limit_w=(
+                        phase_commands.primary_grid_charge_power_w
+                        if phase_commands is not None
+                        else None
+                    ),
                 )
                 combined_summary.results.extend(bat_summary.results)
 
@@ -483,7 +518,9 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
                     self,
                     cfg,
                     live,
-                    hourly_rec,
+                    phase_commands.recommendation
+                    if phase_commands is not None
+                    else hourly_rec,
                 )
                 combined_summary.results.extend(secondary_summary.results)
 

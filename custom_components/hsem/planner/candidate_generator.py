@@ -313,6 +313,11 @@ def generate_candidates(
             no_export=not inp.excess_export_enabled,
             main_fuse_amps=inp.main_fuse_amps,
             main_fuse_phases=inp.main_fuse_phases,
+            phase_power_imbalance_w=(
+                inp.grid_phase_power_imbalance_w
+                if inp.phase_aware_charging_enabled
+                else None
+            ),
             max_grid_export_power_kw=inp.max_grid_export_power_kw,
             secondary_storage=inp.secondary_storage,
             battery_export_min_price=inp.battery_export_min_price,

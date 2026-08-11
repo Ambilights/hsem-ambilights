@@ -101,6 +101,10 @@ async def get_secondary_storage_step_schema(
                 default=value("hsem_secondary_storage_max_charge_current_a"),
             ): selector(_number(10.0, 80.0, 10.0, UnitOfElectricCurrent.AMPERE)),
             vol.Required(
+                "hsem_secondary_storage_grid_phase",
+                default=value("hsem_secondary_storage_grid_phase"),
+            ): selector(_number(1.0, 3.0, 1.0)),
+            vol.Required(
                 "hsem_secondary_storage_charge_efficiency_pct",
                 default=value("hsem_secondary_storage_charge_efficiency_pct"),
             ): selector(_number(1.0, 100.0, 0.1, PERCENTAGE)),
@@ -174,5 +178,10 @@ async def validate_secondary_storage_input(
     ):
         errors["hsem_secondary_storage_min_charge_current_a"] = (
             "secondary_storage_invalid_charge_range"
+        )
+    grid_phase = int(user_input.get("hsem_secondary_storage_grid_phase", 3))
+    if grid_phase not in {1, 2, 3}:
+        errors["hsem_secondary_storage_grid_phase"] = (
+            "secondary_storage_invalid_grid_phase"
         )
     return errors

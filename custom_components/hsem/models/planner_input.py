@@ -193,6 +193,13 @@ class PlannerInput:
     #: installations MUST set this to 1 — using 3 on a single-phase install
     #: makes the fuse constraint 3× too permissive.
     main_fuse_phases: int = 3
+    #: When enabled, use signed three-phase meter telemetry to enforce a hard
+    #: per-phase import ceiling for controllable battery charging.
+    phase_aware_charging_enabled: bool = False
+    #: Zero-sum per-phase load offsets in Watts, derived from the latest live
+    #: meter snapshot after removing the explicitly modelled secondary branch.
+    #: ``None`` disables phase-aware constraints for backward compatibility.
+    grid_phase_power_imbalance_w: tuple[float, float, float] | None = None
 
     # --- grid export power cap (issue #726) ---
     #: Maximum grid export power in kW (0 or None = disabled).  DNO/inverter

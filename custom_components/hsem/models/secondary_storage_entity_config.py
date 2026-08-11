@@ -31,3 +31,4 @@ class SecondaryStorageEntityConfig:
     cycle_cost_per_kwh: float = 0.0
     base_load_includes_dedicated_load: bool = True
     allow_primary_battery_transfer: bool = False
+    grid_phase: int = 3

@@ -224,6 +224,30 @@ async def async_collect_live_state(
         )
         or 0.0
     )
+    if cfg.phase_aware_charging_enabled:
+        state.grid_phase_power_w = (
+            convert_to_float(
+                _read(
+                    cfg.huawei_solar_power_meter_phase_a_active_power,
+                    "float",
+                    label="power_meter_phase_a_active_power",
+                )
+            ),
+            convert_to_float(
+                _read(
+                    cfg.huawei_solar_power_meter_phase_b_active_power,
+                    "float",
+                    label="power_meter_phase_b_active_power",
+                )
+            ),
+            convert_to_float(
+                _read(
+                    cfg.huawei_solar_power_meter_phase_c_active_power,
+                    "float",
+                    label="power_meter_phase_c_active_power",
+                )
+            ),
+        )
 
     # --- Optional dedicated-load secondary storage ---
     if cfg.secondary_storage.enabled:
@@ -355,6 +379,22 @@ async def async_collect_live_state(
             label="grid_charge_cutoff_soc",
         )
     )
+
+    if cfg.phase_aware_charging_enabled:
+        state.huawei_batteries_grid_charge_max_power_w = convert_to_float(
+            _read(
+                cfg.huawei_solar_batteries_grid_charge_maximum_power,
+                "float",
+                label="grid_charge_maximum_power",
+            )
+        )
+        state.huawei_batteries_charge_discharge_power_w = convert_to_float(
+            _read(
+                cfg.huawei_solar_batteries_charge_discharge_power,
+                "float",
+                label="batteries_charge_discharge_power",
+            )
+        )
 
     max_charge_w = convert_to_float(
         _read(

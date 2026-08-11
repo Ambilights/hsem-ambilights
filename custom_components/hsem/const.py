@@ -103,6 +103,10 @@ DEFAULT_CONFIG_VALUES = {
     "hsem_house_power_includes_ev_charger_power": True,
     "hsem_main_fuse_amps": 25,
     "hsem_main_fuse_phases": 3,
+    # Optional phase-aware charging protection.  When enabled, the planner
+    # and runtime applier use signed Huawei power-meter phase readings to keep
+    # every phase at or below the configured main-fuse current.
+    "hsem_phase_aware_charging_enabled": False,
     "hsem_max_grid_export_power_kw": 0,
     # Optional dedicated-load secondary storage (PowMr reference topology).
     # Control has a separate opt-in gate and remains blocked by hsem_read_only.
@@ -126,11 +130,14 @@ DEFAULT_CONFIG_VALUES = {
     "hsem_secondary_storage_cycle_cost_per_kwh": 0.0,
     "hsem_secondary_storage_base_load_includes_dedicated_load": True,
     "hsem_secondary_storage_allow_primary_battery_transfer": False,
+    "hsem_secondary_storage_grid_phase": 3,
     "hsem_huawei_solar_batteries_charging_cutoff_capacity": "number.batteries_end_of_charge_soc",
     "hsem_huawei_solar_batteries_end_of_discharge_soc": "number.batteries_end_of_discharge_soc",
     "hsem_huawei_solar_batteries_excess_pv_energy_use_in_tou": "select.batteries_excess_pv_energy_use_in_tou",
     "hsem_huawei_solar_batteries_forcible_charge": "sensor.batteries_forcible_charge",
     "hsem_huawei_solar_batteries_grid_charge_cutoff_soc": "number.batteries_grid_charge_cutoff_soc",
+    "hsem_huawei_solar_batteries_grid_charge_maximum_power": "number.batteries_grid_charge_maximum_power",
+    "hsem_huawei_solar_batteries_charge_discharge_power": "sensor.batteries_charge_discharge_power",
     "hsem_huawei_solar_batteries_maximum_charging_power": "number.batteries_maximum_charging_power",
     "hsem_huawei_solar_batteries_maximum_discharging_power": "number.batteries_maximum_discharging_power",
     "hsem_huawei_solar_batteries_rated_capacity": "sensor.batteries_rated_capacity",
@@ -141,6 +148,9 @@ DEFAULT_CONFIG_VALUES = {
     "hsem_huawei_solar_device_id_inverter_1": vol.UNDEFINED,
     "hsem_huawei_solar_device_id_inverter_2": vol.UNDEFINED,
     "hsem_huawei_solar_inverter_active_power_control": "sensor.inverter_active_power_control",
+    "hsem_huawei_solar_power_meter_phase_a_active_power": "sensor.power_meter_phase_a_active_power",
+    "hsem_huawei_solar_power_meter_phase_b_active_power": "sensor.power_meter_phase_b_active_power",
+    "hsem_huawei_solar_power_meter_phase_c_active_power": "sensor.power_meter_phase_c_active_power",
     "hsem_months_summer": [5, 6, 7, 8, 9],
     "hsem_months_winter": [1, 2, 3, 4, 10, 11, 12],
     "hsem_read_only": False,

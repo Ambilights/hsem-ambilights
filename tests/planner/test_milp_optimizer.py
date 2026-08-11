@@ -25,6 +25,9 @@ import pytest
 from custom_components.hsem.models.ev_config import EVConfig
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.planner_input import PlannerInput
+from custom_components.hsem.models.secondary_storage_config import (
+    SecondaryStorageConfig,
+)
 from custom_components.hsem.planner import run_planner
 from custom_components.hsem.planner.candidate_generator import (
     CANDIDATE_MILP,
@@ -1728,6 +1731,163 @@ def test_main_fuse_default_phase_preserves_behavior():
     assert diag_default.get("total_fuse_violation_kwh", 1.0) == pytest.approx(
         diag_explicit.get("total_fuse_violation_kwh", 1.0)
     )
+
+
+# ---------------------------------------------------------------------------
+# Hard per-phase battery-charge protection (PowMr fork)
+# ---------------------------------------------------------------------------
+
+
+@_scipy_skip()
+def test_phase_fuse_caps_balanced_huawei_on_most_loaded_phase() -> None:
+    """The 5/10/3 A profile limits Huawei to the 6 A L2 headroom."""
+    slots = [
+        _make_slot(hour=0, import_price=0.01, consumption_kwh=4.14),
+        _make_slot(hour=1, import_price=3.00, consumption_kwh=5.00),
+    ]
+
+    result = solve_milp(
+        slots,
+        _NOW,
+        current_kwh=0.0,
+        usable_kwh=10.0,
+        max_charge_per_slot=5.0,
+        max_discharge_per_slot=5.0,
+        charge_efficiency_pct=100.0,
+        discharge_efficiency_pct=100.0,
+        main_fuse_amps=16.0,
+        main_fuse_phases=3,
+        phase_power_imbalance_w=(-230.0, 920.0, -690.0),
+        no_export=True,
+    )
+
+    assert result is not None
+    planned, diagnostics = result
+    assert diagnostics["phase_fuse_active"] is True
+    assert max(diagnostics["max_phase_import_kwh"] - 3.68, 0.0) == pytest.approx(
+        0.0, abs=1e-6
+    )
+    assert planned[0].batteries_charged_kwh == pytest.approx(4.14, abs=1e-3)
+
+
+@_scipy_skip()
+def test_phase_fuse_allows_unavoidable_baseline_but_no_extra_charge() -> None:
+    """A phase already above 16 A remains feasible and may not be worsened."""
+    slots = [
+        _make_slot(hour=0, import_price=0.01, consumption_kwh=5.98),
+        _make_slot(hour=1, import_price=3.00, consumption_kwh=5.98),
+    ]
+    result = solve_milp(
+        slots,
+        _NOW,
+        current_kwh=0.0,
+        usable_kwh=10.0,
+        max_charge_per_slot=5.0,
+        max_discharge_per_slot=5.0,
+        charge_efficiency_pct=100.0,
+        discharge_efficiency_pct=100.0,
+        main_fuse_amps=16.0,
+        main_fuse_phases=3,
+        phase_power_imbalance_w=(-1303.333333, 2606.666667, -1303.333333),
+        no_export=True,
+    )
+
+    assert result is not None
+    planned, diagnostics = result
+    assert diagnostics["phase_fuse_active"] is True
+    assert diagnostics["max_phase_import_kwh"] == pytest.approx(4.6, abs=1e-5)
+    assert planned[0].batteries_charged_kwh == pytest.approx(0.0, abs=1e-6)
+
+
+@_scipy_skip()
+def test_phase_fuse_places_powmr_charge_only_on_configured_l3() -> None:
+    """A 12 A L3 baseline leaves at most three 10 A PowMr DC steps."""
+    slots = [
+        _make_slot(
+            hour=hour,
+            import_price=0.01 if hour == 0 else 3.00,
+            consumption_kwh=4.14,
+        )
+        for hour in range(8)
+    ]
+    secondary = SecondaryStorageConfig(
+        enabled=True,
+        capacity_kwh=15.0,
+        current_soc_pct=20.0,
+        min_soc_pct=20.0,
+        max_soc_pct=100.0,
+        nominal_voltage_v=25.6,
+        load_power_w=500.0,
+        min_charge_current_a=10.0,
+        max_charge_current_a=60.0,
+        charge_current_step_a=10.0,
+        charge_efficiency_pct=93.0,
+        discharge_efficiency_pct=93.0,
+        inverter_standby_power_w=55.0,
+        replacement_price_per_kwh=3.0,
+        base_load_includes_dedicated_load=True,
+        grid_phase=3,
+    )
+
+    result = solve_milp(
+        slots,
+        _NOW,
+        current_kwh=9.0,
+        usable_kwh=9.0,
+        max_charge_per_slot=5.0,
+        max_discharge_per_slot=5.0,
+        main_fuse_amps=16.0,
+        main_fuse_phases=3,
+        phase_power_imbalance_w=(-690.0, -690.0, 1380.0),
+        secondary_storage=secondary,
+        no_export=True,
+    )
+
+    assert result is not None
+    planned, diagnostics = result
+    assert diagnostics["phase_fuse_active"] is True
+    assert max(diagnostics["max_phase_import_kwh"] - 3.68, 0.0) == pytest.approx(
+        0.0, abs=1e-6
+    )
+    assert planned[0].secondary_storage_mode == "charge"
+    assert planned[0].secondary_storage_charge_current_a == pytest.approx(30.0)
+
+
+@_scipy_skip()
+def test_phase_fuse_is_opt_in_and_preserves_legacy_plan() -> None:
+    """Omitting phase offsets leaves the existing aggregate model unchanged."""
+    slots = _make_arbitrage_slots([0, 1], [20, 21])
+    legacy = solve_milp(
+        slots,
+        _NOW,
+        current_kwh=0.0,
+        usable_kwh=9.0,
+        max_charge_per_slot=5.0,
+        max_discharge_per_slot=5.0,
+        main_fuse_amps=16.0,
+        main_fuse_phases=3,
+    )
+    explicit_disabled = solve_milp(
+        slots,
+        _NOW,
+        current_kwh=0.0,
+        usable_kwh=9.0,
+        max_charge_per_slot=5.0,
+        max_discharge_per_slot=5.0,
+        main_fuse_amps=16.0,
+        main_fuse_phases=3,
+        phase_power_imbalance_w=None,
+    )
+
+    assert legacy is not None
+    assert explicit_disabled is not None
+    legacy_slots, legacy_diagnostics = legacy
+    disabled_slots, disabled_diagnostics = explicit_disabled
+    assert [slot.recommendation for slot in legacy_slots] == [
+        slot.recommendation for slot in disabled_slots
+    ]
+    assert legacy_diagnostics["phase_fuse_active"] is False
+    assert disabled_diagnostics["phase_fuse_active"] is False
 
 
 # ---------------------------------------------------------------------------

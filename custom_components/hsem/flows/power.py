@@ -56,6 +56,12 @@ async def get_power_step_schema(
                     }
                 }
             ),
+            vol.Required(
+                "hsem_phase_aware_charging_enabled",
+                default=get_config_value(
+                    config_entry, "hsem_phase_aware_charging_enabled"
+                ),
+            ): selector({"boolean": {}}),
             vol.Optional(
                 "hsem_max_grid_export_power_kw",
                 default=get_config_value(config_entry, "hsem_max_grid_export_power_kw"),

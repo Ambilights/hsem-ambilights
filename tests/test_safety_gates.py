@@ -355,6 +355,97 @@ class TestBatterySettingsSafetyGate:
 
         mock_wv.assert_called()
 
+    @pytest.mark.asyncio
+    async def test_phase_charge_cap_is_first_grid_charge_write(self):
+        """Huawei power must be capped before TOU forced charging can start."""
+        from custom_components.hsem.utils.inverter_verify import ApplyResult
+        from custom_components.hsem.utils.recommendations import Recommendations
+
+        sensor = _make_sensor()
+        cfg = _make_cfg(read_only=False)
+        cfg.huawei_solar_batteries_grid_charge_maximum_power = (
+            "number.batteries_grid_charge_maximum_power"
+        )
+        live = _make_live(degraded_mode=DegradedMode.OK)
+        live.huawei_batteries_rated_capacity_wh = 30000.0
+        live.huawei_batteries_max_discharge_power_w = 10000.0
+        live.huawei_batteries_max_charge_power_w = 10000.0
+        live.huawei_batteries_grid_charge_max_power_w = 5000.0
+        rec = _make_rec(Recommendations.BatteriesChargeGrid.value)
+
+        with (
+            patch(_LOGGER_PATCH, new_callable=MagicMock),
+            patch(
+                "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+                new_callable=AsyncMock,
+                return_value=ApplyResult(
+                    entity_id="number.batteries_grid_charge_maximum_power",
+                    desired=4100.0,
+                    actual=4100.0,
+                    status=ApplyStatus.OK,
+                    attempts=1,
+                ),
+            ) as verifier,
+        ):
+            await async_apply_battery_settings(
+                sensor,
+                cfg,
+                live,
+                rec,
+                5.0,
+                grid_charge_power_limit_w=4175.0,
+            )
+
+        first_call = verifier.await_args_list[0]
+        assert first_call.kwargs["entity_id"] == (
+            "number.batteries_grid_charge_maximum_power"
+        )
+        assert first_call.kwargs["desired"] == pytest.approx(4100.0)
+
+    @pytest.mark.asyncio
+    async def test_failed_phase_charge_cap_blocks_forced_charge(self):
+        """An unverified Huawei cap must stop every later battery write."""
+        from custom_components.hsem.utils.inverter_verify import ApplyResult
+        from custom_components.hsem.utils.recommendations import Recommendations
+
+        sensor = _make_sensor()
+        cfg = _make_cfg(read_only=False)
+        cfg.huawei_solar_batteries_grid_charge_maximum_power = (
+            "number.batteries_grid_charge_maximum_power"
+        )
+        live = _make_live(degraded_mode=DegradedMode.OK)
+        live.huawei_batteries_rated_capacity_wh = 30000.0
+        live.huawei_batteries_max_discharge_power_w = 10000.0
+        live.huawei_batteries_max_charge_power_w = 10000.0
+        live.huawei_batteries_grid_charge_max_power_w = 5000.0
+        rec = _make_rec(Recommendations.BatteriesChargeGrid.value)
+
+        with (
+            patch(_LOGGER_PATCH, new_callable=MagicMock),
+            patch(
+                "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+                new_callable=AsyncMock,
+                return_value=ApplyResult(
+                    entity_id="number.batteries_grid_charge_maximum_power",
+                    desired=0.0,
+                    actual=5000.0,
+                    status=ApplyStatus.FAILED,
+                    attempts=3,
+                ),
+            ) as verifier,
+        ):
+            summary = await async_apply_battery_settings(
+                sensor,
+                cfg,
+                live,
+                rec,
+                5.0,
+                grid_charge_power_limit_w=0.0,
+            )
+
+        assert verifier.await_count == 1
+        assert summary.overall_status == ApplyStatus.FAILED
+
 
 # ---------------------------------------------------------------------------
 # Working-mode sensor top-level gate (_async_apply_hardware_writes)
@@ -394,7 +485,10 @@ class TestWorkingModeSensorTopLevelGate:
         data = self._make_coordinator_data(read_only=True)
 
         with (
-            patch(_LOGGER_PATCH, new_callable=MagicMock),
+            patch(
+                "custom_components.hsem.custom_sensors.working_mode_sensor._LOGGER",
+                new_callable=MagicMock,
+            ) as mock_logger,
             patch(
                 "custom_components.hsem.custom_sensors.working_mode_sensor.async_apply_inverter_power_control",
                 new_callable=AsyncMock,
@@ -416,6 +510,9 @@ class TestWorkingModeSensorTopLevelGate:
 
         mock_inv.assert_not_called()
         mock_bat.assert_not_called()
+        mock_logger.debug.assert_called_once_with(
+            "Hardware writes SKIPPED — read_only=True"
+        )
 
     @pytest.mark.asyncio
     async def test_error_mode_skips_both_appliers(self):

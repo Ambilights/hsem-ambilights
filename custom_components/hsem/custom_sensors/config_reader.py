@@ -147,6 +147,12 @@ def build_sensor_config(
     cfg.huawei_solar_batteries_grid_charge_cutoff_soc = get_config_value(
         config_entry, "hsem_huawei_solar_batteries_grid_charge_cutoff_soc"
     )
+    cfg.huawei_solar_batteries_grid_charge_maximum_power = get_config_value(
+        config_entry, "hsem_huawei_solar_batteries_grid_charge_maximum_power"
+    )
+    cfg.huawei_solar_batteries_charge_discharge_power = get_config_value(
+        config_entry, "hsem_huawei_solar_batteries_charge_discharge_power"
+    )
     cfg.huawei_solar_batteries_maximum_charging_power = get_config_value(
         config_entry, "hsem_huawei_solar_batteries_maximum_charging_power"
     )
@@ -169,6 +175,15 @@ def build_sensor_config(
     cfg.huawei_solar_batteries_rated_capacity = get_config_value(
         config_entry, "hsem_huawei_solar_batteries_rated_capacity"
     )
+    cfg.huawei_solar_power_meter_phase_a_active_power = get_config_value(
+        config_entry, "hsem_huawei_solar_power_meter_phase_a_active_power"
+    )
+    cfg.huawei_solar_power_meter_phase_b_active_power = get_config_value(
+        config_entry, "hsem_huawei_solar_power_meter_phase_b_active_power"
+    )
+    cfg.huawei_solar_power_meter_phase_c_active_power = get_config_value(
+        config_entry, "hsem_huawei_solar_power_meter_phase_c_active_power"
+    )
 
     # Power meters
     cfg.house_consumption_power = get_config_value(
@@ -186,6 +201,9 @@ def build_sensor_config(
         get_config_value(config_entry, "hsem_main_fuse_phases")
     )
     cfg.main_fuse_phases = _main_fuse_phases if _main_fuse_phases is not None else 3
+    cfg.phase_aware_charging_enabled = convert_to_boolean(
+        get_config_value(config_entry, "hsem_phase_aware_charging_enabled")
+    )
     _max_export_kw = convert_to_float(
         get_config_value(config_entry, "hsem_max_grid_export_power_kw")
     )
@@ -265,6 +283,12 @@ def build_sensor_config(
         get_config_value(
             config_entry, "hsem_secondary_storage_allow_primary_battery_transfer"
         )
+    )
+    _secondary_grid_phase = convert_to_int(
+        get_config_value(config_entry, "hsem_secondary_storage_grid_phase")
+    )
+    secondary.grid_phase = (
+        _secondary_grid_phase if _secondary_grid_phase in {1, 2, 3} else 3
     )
     cfg.secondary_storage = secondary
 

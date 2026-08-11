@@ -27,11 +27,12 @@ from custom_components.hsem.utils.inverter_verify import (
     async_write_and_verify,
 )
 from custom_components.hsem.utils.logger import HSEM_LOGGER as _LOGGER
-
-POWMR_OUTPUT_UTILITY = "Utility first"
-POWMR_OUTPUT_SBU = "SBU priority"
-POWMR_CHARGER_UTILITY = "Solar and Utility"
-POWMR_CHARGER_SOLAR_ONLY = "Only Solar"
+from custom_components.hsem.utils.phase_power import (
+    POWMR_CHARGER_SOLAR_ONLY,
+    POWMR_CHARGER_UTILITY,
+    POWMR_OUTPUT_SBU,
+    POWMR_OUTPUT_UTILITY,
+)
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,12 @@ def build_secondary_write_plan(
     ):
         mode = SECONDARY_MODE_UTILITY
         max_soc_charge_guard = True
+    if (
+        mode == SECONDARY_MODE_CHARGE
+        and rec.secondary_storage_charge_current_a
+        < configured.min_charge_current_a - 1e-9
+    ):
+        mode = SECONDARY_MODE_UTILITY
 
     if mode == SECONDARY_MODE_SBU:
         return [
