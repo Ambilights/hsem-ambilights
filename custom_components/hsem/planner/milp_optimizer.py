@@ -1,22 +1,4 @@
-"""MILP-based optimal battery charge/discharge scheduler.
-
-Formulated as a continuous LP via ``scipy.optimize.linprog`` with HiGHS.
-Binary flags relaxed to continuous; mutex constraint prevents
-simultaneous charge+discharge.
-
-Decision variables per slot t (9+n*1 for EVs + fuse penalties):
-ec, ed, gi, ge, pv, m (=max(ec,ed)), s_max_pen, s_min_pen, curt.
-
-Objective: Σ p_imp·gi - p_exp·ge + cycle_cost·m + p_soc·penalties.
-
-Constraints: SoC recurrence, SoC soft bounds, charge/discharge limits,
-mutex, energy balance (with efficiencies), EV co-optimisation, fuse limit.
-
-Price sanitisation: export<min_export→0, export≤import, import_obj≥0.
-Curtailment variable ``curt[t]`` allows explicit PV shedding.
-
-Pure Python, no HA imports — testable with plain pytest.
-"""
+"""HiGHS optimisation for Huawei storage, EVs, and optional secondary storage."""
 
 from __future__ import annotations
 
@@ -35,6 +17,9 @@ from custom_components.hsem.utils.units import (
 
 if TYPE_CHECKING:
     from custom_components.hsem.models.planned_slot import PlannedSlot
+    from custom_components.hsem.models.secondary_storage_config import (
+        SecondaryStorageConfig,
+    )
 
 # Name exported so the engine and tests can reference it without re-defining
 CANDIDATE_MILP = "milp"
@@ -68,133 +53,38 @@ def solve_milp(
     main_fuse_amps: float | None = None,
     main_fuse_phases: int = 3,
     max_grid_export_power_kw: float | None = None,
+    secondary_storage: SecondaryStorageConfig | None = None,
 ) -> tuple[list[PlannedSlot], dict] | None:
-    """Solve the LP and return a deep-copy slot list with MILP recommendations.
+    """Solve the horizon and return independent result slots plus diagnostics.
 
-    The returned list is independent of *slots* — it is safe to mutate without
-    affecting the caller's data.  Fields written by the MILP are:
+    Huawei storage and EVs use the existing continuous formulation. When
+    ``secondary_storage.valid`` is true, HiGHS also receives binary charge
+    and SBU mode variables for the dedicated-load battery. The secondary
+    output can remove only its configured load from the site balance and can
+    never create grid export.
 
-    - ``recommendation``  — one of ``BatteriesChargeGrid``, ``BatteriesDischargeMode``,
-      ``ForceBatteriesDischarge``, or ``None`` (idle).
-    - ``batteries_charged_kwh`` — energy entering the battery this slot (kWh).
-    - ``batteries_discharged_kwh`` — energy discharged from the battery this slot
-      (kWh).  Derived from the **resolved** ed after mutex resolution — this is the
-      source of truth and must not be re-derived by the SoC simulation.
-    - ``grid_import_kwh`` — grid import this slot (kWh), derived from the energy
-      balance equation using the resolved ec/ed values.
-    - ``grid_export_kwh`` — grid export this slot (kWh), derived from the energy
-      balance equation using the resolved ec/ed values.
-    - ``ev_planned_load_kwh`` — EV AC load that must be added to base consumption
-      (when ``ev_configs`` is provided and ``base_load_includes_ev`` is False).
-    - ``ev_accounted_load_kwh`` — EV AC load already captured in house consumption
-      (when ``ev_configs`` is provided and ``base_load_includes_ev`` is True).
-    - ``ev_total_planned_load_kwh`` — total EV AC load (sum of planned + accounted).
-    - ``ev_charger_calculated_power`` — target AC power (W) for the primary EV charger.
-    - ``ev_second_charger_calculated_power`` — target AC power (W) for the second EV.
-    - ``estimated_net_consumption_kwh`` — recomputed after EV decisions.
-    - ``estimated_cost_currency`` — recomputed after EV decisions.
-
-    The SoC simulation (:func:`~soc_simulation.simulate_soc`) must be run
-    by the caller **after** receiving these slots with
-    ``milp_prepopulated=True`` to populate ``estimated_battery_soc``
-    and ``estimated_battery_capacity_kwh`` while preserving the LP-derived
-    energy flow fields.
-
-    The MILP objective now includes conversion loss costs so its optimisation
-    matches the cost function's ``total_cost``.  The energy balance equation
-    accounts for charge/discharge efficiencies so ``gi[t]`` reflects real grid
-    import (not the idealised lossless value).
-
-    Args:
-        slots:
-            Fully populated (pre-SoC-simulation) slot list from the engine.
-            Past slots with recommendation ``TimePassed`` are treated as fixed
-            (zero charge/discharge) and excluded from the LP.
-        now:
-            Timezone-aware current datetime used to identify past slots.
-        current_kwh:
-            Battery energy above the discharge floor at the start of the horizon
-            (kWh).  This is the LP's initial SoC state.
-        usable_kwh:
-            Maximum usable energy (max_soc − min_soc, kWh).  Acts as the SoC
-            upper bound.
-        max_charge_per_slot:
-            Maximum energy chargeable per slot (kWh, post-conversion-loss).
-        max_discharge_per_slot:
-            Maximum energy dischargeable per slot (kWh).  ``None`` means unlimited;
-            the LP uses ``usable_kwh`` as the effective ceiling in that case.
-        cycle_cost_per_kwh:
-            Battery cycle (depreciation) cost per kWh cycled.  Defaults to 0.0.
-        charge_efficiency_pct:
-            Charge-side efficiency as a percentage (0-100).  Energy stored in
-            the battery equals input energy x (charge_efficiency_pct / 100).
-            Defaults to 97 % (3 % charge-side loss).
-        discharge_efficiency_pct:
-            Discharge-side efficiency as a percentage (0-100).  Energy delivered
-            to the house equals battery energy removed x (discharge_efficiency_pct / 100).
-            Defaults to 97 % (3 % discharge-side loss).
-        replacement_price_per_kwh:
-            Terminal-SoC replacement price (currency/kWh) used to value the
-            opportunity cost of ending the horizon with less stored energy.
-            Passed from the engine (computed from the next discharge window).
-            ``None`` disables the terminal-SoC credit term.
-        min_export_price:
-            Minimum export price (local currency/kWh) for the combined
-            threshold below which export is not worthwhile.  Set by the
-            caller to ``max(export_min_price, recommended_threshold)``
-            where ``export_min_price`` is the inverter's physical block
-            threshold and ``recommended_threshold`` is the
-            depreciation-based discharge minimum.  Used for:
-            - Clamping export prices to 0 before the LP solves (export
-              below this price is physically blocked).
-            - Deciding between ``ForceBatteriesDischarge`` and
-              ``BatteriesDischargeMode`` in post-processing.
-            Defaults to 0.0.
-        ev_configs:
-            Optional list of :class:`EVConfig` objects (one per EV).  When
-            provided, the MILP co-optimises EV charging alongside the battery.
-            EV loads are treated as decision variables with deadline-target
-            soft constraints.  The ``ev_planned_load_kwh`` field on the input
-            slots is ignored for EV-enabled slots (the MILP decides allocation).
-            ``None`` (default) uses pre-computed ``ev_planned_load_kwh`` as
-            fixed inputs (backward-compatible behaviour).
-        no_export:
-            When ``True``, caps battery discharge per slot so the battery
-            never exports to the grid — it only serves house load.  The
-            per-slot cap is ``ed[t] ≤ base_load[t] / discharge_eff``.
-        main_fuse_amps:
-            Main fuse/breaker rating in amps.  When provided and > 0, a soft
-            constraint limits total grid import power per slot to
-            ``main_fuse_amps * 230 * main_fuse_phases / 1000 * (interval_minutes / 60)`` kWh.
-            A penalty variable ``gi_pen[t]`` absorbs any excess, preventing
-            infeasibility when house base load alone exceeds the fuse rating.
-            ``None`` or 0 disables the constraint (identical to current behaviour).
-        main_fuse_phases:
-            Electrical phase count (1 or 3).  Used as the multiplier in the
-            max-grid-import formula above.  Defaults to 3 (three-phase).
-            Single-phase installations MUST use 1.
-        max_grid_export_power_kw:
-            DNO/inverter grid export cap in kW (issue #726).  When > 0, the
-            per-slot ``ge[t]`` is hard-bounded to
-            ``max_grid_export_power_kw * slot_hours`` kWh so the plan never
-            exceeds the site limit.  ``None`` or 0 disables the bound.
-
-    Returns:
-        A tuple ``(slots, diagnostics)`` where:
-        - ``slots`` is a list of :class:`PlannedSlot` copies with MILP-derived
-          recommendations.
-        - ``diagnostics`` is a dict with keys ``"s_max_pen"``, ``"s_min_pen"``,
-          ``"has_violations"``, ``"total_violation_kwh"``,
-          ``"discharge_loss_cost_destination_aware"``.
-        Returns ``None`` if the solver fails (unrelated to constraint
-        violations — e.g., solver crash or numerical issue).
+    Callers must run :func:`~soc_simulation.simulate_soc` with
+    ``milp_prepopulated=True`` for the Huawei SoC display fields. Returns
+    ``None`` when no future horizon exists or the solver fails.
     """
+    secondary_active = secondary_storage is not None and secondary_storage.valid
+    if secondary_active:
+        import copy
+
+        from custom_components.hsem.planner.secondary_storage import (
+            populate_secondary_storage_load,
+        )
+
+        slots = [copy.copy(slot) for slot in slots]
+        assert secondary_storage is not None
+        populate_secondary_storage_load(slots, secondary_storage)
+
     log_planner(
         "debug",
         "[milp] solve_milp  slots=%d  current=%.3f  usable=%.3f  "
         "max_chg=%.3f  max_dis=%s  cycle_cost=%.6f  "
         "chg_eff=%.2f  dis_eff=%.2f  discount=%.4f  repl_price=%s  "
-        "no_export=%s  min_export_price=%.4f  fuse=%s",
+        "no_export=%s  min_export_price=%.4f  fuse=%s  secondary=%s",
         len(slots),
         current_kwh,
         usable_kwh,
@@ -216,6 +106,7 @@ def solve_milp(
             if main_fuse_amps is not None
             else "disabled"
         ),
+        secondary_active,
     )
 
     try:
@@ -500,6 +391,15 @@ def solve_milp(
     charge_loss = 1.0 - charge_eff
     discharge_loss = 1.0 - discharge_eff
 
+    base_n_vars = n_vars
+    secondary_layout = None
+    if secondary_active:
+        from custom_components.hsem.planner.milp._secondary_storage import (
+            _allocate_secondary_variables,
+        )
+
+        secondary_layout, n_vars = _allocate_secondary_variables(base_n_vars, m)
+
     # ------------------------------------------------------------------
     # Build objective vector and constraint matrices
     # ------------------------------------------------------------------
@@ -540,9 +440,28 @@ def solve_milp(
         max_charge_per_slot=max_charge_per_slot,
     )
 
+    if secondary_active:
+        from custom_components.hsem.planner.milp._secondary_storage import (
+            _add_secondary_objective,
+        )
+
+        assert secondary_layout is not None
+        assert secondary_storage is not None
+        _add_secondary_objective(
+            c_obj,
+            layout=secondary_layout,
+            config=secondary_storage,
+            slots=slots,
+            future_idx=future_idx,
+            p_imp_obj=p_imp_obj,
+            p_exp=p_exp,
+            time_discount_rate=time_discount_rate,
+            now=now,
+        )
+
     constraints = _build_constraints(
         m,
-        n_vars,
+        base_n_vars,
         ec_off,
         ed_off,
         gi_off,
@@ -577,6 +496,28 @@ def solve_milp(
         export_limit_active=export_limit_active,
     )
 
+    integrality = None
+    if secondary_active:
+        from custom_components.hsem.planner.milp._secondary_storage import (
+            _extend_secondary_constraints,
+            _secondary_integrality,
+        )
+
+        assert secondary_layout is not None
+        assert secondary_storage is not None
+        constraints = _extend_secondary_constraints(
+            constraints,
+            n_vars=n_vars,
+            m=m,
+            layout=secondary_layout,
+            config=secondary_storage,
+            slots=slots,
+            future_idx=future_idx,
+            primary_discharge_off=ed_off,
+            primary_max_discharge_kwh=max_dis,
+        )
+        integrality = _secondary_integrality(n_vars, m, secondary_layout)
+
     A_eq = constraints["A_eq"]
     b_eq = constraints["b_eq"]
     A_ub = constraints["A_ub"]
@@ -586,6 +527,12 @@ def solve_milp(
     # ------------------------------------------------------------------
     # Solve using HiGHS
     # ------------------------------------------------------------------
+    solver_options: dict[str, float | bool] = {
+        "time_limit": 5.0 if secondary_active else _SOLVER_TIME_LIMIT_S,
+        "disp": False,
+    }
+    if secondary_active:
+        solver_options["mip_rel_gap"] = 0.005
     try:
         result = linprog(
             c_obj,
@@ -594,8 +541,9 @@ def solve_milp(
             A_eq=A_eq,
             b_eq=b_eq,
             bounds=bounds,
+            integrality=integrality,
             method="highs",
-            options={"time_limit": _SOLVER_TIME_LIMIT_S, "disp": False},
+            options=solver_options,
         )
     except Exception as exc:
         log_planner("warning", "[milp] Solver raised an exception: %s", exc)
@@ -702,6 +650,23 @@ def solve_milp(
         terminal_soc_credit,
         _min_action_kwh=_MIN_ACTION_KWH,
     )
+
+    if secondary_active:
+        from custom_components.hsem.planner.milp._secondary_storage import (
+            _write_secondary_results,
+        )
+
+        assert secondary_layout is not None
+        assert secondary_storage is not None
+        secondary_diagnostics = _write_secondary_results(
+            out_slots,
+            result_x=result.x,
+            layout=secondary_layout,
+            config=secondary_storage,
+            future_idx=future_idx,
+            minimum_action_kwh=_MIN_ACTION_KWH,
+        )
+        diagnostics.update(secondary_diagnostics)
 
     return out_slots, diagnostics
 

@@ -11,7 +11,7 @@ HSEM exposes these entity types:
 
 | Type | Count | Description |
 |---|---|---|
-| **Sensor** | ~40 | Read-only state, plan, diagnostic, financial, and EV entities |
+| **Sensor** | ~41 | Read-only state, plan, diagnostic, financial, and EV entities |
 | **Select** | 2 | Force working mode override and Solcast likelihood selector |
 | **Switch** | ~15 | Toggle entities for schedules, EV settings, features, and ML options |
 | **Time** | 8 | Start/end time inputs for battery schedules and EV deadlines |
@@ -111,6 +111,14 @@ Each entry in the `hourly_recommendations` list is a dictionary with these keys:
 | `grid_import_kwh` | float | Energy imported from grid (kWh) |
 | `grid_export_kwh` | float | Energy exported to grid (kWh) |
 | `is_ev_surplus_only_slot` | bool | Slot restricted to EV surplus-only charging |
+| `secondary_storage_load_kwh` | float | Dedicated PowMr load energy (kWh) |
+| `secondary_storage_charged_kwh` | float | Battery-side PowMr charge energy (kWh) |
+| `secondary_storage_discharged_kwh` | float | Battery energy removed by PowMr (kWh) |
+| `secondary_storage_grid_import_kwh` | float | PowMr branch utility import (kWh) |
+| `secondary_storage_estimated_capacity_kwh` | float | PowMr usable energy above reserve at slot end |
+| `secondary_storage_estimated_soc_pct` | float | Absolute PowMr SoC at slot end (%) |
+| `secondary_storage_charge_current_a` | float | Physical 10 A-step charge target |
+| `secondary_storage_mode` | string \| null | `utility`, `charge`, or `sbu` |
 
 ### Extended attributes (when enabled)
 
@@ -325,6 +333,44 @@ Diagnostic sensors displaying the EV charging plan details.
 | `charging_slots` | List of allocated charging slots with details |
 | `planned_load_by_slot` | Dict of slot → kWh load |
 | `data_quality` | Diagnostic warnings |
+
+---
+
+## Secondary storage plan sensor
+
+Diagnostic shadow-plan sensor for the optional non-exporting PowMr battery.
+
+**Entity:** `sensor.hsem_secondary_storage_plan`
+
+| State | Meaning |
+|---|---|
+| `disabled` | Secondary optimisation is not enabled |
+| `utility` | Utility bypass supplies the dedicated NAS load; grid charging is off |
+| `charge` | Utility supplies the load and charges PowMr at the planned current |
+| `sbu` | PowMr battery supplies only the dedicated load |
+| `unavailable` | Required telemetry or a current recommendation is unavailable |
+
+Key attributes:
+
+| Attribute | Description |
+|---|---|
+| `enabled` | Secondary MILP planning enabled |
+| `control_enabled` | Separate PowMr hardware-control gate |
+| `read_only` | Global HSEM read-only gate; always overrides control |
+| `actual_soc_pct` | Live `sensor.powmr_soc` value |
+| `actual_battery_net_power_w` | Live signed PowMr battery power; positive charge, negative discharge |
+| `actual_load_power_w` | Live dedicated-load power |
+| `actual_output_source_priority` | Current PowMr output mode |
+| `actual_charger_source_priority` | Current PowMr charger-source mode |
+| `actual_max_charge_current_a` | Current PowMr number-entity setting |
+| `target_charge_current_a` | Current slot's 10 A-step charge target |
+| `target_soc_at_slot_end_pct` | Planned PowMr SoC at the end of the active slot |
+| `planned_soc_at_horizon_end_pct` | Planned PowMr SoC at the end of the horizon |
+| `planned_windows` | Consecutive equal-mode slots coalesced into compact windows |
+
+Each `planned_windows` item contains `start`, `end`, `mode`, `charged_kwh`,
+`discharged_kwh`, `grid_import_kwh`, `soc_at_end_pct`, and
+`charge_current_a`. Keep both control gates off while validating these windows.
 
 ---
 

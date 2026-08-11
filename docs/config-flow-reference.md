@@ -10,7 +10,8 @@ The config flow is a multi-step wizard. Steps appear in this order:
 
 ```
 quick_setup → init → prices → months → solcast → huawei_solar
-    → battery_economics → power → ev → [ev_second] → ev_planned_load
+    → battery_economics → power → secondary_storage → ev → [ev_second]
+    → ev_planned_load
     → [ev_second_planned_load] → ocpp → batteries_schedules
     → batteries_excess_export → weighted_values
     → energy_and_ml
@@ -119,6 +120,49 @@ Power sensor configuration.
 | Main fuse amps | `hsem_main_fuse_amps` | 25 | Main fuse/breaker rating in amps. Set to 0 to disable. The MILP optimizer will respect this limit when scheduling battery and EV charging |
 | Main fuse phases | `hsem_main_fuse_phases` | 3 | Electrical phase count (1 or 3). Single-phase installations MUST set this to 1 — setting 3 on a single-phase install makes the fuse constraint 3× too permissive |
 | Max grid export power | `hsem_max_grid_export_power_kw` | 0 | DNO/inverter grid export cap in kW for export-limited connections (issue #726). The MILP planner never schedules export above this limit. Set to 0 to disable |
+
+### Step: `secondary_storage`
+
+Optional topology-aware planning for a non-exporting PowMr battery that powers
+only a dedicated AC load. The reference defaults match the PowMr/NAS installation
+for this fork; the feature is disabled and control is separately disabled by
+default.
+
+| Field | Key | Default | Description |
+|---|---|---|---|
+| Enable planning | `hsem_secondary_storage_enabled` | `False` | Add PowMr state and modes to the MILP |
+| Enable control | `hsem_secondary_storage_control_enabled` | `False` | Permit the PowMr adapter; global read-only still wins |
+| SoC sensor | `hsem_secondary_storage_soc_entity` | `sensor.powmr_soc` | Current battery SoC (%) |
+| Battery net power | `hsem_secondary_storage_battery_net_power_entity` | `sensor.powmr_battery_net_power` | Optional diagnostic; positive charge, negative discharge |
+| Dedicated load power | `hsem_secondary_storage_load_power_entity` | `sensor.powmr_load_power_internal` | Isolated NAS-side AC load (W) |
+| Output priority | `hsem_secondary_storage_output_source_priority_entity` | `select.powmr_output_source_priority` | Supports `Utility first` and `SBU priority` |
+| Charger priority | `hsem_secondary_storage_charger_source_priority_entity` | `select.powmr_charger_source_priority` | Uses `Solar and Utility` or `Only Solar` |
+| Charge-current number | `hsem_secondary_storage_max_charge_current_entity` | `number.powmr_max_total_charge_current` | PowMr total current control |
+| Capacity | `hsem_secondary_storage_capacity_kwh` | 15 kWh | Nameplate battery capacity |
+| Minimum / maximum SoC | `hsem_secondary_storage_min_soc_pct`, `hsem_secondary_storage_max_soc_pct` | 20 / 100 % | Hard planning and runtime bounds |
+| Nominal voltage | `hsem_secondary_storage_nominal_voltage_v` | 24 V | Converts stored kWh to current target |
+| Minimum / maximum current | `hsem_secondary_storage_min_charge_current_a`, `hsem_secondary_storage_max_charge_current_a` | 10 / 60 A | Must be 10 A steps within the verified 10–80 A entity range |
+| Charge / discharge efficiency | `hsem_secondary_storage_charge_efficiency_pct`, `hsem_secondary_storage_discharge_efficiency_pct` | 93 / 93 % | AC↔battery conversion efficiencies |
+| SBU overhead | `hsem_secondary_storage_inverter_standby_power_w` | 55 W | Additional DC draw while battery supplies the load |
+| Cycle cost | `hsem_secondary_storage_cycle_cost_per_kwh` | 0 | Optional wear cost per throughput kWh |
+| History includes load | `hsem_secondary_storage_base_load_includes_dedicated_load` | `True` | House history normally contains the NAS utility load |
+| Allow battery transfer | `hsem_secondary_storage_allow_primary_battery_transfer` | `False` | Allow Huawei discharge while PowMr charges |
+
+Safe commissioning order:
+
+1. Enable secondary-storage planning only.
+2. Keep `hsem_secondary_storage_control_enabled=False` and global
+   `hsem_read_only=True`.
+3. Inspect `sensor.hsem_secondary_storage_plan` through several price changes.
+4. Before enabling control, disable any automation that also writes the three
+   PowMr control entities (for this installation, `automation.powmr_automatik`).
+5. Enable the feature control gate only after the shadow plan is verified; lift
+   global read-only separately when all HSEM hardware control is intended.
+
+If required PowMr SoC or load telemetry is unavailable, no secondary plan is
+produced and degraded-mode safety blocks writes. Mixed Utility/SBU history is an
+approximation because the house-consumption series includes the NAS only while it
+is supplied from utility.
 
 ### Step: `ev`
 

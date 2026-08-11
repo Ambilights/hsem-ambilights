@@ -8,6 +8,7 @@ directly testable with plain ``pytest`` without a running HA instance.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 
 from custom_components.hsem.models.ev_config import EVConfig
@@ -21,20 +22,7 @@ from custom_components.hsem.planner.candidate_selector import (
     replacement_price_from_next_discharge,
     select_best_candidate,
 )
-from custom_components.hsem.planner.charging.arbitrage_charge import (
-    apply_arbitrage_grid_charge,
-)
-from custom_components.hsem.planner.charging.opportunistic_charge import (
-    apply_opportunistic_charge,
-)
-from custom_components.hsem.planner.charging.pre_charge import apply_charge_schedules
 from custom_components.hsem.planner.cost_function import CostWeights, score_plan
-from custom_components.hsem.planner.discharge_scheduler import (
-    apply_discharge_schedules,
-    apply_excess_export,
-    apply_optimization_strategy,
-    calculate_required_battery_until_solar,
-)
 from custom_components.hsem.planner.engine_ev import (
     _build_and_inject_for_ev,
     _compute_ev_charger_power,
@@ -51,15 +39,18 @@ from custom_components.hsem.planner.engine_population import (
     _parse_now,
     _populate_slots,
 )
+from custom_components.hsem.planner.engine_scheduling import _schedule_slots
 from custom_components.hsem.planner.ev_planner import (
     EVChargingPlan,
     rebuild_ev_plan_from_slots,
 )
+from custom_components.hsem.planner.secondary_storage import (
+    populate_secondary_storage_load,
+    resolve_secondary_terminal_price,
+)
 from custom_components.hsem.planner.slot_population import (
     build_slots,
     build_time_series_index,
-    mark_time_passed,
-    populate_battery_capacity,
     populate_estimated_cost,
     populate_net_consumption,
     usable_capacity,
@@ -75,137 +66,7 @@ from custom_components.hsem.utils.recommendations import Recommendations
 from custom_components.hsem.utils.units import (
     fuse_max_energy_per_slot_kwh,
     hours_ahead,
-    max_energy_per_slot_kwh,
-    roundtrip_loss_pct,
 )
-
-
-def _schedule_slots(
-    slots: list,
-    inp: PlannerInput,
-    now: datetime,
-    current_kwh: float,
-    usable_kwh: float,
-    rt: float,
-    effective_cycle_cost: float,
-    warnings: list[str],
-) -> tuple[float, float | None, float, float, list[str]]:
-    """All charge/discharge scheduling passes.
-
-    Args:
-        effective_cycle_cost: Resolved per-kWh cycle cost used by all charge
-            passes.  Computed as ``max(auto_calc, user_configured_margin)`` by
-            the caller so heuristic and MILP paths use the same value.
-    """
-    mark_time_passed(slots, now)
-    apply_discharge_schedules(slots, inp.battery_schedules, now)
-    log_planner(
-        "debug",
-        "[core] _schedule_slots  pass=discharge_schedules  slots=%d",
-        len(slots),
-    )
-    cd = clamp_efficiency(inp.battery_charge_efficiency_pct)
-    rlp = roundtrip_loss_pct(
-        inp.battery_charge_efficiency_pct,
-        inp.battery_discharge_efficiency_pct,
-    )
-    mcphi = max_energy_per_slot_kwh(
-        inp.battery_max_charge_power_w,
-        inp.interval_minutes,
-        efficiency_fraction=cd,
-    )
-    apply_charge_schedules(
-        slots,
-        inp.battery_schedules,
-        now,
-        mcphi,
-        current_kwh=current_kwh,
-        usable_kwh=usable_kwh,
-        cycle_cost_per_kwh=effective_cycle_cost,
-        recommended_threshold=rt,
-    )
-    apply_opportunistic_charge(
-        slots,
-        now,
-        current_kwh,
-        usable_kwh,
-        mcphi,
-        rt,
-        cycle_cost_per_kwh=effective_cycle_cost,
-    )
-    apply_arbitrage_grid_charge(
-        slots,
-        inp.battery_schedules,
-        now,
-        current_kwh,
-        usable_kwh,
-        mcphi,
-        conversion_loss_pct=rlp,
-        cycle_cost_per_kwh=effective_cycle_cost,
-        recommended_threshold=rt,
-    )
-    mcps = mcphi  # same formula — max charge energy per slot
-    mdps: float | None = None
-    if inp.battery_max_discharge_power_w is not None:
-        mdps = max_energy_per_slot_kwh(
-            inp.battery_max_discharge_power_w,
-            inp.interval_minutes,
-        )
-    max_soc_kwh = usable_kwh
-    populate_battery_capacity(slots, now, current_kwh, usable_kwh)
-    rc = calculate_required_battery_until_solar(
-        slots, now, usable_kwh, inp.excess_export_discharge_buffer_pct
-    )
-    log_planner(
-        "debug",
-        "[core] _schedule_slots  pass=after_scheduling  mcps=%.3f  mdps=%s  "
-        "max_soc=%.3f  rc=%.3f",
-        mcps,
-        f"{mdps:.3f}" if mdps is not None else "∞",
-        max_soc_kwh,
-        rc,
-    )
-    if inp.excess_export_enabled:
-        apply_excess_export(
-            slots,
-            now,
-            current_kwh,
-            rc,
-            inp.excess_export_price_threshold,
-            warnings,
-            export_min_price=inp.export_min_price,
-            recommended_threshold=rt,
-        )
-        log_planner(
-            "debug",
-            "[core] _schedule_slots  pass=excess_export  enabled=True",
-        )
-    else:
-        log_planner(
-            "debug",
-            "[core] _schedule_slots  pass=excess_export  enabled=False  "
-            "→ MILP no_export constraint active (battery will not export to grid)",
-        )
-    apply_optimization_strategy(
-        slots,
-        now,
-        current_kwh,
-        usable_kwh,
-        rc,
-        inp.months_winter,
-        export_min_price=inp.export_min_price,
-    )
-    log_planner(
-        "debug",
-        "[core] _schedule_slots DONE  mcps=%.3f  mdps=%s  max_soc=%.3f  rc=%.3f  "
-        "warnings=%d",
-        mcps,
-        f"{mdps:.3f}" if mdps is not None else "∞",
-        max_soc_kwh,
-        rc,
-        len(warnings),
-    )
-    return mcps, mdps, max_soc_kwh, rc, warnings
 
 
 def _select_candidate(
@@ -258,6 +119,7 @@ def _select_candidate(
         hysteresis_percentage=inp.planner_hysteresis_percentage,
         previous_winner_name=inp.previous_winner_name,
         previous_winner_score=inp.previous_winner_score,
+        secondary_storage=inp.secondary_storage,
     )
     log_planner(
         "debug",
@@ -342,6 +204,34 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
     )
     # Step 1b — inject live solar and consumption into the current slot
     _inject_live_data_into_current_slot(slots, inp, now)
+
+    if inp.secondary_storage.valid:
+        populate_secondary_storage_load(slots, inp.secondary_storage)
+        secondary_replacement_price = resolve_secondary_terminal_price(
+            slots,
+            inp.secondary_storage,
+            now,
+        )
+        inp = replace(
+            inp,
+            secondary_storage=replace(
+                inp.secondary_storage,
+                replacement_price_per_kwh=secondary_replacement_price,
+            ),
+        )
+        log_planner(
+            "debug",
+            "[core] Secondary storage enabled: capacity=%.3f kWh soc=%.1f%% "
+            "load=%.0f W terminal_value=%s",
+            inp.secondary_storage.capacity_kwh,
+            inp.secondary_storage.current_soc_pct,
+            inp.secondary_storage.load_power_w,
+            (
+                f"{secondary_replacement_price:.6f}"
+                if secondary_replacement_price is not None
+                else "None"
+            ),
+        )
 
     # Step 2 — EV planned load injection
     ev_cp: EVChargingPlan | None = None
@@ -477,6 +367,17 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
         time_discount_rate=inp.time_discount_rate,
         battery_usable_capacity_kwh=usable_kwh,
         max_charge_per_slot_kwh=mcps,
+        secondary_storage_enabled=inp.secondary_storage.valid,
+        secondary_storage_charge_efficiency_pct=(
+            inp.secondary_storage.charge_efficiency_pct
+        ),
+        secondary_storage_discharge_efficiency_pct=(
+            inp.secondary_storage.discharge_efficiency_pct
+        ),
+        secondary_storage_cycle_cost_per_kwh=(inp.secondary_storage.cycle_cost_per_kwh),
+        secondary_storage_replacement_price_per_kwh=(
+            inp.secondary_storage.replacement_price_per_kwh
+        ),
     )
     sdh = inp.interval_minutes / 60.0
     import math
@@ -722,6 +623,11 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
             break
     fut = [s for s in slots if as_tz(s.end, now.tzinfo) > now]
     bsoc_end = fut[-1].estimated_battery_soc_pct if fut else 0.0
+    secondary_soc_end = (
+        fut[-1].secondary_storage_estimated_soc_pct
+        if fut and inp.secondary_storage.valid
+        else 0.0
+    )
     cw_out, dw_out = _derive_windows(slots)
     expl = _build_explanation(inp, slots, bsoc_end, now)
     expl.winner_name = winner.name
@@ -783,6 +689,7 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
         discharge_windows=dw_out,
         current_recommendation=cur_rec,
         battery_soc_at_end=bsoc_end,
+        secondary_storage_soc_at_end=secondary_soc_end,
         required_capacity_kwh=rc,
         missing_inputs=missing_inputs,
         warnings=warnings,

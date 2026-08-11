@@ -39,9 +39,9 @@ flowchart TD
 
 ## Variable layout
 
-### Base battery variables (8 × n slots)
+### Base battery variables (9 × n slots)
 
-For each slot `t ∈ 0…n-1` the LP variable vector `x` contains eight decision variables:
+For each slot `t ∈ 0…n-1` the LP variable vector `x` contains nine decision variables:
 
 | Offset | Variable | Name | Description | Bounds |
 |---|---|---|---|---|
@@ -53,6 +53,7 @@ For each slot `t ∈ 0…n-1` the LP variable vector `x` contains eight decision
 | `5n` | `m[t]` | `m_off` | Auxiliary variable ≥ max(ec[t], ed[t]) for cycle cost (kWh) | `[0, ∞)` |
 | `6n` | `s_max_pen[t]` | `s_max_off` | SoC upper penalty — kWh by which state of charge exceeds `usable_kwh` | `[0, ∞)` |
 | `7n` | `s_min_pen[t]` | `s_min_off` | SoC lower penalty — kWh by which state of charge drops below 0 | `[0, ∞)` |
+| `8n` | `curt[t]` | `curt_off` | Explicit PV curtailment (kWh) | `[0, ∞)`; site balance limits useful curtailment |
 
 The state of charge `soc[t]` is **not an explicit variable** — it is derived from the forward recurrence:
 
@@ -67,15 +68,15 @@ Penalty variables `s_max_pen` and `s_min_pen` prevent infeasibility when the ini
 When one or more active EVs are provided, the variable vector expands to:
 
 $$
-\text{total variables} = 8n + n \cdot E + E
+\text{total variables} = 9n + n \cdot E + E
 $$
 
 where `E` is the number of active EVs.
 
 | Offset | Variable | Name | Description | Bounds |
 |---|---|---|---|---|
-| `8n + i·n` | `evN_c[t]` | EV N DC-side charge per slot (kWh) | `[0, evN.max_charge_per_slot]` |
-| `8n + E·n + i` | `evN_pen` | EV N deadline target slack (kWh shortfall) | `[0, ∞)` |
+| `9n + i·n` | `evN_c[t]` | EV N DC-side charge per slot (kWh) | `[0, evN.max_charge_per_slot]` |
+| `9n + E·n + i` | `evN_pen` | EV N deadline target slack (kWh shortfall) | `[0, ∞)` |
 
 The EV charger AC load entering the energy balance equation is `evN_c[t] / charger_efficiency`.
 
@@ -93,7 +94,7 @@ When an EV has a deadline and `charge_past_target=False` (normal mode):
 When `main_fuse_amps > 0`, the variable vector expands further:
 
 $$
-\text{total variables} = 8n + n \cdot E + E + n
+\text{total variables} = 9n + n \cdot E + E + n
 $$
 
 | Offset | Variable | Name | Description | Bounds |
@@ -110,6 +111,45 @@ where ``phases`` is the electrical phase count (1 or 3, default 3).
 This assumes balanced load at 230 V phase-to-neutral per phase.
 
 The penalty uses the same high coefficient as SoC penalties (`max(p_imp) × 100`), ensuring the solver only exceeds the fuse limit when physically unavoidable (e.g. house base load alone exceeds the rating). When `main_fuse_amps` is `None` or 0, no variables or constraints are added — behaviour is unchanged.
+
+### Secondary stationary-storage extension (PowMr fork, issue #1)
+
+When a valid `SecondaryStorageConfig` is present, six `n`-slot blocks are
+appended after the base, EV, and optional fuse variables. Let `B` be that prior
+vector length:
+
+| Offset | Variable | Description | Type / bounds |
+|---|---|---|---|
+| `B` | `secondary_charge[t]` | Stored PowMr charge energy (kWh) | continuous, bounded by configured current |
+| `B+n` | `secondary_discharge[t]` | PowMr battery energy removed (kWh) | continuous, dedicated-load equality |
+| `B+2n` | `secondary_throughput[t]` | max(charge, discharge) wear auxiliary | continuous, non-negative |
+| `B+3n` | `secondary_charge_mode[t]` | Utility-charge mode | binary |
+| `B+4n` | `secondary_sbu_mode[t]` | Battery supplies dedicated load | binary |
+| `B+5n` | `secondary_charge_steps[t]` | Count of physical current increments | integer |
+
+The current-step equality is:
+
+$$
+secondary\_charge[t]
+= \frac{V \times \Delta I \times slot\_hours}{1000}
+\times secondary\_charge\_steps[t]
+$$
+
+For the PowMr reference hardware, $\Delta I=10$ A. Charge and SBU mode are
+mutually exclusive. The secondary state recurrence uses hard 20–100 % bounds,
+and SBU discharge is fixed to dedicated AC load divided by discharge efficiency
+plus configured inverter overhead. Because discharge is tied to that isolated
+load, it cannot backfeed or export.
+
+When house history is configured to include the dedicated load, the site-bus
+credit is conservatively capped at `min(dedicated_load, gross_house_load)`.
+Battery draw still serves the full live dedicated load, but incomplete mixed
+Utility/SBU history can never turn that draw into modeled PowMr backfeed.
+
+The secondary AC branch is included in `gi[t]`, so the existing main-fuse row
+also covers its bypass load and charging. Unless explicitly allowed, an extra
+constraint enforces zero Huawei discharge whenever secondary charge mode is on.
+This prevents battery-to-battery transfer through two conversion stages.
 
 ---
 
@@ -396,6 +436,12 @@ making them the source of truth:
 | `batteries_discharged_kwh` | `ed[t]` | Energy discharged from battery (kWh) |
 | `grid_import_kwh` | `gi[t]` | Grid import (kWh) |
 | `grid_export_kwh` | `ge[t]` | Grid export (kWh) |
+| `secondary_storage_charged_kwh` | secondary charge | Energy stored in PowMr (kWh) |
+| `secondary_storage_discharged_kwh` | secondary discharge | Energy removed from PowMr (kWh) |
+| `secondary_storage_grid_import_kwh` | derived branch flow | PowMr utility load plus AC charging draw (kWh) |
+| `secondary_storage_estimated_soc_pct` | state recurrence | Absolute PowMr SoC at slot end |
+| `secondary_storage_charge_current_a` | integer charge steps | Physical current target |
+| `secondary_storage_mode` | mode binaries | `utility`, `charge`, or `sbu` |
 
 These are populated for **every** future slot (zero for idle slots).  The
 SoC simulation (:func:`~soc_simulation.simulate_soc`) must be called with
@@ -431,7 +477,7 @@ After the MILP (or baseline) winner is selected, the engine runs a final pass ov
 
 ## Assumptions
 
-- **Linear relaxation**: Binary charge/discharge flags are relaxed to continuous because the mutual-exclusion constraint and per-slot power caps already prevent simultaneous charge + discharge in the optimal solution.
+- **Conditional integrality**: Huawei/EV behavior retains its continuous formulation. When secondary storage is enabled, PowMr charge/SBU modes are binary and its current-step variable is integer, so HiGHS solves a mixed-integer model.
 - **Deterministic inputs**: All forecasts (prices, PV, load) are treated as known with certainty — no stochastic programming.
 - **Cycle cost proxy**: The `m[t] = max(ec[t], ed[t])` formulation counts the larger of charge or discharge per slot, matching the 2× denominator in the cycle cost formula.
 - **Time discount**: The objective uses exponential discounting with `time_discount_rate^hours_ahead` to match the selector's discounted score.
@@ -445,7 +491,8 @@ After the MILP (or baseline) winner is selected, the engine runs a final pass ov
 | Parameter | Value | Rationale |
 |---|---|---|
 | Method | `highs` | scipy's HiGHS is the only supported LP method |
-| Timeout | 2.0 s | Covers 192-slot (768+ variable) problems where preprocessing reaches 200-400 ms |
+| Timeout | 2.0 s normally; 5.0 s with secondary storage | The PowMr extension adds binary modes and integer current steps across the horizon |
+| Relative MIP gap | 0.5% with secondary storage | Bounds solve time for the 192-slot mixed-integer horizon; not applied to the original continuous model |
 | `pv[t]` bounds | `(pv_avail[t], pv_avail[t])` | Fixed — PV surplus is not chosen by the LP |
 
 ---

@@ -36,16 +36,25 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from custom_components.hsem.models.rejected_plan import RejectedPlan
+from custom_components.hsem.models.secondary_storage_config import (
+    SecondaryStorageConfig,
+)
 from custom_components.hsem.planner.candidate_generator import (
     CANDIDATE_BASELINE,
     CANDIDATE_MILP,
     CANDIDATE_NO_ACTION,
     CandidatePlan,
 )
+from custom_components.hsem.planner.candidate_validation import (
+    validate_candidate as _validate_candidate,
+)
 from custom_components.hsem.planner.cost_function import CostWeights, score_plan
 from custom_components.hsem.planner.discharge_scheduler import (
     apply_optimization_strategy,
     concentrate_discharge_on_expensive_slots,
+)
+from custom_components.hsem.planner.secondary_storage import (
+    apply_secondary_utility_bypass,
 )
 from custom_components.hsem.planner.soc_simulation import simulate_soc
 from custom_components.hsem.utils.datetime_utils import as_tz
@@ -53,12 +62,6 @@ from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.recommendations import (
     DISCHARGE_RECS as _DISCHARGE_RECS,
 )
-
-# SoC floor tolerance — plans are accepted even if they dip this many
-# percentage points below end_of_discharge_soc_pct (rounding / simulation
-# artefact allowance).
-_SOC_TOLERANCE_PCT = 0.5
-
 
 # ---------------------------------------------------------------------------
 # Hysteresis result — communicated back to the engine for explanation
@@ -116,6 +119,7 @@ def select_best_candidate(  # NOSONAR
     hysteresis_percentage: float = 5.0,
     previous_winner_name: str | None = None,
     previous_winner_score: float = 0.0,
+    secondary_storage: SecondaryStorageConfig | None = None,
 ) -> tuple[CandidatePlan, list[RejectedPlan], HysteresisResult]:
     """Score all candidates, validate them, and return the best one.
 
@@ -249,8 +253,20 @@ def select_best_candidate(  # NOSONAR
             discharge_efficiency_pct=discharge_efficiency_pct,
             milp_prepopulated=(candidate.name == CANDIDATE_MILP),
         )
+        if (
+            secondary_storage is not None
+            and secondary_storage.valid
+            and candidate.name != CANDIDATE_MILP
+        ):
+            apply_secondary_utility_bypass(
+                candidate.slots,
+                secondary_storage,
+                now,
+            )
         candidate.is_valid, candidate.rejection_reason = _validate_candidate(
-            candidate, end_of_discharge_soc_pct
+            candidate,
+            end_of_discharge_soc_pct,
+            secondary_storage=secondary_storage,
         )
         log_planner(
             "debug",
@@ -510,39 +526,6 @@ def select_best_candidate(  # NOSONAR
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
-
-
-def _validate_candidate(
-    candidate: CandidatePlan,
-    end_of_discharge_soc_pct: float,
-) -> tuple[bool, str]:
-    """Return ``(is_valid, rejection_reason)`` for *candidate*.
-
-    A plan is invalid when any slot's ``estimated_battery_soc`` falls below
-    the end-of-discharge floor by more than :data:`_SOC_TOLERANCE_PCT`.
-    The SoC simulation already clamps discharges, so this catches numerical
-    edge cases only.
-
-    Args:
-        candidate: The candidate to validate.
-        end_of_discharge_soc_pct: Minimum allowed battery SoC (0-100).
-
-    Returns:
-        ``(True, "")`` when valid; ``(False, reason_string)`` when invalid.
-    """
-    floor = end_of_discharge_soc_pct - _SOC_TOLERANCE_PCT
-    for slot in candidate.slots:
-        soc = slot.estimated_battery_soc_pct
-        if soc > 0 and soc < floor:
-            return (
-                False,
-                (
-                    f"SoC {soc:.1f}% dropped below floor "
-                    f"{end_of_discharge_soc_pct:.1f}% "
-                    f"at slot starting {slot.start.isoformat()}."
-                ),
-            )
-    return True, ""
 
 
 def _find_by_name(candidates: list[CandidatePlan], name: str) -> CandidatePlan | None:

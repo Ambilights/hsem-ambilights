@@ -1,0 +1,130 @@
+"""Pure helpers for dedicated-load secondary-storage planning."""
+
+from __future__ import annotations
+
+import math
+from datetime import datetime, timedelta
+
+from custom_components.hsem.models.planned_slot import PlannedSlot
+from custom_components.hsem.models.secondary_storage_config import (
+    SecondaryStorageConfig,
+)
+from custom_components.hsem.utils.datetime_utils import as_tz
+from custom_components.hsem.utils.misc import clamp_efficiency
+from custom_components.hsem.utils.units import slot_duration_hours
+
+SECONDARY_MODE_CHARGE = "charge"
+SECONDARY_MODE_SBU = "sbu"
+SECONDARY_MODE_UTILITY = "utility"
+
+
+def secondary_charge_limits_kwh(
+    config: SecondaryStorageConfig,
+    slot_hours: float,
+) -> tuple[float, float]:
+    """Return minimum and maximum battery-side charge energy per slot."""
+    volts = max(config.nominal_voltage_v, 0.0)
+    minimum = volts * max(config.min_charge_current_a, 0.0) * slot_hours / 1000.0
+    maximum = volts * max(config.max_charge_current_a, 0.0) * slot_hours / 1000.0
+    return min(minimum, maximum), maximum
+
+
+def populate_secondary_storage_load(
+    slots: list[PlannedSlot],
+    config: SecondaryStorageConfig,
+) -> None:
+    """Populate the dedicated-load energy forecast on every slot."""
+    if not config.valid:
+        return
+    for slot in slots:
+        hours = slot_duration_hours(slot.start, slot.end)
+        slot.secondary_storage_load_kwh = round(
+            max(config.load_power_w, 0.0) * hours / 1000.0,
+            6,
+        )
+
+
+def secondary_site_load_offset_kwh(
+    slot: PlannedSlot,
+    config: SecondaryStorageConfig,
+) -> float:
+    """Return the dedicated load represented in the site-load forecast."""
+    load_kwh = max(slot.secondary_storage_load_kwh, 0.0)
+    if not config.base_load_includes_dedicated_load:
+        return load_kwh
+    # Mixed Utility/SBU history can contain less than a full dedicated load.
+    # Subtracting more than the gross house forecast would model impossible
+    # PowMr backfeed, so value only the portion demonstrably present.
+    return min(load_kwh, max(slot.avg_house_consumption_kwh, 0.0))
+
+
+def apply_secondary_utility_bypass(
+    slots: list[PlannedSlot],
+    config: SecondaryStorageConfig,
+    now: datetime,
+) -> None:
+    """Apply a physically valid utility-bypass fallback to non-MILP plans."""
+    if not config.valid:
+        return
+
+    populate_secondary_storage_load(slots, config)
+    current_capacity = config.current_usable_kwh
+    for slot in slots:
+        if as_tz(slot.end, now.tzinfo) <= now:
+            continue
+
+        load_kwh = slot.secondary_storage_load_kwh
+        slot.secondary_storage_charged_kwh = 0.0
+        slot.secondary_storage_discharged_kwh = 0.0
+        slot.secondary_storage_grid_import_kwh = round(load_kwh, 3)
+        slot.secondary_storage_estimated_capacity_kwh = round(current_capacity, 3)
+        slot.secondary_storage_estimated_soc_pct = round(
+            config.current_soc_pct,
+            2,
+        )
+        slot.secondary_storage_charge_current_a = 0.0
+        slot.secondary_storage_mode = SECONDARY_MODE_UTILITY
+
+        site_delta = 0.0 if config.base_load_includes_dedicated_load else load_kwh
+        net_grid = slot.grid_import_kwh - slot.grid_export_kwh + site_delta
+        slot.grid_import_kwh = round(max(net_grid, 0.0), 3)
+        slot.grid_export_kwh = round(max(-net_grid, 0.0), 3)
+        slot.estimated_cost_currency = round(
+            slot.grid_import_kwh * max(slot.price.import_price, 0.0)
+            - slot.grid_export_kwh * slot.price.export_price,
+            4,
+        )
+
+
+def resolve_secondary_terminal_price(
+    slots: list[PlannedSlot],
+    config: SecondaryStorageConfig,
+    now: datetime,
+) -> float | None:
+    """Return the configured or horizon-tail value of stored secondary energy."""
+    if not config.valid:
+        return None
+    if config.replacement_price_per_kwh is not None:
+        return max(config.replacement_price_per_kwh, 0.0)
+
+    future = [
+        slot
+        for slot in slots
+        if as_tz(slot.end, now.tzinfo) > now and not math.isnan(slot.price.import_price)
+    ]
+    if not future:
+        return None
+
+    horizon_end = max(as_tz(slot.end, now.tzinfo) for slot in future)
+    tail_start = horizon_end - timedelta(hours=24)
+    tail_prices = [
+        max(slot.price.import_price, 0.0)
+        for slot in future
+        if as_tz(slot.start, now.tzinfo) >= tail_start
+    ]
+    if not tail_prices:
+        return None
+
+    # Battery-side energy can offset only discharge-efficiency-adjusted load.
+    discharge_eff = clamp_efficiency(config.discharge_efficiency_pct)
+    return (sum(tail_prices) / len(tail_prices)) * discharge_eff

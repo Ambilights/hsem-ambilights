@@ -19,6 +19,9 @@ import pytest
 from homeassistant.const import STATE_UNKNOWN
 
 from custom_components.hsem.models.planner_input import PlannerInput
+from custom_components.hsem.models.secondary_storage_config import (
+    SecondaryStorageConfig,
+)
 from custom_components.hsem.planner import run_planner
 from custom_components.hsem.utils.diagnostics import (
     _REDACTED,
@@ -174,6 +177,24 @@ class TestPlannerInputRoundTrip:
         dump = build_diagnostics_dump(original, run_planner(original))
         reconstructed = load_planner_input_from_dump(dump)
         assert reconstructed.battery_rated_capacity_kwh == pytest.approx(0.0)
+
+    def test_secondary_storage_roundtrip(self) -> None:
+        original = _make_minimal_input()
+        original.secondary_storage = SecondaryStorageConfig(
+            enabled=True,
+            capacity_kwh=15.0,
+            current_soc_pct=60.0,
+            load_power_w=180.0,
+        )
+        dump = build_diagnostics_dump(original, run_planner(original))
+
+        reconstructed = load_planner_input_from_dump(dump)
+
+        assert isinstance(reconstructed.secondary_storage, SecondaryStorageConfig)
+        assert reconstructed.secondary_storage.enabled is True
+        assert reconstructed.secondary_storage.capacity_kwh == pytest.approx(15.0)
+        assert reconstructed.secondary_storage.current_soc_pct == pytest.approx(60.0)
+        assert reconstructed.secondary_storage.load_power_w == pytest.approx(180.0)
 
     def test_missing_planner_input_key_raises(self) -> None:
         with pytest.raises(KeyError):

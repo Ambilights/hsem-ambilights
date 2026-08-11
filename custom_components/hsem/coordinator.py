@@ -423,6 +423,9 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._last_plan_ev2_target_soc: float | None = None
         self._last_plan_ev2_smart_charging: bool | None = None
         self._last_plan_ev2_deadline: datetime | None = None
+        self._last_plan_secondary_soc_pct: float | None = None
+        self._last_plan_secondary_load_power_w: float | None = None
+        self._last_plan_secondary_output_priority: str | None = None
 
         # Solar forecast accuracy auto-corrector (issue #602).
         self._solar_corrector: SolarForecastCorrector = SolarForecastCorrector()
@@ -1543,6 +1546,41 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 )
                 return True
 
+        if self._cfg.secondary_storage.enabled:
+            secondary = live.secondary_storage
+            if (
+                self._last_plan_secondary_soc_pct is not None
+                and secondary.soc_pct is not None
+                and abs(secondary.soc_pct - self._last_plan_secondary_soc_pct) >= 1.0
+            ):
+                async_log(
+                    "debug",
+                    "[replan] Secondary SoC changed (%.1f → %.1f) — re-planning.",
+                    self._last_plan_secondary_soc_pct,
+                    secondary.soc_pct,
+                )
+                return True
+            if (
+                self._last_plan_secondary_load_power_w is not None
+                and secondary.load_power_w is not None
+                and abs(secondary.load_power_w - self._last_plan_secondary_load_power_w)
+                >= 25.0
+            ):
+                async_log(
+                    "debug",
+                    "[replan] Secondary dedicated load changed materially — re-planning.",
+                )
+                return True
+            if (
+                secondary.output_source_priority
+                != self._last_plan_secondary_output_priority
+            ):
+                async_log(
+                    "debug",
+                    "[replan] Secondary output priority changed — re-planning.",
+                )
+                return True
+
         # Forced working mode changed.
         if live.force_working_mode_state != self._last_plan_force_mode:
             async_log(
@@ -1601,6 +1639,11 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             live.ev_second_planned_load_smart_charging_enabled
         )
         self._last_plan_ev2_deadline = live.ev_second_planned_load_deadline
+        self._last_plan_secondary_soc_pct = live.secondary_storage.soc_pct
+        self._last_plan_secondary_load_power_w = live.secondary_storage.load_power_w
+        self._last_plan_secondary_output_priority = (
+            live.secondary_storage.output_source_priority
+        )
 
     def _apply_planner_output(self, output: PlannerOutput) -> None:
         """Write :class:`PlannerOutput` decisions back into the recommendation list.
@@ -1634,6 +1677,22 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             rec.ev_second_charger_calculated_power = (
                 slot.ev_second_charger_calculated_power
             )
+            rec.secondary_storage_load_kwh = slot.secondary_storage_load_kwh
+            rec.secondary_storage_charged_kwh = slot.secondary_storage_charged_kwh
+            rec.secondary_storage_discharged_kwh = slot.secondary_storage_discharged_kwh
+            rec.secondary_storage_grid_import_kwh = (
+                slot.secondary_storage_grid_import_kwh
+            )
+            rec.secondary_storage_estimated_capacity_kwh = (
+                slot.secondary_storage_estimated_capacity_kwh
+            )
+            rec.secondary_storage_estimated_soc_pct = (
+                slot.secondary_storage_estimated_soc_pct
+            )
+            rec.secondary_storage_charge_current_a = (
+                slot.secondary_storage_charge_current_a
+            )
+            rec.secondary_storage_mode = slot.secondary_storage_mode
             rec.estimated_cost_currency = slot.estimated_cost_currency
             rec.estimated_battery_capacity_kwh = slot.estimated_battery_capacity_kwh
             rec.estimated_battery_soc_pct = slot.estimated_battery_soc_pct

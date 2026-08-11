@@ -17,6 +17,9 @@ from datetime import time
 from typing import cast
 
 from custom_components.hsem.const import DEFAULT_CONFIG_VALUES
+from custom_components.hsem.models.secondary_storage_entity_config import (
+    SecondaryStorageEntityConfig,
+)
 
 
 @dataclass
@@ -175,6 +178,11 @@ class SensorConfig:
     #: cap for export-limited connections (issue #726).  The MILP optimizer
     #: uses this as a hard bound on per-slot grid export energy.
     max_grid_export_power_kw: float = 0.0
+
+    # Optional dedicated-load secondary storage (PowMr in this fork)
+    secondary_storage: SecondaryStorageEntityConfig = field(
+        default_factory=SecondaryStorageEntityConfig
+    )
 
     # Solcast
     solcast_pv_forecast_forecast_today: str | None = None

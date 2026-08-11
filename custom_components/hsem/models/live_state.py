@@ -66,6 +66,18 @@ class TouPeriodsState:
 
 
 @dataclass
+class SecondaryStorageLiveState:
+    """Live telemetry and control state for dedicated-load secondary storage."""
+
+    soc_pct: float | None = None
+    battery_net_power_w: float | None = None
+    load_power_w: float | None = None
+    output_source_priority: str | None = None
+    charger_source_priority: str | None = None
+    max_charge_current_a: float | None = None
+
+
+@dataclass
 class LiveState:
     """Complete live snapshot of every HA entity read during one update cycle.
 
@@ -125,6 +137,11 @@ class LiveState:
     # EV chargers
     ev: EVLiveState = field(default_factory=EVLiveState)
     ev_second: EVLiveState = field(default_factory=EVLiveState)
+
+    # Optional dedicated-load secondary storage
+    secondary_storage: SecondaryStorageLiveState = field(
+        default_factory=SecondaryStorageLiveState
+    )
 
     # Power readings
     house_consumption_power_w: float | None = None

@@ -218,6 +218,115 @@ Battery energy to remove in order to deliver a target house load:
 battery_energy_removed_kwh = house_load_kwh / discharge_efficiency
 ```
 
+## Secondary stationary storage (PowMr fork, issue #1)
+
+The optional secondary-storage model represents a topology that is materially
+different from the Huawei battery:
+
+- all PV is connected to Huawei; PowMr has no solar input
+- PowMr can charge from the site AC bus
+- PowMr output supplies one dedicated AC load only (the NAS)
+- PowMr cannot backfeed the site bus or export to the grid
+- `SBU priority` transfers that dedicated load from utility to the PowMr battery
+- utility bypass takes over at the configured hard reserve (20 % by default)
+
+For slot $t$, let $L_t$ be dedicated-load AC energy, $h_t$ the slot duration,
+$c_t$ stored charge energy, $d_t$ battery energy removed, $z^c_t$ the charge-mode
+binary, and $z^s_t$ the SBU-mode binary. The three physical modes are utility
+($z^c_t=z^s_t=0$), charge, and SBU, with:
+
+$$
+z^c_t + z^s_t \le 1
+$$
+
+The PowMr current entity supports integer 10 A steps. With nominal voltage $V$,
+configured current step $\Delta I$, and non-negative integer $q_t$:
+
+$$
+c_t = \frac{V \times \Delta I \times h_t}{1000} q_t
+$$
+
+The charge-mode constraints bind $c_t$ to the configured minimum and maximum
+current. With discharge efficiency $\eta_d$ and inverter overhead $P_o$:
+
+$$
+d_t = z^s_t \left(\frac{L_t}{\eta_d} + \frac{P_o h_t}{1000}\right)
+$$
+
+This equality is the no-export invariant: secondary discharge can serve exactly
+the dedicated load plus its DC-side overhead and no more. It can never enter the
+Huawei/grid export path.
+
+Let $E_0$ be energy above the reserve and $E_{usable}$ the energy between the
+minimum and maximum SoC. The secondary state equation is hard-constrained:
+
+$$
+E_t = E_0 + \sum_{k=0}^{t}(c_k-d_k), \qquad
+0 \le E_t \le E_{usable}
+$$
+
+The site-bus adjustment depends on the meaning of the house-consumption history.
+When history already includes the dedicated PowMr/NAS utility load (the default),
+let $\widehat{L}_t=\min(L_t, house\_load_t)$ be the portion demonstrably present
+in that forecast:
+
+$$
+\Delta site_t = \frac{c_t}{\eta_c} - z^s_t \widehat{L}_t
+$$
+
+When history excludes it:
+
+$$
+\Delta site_t = \frac{c_t}{\eta_c} + (1-z^s_t)L_t
+$$
+
+Mixed historical Utility/SBU operation is necessarily an approximation because
+the same house-history series alternately includes and excludes the NAS. The
+clamp prevents an incomplete history sample from modeling PowMr backfeed; the
+explicit load sensor remains the source of truth for battery draw.
+
+Secondary charge participates in the same site grid balance and main-fuse limit
+as Huawei and EV charging. By default, Huawei discharge is forbidden while PowMr
+grid charging is active, preventing an inefficient Huawei DC→AC→PowMr DC transfer.
+The advanced transfer option must be explicitly enabled to relax this guard.
+
+The MILP and authoritative candidate scorer both include secondary conversion
+loss, cycle wear, time discount, and a horizon-tail value for stored energy.
+Non-MILP candidates receive a physically valid utility-bypass plan so candidate
+comparison never leaves the dedicated load unaccounted.
+
+### Secondary-storage control safety
+
+Planning and control are separate opt-ins. `hsem_secondary_storage_enabled`
+enables MILP shadow planning; `hsem_secondary_storage_control_enabled` permits the
+PowMr adapter. Global `hsem_read_only`, degraded mode, and missing live SoC/load
+each independently prevent writes. The adapter applies ordered transitions and
+verifies each write before continuing:
+
+- SBU: set charger to `Only Solar`, then output to `SBU priority`
+- charge: set output to `Utility first`, set the 10 A-step current, then charger
+  to `Solar and Utility`
+- utility: set output to `Utility first`, then charger to `Only Solar`
+
+At or below minimum SoC, a stale SBU plan is forced to utility. At maximum SoC,
+a stale charge plan is forced to utility, stopping grid charging with
+`Only Solar` before switching the output to `Utility first`.
+An invalid live SoC/load sample or an unverified preceding Huawei write blocks
+the PowMr adapter for that cycle.
+
+### Secondary-storage invariants for tests
+
+- secondary SoC never crosses the configured 20 % reserve or maximum SoC
+- SBU discharge equals dedicated load divided by discharge efficiency plus
+  inverter overhead
+- secondary discharge is tied to the dedicated load and never directly backfeeds;
+  it may only free Huawei PV that is independently eligible for export
+- charge current is always a supported 10 A increment
+- Huawei discharge is zero during PowMr charging unless transfer is enabled
+- disabled secondary storage is numerically identical to the upstream planner
+- missing required PowMr telemetry produces no secondary plan and blocks control
+- global read-only and the feature control switch each independently block writes
+
 ## Battery efficiency
 
 HSEM tracks charge-side and discharge-side efficiency independently.

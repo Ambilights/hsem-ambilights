@@ -12,6 +12,9 @@ from custom_components.hsem.models.hourly_consumption_average import (
     HourlyConsumptionAverage,
 )
 from custom_components.hsem.models.price_point import PricePoint
+from custom_components.hsem.models.secondary_storage_config import (
+    SecondaryStorageConfig,
+)
 from custom_components.hsem.models.solcast_slot import SolcastSlot
 
 
@@ -111,6 +114,11 @@ class PlannerInput:
     battery_max_discharge_power_w: float | None = None
     battery_charge_efficiency_pct: float = 97.0
     battery_discharge_efficiency_pct: float = 97.0
+
+    # --- optional dedicated-load secondary storage ---
+    secondary_storage: SecondaryStorageConfig = field(
+        default_factory=SecondaryStorageConfig
+    )
 
     # --- battery economics ---
     battery_purchase_price: float = 0.0

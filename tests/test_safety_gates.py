@@ -525,6 +525,62 @@ class TestWorkingModeSensorTopLevelGate:
         mock_inv.assert_called_once()
         mock_bat.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_unverified_huawei_write_blocks_powmr_applier(self):
+        """PowMr control must not proceed after an unconfirmed Huawei transition."""
+        data = self._make_coordinator_data(
+            read_only=False,
+            degraded_mode=DegradedMode.OK,
+        )
+        data.hourly_recommendation = MagicMock()
+
+        from custom_components.hsem.utils.inverter_verify import (
+            ApplyResult,
+            CycleApplySummary,
+        )
+
+        inv_summary = CycleApplySummary(
+            results=[
+                ApplyResult(
+                    entity_id="select.inverter_mode",
+                    desired="target",
+                    actual=None,
+                    status=ApplyStatus.UNVERIFIED,
+                )
+            ]
+        )
+
+        with (
+            patch(_LOGGER_PATCH, new_callable=MagicMock),
+            patch(
+                "custom_components.hsem.custom_sensors.working_mode_sensor.async_apply_inverter_power_control",
+                new_callable=AsyncMock,
+                return_value=inv_summary,
+            ),
+            patch(
+                "custom_components.hsem.custom_sensors.working_mode_sensor.async_apply_battery_settings",
+                new_callable=AsyncMock,
+                return_value=CycleApplySummary(),
+            ),
+            patch(
+                "custom_components.hsem.custom_sensors.working_mode_sensor.async_apply_secondary_storage",
+                new_callable=AsyncMock,
+            ) as mock_secondary,
+            patch(
+                "custom_components.hsem.custom_sensors.working_mode_sensor.resolve_current_recommendation"
+            ),
+        ):
+            from custom_components.hsem.custom_sensors.working_mode_sensor import (
+                HSEMWorkingModeSensor,
+            )
+
+            sensor = MagicMock(spec=HSEMWorkingModeSensor)
+            sensor.hass = MagicMock()
+
+            await HSEMWorkingModeSensor._async_apply_hardware_writes(sensor, data)
+
+        mock_secondary.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # hardware_writes_allowed — unit tests (full coverage)

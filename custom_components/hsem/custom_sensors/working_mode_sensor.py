@@ -34,6 +34,9 @@ from custom_components.hsem.custom_sensors.applier import (
 from custom_components.hsem.custom_sensors.recommendation_resolver import (
     resolve_current_recommendation,
 )
+from custom_components.hsem.custom_sensors.secondary_storage_applier import (
+    async_apply_secondary_storage,
+)
 from custom_components.hsem.entity import HSEMCoordinatorEntity, HSEMEntity
 from custom_components.hsem.utils.degraded_mode import hardware_writes_allowed
 from custom_components.hsem.utils.inverter_verify import ApplyStatus, CycleApplySummary
@@ -471,6 +474,18 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
                     data.current_required_battery,
                 )
                 combined_summary.results.extend(bat_summary.results)
+
+            if (
+                combined_summary.overall_status in {ApplyStatus.OK, ApplyStatus.SKIPPED}
+                and hourly_rec is not None
+            ):
+                secondary_summary = await async_apply_secondary_storage(
+                    self,
+                    cfg,
+                    live,
+                    hourly_rec,
+                )
+                combined_summary.results.extend(secondary_summary.results)
 
         # Persist the apply summary onto the coordinator data so the status
         # sensor and extra_state_attributes can surface it to HA.

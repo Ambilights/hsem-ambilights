@@ -81,3 +81,11 @@ class HourlyRecommendation:
     ev_total_planned_load_kwh: float = 0.0
     ev_charger_calculated_power: float = 0.0
     ev_second_charger_calculated_power: float = 0.0
+    secondary_storage_load_kwh: float = 0.0
+    secondary_storage_charged_kwh: float = 0.0
+    secondary_storage_discharged_kwh: float = 0.0
+    secondary_storage_grid_import_kwh: float = 0.0
+    secondary_storage_estimated_capacity_kwh: float = 0.0
+    secondary_storage_estimated_soc_pct: float = 0.0
+    secondary_storage_charge_current_a: float = 0.0
+    secondary_storage_mode: str | None = None

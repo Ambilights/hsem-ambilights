@@ -48,6 +48,9 @@ from custom_components.hsem.models.hourly_consumption_average import (
 from custom_components.hsem.models.planner_input import PlannerInput
 from custom_components.hsem.models.planner_output import PlannerOutput
 from custom_components.hsem.models.price_point import PricePoint
+from custom_components.hsem.models.secondary_storage_config import (
+    SecondaryStorageConfig,
+)
 from custom_components.hsem.models.solcast_slot import SolcastSlot
 
 # ---------------------------------------------------------------------------
@@ -231,6 +234,9 @@ def _planner_input_from_dict(data: dict[str, Any]) -> PlannerInput:
     inp_data["solcast_slots"] = [
         SolcastSlot(**item) for item in inp_data.get("solcast_slots", [])
     ]
+    secondary_data = inp_data.get("secondary_storage")
+    if isinstance(secondary_data, dict):
+        inp_data["secondary_storage"] = SecondaryStorageConfig(**secondary_data)
 
     schedules = []
     for raw_sched in inp_data.get("battery_schedules", []):

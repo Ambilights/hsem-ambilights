@@ -93,6 +93,7 @@ from custom_components.hsem.planner.cost_types import (  # noqa: F401
     CostWeights,
     PlanCostBreakdown,
 )
+from custom_components.hsem.planner.secondary_cost import secondary_slot_cost
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import clamp_efficiency
 from custom_components.hsem.utils.recommendations import Recommendations
@@ -269,6 +270,9 @@ def score_plan(
     grid_limit_penalty = 0.0
     override_penalty = 0.0
     terminal_soc_value = 0.0
+    secondary_conversion_loss_cost = 0.0
+    secondary_cycle_cost = 0.0
+    secondary_terminal_soc_value = 0.0
 
     # Discounted versions for the selector score (total_cost stays raw).
     # time_discount_rate < 1.0 means future savings are worth less.
@@ -423,6 +427,22 @@ def score_plan(
             cycle_cost_total += cycle
             cycle_cost_total_disc += cycle * discount
 
+        if weights.secondary_storage_enabled:
+            secondary_conv, secondary_cycle, secondary_terminal = secondary_slot_cost(
+                slot,
+                weights,
+                import_price=imp_price,
+                export_price=exp_price,
+            )
+            conversion_loss_cost += secondary_conv
+            conversion_loss_cost_disc += secondary_conv * discount
+            secondary_conversion_loss_cost += secondary_conv
+            cycle_cost_total += secondary_cycle
+            cycle_cost_total_disc += secondary_cycle * discount
+            secondary_cycle_cost += secondary_cycle
+            terminal_soc_value += secondary_terminal
+            secondary_terminal_soc_value += secondary_terminal
+
         # 5. SoC guard penalties (quadratic in the violation magnitude).
         soc = slot.estimated_battery_soc_pct
         if soc < weights.min_soc_pct:
@@ -542,6 +562,9 @@ def score_plan(
         grid_limit_penalty=round(grid_limit_penalty, 6),
         override_penalty=round(override_penalty, 6),
         terminal_soc_value=round(terminal_soc_value, 6),
+        secondary_conversion_loss_cost=round(secondary_conversion_loss_cost, 6),
+        secondary_cycle_cost=round(secondary_cycle_cost, 6),
+        secondary_terminal_soc_value=round(secondary_terminal_soc_value, 6),
         total_cost=round(total_cost, 6),
         score=score_rounded,
         # ``total`` is a deprecated alias for ``score`` (issue #413).

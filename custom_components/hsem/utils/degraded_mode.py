@@ -65,6 +65,9 @@ _CRITICAL_KEYWORDS: frozenset[str] = frozenset(
         "batteries_rated_capacity",
         # House load — needed to compute net consumption correctly
         "house_consumption_power",
+        # Optional secondary storage becomes critical only when its collector
+        # records a missing field (the feature is otherwise not read at all).
+        "secondary_storage_",
     }
 )
 

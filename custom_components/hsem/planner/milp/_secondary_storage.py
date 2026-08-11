@@ -1,0 +1,324 @@
+"""Mixed-integer MILP extension for dedicated-load secondary storage."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+import numpy as np
+
+from custom_components.hsem.models.planned_slot import PlannedSlot
+from custom_components.hsem.models.secondary_storage_config import (
+    SecondaryStorageConfig,
+)
+from custom_components.hsem.planner.cost_helpers import compute_charge_premium
+from custom_components.hsem.planner.secondary_storage import (
+    SECONDARY_MODE_CHARGE,
+    SECONDARY_MODE_SBU,
+    SECONDARY_MODE_UTILITY,
+    secondary_charge_limits_kwh,
+    secondary_site_load_offset_kwh,
+)
+from custom_components.hsem.utils.misc import clamp_efficiency
+from custom_components.hsem.utils.units import (
+    hours_ahead,
+    slot_duration_hours,
+)
+
+SecondaryLayout = dict[str, int]
+
+
+def _allocate_secondary_variables(
+    base_n_vars: int,
+    m: int,
+) -> tuple[SecondaryLayout, int]:
+    """Append secondary energy, mode, and integer-current-step blocks."""
+    layout = {
+        "charge": base_n_vars,
+        "discharge": base_n_vars + m,
+        "throughput": base_n_vars + 2 * m,
+        "charge_mode": base_n_vars + 3 * m,
+        "sbu_mode": base_n_vars + 4 * m,
+        "charge_steps": base_n_vars + 5 * m,
+    }
+    return layout, base_n_vars + 6 * m
+
+
+def _extend_secondary_constraints(
+    constraints: dict[str, Any],
+    *,
+    n_vars: int,
+    m: int,
+    layout: SecondaryLayout,
+    config: SecondaryStorageConfig,
+    slots: list[PlannedSlot],
+    future_idx: list[int],
+    primary_discharge_off: int,
+    primary_max_discharge_kwh: float,
+) -> dict[str, Any]:
+    """Add site balance, secondary SoC, discrete modes, and no-transfer rows."""
+    charge_eff = clamp_efficiency(config.charge_efficiency_pct)
+    discharge_eff = clamp_efficiency(config.discharge_efficiency_pct)
+    charge_off = layout["charge"]
+    discharge_off = layout["discharge"]
+    throughput_off = layout["throughput"]
+    charge_mode_off = layout["charge_mode"]
+    sbu_mode_off = layout["sbu_mode"]
+    charge_steps_off = layout["charge_steps"]
+
+    old_a_eq = constraints["A_eq"]
+    old_b_eq = constraints["b_eq"]
+    old_eq_rows = old_a_eq.shape[0]
+    a_eq = np.zeros((old_eq_rows + 2 * m, n_vars))
+    b_eq = np.zeros(old_eq_rows + 2 * m)
+    a_eq[:old_eq_rows, : old_a_eq.shape[1]] = old_a_eq
+    b_eq[:old_eq_rows] = old_b_eq
+
+    for t, slot_i in enumerate(future_idx):
+        load_kwh = slots[slot_i].secondary_storage_load_kwh
+        site_load_offset_kwh = secondary_site_load_offset_kwh(slots[slot_i], config)
+        hours = slot_duration_hours(slots[slot_i].start, slots[slot_i].end)
+        standby_kwh = max(config.inverter_standby_power_w, 0.0) * hours / 1000.0
+        battery_draw_kwh = load_kwh / discharge_eff + standby_kwh
+
+        # Site bus: charging always draws AC. SBU removes the dedicated load
+        # from the site bus because the secondary output cannot backfeed it.
+        a_eq[t, charge_off + t] = -1.0 / charge_eff
+        a_eq[t, sbu_mode_off + t] = site_load_offset_kwh
+        if not config.base_load_includes_dedicated_load:
+            b_eq[t] += load_kwh
+
+        # Dedicated-load node: SBU must supply exactly its load and overhead.
+        a_eq[old_eq_rows + t, discharge_off + t] = 1.0
+        a_eq[old_eq_rows + t, sbu_mode_off + t] = -battery_draw_kwh
+
+        # PowMr exposes a 10 A-step number. Tie stored charge energy to an
+        # integer count of those physical current steps so planned energy and
+        # the adapter command remain identical.
+        step_energy_kwh = (
+            config.nominal_voltage_v * config.charge_current_step_a * hours / 1000.0
+        )
+        a_eq[old_eq_rows + m + t, charge_off + t] = 1.0
+        a_eq[old_eq_rows + m + t, charge_steps_off + t] = -step_energy_kwh
+
+    old_a_ub = constraints["A_ub"]
+    old_b_ub = constraints["b_ub"]
+    old_ub_rows = old_a_ub.shape[0]
+    transfer_rows = 0 if config.allow_primary_battery_transfer else m
+    added_rows = 7 * m + transfer_rows
+    a_ub = np.zeros((old_ub_rows + added_rows, n_vars))
+    b_ub = np.zeros(old_ub_rows + added_rows)
+    a_ub[:old_ub_rows, : old_a_ub.shape[1]] = old_a_ub
+    b_ub[:old_ub_rows] = old_b_ub
+
+    current_kwh = min(max(config.current_usable_kwh, 0.0), config.usable_kwh)
+    usable_kwh = config.usable_kwh
+    first_slot = slots[future_idx[0]]
+    slot_hours = slot_duration_hours(first_slot.start, first_slot.end)
+    minimum_charge, maximum_charge = secondary_charge_limits_kwh(config, slot_hours)
+    maximum_steps = int(
+        max(config.max_charge_current_a, 0.0) // max(config.charge_current_step_a, 1e-9)
+    )
+
+    row = old_ub_rows
+    for t in range(m):
+        for k in range(t + 1):
+            a_ub[row + t, charge_off + k] = 1.0
+            a_ub[row + t, discharge_off + k] = -1.0
+            a_ub[row + m + t, charge_off + k] = -1.0
+            a_ub[row + m + t, discharge_off + k] = 1.0
+        b_ub[row + t] = usable_kwh - current_kwh
+        b_ub[row + m + t] = current_kwh
+    row += 2 * m
+
+    for t in range(m):
+        # Charge current can be non-zero only in charge mode.
+        a_ub[row + t, charge_off + t] = 1.0
+        a_ub[row + t, charge_mode_off + t] = -maximum_charge
+        a_ub[row + m + t, charge_off + t] = -1.0
+        a_ub[row + m + t, charge_mode_off + t] = minimum_charge
+
+        # Charge and SBU are mutually exclusive ternary states.
+        a_ub[row + 2 * m + t, charge_mode_off + t] = 1.0
+        a_ub[row + 2 * m + t, sbu_mode_off + t] = 1.0
+        b_ub[row + 2 * m + t] = 1.0
+
+        # Throughput auxiliary equals max(charge, discharge) at optimum.
+        a_ub[row + 3 * m + t, charge_off + t] = 1.0
+        a_ub[row + 3 * m + t, throughput_off + t] = -1.0
+        a_ub[row + 4 * m + t, discharge_off + t] = 1.0
+        a_ub[row + 4 * m + t, throughput_off + t] = -1.0
+    row += 5 * m
+
+    if not config.allow_primary_battery_transfer:
+        for t in range(m):
+            # Conservative source guard: never discharge Huawei while PowMr
+            # grid charging is enabled, avoiding DC→AC→DC battery transfer.
+            a_ub[row + t, primary_discharge_off + t] = 1.0
+            a_ub[row + t, charge_mode_off + t] = primary_max_discharge_kwh
+            b_ub[row + t] = primary_max_discharge_kwh
+
+    constraints["A_eq"] = a_eq
+    constraints["b_eq"] = b_eq
+    constraints["A_ub"] = a_ub
+    constraints["b_ub"] = b_ub
+    constraints["bounds"] += (
+        [(0.0, maximum_charge)] * m
+        + [(0.0, config.usable_kwh)] * m
+        + [(0.0, None)] * m
+        + [(0.0, 1.0)] * m
+        + [(0.0, 1.0)] * m
+        + [(0.0, float(maximum_steps))] * m
+    )
+    return constraints
+
+
+def _add_secondary_objective(
+    objective: np.ndarray,  # type: ignore[name-defined]
+    *,
+    layout: SecondaryLayout,
+    config: SecondaryStorageConfig,
+    slots: list[PlannedSlot],
+    future_idx: list[int],
+    p_imp_obj: np.ndarray,  # type: ignore[name-defined]
+    p_exp: np.ndarray,  # type: ignore[name-defined]
+    time_discount_rate: float,
+    now: datetime,
+) -> None:
+    """Add secondary wear, conversion-loss, and terminal-value coefficients."""
+    charge_eff = clamp_efficiency(config.charge_efficiency_pct)
+    discharge_eff = clamp_efficiency(config.discharge_efficiency_pct)
+    use_discount = time_discount_rate < 1.0 - 1e-9
+
+    for t, slot_i in enumerate(future_idx):
+        discount = 1.0
+        if use_discount:
+            slot = slots[slot_i]
+            midpoint = slot.start + (slot.end - slot.start) / 2
+            discount = time_discount_rate ** hours_ahead(now, midpoint)
+
+        objective[layout["charge"] + t] += (1.0 - charge_eff) * p_imp_obj[t] * discount
+        objective[layout["discharge"] + t] += (
+            (1.0 - discharge_eff) * p_imp_obj[t] * discount
+        )
+        objective[layout["throughput"] + t] += (
+            max(config.cycle_cost_per_kwh, 0.0) * discount
+        )
+
+        replacement = config.replacement_price_per_kwh
+        if replacement is None or replacement <= 1e-9:
+            continue
+        charge_premium = compute_charge_premium(
+            replacement_price_per_kwh=replacement,
+            imp_price_obj=p_imp_obj[t],
+            exp_price=p_exp[t],
+            charge_eff=charge_eff,
+            deferred_export_price=None,
+        )
+        discharge_premium = max(0.0, replacement - p_imp_obj[t])
+        objective[layout["charge"] + t] -= charge_premium
+        objective[layout["discharge"] + t] += discharge_premium
+
+
+def _secondary_integrality(
+    n_vars: int,
+    m: int,
+    layout: SecondaryLayout,
+) -> np.ndarray:  # type: ignore[name-defined]
+    """Return a HiGHS integrality vector for charge and SBU mode blocks."""
+    integrality = np.zeros(n_vars, dtype=int)
+    integrality[layout["charge_mode"] : layout["charge_mode"] + m] = 1
+    integrality[layout["sbu_mode"] : layout["sbu_mode"] + m] = 1
+    integrality[layout["charge_steps"] : layout["charge_steps"] + m] = 1
+    return integrality
+
+
+def _write_secondary_results(
+    out_slots: list[PlannedSlot],
+    *,
+    result_x: np.ndarray,  # type: ignore[name-defined]
+    layout: SecondaryLayout,
+    config: SecondaryStorageConfig,
+    future_idx: list[int],
+    minimum_action_kwh: float,
+) -> dict[str, float | int]:
+    """Write solved secondary flows, modes, current targets, and SoC."""
+    charge_eff = clamp_efficiency(config.charge_efficiency_pct)
+    running_capacity = config.current_usable_kwh
+    charge_slots = 0
+    sbu_slots = 0
+    total_charge = 0.0
+    total_discharge = 0.0
+
+    for t, slot_i in enumerate(future_idx):
+        slot = out_slots[slot_i]
+        charge_kwh = max(float(result_x[layout["charge"] + t]), 0.0)
+        discharge_kwh = max(float(result_x[layout["discharge"] + t]), 0.0)
+        charge_mode = float(result_x[layout["charge_mode"] + t]) > 0.5
+        sbu_mode = float(result_x[layout["sbu_mode"] + t]) > 0.5
+        load_kwh = slot.secondary_storage_load_kwh
+        site_load_offset_kwh = secondary_site_load_offset_kwh(slot, config)
+
+        if sbu_mode:
+            mode = SECONDARY_MODE_SBU
+            sbu_slots += 1
+        elif charge_mode and charge_kwh > minimum_action_kwh:
+            mode = SECONDARY_MODE_CHARGE
+            charge_slots += 1
+        else:
+            mode = SECONDARY_MODE_UTILITY
+
+        running_capacity += charge_kwh - discharge_kwh
+        running_capacity = min(max(running_capacity, 0.0), config.usable_kwh)
+        reserve_kwh = config.capacity_kwh * config.min_soc_pct / 100.0
+        absolute_soc = (running_capacity + reserve_kwh) / config.capacity_kwh * 100.0
+
+        full_hours = slot_duration_hours(slot.start, slot.end)
+        current_a = 0.0
+        if charge_kwh > minimum_action_kwh and full_hours > 1e-9:
+            # Use the same full-slot duration as the integer current-step
+            # constraint. The planner is refreshed during a partial current
+            # slot; inflating the command to "catch up" would break the
+            # exact 10 A hardware-step model.
+            current_a = charge_kwh * 1000.0 / (config.nominal_voltage_v * full_hours)
+            current_a = min(
+                max(current_a, config.min_charge_current_a), config.max_charge_current_a
+            )
+
+        powmr_grid_import = (0.0 if sbu_mode else load_kwh) + charge_kwh / charge_eff
+        if config.base_load_includes_dedicated_load:
+            site_delta = charge_kwh / charge_eff - (
+                site_load_offset_kwh if sbu_mode else 0.0
+            )
+        else:
+            site_delta = powmr_grid_import
+        net_grid = slot.grid_import_kwh - slot.grid_export_kwh + site_delta
+
+        slot.secondary_storage_charged_kwh = round(charge_kwh, 3)
+        slot.secondary_storage_discharged_kwh = round(discharge_kwh, 3)
+        slot.secondary_storage_grid_import_kwh = round(powmr_grid_import, 3)
+        slot.secondary_storage_estimated_capacity_kwh = round(running_capacity, 3)
+        slot.secondary_storage_estimated_soc_pct = round(absolute_soc, 2)
+        slot.secondary_storage_charge_current_a = round(current_a, 1)
+        slot.secondary_storage_mode = mode
+        # The base writer deliberately reconstructs grid flow from Huawei/EV
+        # fields instead of raw gi/ge (it may resolve degenerate ec/ed values).
+        # Apply the secondary branch once to that reconstructed base flow.
+        slot.grid_import_kwh = round(max(net_grid, 0.0), 3)
+        slot.grid_export_kwh = round(max(-net_grid, 0.0), 3)
+        slot.estimated_cost_currency = round(
+            slot.grid_import_kwh * max(slot.price.import_price, 0.0)
+            - slot.grid_export_kwh * slot.price.export_price,
+            4,
+        )
+
+        total_charge += charge_kwh
+        total_discharge += discharge_kwh
+
+    return {
+        "secondary_charge_slots": charge_slots,
+        "secondary_final_usable_kwh": round(running_capacity, 6),
+        "secondary_sbu_slots": sbu_slots,
+        "secondary_total_charged_kwh": round(total_charge, 6),
+        "secondary_total_discharged_kwh": round(total_discharge, 6),
+    }

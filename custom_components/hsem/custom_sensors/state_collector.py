@@ -31,6 +31,7 @@ from custom_components.hsem.custom_sensors.config_reader import (  # noqa: F401 
 from custom_components.hsem.models.live_state import (
     EVLiveState,
     LiveState,
+    SecondaryStorageLiveState,
     TouPeriodsState,
 )
 from custom_components.hsem.models.sensor_config import SensorConfig
@@ -109,27 +110,31 @@ async def async_collect_live_state(
         conv_type: str | None = None,
         decimals: int = 3,
         label: str = "",
+        *,
+        required: bool = True,
     ) -> Any:  # NOSONAR -- return type varies by conv_type
         """Read one entity state, recording it as missing on any failure."""
         if not entity_id:
-            state.add_missing_entity(f"Missing entity: {label or entity_id}")
+            if required:
+                state.add_missing_entity(f"Missing entity: {label or entity_id}")
             return None
         try:
             return ha_get_entity_state_and_convert(
                 sensor, entity_id, conv_type, decimals
             )
         except (HomeAssistantError, ValueError, TypeError, AttributeError) as exc:
-            state.add_missing_entity(
-                f"Error reading {label or entity_id} (entity_id={entity_id}): "
-                f"{type(exc).__name__}: {exc}"
-            )
-            _LOGGER.warning(
-                "Sensor read failed for entity_id=%s (label=%s): %s: %s",
-                entity_id,
-                label or entity_id,
-                type(exc).__name__,
-                repr(exc),
-            )
+            if required:
+                state.add_missing_entity(
+                    f"Error reading {label or entity_id} (entity_id={entity_id}): "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                _LOGGER.warning(
+                    "Sensor read failed for entity_id=%s (label=%s): %s: %s",
+                    entity_id,
+                    label or entity_id,
+                    type(exc).__name__,
+                    repr(exc),
+                )
             return None
 
     # Force working mode
@@ -219,6 +224,71 @@ async def async_collect_live_state(
         )
         or 0.0
     )
+
+    # --- Optional dedicated-load secondary storage ---
+    if cfg.secondary_storage.enabled:
+        secondary = SecondaryStorageLiveState()
+        secondary.soc_pct = convert_to_float(
+            _read(
+                cfg.secondary_storage.soc_entity,
+                "float",
+                label="secondary_storage_soc",
+            )
+        )
+        secondary.load_power_w = convert_to_float(
+            _read(
+                cfg.secondary_storage.load_power_entity,
+                "float",
+                label="secondary_storage_load_power",
+            )
+        )
+        if secondary.soc_pct is not None and not 0.0 <= secondary.soc_pct <= 100.0:
+            state.add_missing_entity(
+                "Critical: secondary_storage_soc is outside 0-100%"
+            )
+            secondary.soc_pct = None
+        if secondary.load_power_w is not None and secondary.load_power_w < 0.0:
+            state.add_missing_entity(
+                "Critical: secondary_storage_load_power is negative"
+            )
+            secondary.load_power_w = None
+        secondary.battery_net_power_w = convert_to_float(
+            _read(
+                cfg.secondary_storage.battery_net_power_entity,
+                "float",
+                label="secondary_storage_battery_net_power",
+                required=False,
+            )
+        )
+
+        control_required = cfg.secondary_storage.control_enabled
+        raw_output_priority = _read(
+            cfg.secondary_storage.output_source_priority_entity,
+            "string",
+            label="secondary_storage_output_source_priority",
+            required=control_required,
+        )
+        secondary.output_source_priority = (
+            str(raw_output_priority) if raw_output_priority is not None else None
+        )
+        raw_charger_priority = _read(
+            cfg.secondary_storage.charger_source_priority_entity,
+            "string",
+            label="secondary_storage_charger_source_priority",
+            required=control_required,
+        )
+        secondary.charger_source_priority = (
+            str(raw_charger_priority) if raw_charger_priority is not None else None
+        )
+        secondary.max_charge_current_a = convert_to_float(
+            _read(
+                cfg.secondary_storage.max_charge_current_entity,
+                "float",
+                label="secondary_storage_max_charge_current",
+                required=control_required,
+            )
+        )
+        state.secondary_storage = secondary
 
     # --- Huawei Solar battery entities ---
     # _read() returns float|int|bool|str|None; these calls use conv_type="string"
@@ -688,6 +758,23 @@ async def _register_listeners(
         get_ev_second_deadline_time_entity_id(),
         state.force_working_mode,
     ]
+
+    if cfg.secondary_storage.enabled:
+        candidates.extend(
+            [
+                cfg.secondary_storage.soc_entity,
+                cfg.secondary_storage.load_power_entity,
+                cfg.secondary_storage.battery_net_power_entity,
+            ]
+        )
+        if cfg.secondary_storage.control_enabled:
+            candidates.extend(
+                [
+                    cfg.secondary_storage.output_source_priority_entity,
+                    cfg.secondary_storage.charger_source_priority_entity,
+                    cfg.secondary_storage.max_charge_current_entity,
+                ]
+            )
 
     for entity_id in candidates:
         if entity_id and entity_id not in tracked_entities:

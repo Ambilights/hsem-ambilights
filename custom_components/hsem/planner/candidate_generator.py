@@ -314,6 +314,7 @@ def generate_candidates(
             main_fuse_amps=inp.main_fuse_amps,
             main_fuse_phases=inp.main_fuse_phases,
             max_grid_export_power_kw=inp.max_grid_export_power_kw,
+            secondary_storage=inp.secondary_storage,
         )
         log_planner(
             "debug",

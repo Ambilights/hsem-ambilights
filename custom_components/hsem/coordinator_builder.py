@@ -26,6 +26,9 @@ from custom_components.hsem.models.hourly_recommendation import HourlyRecommenda
 from custom_components.hsem.models.live_state import LiveState
 from custom_components.hsem.models.planner_input import PlannerInput
 from custom_components.hsem.models.price_point import PricePoint
+from custom_components.hsem.models.secondary_storage_config import (
+    SecondaryStorageConfig,
+)
 from custom_components.hsem.models.sensor_config import SensorConfig
 from custom_components.hsem.models.solcast_slot import SolcastSlot
 from custom_components.hsem.utils.capacity_learner import CapacityLearner
@@ -93,6 +96,42 @@ def _resolve_max_discharge_power_w(live: LiveState) -> float | None:
         return float(get_max_discharge_power(rated_wh))
     # Degraded fallback: no rated capacity known — use the live read-back.
     return convert_to_float(live.huawei_batteries_max_discharge_power_w) or None
+
+
+def _build_secondary_storage_config(
+    cfg: SensorConfig,
+    live: LiveState,
+) -> SecondaryStorageConfig:
+    """Build the pure planner model from HA config and live PowMr telemetry."""
+    configured = cfg.secondary_storage
+    measured = live.secondary_storage
+    current_soc = measured.soc_pct if measured.soc_pct is not None else 0.0
+    load_power = measured.load_power_w if measured.load_power_w is not None else 0.0
+    telemetry_valid = (
+        measured.soc_pct is not None
+        and 0.0 <= measured.soc_pct <= 100.0
+        and measured.load_power_w is not None
+        and measured.load_power_w >= 0.0
+    )
+    return SecondaryStorageConfig(
+        enabled=configured.enabled and telemetry_valid,
+        capacity_kwh=configured.capacity_kwh,
+        current_soc_pct=current_soc,
+        min_soc_pct=configured.min_soc_pct,
+        max_soc_pct=configured.max_soc_pct,
+        nominal_voltage_v=configured.nominal_voltage_v,
+        load_power_w=max(load_power, 0.0),
+        max_charge_current_a=configured.max_charge_current_a,
+        min_charge_current_a=configured.min_charge_current_a,
+        charge_efficiency_pct=configured.charge_efficiency_pct,
+        discharge_efficiency_pct=configured.discharge_efficiency_pct,
+        inverter_standby_power_w=configured.inverter_standby_power_w,
+        cycle_cost_per_kwh=configured.cycle_cost_per_kwh,
+        base_load_includes_dedicated_load=(
+            configured.base_load_includes_dedicated_load
+        ),
+        allow_primary_battery_transfer=configured.allow_primary_battery_transfer,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +302,7 @@ def build_planner_input(
             cfg.batteries_discharge_efficiency
         )
         or 95.0,
+        secondary_storage=_build_secondary_storage_config(cfg, live),
         battery_purchase_price=convert_to_float(cfg.batteries_purchase_price) or 0.0,
         battery_expected_cycles=_cycles if _cycles is not None else 6000,
         battery_cycle_cost_per_kwh=convert_to_float(cfg.batteries_cycle_cost) or 0.0,

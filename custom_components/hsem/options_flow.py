@@ -56,6 +56,10 @@ from custom_components.hsem.flows.prices import (
     get_prices_step_schema,
     validate_prices_input,
 )
+from custom_components.hsem.flows.secondary_storage import (
+    get_secondary_storage_step_schema,
+    validate_secondary_storage_input,
+)
 from custom_components.hsem.flows.solcast import (
     get_solcast_step_schema,
     validate_solcast_step_input,
@@ -252,13 +256,31 @@ class HSEMOptionsFlow(config_entries.OptionsFlow):
             errors = await validate_power_step_input(self.hass, user_input)
             if not errors:
                 self._user_input.update(user_input)
-                return await self.async_step_ev()
+                return await self.async_step_secondary_storage()
 
         data_schema = await get_power_step_schema(self._config_entry)
 
         return self.async_show_form(
             step_id="power",
             data_schema=data_schema,
+            errors=errors,
+            last_step=False,
+        )
+
+    async def async_step_secondary_storage(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle optional dedicated-load secondary-storage options."""
+        errors = {}
+        if user_input is not None:
+            errors = await validate_secondary_storage_input(self.hass, user_input)
+            if not errors:
+                self._user_input.update(user_input)
+                return await self.async_step_ev()
+
+        return self.async_show_form(
+            step_id="secondary_storage",
+            data_schema=await get_secondary_storage_step_schema(self._config_entry),
             errors=errors,
             last_step=False,
         )

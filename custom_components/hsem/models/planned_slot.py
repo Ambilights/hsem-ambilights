@@ -106,6 +106,9 @@ class PlannedSlot:
             the go-e (or compatible) API instead of running at full speed.
         ev_second_charger_calculated_power:
             Same as ``ev_charger_calculated_power``, but for the second EV.
+        secondary_storage_mode:
+            Planned secondary-inverter state: ``utility``, ``charge``, or
+            ``sbu``. ``None`` when secondary storage is disabled.
     """
 
     start: datetime
@@ -122,6 +125,14 @@ class PlannedSlot:
     ev_total_planned_load_kwh: float = 0.0
     ev_charger_calculated_power: float = 0.0
     ev_second_charger_calculated_power: float = 0.0
+    secondary_storage_load_kwh: float = 0.0
+    secondary_storage_charged_kwh: float = 0.0
+    secondary_storage_discharged_kwh: float = 0.0
+    secondary_storage_grid_import_kwh: float = 0.0
+    secondary_storage_estimated_capacity_kwh: float = 0.0
+    secondary_storage_estimated_soc_pct: float = 0.0
+    secondary_storage_charge_current_a: float = 0.0
+    secondary_storage_mode: str | None = None
     estimated_net_consumption_kwh: float = 0.0
     estimated_cost_currency: float = 0.0
     estimated_battery_soc_pct: float = 0.0

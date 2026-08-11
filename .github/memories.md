@@ -15,11 +15,16 @@ for the HSEM (Home Smart Energy Management) project. Read this before making any
 | `slot_population.py` | Builds the 48/96/192-slot time horizon from price data |
 | `candidate_generator.py` | Generates charge/discharge plan candidates (partial-SoC, MILP, solar) |
 | `candidate_selector.py` | Picks the best candidate using time-discounted score; also hosts avoided-cost pricing helpers (`replacement_price_from_next_discharge`, `ev_future_charge_value_per_kwh`) |
+| `candidate_validation.py` | Validates candidate energy/cost invariants before selection. |
 | `charge_scheduler.py` | Assigns charge recommendations to slots |
 | `discharge_scheduler.py` | Assigns discharge recommendations to slots; `concentrate_discharge_on_expensive_slots` uses **per-calendar-day** budget pools |
-| `milp_optimizer.py` | Solves the MILP LP problem — variable vector is 8*n base, growing to 8n + 2n·E + E with EV co-optimisation.  Accepts optional `EVConfig` list for EV integration. |
+| `milp_optimizer.py` | Orchestrates the HiGHS model — 9*n base variables, optional EV/fuse blocks, and an optional mixed-integer secondary-storage extension. |
+| `milp/_secondary_storage.py` | Adds PowMr mode/current-step variables, hard SoC recurrence, dedicated-load balance, objective terms, and result decoding. |
+| `secondary_storage.py` | Pure dedicated-load forecast, utility fallback, and terminal-value helpers. |
+| `secondary_cost.py` | Secondary conversion, wear, and terminal-value scoring shared with candidate selection. |
 | `cost_function.py` | Scores a candidate plan — source of truth for cost math |
 | `soc_simulation.py` | Simulates battery SoC forward through a slot plan |
+| `engine_scheduling.py` | Applies the selected charge/discharge windows to the planner slots. |
 | `ev_planner.py` | EV-specific planning logic |
 
 ### ML layer (`custom_components/hsem/ml/`)
@@ -139,6 +144,13 @@ Index range      Variable     Meaning
 [11n+1]          ev1_pen      EV1 deadline target slack (if second EV active)
 --- Main-fuse soft constraint (when main_fuse_amps > 0) ---
 [... .. +n-1]    gi_pen[t]    Grid-import excess above fuse limit per slot (kWh)
+--- Secondary stationary storage (when configured; B = prior vector length) ---
+[B .. B+n-1]      sec_c[t]      PowMr stored charge energy (kWh)
+[B+n .. B+2n-1]   sec_d[t]      PowMr battery energy removed (kWh)
+[B+2n .. B+3n-1] sec_m[t]      max(sec_c, sec_d) wear auxiliary
+[B+3n .. B+4n-1] sec_charge[t] PowMr utility-charge mode (binary)
+[B+4n .. B+5n-1] sec_sbu[t]    PowMr dedicated-load SBU mode (binary)
+[B+5n .. B+6n-1] sec_steps[t]  Physical charge-current increments (integer)
 ```
 
 Grid export power cap (issue #726): when `max_grid_export_power_kw > 0` the
@@ -147,6 +159,51 @@ extra variables); otherwise `ge[t]` is unbounded above.
 
 Cycle cost is counted as `α * m[t]` — **not** `α * (ec[t] + ed[t])`.
 The `m[t]` constraints are: `m[t] >= ec[t]` and `m[t] >= ed[t]`.
+
+---
+
+## Secondary Stationary Storage — Dedicated-Load Topology (fork issue #1)
+
+The PowMr model is intentionally not a second generic site battery:
+
+- Huawei owns all PV and the grid-capable battery path.
+- PowMr has no PV and can supply only its dedicated NAS output.
+- PowMr may charge from the site bus but may never backfeed or export.
+- `SBU priority` discharge is fixed to `load / discharge_efficiency + 55 W`
+  inverter overhead and stops at the 20 % hard reserve.
+- Charge current is tied to the physical 10 A-step number entity using an
+  integer MILP variable; the discovered entity supports 10–80 A and this fork
+  defaults to a 60 A cap.
+- The site main-fuse row includes PowMr bypass load and charging.
+- Huawei discharge while PowMr charges is forbidden unless the advanced
+  transfer flag is explicitly enabled.
+- Non-MILP candidates must receive a utility-bypass secondary plan before
+  scoring; otherwise candidate costs are not comparable.
+
+HA control is defense-in-depth gated by both global `hsem_read_only` and
+`hsem_secondary_storage_control_enabled`. Missing SoC/load telemetry disables
+the pure planner config and enters critical degraded mode. Safe write order is:
+SBU (`Only Solar` → `SBU priority`), charge (`Utility first` → current →
+`Solar and Utility`), utility (`Utility first` → `Only Solar`). Each operation
+uses write-and-verify; failed or unverified writes stop the remainder of the
+transition. PowMr control also requires valid live SoC/load telemetry and is
+not attempted after an unverified Huawei write.
+The maximum-SoC runtime guard reverses the ordinary utility order: it stops grid
+charging with `Only Solar` before setting `Utility first`.
+
+The secondary MIP uses a 5-second solver limit and a 0.5% relative MIP gap. The
+gap is scoped to the secondary-storage path; the original continuous Huawei/EV
+solver configuration is unchanged when secondary storage is disabled.
+
+The house-history flag defaults true for the reference installation. In that
+mode, utility load is already present in the forecast, SBU subtracts the NAS
+load once, and PowMr charge adds only its AC charging draw. The SBU site credit
+is capped at `min(dedicated_load, gross_house_load)` so mixed Utility/SBU history
+can never model PowMr backfeed. Mixed history remains an acknowledged
+approximation and must be explained in UI/docs.
+
+Regression tests: `tests/planner/test_secondary_storage.py` and
+`tests/test_secondary_storage_integration.py`.
 
 ---
 

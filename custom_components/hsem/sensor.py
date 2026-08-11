@@ -84,6 +84,9 @@ from custom_components.hsem.custom_sensors.recommendation_interval_sensor import
 from custom_components.hsem.custom_sensors.savings_sensor import (
     HSEMSavingsSensor,
 )
+from custom_components.hsem.custom_sensors.secondary_storage_plan_sensor import (
+    HSEMSecondaryStoragePlanSensor,
+)
 from custom_components.hsem.custom_sensors.solar_confidence_sensor import (
     HSEMSolarConfidenceSensor,
 )
@@ -124,6 +127,9 @@ async def async_setup_entry(  # NOSONAR -- HA platform callback, must be async
         config_entry, coordinator
     )
     ev_second_optimal_charging_plan_sensor = HSEMEVSecondOptimalChargingPlanSensor(
+        config_entry, coordinator
+    )
+    secondary_storage_plan_sensor = HSEMSecondaryStoragePlanSensor(
         config_entry, coordinator
     )
 
@@ -188,6 +194,7 @@ async def async_setup_entry(  # NOSONAR -- HA platform callback, must be async
             ev_charging_sensor,
             ev_optimal_charging_plan_sensor,
             ev_second_optimal_charging_plan_sensor,
+            secondary_storage_plan_sensor,
             applier_status_sensor,
             plan_explanation_sensor,
             forecast_accuracy_sensor,

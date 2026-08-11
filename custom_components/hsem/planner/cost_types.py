@@ -127,6 +127,13 @@ class CostWeights:
     # Time discount for selector score (1.0 = no discount)
     time_discount_rate: float = 0.995
 
+    # Optional dedicated-load secondary storage.
+    secondary_storage_enabled: bool = False
+    secondary_storage_charge_efficiency_pct: float = 100.0
+    secondary_storage_discharge_efficiency_pct: float = 100.0
+    secondary_storage_cycle_cost_per_kwh: float = 0.0
+    secondary_storage_replacement_price_per_kwh: float | None = None
+
 
 @dataclass
 class PlanCostBreakdown:
@@ -197,6 +204,9 @@ class PlanCostBreakdown:
     grid_limit_penalty: float = 0.0
     override_penalty: float = 0.0
     terminal_soc_value: float = 0.0
+    secondary_conversion_loss_cost: float = 0.0
+    secondary_cycle_cost: float = 0.0
+    secondary_terminal_soc_value: float = 0.0
     total_cost: float = 0.0
     score: float = 0.0
     # Deprecated alias for ``score``; kept for backward compatibility.

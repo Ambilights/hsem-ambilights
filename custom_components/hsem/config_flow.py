@@ -67,6 +67,10 @@ from custom_components.hsem.flows.quick_setup import (
     CRITICAL_DETECTION_KEYS,
     auto_detect_entities,
 )
+from custom_components.hsem.flows.secondary_storage import (
+    get_secondary_storage_step_schema,
+    validate_secondary_storage_input,
+)
 from custom_components.hsem.flows.solcast import (
     get_solcast_step_schema,
     validate_solcast_step_input,
@@ -487,13 +491,31 @@ class HSEMConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):  # pyright: igno
             errors = await validate_power_step_input(self.hass, user_input)
             if not errors:
                 self._user_input.update(user_input)
-                return await self.async_step_ev()
+                return await self.async_step_secondary_storage()
 
         data_schema = await get_power_step_schema(None)
 
         return self.async_show_form(
             step_id="power",
             data_schema=data_schema,
+            errors=errors,
+            last_step=False,
+        )
+
+    async def async_step_secondary_storage(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle the optional dedicated-load secondary-storage step."""
+        errors = {}
+        if user_input is not None:
+            errors = await validate_secondary_storage_input(self.hass, user_input)
+            if not errors:
+                self._user_input.update(user_input)
+                return await self.async_step_ev()
+
+        return self.async_show_form(
+            step_id="secondary_storage",
+            data_schema=await get_secondary_storage_step_schema(None),
             errors=errors,
             last_step=False,
         )

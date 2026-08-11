@@ -22,6 +22,8 @@
       "power_out_of_range": "Effektværdien er uden for det tilladte område.",
       "price_out_of_range": "Prisværdien er uden for det tilladte område.",
       "required": "Dette felt er påkrævet.",
+      "secondary_storage_invalid_charge_range": "Ladestrømmen skal bruge trin på 10 A mellem 10 A og 80 A, og minimum må ikke overstige maksimum.",
+      "secondary_storage_invalid_soc_range": "SoC-grænserne for det sekundære lager skal opfylde 0 ≤ minimum < maksimum ≤ 100.",
       "start_time_after_end_time": "Starttidspunkt skal være før sluttidspunkt.",
       "start_time_equals_end_time": "Starttidspunkt og sluttidspunkt kan ikke være ens - dette skaber et nul-længdevindue. Deaktiver tidsplanen i stedet."
     },
@@ -292,6 +294,54 @@
         "description": "Vælg effektsensorer til HSEM.",
         "title": "Effektsensorer"
       },
+      "secondary_storage": {
+        "data": {
+          "hsem_secondary_storage_enabled": "Aktiver optimering af sekundært lager",
+          "hsem_secondary_storage_control_enabled": "Aktiver PowMr-hardwarestyring",
+          "hsem_secondary_storage_soc_entity": "Batteriets SoC-sensor",
+          "hsem_secondary_storage_battery_net_power_entity": "Sensor for batteriets nettoeffekt",
+          "hsem_secondary_storage_load_power_entity": "Effektsensor for dedikeret belastning",
+          "hsem_secondary_storage_output_source_priority_entity": "Valg af udgangskildeprioritet",
+          "hsem_secondary_storage_charger_source_priority_entity": "Valg af laderkildeprioritet",
+          "hsem_secondary_storage_max_charge_current_entity": "Tal for maksimal ladestrøm",
+          "hsem_secondary_storage_capacity_kwh": "Batterikapacitet (kWh)",
+          "hsem_secondary_storage_min_soc_pct": "Minimum SoC (%)",
+          "hsem_secondary_storage_max_soc_pct": "Maksimum SoC (%)",
+          "hsem_secondary_storage_nominal_voltage_v": "Nominel batterispænding (V)",
+          "hsem_secondary_storage_min_charge_current_a": "Minimum ladestrøm (A)",
+          "hsem_secondary_storage_max_charge_current_a": "Maksimum ladestrøm (A)",
+          "hsem_secondary_storage_charge_efficiency_pct": "Ladeeffektivitet (%)",
+          "hsem_secondary_storage_discharge_efficiency_pct": "Afladningseffektivitet (%)",
+          "hsem_secondary_storage_inverter_standby_power_w": "SBU-inverteroverhead (W)",
+          "hsem_secondary_storage_cycle_cost_per_kwh": "Cyklusomkostning pr. kWh",
+          "hsem_secondary_storage_base_load_includes_dedicated_load": "Hushistorik inkluderer den dedikerede belastning",
+          "hsem_secondary_storage_allow_primary_battery_transfer": "Tillad energioverførsel fra Huawei til PowMr"
+        },
+        "data_description": {
+          "hsem_secondary_storage_enabled": "Tilføj et ikke-eksporterende sekundært batteri til MILP-planlægningen.",
+          "hsem_secondary_storage_control_enabled": "Lad HSEM anvende Utility/Charge/SBU-planen på PowMr. Lad den være deaktiveret til skyggeplanlægning. HSEM's globale skrivebeskyttelse blokerer altid skrivninger.",
+          "hsem_secondary_storage_soc_entity": "Aktuel PowMr-batteri-SoC, f.eks. sensor.powmr_soc.",
+          "hsem_secondary_storage_battery_net_power_entity": "Valgfri signeret batterieffekt til diagnosticering; positiv er opladning og negativ er afladning.",
+          "hsem_secondary_storage_load_power_entity": "Effekten for den isolerede belastning, som PowMr leverer til.",
+          "hsem_secondary_storage_output_source_priority_entity": "PowMr-valg med indstillingerne Utility first og SBU priority.",
+          "hsem_secondary_storage_charger_source_priority_entity": "PowMr-valg med indstillingerne Solar and Utility og Only Solar.",
+          "hsem_secondary_storage_max_charge_current_entity": "PowMr-tal, der indstiller den samlede batteriladestrøm.",
+          "hsem_secondary_storage_capacity_kwh": "Det sekundære batteris mærkekapacitet.",
+          "hsem_secondary_storage_min_soc_pct": "Fast reserve. SBU planlægges eller anvendes aldrig under denne SoC.",
+          "hsem_secondary_storage_max_soc_pct": "Højeste SoC, som optimeringen må planlægge.",
+          "hsem_secondary_storage_nominal_voltage_v": "Nominel DC-spænding til omregning af planlagt kWh til ladestrøm.",
+          "hsem_secondary_storage_min_charge_current_a": "Mindste understøttede netladestrøm.",
+          "hsem_secondary_storage_max_charge_current_a": "Største tilladte netladestrøm.",
+          "hsem_secondary_storage_charge_efficiency_pct": "Effektivitet fra AC til lagret batterienergi.",
+          "hsem_secondary_storage_discharge_efficiency_pct": "Effektivitet fra batteri til belastning.",
+          "hsem_secondary_storage_inverter_standby_power_w": "Ekstra DC-forbrug, mens SBU leverer til den dedikerede belastning.",
+          "hsem_secondary_storage_cycle_cost_per_kwh": "Valgfri slidomkostning for hver opladet eller afladet kWh.",
+          "hsem_secondary_storage_base_load_includes_dedicated_load": "Aktiver, når husets forbrugshistorik normalt inkluderer PowMr/NAS-netbelastningen. Blandet Utility/SBU-historik er fortsat en tilnærmelse.",
+          "hsem_secondary_storage_allow_primary_battery_transfer": "Avanceret: tillad Huawei-afladning, mens PowMr oplader. Deaktiveret som standard for at undgå batteri-til-batteri-tab."
+        },
+        "description": "Konfigurer et topologibevidst, ikke-eksporterende PowMr-batteri til koordineret optimering. Hardwarestyring kræver separat tilvalg.",
+        "title": "Sekundært lager (PowMr)"
+      },
       "solcast": {
         "data": {
           "hsem_solcast_pv_forecast_forecast_likelihood": "Solcast PV-prognose foretrukket sandsynlighed",
@@ -489,6 +539,8 @@
       "power_out_of_range": "Effektværdien er uden for det tilladte område.",
       "price_out_of_range": "Prisværdien er uden for det tilladte område.",
       "required": "Dette felt er påkrævet.",
+      "secondary_storage_invalid_charge_range": "Ladestrømmen skal bruge trin på 10 A mellem 10 A og 80 A, og minimum må ikke overstige maksimum.",
+      "secondary_storage_invalid_soc_range": "SoC-grænserne for det sekundære lager skal opfylde 0 ≤ minimum < maksimum ≤ 100.",
       "start_time_after_end_time": "Starttidspunkt skal være før sluttidspunkt.",
       "start_time_equals_end_time": "Starttidspunkt og sluttidspunkt kan ikke være ens - dette skaber et nul-længdevindue. Deaktiver tidsplanen i stedet."
     },
@@ -738,6 +790,54 @@
         },
         "description": "Select power sensors for HSEM.",
         "title": "Power Sensors"
+      },
+      "secondary_storage": {
+        "data": {
+          "hsem_secondary_storage_enabled": "Enable Secondary Storage Optimisation",
+          "hsem_secondary_storage_control_enabled": "Enable PowMr Hardware Control",
+          "hsem_secondary_storage_soc_entity": "Battery SoC Sensor",
+          "hsem_secondary_storage_battery_net_power_entity": "Battery Net Power Sensor",
+          "hsem_secondary_storage_load_power_entity": "Dedicated Load Power Sensor",
+          "hsem_secondary_storage_output_source_priority_entity": "Output Source Priority Select",
+          "hsem_secondary_storage_charger_source_priority_entity": "Charger Source Priority Select",
+          "hsem_secondary_storage_max_charge_current_entity": "Maximum Charge Current Number",
+          "hsem_secondary_storage_capacity_kwh": "Battery Capacity (kWh)",
+          "hsem_secondary_storage_min_soc_pct": "Minimum SoC (%)",
+          "hsem_secondary_storage_max_soc_pct": "Maximum SoC (%)",
+          "hsem_secondary_storage_nominal_voltage_v": "Nominal Battery Voltage (V)",
+          "hsem_secondary_storage_min_charge_current_a": "Minimum Charge Current (A)",
+          "hsem_secondary_storage_max_charge_current_a": "Maximum Charge Current (A)",
+          "hsem_secondary_storage_charge_efficiency_pct": "Charge Efficiency (%)",
+          "hsem_secondary_storage_discharge_efficiency_pct": "Discharge Efficiency (%)",
+          "hsem_secondary_storage_inverter_standby_power_w": "SBU Inverter Overhead (W)",
+          "hsem_secondary_storage_cycle_cost_per_kwh": "Cycle Cost per kWh",
+          "hsem_secondary_storage_base_load_includes_dedicated_load": "House History Includes Dedicated Load",
+          "hsem_secondary_storage_allow_primary_battery_transfer": "Allow Huawei-to-PowMr Energy Transfer"
+        },
+        "data_description": {
+          "hsem_secondary_storage_enabled": "Add a non-exporting second battery to the MILP. It may charge from utility and power only its dedicated AC load.",
+          "hsem_secondary_storage_control_enabled": "Allow HSEM to apply the planned Utility/Charge/SBU mode to PowMr. Leave disabled for shadow planning. Global HSEM read-only mode always blocks these writes.",
+          "hsem_secondary_storage_soc_entity": "Current PowMr battery state of charge, for example sensor.powmr_soc.",
+          "hsem_secondary_storage_battery_net_power_entity": "Optional signed battery power for diagnostics; positive means charging and negative means discharging.",
+          "hsem_secondary_storage_load_power_entity": "Power of the isolated load supplied by PowMr, for example sensor.powmr_load_power_internal.",
+          "hsem_secondary_storage_output_source_priority_entity": "PowMr select with Utility first and SBU priority options.",
+          "hsem_secondary_storage_charger_source_priority_entity": "PowMr select with Solar and Utility and Only Solar options.",
+          "hsem_secondary_storage_max_charge_current_entity": "PowMr number used to set total battery charge current.",
+          "hsem_secondary_storage_capacity_kwh": "Nameplate capacity of the secondary battery.",
+          "hsem_secondary_storage_min_soc_pct": "Hard reserve. SBU is never planned or applied below this SoC.",
+          "hsem_secondary_storage_max_soc_pct": "Highest SoC the optimiser may schedule.",
+          "hsem_secondary_storage_nominal_voltage_v": "Nominal DC voltage used to convert planned kWh into a charge-current target.",
+          "hsem_secondary_storage_min_charge_current_a": "Smallest supported utility charge-current setting.",
+          "hsem_secondary_storage_max_charge_current_a": "Largest allowed utility charge current.",
+          "hsem_secondary_storage_charge_efficiency_pct": "AC-to-battery storage efficiency.",
+          "hsem_secondary_storage_discharge_efficiency_pct": "Battery-to-load conversion efficiency.",
+          "hsem_secondary_storage_inverter_standby_power_w": "Additional DC draw while SBU powers the dedicated load.",
+          "hsem_secondary_storage_cycle_cost_per_kwh": "Optional wear cost added for each kWh charged or discharged.",
+          "hsem_secondary_storage_base_load_includes_dedicated_load": "Enable when the house-consumption history normally includes the PowMr/NAS utility load. Mixed Utility/SBU history remains an approximation.",
+          "hsem_secondary_storage_allow_primary_battery_transfer": "Advanced: permit Huawei discharge while PowMr charges. Disabled by default to prevent battery-to-battery conversion losses."
+        },
+        "description": "Configure a topology-aware, non-exporting PowMr battery for coordinated optimisation. Hardware control is a separate opt-in and remains subject to HSEM read-only mode.",
+        "title": "Secondary Storage (PowMr)"
       },
       "solcast": {
         "data": {
@@ -1055,6 +1155,16 @@
       },
       "daily_plan_vs_actual": {
         "name": "Daglig Plan vs Faktisk"
+      },
+      "secondary_storage_plan": {
+        "name": "Plan for sekundært lager",
+        "state": {
+          "charge": "Oplad fra elnettet",
+          "disabled": "Deaktiveret",
+          "sbu": "Batteriet leverer til den dedikerede belastning",
+          "unavailable": "Utilgængelig",
+          "utility": "Elnettet leverer til den dedikerede belastning"
+        }
       },
       "degraded_mode": {
         "name": "Systemtilstand",

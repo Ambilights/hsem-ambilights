@@ -17,6 +17,9 @@ from typing import Any, cast
 import voluptuous as vol
 
 from custom_components.hsem.models.battery_schedule import BatterySchedule
+from custom_components.hsem.models.secondary_storage_entity_config import (
+    SecondaryStorageEntityConfig,
+)
 from custom_components.hsem.models.sensor_config import (
     BatteryScheduleConfig,
     EVChargerConfig,
@@ -187,6 +190,83 @@ def build_sensor_config(
         get_config_value(config_entry, "hsem_max_grid_export_power_kw")
     )
     cfg.max_grid_export_power_kw = _max_export_kw if _max_export_kw is not None else 0.0
+
+    # Optional dedicated-load secondary storage
+    secondary = SecondaryStorageEntityConfig()
+    secondary.enabled = convert_to_boolean(
+        get_config_value(config_entry, "hsem_secondary_storage_enabled")
+    )
+    secondary.control_enabled = convert_to_boolean(
+        get_config_value(config_entry, "hsem_secondary_storage_control_enabled")
+    )
+    secondary.soc_entity = _optional_entity(
+        get_config_value(config_entry, "hsem_secondary_storage_soc_entity")
+    )
+    secondary.battery_net_power_entity = _optional_entity(
+        get_config_value(
+            config_entry, "hsem_secondary_storage_battery_net_power_entity"
+        )
+    )
+    secondary.load_power_entity = _optional_entity(
+        get_config_value(config_entry, "hsem_secondary_storage_load_power_entity")
+    )
+    secondary.output_source_priority_entity = _optional_entity(
+        get_config_value(
+            config_entry, "hsem_secondary_storage_output_source_priority_entity"
+        )
+    )
+    secondary.charger_source_priority_entity = _optional_entity(
+        get_config_value(
+            config_entry, "hsem_secondary_storage_charger_source_priority_entity"
+        )
+    )
+    secondary.max_charge_current_entity = _optional_entity(
+        get_config_value(
+            config_entry, "hsem_secondary_storage_max_charge_current_entity"
+        )
+    )
+    secondary.capacity_kwh = _float_config(
+        config_entry, "hsem_secondary_storage_capacity_kwh", 15.0
+    )
+    secondary.min_soc_pct = _float_config(
+        config_entry, "hsem_secondary_storage_min_soc_pct", 20.0
+    )
+    secondary.max_soc_pct = _float_config(
+        config_entry, "hsem_secondary_storage_max_soc_pct", 100.0
+    )
+    secondary.nominal_voltage_v = _float_config(
+        config_entry, "hsem_secondary_storage_nominal_voltage_v", 24.0
+    )
+    secondary.min_charge_current_a = _float_config(
+        config_entry, "hsem_secondary_storage_min_charge_current_a", 10.0
+    )
+    secondary.max_charge_current_a = _float_config(
+        config_entry, "hsem_secondary_storage_max_charge_current_a", 60.0
+    )
+    secondary.charge_efficiency_pct = _float_config(
+        config_entry, "hsem_secondary_storage_charge_efficiency_pct", 93.0
+    )
+    secondary.discharge_efficiency_pct = _float_config(
+        config_entry, "hsem_secondary_storage_discharge_efficiency_pct", 93.0
+    )
+    secondary.inverter_standby_power_w = _float_config(
+        config_entry, "hsem_secondary_storage_inverter_standby_power_w", 55.0
+    )
+    secondary.cycle_cost_per_kwh = _float_config(
+        config_entry, "hsem_secondary_storage_cycle_cost_per_kwh", 0.0
+    )
+    secondary.base_load_includes_dedicated_load = convert_to_boolean(
+        get_config_value(
+            config_entry,
+            "hsem_secondary_storage_base_load_includes_dedicated_load",
+        )
+    )
+    secondary.allow_primary_battery_transfer = convert_to_boolean(
+        get_config_value(
+            config_entry, "hsem_secondary_storage_allow_primary_battery_transfer"
+        )
+    )
+    cfg.secondary_storage = secondary
 
     # Solcast
     cfg.solcast_pv_forecast_forecast_today = get_config_value(
@@ -537,6 +617,12 @@ def build_battery_schedules(cfg: SensorConfig) -> list[BatterySchedule]:
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+
+def _float_config(config_entry: Any, key: str, default: float) -> float:
+    """Return a numeric config value while preserving an explicit zero."""
+    value = convert_to_float(get_config_value(config_entry, key))
+    return value if value is not None else default
 
 
 def _optional_entity(
