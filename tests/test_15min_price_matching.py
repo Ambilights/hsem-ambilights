@@ -24,10 +24,12 @@ helper logic with the async path.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
 from custom_components.hsem.custom_sensors.hourly_data_populator.prices_solcast import (
+    _async_update_hourly_field,
     populate_price_and_solcast_from_snapshot,
 )
 from custom_components.hsem.models.hourly_recommendation import HourlyRecommendation
@@ -212,3 +214,72 @@ class TestQuarterHourlyPriceMatching:
             assert rec.import_price == pytest.approx(expected, abs=1e-4), (
                 f"Hour {h}: expected {expected}, got {rec.import_price}"
             )
+
+
+class TestNordPoolRawPriceKeys:
+    """Nord Pool ``raw_*`` arrays use ``start``/``value`` (issue #750)."""
+
+    def setup_method(self) -> None:
+        self.base = datetime.fromisoformat("2026-08-11T00:00:00+02:00")
+        self.values = [0.842, 0.913, 1.104, 1.287]
+
+    def _recommendations(self) -> list[HourlyRecommendation]:
+        return [
+            _make_rec(
+                self.base + timedelta(minutes=15 * i),
+                self.base + timedelta(minutes=15 * (i + 1)),
+            )
+            for i in range(len(self.values))
+        ]
+
+    def _raw_prices(self) -> list[dict[str, str | float]]:
+        return [
+            {
+                "start": (self.base + timedelta(minutes=15 * i)).isoformat(),
+                "end": (self.base + timedelta(minutes=15 * (i + 1))).isoformat(),
+                "value": value,
+            }
+            for i, value in enumerate(self.values)
+        ]
+
+    @pytest.mark.parametrize("attribute", ["raw_today", "raw_tomorrow"])
+    def test_snapshot_path_reads_start_value_pairs(self, attribute: str) -> None:
+        """The snapshot planner path must ingest current Nord Pool payloads."""
+        cfg = _Cfg(price_interval=15, slot_interval=15)
+        recs = self._recommendations()
+        raw = self._raw_prices()
+        attrs = {
+            "sensor.eds_import": {attribute: raw},
+            "sensor.eds_export": {attribute: raw},
+        }
+
+        _populate(recs, attrs, cfg)
+
+        for rec, expected in zip(recs, self.values, strict=True):
+            assert rec.import_price == pytest.approx(expected)
+            assert rec.export_price == pytest.approx(expected)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("attribute", ["raw_today", "raw_tomorrow"])
+    async def test_live_path_reads_start_value_pairs(self, attribute: str) -> None:
+        """The live HA-state path must ingest current Nord Pool payloads."""
+        recs = self._recommendations()
+        state = SimpleNamespace(attributes={attribute: self._raw_prices()})
+        sensor = SimpleNamespace(
+            hass=SimpleNamespace(
+                states=SimpleNamespace(get=lambda _entity_id: state),
+            )
+        )
+
+        await _async_update_hourly_field(
+            sensor,
+            recs,
+            "sensor.nordpool",
+            "import_price",
+            1.0,
+            "pv_estimate",
+            15,
+        )
+
+        for rec, expected in zip(recs, self.values, strict=True):
+            assert rec.import_price == pytest.approx(expected)
