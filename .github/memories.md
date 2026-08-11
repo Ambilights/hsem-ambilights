@@ -327,6 +327,45 @@ Also in `_build_constraints`, the session-EV AC load is simply
 by definition.  Do not re-introduce a multiply-then-divide by
 `charger_efficiency`.
 
+## Battery Export Minimum Price Floor (Issue #752)
+
+A third per-slot ed cap, in the same `_build_constraints` loop:
+
+3. **Battery-export-min-price floor** — when `battery_export_min_price > 0`
+   and the slot's RAW export price is strictly below the floor
+   (`p_exp[t] < battery_export_min_price`, evaluated on the raw p_exp
+   BEFORE the `min_export_price` and export-≤-import clamps), apply
+   `ed[t] ≤ base_load / η_dis` to that slot.  This is the per-slot,
+   soft-switch companion to the global `no_export` cap — it blocks
+   *intentional* battery-to-grid export only on slots below the user's
+   explicit floor, not everywhere.  Above the floor the optimizer is
+   free to decide whether exporting is worthwhile; reaching the threshold
+   does NOT auto-trigger export.  The non-MILP `apply_excess_export` path
+   enforces the same floor via
+   `export_price >= max(export_min_price, recommended_threshold, battery_export_min_price)`.
+
+   - The mask is computed in `milp_optimizer.py::solve_milp`
+     (`battery_export_blocked`) and passed to `_build_constraints` via the
+     `battery_export_blocked=` kwarg.  Wire it end-to-end:
+     `const.py` (`hsem_batteries_export_min_price` default 0.0) →
+     `flows/batteries_excess_export.py` schema/validator →
+     `models/sensor_config.py::batteries_export_min_price` →
+     `custom_sensors/config_reader.py` →
+     `models/planner_input.py::battery_export_min_price` →
+     `coordinator_builder.py::build_planner_input` →
+     `planner/candidate_generator.py::generate_candidates` →
+     `planner/milp_optimizer.py::solve_milp` (kwarg) →
+     `planner/milp/_constraints.py::_build_constraints` (mask).
+   - The cost function mirrors the floor via
+     `CostWeights.battery_export_min_price`; battery-destined export
+     revenue (and discharge-loss export-destined pricing) is zeroed on
+     blocked slots so scored costs match the optimisation.
+   - The guard applies ONLY to intentional battery-to-grid export
+     (`force_batteries_discharge`).  It does NOT affect normal battery
+     self-consumption, PV export, or PV charging.  With the default
+     `0.0` the planner is identical to the pre-#752 code (backward
+     compatible) — verify the backward-compat invariant in tests.
+
 ## Live-Injection Spike Floor (Issue #592)
 
 In `planner/engine_population.py::_inject_live_data_into_current_slot`, the
@@ -938,6 +977,31 @@ Regression tests: ``tests/planner/test_zero_pv_solar_charge_mislabel.py``.
 
 ---
 
+## Nordpool Price Format — raw_today/raw_tomorrow (issue #750)
+
+``custom-components/nordpool`` publishes ``raw_today`` / ``raw_tomorrow``
+attributes as ``{"start": datetime, "end": datetime, "value": price}``.
+HSEM's price populator (``custom_sensors/hourly_data_populator/prices_solcast.py``)
+mapped those attributes as ``{"k": "hour", "v": "price"}``, so every entry
+was silently skipped and all planner slots got ``import_price = 0.0``.
+
+**Canonical rule:** the ``data_sources`` mapping for ``raw_today`` /
+``raw_tomorrow`` accepts both the legacy ``hour``/``price`` format and
+the nordpool ``start``/``value`` format.  The mapping is a list of
+fallbacks — add new formats as additional ``{"k": ..., "v": ...}``
+entries rather than replacing existing ones.
+
+Regression tests: ``tests/test_15min_price_matching.py``
+(``TestNordpoolRawFormat``).
+
+**Observability rule:** when a configured price sensor yields zero matched
+data points, the populator logs a ``warning`` naming the sensor.  A
+``debug`` message is logged for Solcast sensors (PV forecast is optional).
+This makes format mismatches visible instead of silently planning with
+``import_price = 0.0`` (issue #750).
+
+---
+
 ## File Organization — By Responsibility, Not By Theme
 
 AI agents naturally bucket related things together (e.g. "all planner inputs in one file").
@@ -959,3 +1023,55 @@ Do **not** create files like `planner_inputs.py` (6 unrelated dataclasses) or
 **Why**: Smaller, focused files give AI agents exactly the context they need.
 Thematic bucketing loads irrelevant code into every prompt, reducing precision
 and causing edit collisions between unrelated classes.
+
+## EV Charger Power Must Be Slot-Stable (issue #738)
+
+`ev_charger_calculated_power` and `ev_second_charger_calculated_power` are HSEM's
+*command* to the EV charger. They must remain **constant for the entire current
+15-minute slot** once computed at slot start.
+
+The EV planner recomputes these fields whenever the planner reruns, and the
+recomputation uses live-injected PV and house-consumption data for the current
+slot. Without freezing, a Go-E or similar charger that uses the field as a
+power setpoint sees the target jump whenever:
+
+- a cloud changes the live PV reading,
+- the charger itself toggles on/off (changing `is_charging`), or
+- any other replan trigger fires inside the slot.
+
+The coordinator freezes the slot-start values in
+`_freeze_ev_charger_power_for_current_slot` and restores them to the current
+slot on every replan. Explicit overrides (force-charge-now, auto-full-EV on
+negative price) are applied **after** the freeze, so they can still change the
+current slot while active; when they end, the frozen value is restored.
+
+This is a runtime stability rule, not a planner algorithm change. The planner
+still sees live data for battery/SoC decisions; only the per-EV charger power
+command is held constant.
+
+---
+
+## Wait Mode Self-Consumption with Reserve (issue #742)
+
+`batteries_wait_mode` can now optionally allow normal household self-consumption
+instead of keeping the battery strictly idle.
+
+- Config key: `hsem_batteries_wait_mode_behavior`
+- Values: `"strict"` (default) or `"self_consumption_with_reserve"`
+- When set to `"self_consumption_with_reserve"`, the applier
+  (`custom_components/hsem/custom_sensors/applier.py`) switches the inverter to
+  `MaximizeSelfConsumption` and caps the discharge power so only surplus energy
+  above the planner's required reserve (`current_required_battery_kwh`) can be
+  used.  Once the battery reaches the reserve, the applier falls back to strict
+  TOU wait mode.
+- PV surplus during wait-mode self-consumption is directed to charge the battery
+  (`desired_excess = "charge"`), not exported to grid.
+- The cap is computed from the surplus energy and the slot duration so the
+  reserve is preserved even if the house load is high.
+- EV-active slots keep their existing EV discharge cap logic; the wait-mode cap
+  is not applied while an EV is charging.
+
+Files involved: `flows/batteries_wait_mode.py`, `config_flow.py`,
+`options_flow.py`, `translations/en.json`, `const.py`,
+`models/sensor_config.py`, `custom_sensors/config_reader.py`,
+`custom_sensors/applier.py`.

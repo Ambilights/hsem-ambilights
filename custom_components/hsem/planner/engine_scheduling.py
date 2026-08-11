@@ -122,6 +122,7 @@ def _schedule_slots(
             warnings,
             export_min_price=inp.export_min_price,
             recommended_threshold=rt,
+            battery_export_min_price=inp.battery_export_min_price,
         )
         log_planner(
             "debug",

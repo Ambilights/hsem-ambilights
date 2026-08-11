@@ -187,6 +187,8 @@ class TestBuildPlannerInputSlotInDay:
 
         recs = [_rec(i) for i in range(192)]
 
+        # build_planner_input uses the imported hsem_now alias. Pin it to the
+        # recommendation window so this remains deterministic wall-clock time.
         with patch(
             "custom_components.hsem.coordinator_builder.hsem_now",
             return_value=base,

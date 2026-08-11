@@ -53,6 +53,7 @@ def solve_milp(
     main_fuse_amps: float | None = None,
     main_fuse_phases: int = 3,
     max_grid_export_power_kw: float | None = None,
+    battery_export_min_price: float = 0.0,
     secondary_storage: SecondaryStorageConfig | None = None,
 ) -> tuple[list[PlannedSlot], dict] | None:
     """Solve the horizon and return independent result slots plus diagnostics.
@@ -63,9 +64,124 @@ def solve_milp(
     output can remove only its configured load from the site balance and can
     never create grid export.
 
-    Callers must run :func:`~soc_simulation.simulate_soc` with
-    ``milp_prepopulated=True`` for the Huawei SoC display fields. Returns
-    ``None`` when no future horizon exists or the solver fails.
+    - ``recommendation``  — one of ``BatteriesChargeGrid``, ``BatteriesDischargeMode``,
+      ``ForceBatteriesDischarge``, or ``None`` (idle).
+    - ``batteries_charged_kwh`` — energy entering the battery this slot (kWh).
+    - ``batteries_discharged_kwh`` — energy discharged from the battery this slot
+      (kWh).  Derived from the **resolved** ed after mutex resolution — this is the
+      source of truth and must not be re-derived by the SoC simulation.
+    - ``grid_import_kwh`` — grid import this slot (kWh), derived from the energy
+      balance equation using the resolved ec/ed values.
+    - ``grid_export_kwh`` — grid export this slot (kWh), derived from the energy
+      balance equation using the resolved ec/ed values.
+    - ``ev_planned_load_kwh`` — EV AC load that must be added to base consumption
+      (when ``ev_configs`` is provided and ``base_load_includes_ev`` is False).
+    - ``ev_accounted_load_kwh`` — EV AC load already captured in house consumption
+      (when ``ev_configs`` is provided and ``base_load_includes_ev`` is True).
+    - ``ev_total_planned_load_kwh`` — total EV AC load (sum of planned + accounted).
+    - ``ev_charger_calculated_power`` — target AC power (W) for the primary EV charger.
+    - ``ev_second_charger_calculated_power`` — target AC power (W) for the second EV.
+    - ``estimated_net_consumption_kwh`` — recomputed after EV decisions.
+    - ``estimated_cost_currency`` — recomputed after EV decisions.
+
+    The SoC simulation (:func:`~soc_simulation.simulate_soc`) must be run
+    by the caller **after** receiving these slots with
+    ``milp_prepopulated=True`` to populate ``estimated_battery_soc``
+    and ``estimated_battery_capacity_kwh`` while preserving the LP-derived
+    energy flow fields.
+
+    The MILP objective now includes conversion loss costs so its optimisation
+    matches the cost function's ``total_cost``.  The energy balance equation
+    accounts for charge/discharge efficiencies so ``gi[t]`` reflects real grid
+    import (not the idealised lossless value).
+
+    Args:
+        slots:
+            Fully populated (pre-SoC-simulation) slot list from the engine.
+            Past slots with recommendation ``TimePassed`` are treated as fixed
+            (zero charge/discharge) and excluded from the LP.
+        now:
+            Timezone-aware current datetime used to identify past slots.
+        current_kwh:
+            Battery energy above the discharge floor at the start of the horizon
+            (kWh).  This is the LP's initial SoC state.
+        usable_kwh:
+            Maximum usable energy (max_soc − min_soc, kWh).  Acts as the SoC
+            upper bound.
+        max_charge_per_slot:
+            Maximum energy chargeable per slot (kWh, post-conversion-loss).
+        max_discharge_per_slot:
+            Maximum energy dischargeable per slot (kWh).  ``None`` means unlimited;
+            the LP uses ``usable_kwh`` as the effective ceiling in that case.
+        cycle_cost_per_kwh:
+            Battery cycle (depreciation) cost per kWh cycled.  Defaults to 0.0.
+        charge_efficiency_pct:
+            Charge-side efficiency as a percentage (0-100).  Energy stored in
+            the battery equals input energy x (charge_efficiency_pct / 100).
+            Defaults to 97 % (3 % charge-side loss).
+        discharge_efficiency_pct:
+            Discharge-side efficiency as a percentage (0-100).  Energy delivered
+            to the house equals battery energy removed x (discharge_efficiency_pct / 100).
+            Defaults to 97 % (3 % discharge-side loss).
+        replacement_price_per_kwh:
+            Terminal-SoC replacement price (currency/kWh) used to value the
+            opportunity cost of ending the horizon with less stored energy.
+            Passed from the engine (computed from the next discharge window).
+            ``None`` disables the terminal-SoC credit term.
+        min_export_price:
+            Minimum export price (local currency/kWh) for the combined
+            threshold below which export is not worthwhile.  Set by the
+            caller to ``max(export_min_price, recommended_threshold)``
+            where ``export_min_price`` is the inverter's physical block
+            threshold and ``recommended_threshold`` is the
+            depreciation-based discharge minimum.  Used for:
+            - Clamping export prices to 0 before the LP solves (export
+              below this price is physically blocked).
+            - Deciding between ``ForceBatteriesDischarge`` and
+              ``BatteriesDischargeMode`` in post-processing.
+            Defaults to 0.0.
+        ev_configs:
+            Optional list of :class:`EVConfig` objects (one per EV).  When
+            provided, the MILP co-optimises EV charging alongside the battery.
+            EV loads are treated as decision variables with deadline-target
+            soft constraints.  The ``ev_planned_load_kwh`` field on the input
+            slots is ignored for EV-enabled slots (the MILP decides allocation).
+            ``None`` (default) uses pre-computed ``ev_planned_load_kwh`` as
+            fixed inputs (backward-compatible behaviour).
+        no_export:
+            When ``True``, caps battery discharge per slot so the battery
+            never exports to the grid — it only serves house load.  The
+            per-slot cap is ``ed[t] ≤ base_load[t] / discharge_eff``.
+        main_fuse_amps:
+            Main fuse/breaker rating in amps.  When provided and > 0, a soft
+            constraint limits total grid import power per slot to
+            ``main_fuse_amps * 230 * main_fuse_phases / 1000 * (interval_minutes / 60)`` kWh.
+            A penalty variable ``gi_pen[t]`` absorbs any excess, preventing
+            infeasibility when house base load alone exceeds the fuse rating.
+            ``None`` or 0 disables the constraint (identical to current behaviour).
+        main_fuse_phases:
+            Electrical phase count (1 or 3).  Used as the multiplier in the
+            max-grid-import formula above.  Defaults to 3 (three-phase).
+            Single-phase installations MUST use 1.
+        max_grid_export_power_kw:
+            DNO/inverter grid export cap in kW (issue #726).  When > 0, the
+            per-slot ``ge[t]`` is hard-bounded to
+            ``max_grid_export_power_kw * slot_hours`` kWh so the plan never
+            exceeds the site limit.  ``None`` or 0 disables the bound.
+        battery_export_min_price:
+            Per-slot hard floor below which intentional battery-to-grid
+            discharge is forbidden (issue #752). `0.0` disables it.
+            Caps `ed[t]` to `base_load[t]/discharge_eff` on blocked slots.
+
+    Returns:
+        A tuple ``(slots, diagnostics)`` where:
+        - ``slots`` is a list of :class:`PlannedSlot` copies with MILP-derived
+          recommendations.
+        - ``diagnostics`` is a dict with keys ``"s_max_pen"``, ``"s_min_pen"``,
+          ``"has_violations"``, ``"total_violation_kwh"``,
+          ``"discharge_loss_cost_destination_aware"``.
+        Returns ``None`` if the solver fails (unrelated to constraint
+        violations — e.g., solver crash or numerical issue).
     """
     secondary_active = secondary_storage is not None and secondary_storage.valid
     if secondary_active:
@@ -84,7 +200,8 @@ def solve_milp(
         "[milp] solve_milp  slots=%d  current=%.3f  usable=%.3f  "
         "max_chg=%.3f  max_dis=%s  cycle_cost=%.6f  "
         "chg_eff=%.2f  dis_eff=%.2f  discount=%.4f  repl_price=%s  "
-        "no_export=%s  min_export_price=%.4f  fuse=%s  secondary=%s",
+        "no_export=%s  min_export_price=%.4f  battery_export_min_price=%.4f  "
+        "fuse=%s  secondary=%s",
         len(slots),
         current_kwh,
         usable_kwh,
@@ -101,6 +218,7 @@ def solve_milp(
         ),
         no_export,
         min_export_price,
+        battery_export_min_price,
         (
             f"{main_fuse_amps:.1f}A/{main_fuse_phases}ph"
             if main_fuse_amps is not None
@@ -152,6 +270,12 @@ def solve_milp(
     # Replace NaN prices with 0 to prevent solver numerical issues
     p_imp = np.nan_to_num(p_imp, nan=0.0)
     p_exp = np.nan_to_num(p_exp, nan=0.0)
+
+    # Per-slot hard floor for intentional battery-to-grid export (issue
+    # #752). 0.0 (default) → mask all-False, backward compatible.
+    battery_export_blocked = np.zeros(len(future_idx), dtype=bool)
+    if battery_export_min_price > 1e-9:
+        battery_export_blocked = p_exp < battery_export_min_price
 
     # Clamp export prices below min_export_price to 0.
     # The applier physically sets the inverter to GRID_EXPORT_LIMIT_WATT
@@ -494,6 +618,7 @@ def solve_milp(
         _has_session_demand,
         max_grid_export_per_slot_kwh=max_grid_export_per_slot_kwh,
         export_limit_active=export_limit_active,
+        battery_export_blocked=battery_export_blocked,
     )
 
     integrality = None

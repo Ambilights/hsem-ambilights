@@ -31,11 +31,13 @@
       "batteries_excess_export": {
         "data": {
           "hsem_batteries_enable_excess_export": "Aktiver overskuds-eksport",
-          "hsem_batteries_excess_export_discharge_buffer": "Afladningsbuffer (%)"
+          "hsem_batteries_excess_export_discharge_buffer": "Afladningsbuffer (%)",
+          "hsem_batteries_export_min_price": "Batterieksport Min. Pris"
         },
         "data_description": {
           "hsem_batteries_enable_excess_export": "Aktiver eller deaktiver eksport af overskydende batterikapacitet til nettet, når det er økonomisk fordelagtigt.",
-          "hsem_batteries_excess_export_discharge_buffer": "Indstil sikkerhedsbufferprocenten for at opretholde minimum batterireserver (0-50%). Standard er 10% for at sikre tilstrækkelig kapacitet til uventet efterspørgsel."
+          "hsem_batteries_excess_export_discharge_buffer": "Indstil sikkerhedsbufferprocenten for at opretholde minimum batterireserver (0-50%). Standard er 10% for at sikre tilstrækkelig kapacitet til uventet efterspørgsel.",
+          "hsem_batteries_export_min_price": "Hårdt prægulv per slot for tilsigtet batteri-til-net eksport (issue #752). Når værdien > 0, forbyder HSEM at markere et slot som force_batteries_discharge når eksportprisen er strengt under dette gulv — batteriet kan stadig betjene husforbruget i disse slots. At nå tærsklen udløser IKKE automatisk eksport; optimizeren bestemmer stadig, om salg er økonomisk fordelagtigt. Gælder kun for tilsigtet batteri-til-net eksport, ikke for normalt selvforbrug, PV-eksport eller PV-opladning. Sæt til 0 for at deaktivere (standard)."
         },
         "description": "Konfigurer indstillinger for eksport af overskydende batterikapacitet til nettet, når det er økonomisk fordelagtigt.",
         "title": "Overskuds-eksport"
@@ -462,6 +464,16 @@
         "description": "Konfigurer energimålere og aktiver ML-baseret forbrugsprognose.",
         "title": "Energi og ML"
       },
+      "batteries_wait_mode": {
+        "data": {
+          "hsem_batteries_wait_mode_behavior": "Ventetilstand-adfærd"
+        },
+        "data_description": {
+          "hsem_batteries_wait_mode_behavior": "Vælg hvordan batteriet opfører sig, når HSEM vælger ventetilstand. Streng ventetilstand holder batteriet inaktivt. Selvforbrug med reserve tillader huset at bruge overskydende batterienergi over planlæggerens nødvendige reserve, hvilket reducerer unødvendig netimport."
+        },
+        "description": "Konfigurer hvordan batteriet opfører sig i ventetilstand.",
+        "title": "Batteri Ventetilstand-adfærd"
+      },
       "ocpp": {
         "data": {
           "hsem_ocpp_enabled": "Aktiver OCPP Server",
@@ -548,11 +560,13 @@
       "batteries_excess_export": {
         "data": {
           "hsem_batteries_enable_excess_export": "Enable Excess Battery Export",
-          "hsem_batteries_excess_export_discharge_buffer": "Discharge Buffer (%)"
+          "hsem_batteries_excess_export_discharge_buffer": "Discharge Buffer (%)",
+          "hsem_batteries_export_min_price": "Batterieksport Min. Pris"
         },
         "data_description": {
           "hsem_batteries_enable_excess_export": "Enable or disable the excess battery export feature, which automatically exports excess battery capacity to the grid when economically beneficial.",
-          "hsem_batteries_excess_export_discharge_buffer": "Set the safety buffer percentage to maintain minimum battery reserves (0-50%). Default is 10% to ensure adequate capacity for unexpected demand."
+          "hsem_batteries_excess_export_discharge_buffer": "Set the safety buffer percentage to maintain minimum battery reserves (0-50%). Default is 10% to ensure adequate capacity for unexpected demand.",
+          "hsem_batteries_export_min_price": "Hårdt prægulv per slot for tilsigtet batteri-til-net eksport (issue #752). Når værdien > 0, forbyder HSEM at markere et slot som force_batteries_discharge når eksportprisen er strengt under dette gulv — batteriet kan stadig betjene husforbruget i disse slots. At nå tærsklen udløser IKKE automatisk eksport; optimizeren bestemmer stadig, om salg er økonomisk fordelagtigt. Gælder kun for tilsigtet batteri-til-net eksport, ikke for normalt selvforbrug, PV-eksport eller PV-opladning. Sæt til 0 for at deaktivere (standard)."
         },
         "description": "Configure excess battery export settings to automatically sell excess energy to the grid when economically beneficial.",
         "title": "Excess Battery Export"
@@ -957,6 +971,16 @@
         "description": "Konfigurer energimålere og aktiver ML-baseret forbrugsprognose.",
         "title": "Energi og ML"
       },
+      "batteries_wait_mode": {
+        "data": {
+          "hsem_batteries_wait_mode_behavior": "Ventetilstand-adfærd"
+        },
+        "data_description": {
+          "hsem_batteries_wait_mode_behavior": "Vælg hvordan batteriet opfører sig, når HSEM vælger ventetilstand. Streng ventetilstand holder batteriet inaktivt. Selvforbrug med reserve tillader huset at bruge overskydende batterienergi over planlæggerens nødvendige reserve, hvilket reducerer unødvendig netimport."
+        },
+        "description": "Konfigurer hvordan batteriet opfører sig i ventetilstand.",
+        "title": "Batteri Ventetilstand-adfærd"
+      },
       "ocpp": {
         "data": {
           "hsem_ocpp_enabled": "Aktiver OCPP Server",
@@ -1019,6 +1043,12 @@
         "36": "36 hours",
         "48": "48 hours",
         "72": "72 hours"
+      }
+    },
+    "batteries_wait_mode_behavior": {
+      "options": {
+        "strict": "Streng ventetilstand — batteriet forbliver inaktivt",
+        "self_consumption_with_reserve": "Selvforbrug med reserve — brug overskud over planlæggerens reserve"
       }
     }
   },

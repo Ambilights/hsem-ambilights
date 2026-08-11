@@ -13,7 +13,7 @@ quick_setup → init → prices → months → solcast → huawei_solar
     → battery_economics → power → secondary_storage → ev → [ev_second]
     → ev_planned_load
     → [ev_second_planned_load] → ocpp → batteries_schedules
-    → batteries_excess_export → weighted_values
+    → batteries_wait_mode → batteries_excess_export → weighted_values
     → energy_and_ml
 ```
 
@@ -233,6 +233,14 @@ Battery charge/discharge schedule windows (up to three).
 
 Schedule 1 and 2 are enabled by default; schedule 3 is disabled by default.
 
+### Step: `batteries_wait_mode`
+
+Battery wait-mode behaviour.
+
+| Field | Key | Default | Description |
+|---|---|---|---|
+| Wait mode behaviour | `hsem_batteries_wait_mode_behavior` | `strict` | `strict` keeps the battery idle in Wait mode; `self_consumption_with_reserve` allows normal household self-consumption while protecting the planner's required battery reserve |
+
 ### Step: `batteries_excess_export`
 
 Excess battery export configuration.
@@ -241,6 +249,7 @@ Excess battery export configuration.
 |---|---|---|---|
 | Enable excess export | `hsem_batteries_enable_excess_export` | `False` | Master switch |
 | Discharge buffer | `hsem_batteries_excess_export_discharge_buffer` | 10 % | Safety SoC buffer before forced export |
+| Battery export min price | `hsem_batteries_export_min_price` | `0.0` | Per-slot hard floor for intentional battery-to-grid export (issue #752). When > 0, the MILP forbids marking a slot as `force_batteries_discharge` when the export price is strictly below this floor — the battery can still serve house load in those slots. Reaching the threshold does NOT automatically trigger export; the optimizer still decides whether selling is worthwhile. Applies only to intentional battery-to-grid export, not to normal self-consumption, PV export, or PV charging. Set to 0 to disable. |
 | Price threshold | — | Auto-calculated | Computed from battery depreciation settings at runtime |
 
 

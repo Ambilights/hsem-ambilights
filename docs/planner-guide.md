@@ -272,6 +272,7 @@ The pre-charge window ends at `schedule.start` and is sized to fill the battery 
 | `excess_export_discharge_buffer_pct` | `10.0` | Safety SoC buffer kept before forced export |
 | `excess_export_price_threshold` | Auto-calculated | Computed at runtime from battery depreciation settings (purchase price, expected cycles, usable capacity) via `calculate_recommended_threshold()`. |
 | `export_min_price` | `0.0` | Below this export price the inverter throttles export to zero |
+| `battery_export_min_price` | `0.0` | Per-slot hard floor for intentional battery-to-grid export (issue #752). When > 0 and a slot's raw `export_price` is strictly below this value, the MILP caps `ed[t]` so the battery can only serve house load (no grid export) for that slot — `force_batteries_discharge` is never labelled there. Reaching the threshold does NOT auto-trigger export; the optimizer still decides. Applies only to intentional battery-to-grid export, not to normal battery self-consumption, PV export, or PV charging. Set to 0 to disable. |
 
 ### Seasonal configuration
 
@@ -388,7 +389,7 @@ Each `PlannedSlot` in the output list covers one time interval and carries:
 | `force_batteries_discharge` | Forced discharge (excess export to grid) |
 | `force_export` | Negative import price — all available energy exported to earn money |
 | `ev_smart_charging` | EV charging load is allocated to this slot (planner or runtime resolver) |
-| `batteries_wait_mode` | Battery idle — neither charging nor discharging |
+| `batteries_wait_mode` | Battery idle by default; when **Wait mode behaviour** is set to *Self-consumption with reserve*, normal household self-consumption is allowed using energy above the planner's required reserve |
 | `time_passed` | Slot is in the past — no recommendation applied |
 | `missing_input_entities` | Required HA entities were unavailable when this slot was scheduled |
 
@@ -450,6 +451,13 @@ recommendation it is not changed by later rules in the same layer.
 > must not be mislabeled as solar charging — that would cause the applier to
 > write `MaximizeSelfConsumption` instead of `TimeOfUse` + charge TOU
 > (issue #720).
+
+> **Wait mode behaviour:** the `batteries_wait_mode` recommendation normally keeps the
+> battery idle.  When `hsem_batteries_wait_mode_behavior` is set to
+> `self_consumption_with_reserve`, the applier switches the inverter to
+> `MaximizeSelfConsumption` and caps discharge power so only surplus energy above
+> the planner's required reserve is used.  This reduces unnecessary grid import
+> while still preserving capacity for future scheduled discharge windows.
 
 **Discharge concentration** (`concentrate_discharge_on_expensive_slots`) runs after the
 seasonal fill but before candidate generation. It re-evaluates all discharge-mode
