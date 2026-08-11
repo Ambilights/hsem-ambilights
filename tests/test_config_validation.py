@@ -684,6 +684,23 @@ class TestFlowValidatorsUseConfigValidator:
             }
         )
         assert result["hsem_main_fuse_phases"] == 3  # pyright: ignore[reportIndexIssue]
+        assert result["hsem_phase_aware_charging_enabled"] is False  # pyright: ignore[reportIndexIssue]
+
+    @pytest.mark.asyncio
+    async def test_power_step_phase_aware_toggle_round_trips(self):
+        """The opt-in phase-aware safety flag must survive schema validation."""
+        from custom_components.hsem.flows.power import get_power_step_schema
+
+        schema = await get_power_step_schema(None)
+        result = schema(
+            {
+                "hsem_house_consumption_power": "sensor.house",
+                "hsem_solar_production_power": "sensor.solar",
+                "hsem_phase_aware_charging_enabled": True,
+            }
+        )
+
+        assert result["hsem_phase_aware_charging_enabled"] is True  # pyright: ignore[reportIndexIssue]
 
         # Omitted phase should get default (3)
         result = schema(

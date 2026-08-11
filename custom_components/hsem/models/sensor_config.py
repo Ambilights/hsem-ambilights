@@ -161,6 +161,8 @@ class SensorConfig:
     huawei_solar_batteries_state_of_capacity: str | None = None
     huawei_solar_batteries_charging_cutoff_capacity: str | None = None
     huawei_solar_batteries_grid_charge_cutoff_soc: str | None = None
+    huawei_solar_batteries_grid_charge_maximum_power: str | None = None
+    huawei_solar_batteries_charge_discharge_power: str | None = None
     huawei_solar_batteries_maximum_charging_power: str | None = None
     huawei_solar_batteries_maximum_discharging_power: str | None = None
     huawei_solar_batteries_tou_charging_and_discharging_periods: str | None = None
@@ -168,6 +170,9 @@ class SensorConfig:
     huawei_solar_batteries_forcible_charge: str | None = None
     huawei_solar_inverter_active_power_control: str | None = None
     huawei_solar_batteries_rated_capacity: str | None = None
+    huawei_solar_power_meter_phase_a_active_power: str | None = None
+    huawei_solar_power_meter_phase_b_active_power: str | None = None
+    huawei_solar_power_meter_phase_c_active_power: str | None = None
 
     # Power meters
     house_consumption_power: str | None = None
@@ -180,6 +185,10 @@ class SensorConfig:
     #: set this to 1 — using 3 on a single-phase install makes the fuse
     #: protection constraint silenty 3× too permissive.
     main_fuse_phases: int = 3
+    #: Use signed per-phase Huawei power-meter telemetry for hard planner
+    #: constraints and live charge-command limiting.  Disabled by default so
+    #: installations without a three-phase meter retain legacy behaviour.
+    phase_aware_charging_enabled: bool = False
     #: Maximum grid export power in kW (0 = disabled).  DNO/inverter export
     #: cap for export-limited connections (issue #726).  The MILP optimizer
     #: uses this as a hard bound on per-slot grid export energy.

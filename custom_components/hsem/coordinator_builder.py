@@ -39,6 +39,11 @@ from custom_components.hsem.utils.misc import (
     calculate_recommended_threshold,
     get_max_discharge_power,
 )
+from custom_components.hsem.utils.phase_power import (
+    phase_imbalance_w,
+    phase_powers_valid,
+    secondary_site_power_delta_w,
+)
 
 
 def _clamp_charge_rate(configured_w: float) -> float:
@@ -131,6 +136,7 @@ def _build_secondary_storage_config(
             configured.base_load_includes_dedicated_load
         ),
         allow_primary_battery_transfer=configured.allow_primary_battery_transfer,
+        grid_phase=configured.grid_phase,
     )
 
 
@@ -275,6 +281,31 @@ def build_planner_input(
     _w7d = convert_to_int(cfg.house_consumption_energy_weight_7d)
     _w14d = convert_to_int(cfg.house_consumption_energy_weight_14d)
 
+    secondary_storage = _build_secondary_storage_config(cfg, live)
+    grid_phase_power_imbalance_w: tuple[float, float, float] | None = None
+    live_phase_power_w = live.grid_phase_power_w
+    if cfg.phase_aware_charging_enabled and phase_powers_valid(live_phase_power_w):
+        measured_phase_power_w = live_phase_power_w
+        secondary_delta_w = 0.0
+        if secondary_storage.valid:
+            secondary_delta_w = secondary_site_power_delta_w(
+                battery_net_power_w=live.secondary_storage.battery_net_power_w,
+                load_power_w=live.secondary_storage.load_power_w,
+                charge_efficiency_pct=secondary_storage.charge_efficiency_pct,
+                base_load_includes_dedicated_load=(
+                    secondary_storage.base_load_includes_dedicated_load
+                ),
+                output_source_priority=(live.secondary_storage.output_source_priority),
+                charger_source_priority=(
+                    live.secondary_storage.charger_source_priority
+                ),
+            )
+        grid_phase_power_imbalance_w = phase_imbalance_w(
+            measured_phase_power_w,
+            secondary_site_delta_w=secondary_delta_w,
+            secondary_grid_phase=secondary_storage.grid_phase,
+        )
+
     return PlannerInput(
         now_iso=now.isoformat(),
         interval_minutes=cfg.recommendation_interval_minutes,
@@ -302,7 +333,7 @@ def build_planner_input(
             cfg.batteries_discharge_efficiency
         )
         or 95.0,
-        secondary_storage=_build_secondary_storage_config(cfg, live),
+        secondary_storage=secondary_storage,
         battery_purchase_price=convert_to_float(cfg.batteries_purchase_price) or 0.0,
         battery_expected_cycles=_cycles if _cycles is not None else 6000,
         battery_cycle_cost_per_kwh=convert_to_float(cfg.batteries_cycle_cost) or 0.0,
@@ -337,6 +368,8 @@ def build_planner_input(
         export_min_price=convert_to_float(cfg.export_electricity_min_price) or 0.0,
         main_fuse_amps=(float(cfg.main_fuse_amps) if cfg.main_fuse_amps > 0 else None),
         main_fuse_phases=cfg.main_fuse_phases,
+        phase_aware_charging_enabled=cfg.phase_aware_charging_enabled,
+        grid_phase_power_imbalance_w=grid_phase_power_imbalance_w,
         max_grid_export_power_kw=(
             float(cfg.max_grid_export_power_kw)
             if cfg.max_grid_export_power_kw > 0

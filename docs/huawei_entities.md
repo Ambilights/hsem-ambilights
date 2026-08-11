@@ -18,7 +18,7 @@
 | End-of-charge SOC | `number.batteries_end_of_charge_soc` | % | ✅ `hsem_huawei_solar_batteries_charging_cutoff_capacity` |
 | End-of-discharge SOC | `number.batteries_end_of_discharge_soc` | % | ✅ `hsem_huawei_solar_batteries_end_of_discharge_soc` |
 | Grid charge cutoff SOC | `number.batteries_grid_charge_cutoff_soc` | % | ✅ `hsem_huawei_solar_batteries_grid_charge_cutoff_soc` |
-| Grid charge maximum power | `number.batteries_grid_charge_maximum_power` | W | — |
+| Grid charge maximum power | `number.batteries_grid_charge_maximum_power` | W | ✅ `hsem_huawei_solar_batteries_grid_charge_maximum_power` (phase-aware control) |
 | Maximum charging power | `number.batteries_maximum_charging_power` | W | ✅ `hsem_huawei_solar_batteries_maximum_charging_power` |
 | Maximum discharging power | `number.batteries_maximum_discharging_power` | W | ✅ `hsem_huawei_solar_batteries_maximum_discharging_power` |
 | Peak Shaving SOC | `number.batteries_peak_shaving_soc` | % | — |
@@ -28,6 +28,7 @@
 | Friendly name | Entity ID | Unit | Used by HSEM |
 |---|---|---|---|
 | State of capacity (SoC) | `sensor.batteries_state_of_capacity` | % | ✅ `hsem_huawei_solar_batteries_state_of_capacity` |
+| Charge/discharge power | `sensor.batteries_charge_discharge_power` | W | ✅ `hsem_huawei_solar_batteries_charge_discharge_power` (positive charge, negative discharge) |
 | Rated capacity | `sensor.batteries_rated_capacity` | Wh | ✅ `hsem_huawei_solar_batteries_rated_capacity` |
 | TOU charging and discharging periods | `sensor.batteries_tou_charging_and_discharging_periods` | — | ✅ `hsem_huawei_solar_batteries_tou_charging_and_discharging_periods` |
 
@@ -103,13 +104,13 @@
 | Exported | `sensor.power_meter_exported` | kWh | — |
 | Frequency | `sensor.power_meter_frequency` | Hz | — |
 | Meter status | `sensor.power_meter_meter_status` | — | — |
-| Phase A active power | `sensor.power_meter_phase_a_active_power` | W | — |
+| Phase A active power | `sensor.power_meter_phase_a_active_power` | W | ✅ `hsem_huawei_solar_power_meter_phase_a_active_power` (phase-aware control) |
 | Phase A current | `sensor.power_meter_current` | A | — |
 | Phase A voltage | `sensor.power_meter_phase_a_voltage` | V | — |
-| Phase B active power | `sensor.power_meter_phase_b_active_power` | W | — |
+| Phase B active power | `sensor.power_meter_phase_b_active_power` | W | ✅ `hsem_huawei_solar_power_meter_phase_b_active_power` (phase-aware control) |
 | Phase B current | `sensor.power_meter_current_2` | A | — |
 | Phase B voltage | `sensor.power_meter_phase_b_voltage` | V | — |
-| Phase C active power | `sensor.power_meter_phase_c_active_power` | W | — |
+| Phase C active power | `sensor.power_meter_phase_c_active_power` | W | ✅ `hsem_huawei_solar_power_meter_phase_c_active_power` (phase-aware control) |
 | Phase C current | `sensor.power_meter_current_3` | A | — |
 | Phase C voltage | `sensor.power_meter_phase_c_voltage` | V | — |
 | Power factor | `sensor.power_meter_power_factor` | — | — |

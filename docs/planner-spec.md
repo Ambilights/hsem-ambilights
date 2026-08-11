@@ -233,6 +233,8 @@ different from the Huawei battery:
 - PowMr can charge from the site AC bus
 - PowMr output supplies one dedicated AC load only (the NAS)
 - PowMr cannot backfeed the site bus or export to the grid
+- PowMr charging and its dedicated load are connected to one configured grid
+  phase (phase 3 by default)
 - `SBU priority` transfers that dedicated load from utility to the PowMr battery
 - utility bypass takes over at the configured hard reserve (20 % by default)
 
@@ -292,9 +294,12 @@ clamp prevents an incomplete history sample from modeling PowMr backfeed; the
 explicit load sensor remains the source of truth for battery draw.
 
 Secondary charge participates in the same site grid balance and main-fuse limit
-as Huawei and EV charging. By default, Huawei discharge is forbidden while PowMr
-grid charging is active, preventing an inefficient Huawei DC→AC→PowMr DC transfer.
-The advanced transfer option must be explicitly enabled to relax this guard.
+as Huawei and EV charging. With phase-aware charging enabled, its entire site
+delta is assigned to the configured physical phase instead of being treated as a
+balanced three-phase load. By default, Huawei discharge is forbidden while
+PowMr grid charging is active, preventing an inefficient Huawei DC→AC→PowMr DC
+transfer. The advanced transfer option must be explicitly enabled to relax this
+guard.
 
 The MILP and authoritative candidate scorer both include secondary conversion
 loss, cycle wear, time discount, and a horizon-tail value for stored energy.
@@ -328,6 +333,7 @@ the PowMr adapter for that cycle.
 - secondary discharge is tied to the dedicated load and never directly backfeeds;
   it may only free Huawei PV that is independently eligible for export
 - charge current is always a supported 10 A increment
+- PowMr charge and utility/SBU load transitions affect only its configured phase
 - Huawei discharge is zero during PowMr charging unless transfer is enabled
 - disabled secondary storage is numerically identical to the upstream planner
 - missing required PowMr telemetry produces no secondary plan and blocks control
@@ -936,6 +942,60 @@ This assumes balanced load at 230 V phase-to-neutral per phase.
 **When disabled** (`main_fuse_amps` is `None` or 0): no constraint is
 added — behaviour is identical to the pre-#567 code.
 
+#### Optional hard per-phase charging protection
+
+`hsem_phase_aware_charging_enabled` is an explicit opt-in for three-phase
+installations. It requires signed Huawei grid-meter readings for phases A, B,
+and C (positive import, negative export), the signed Huawei battery
+charge/discharge-power sensor, and the writable Huawei grid-charge maximum-power
+number. The aggregate soft constraint remains present; the phase model adds
+three hard rows per future slot.
+
+The latest meter snapshot is reduced to a zero-sum fixed-load imbalance after
+removing the currently observed PowMr site delta. The same imbalance is projected
+across the planning horizon. Let $G_t=gi_t-ge_t$ be total signed grid energy,
+$D_t$ the PowMr site delta, $p$ its configured phase, and $\Delta_{i,t}$ the
+fixed phase-imbalance energy. Planned phase flow is:
+
+$$
+F_{i,t}=\frac{G_t}{3}+\Delta_{i,t}
+       +\left(\mathbf{1}_{i=p}-\frac{1}{3}\right)D_t
+$$
+
+This makes Huawei battery charge/discharge and Huawei PV balanced while placing
+all PowMr charge, utility bypass, and SBU load removal on one phase. Each phase
+has the hard target:
+
+$$
+F_{i,t}\leq\max\left(
+  I_{fuse}\times230\times h_t/1000,
+  B_{i,t}
+\right)
+$$
+
+where $B_{i,t}$ is the uncontrollable baseline phase forecast. The `max` keeps
+the MILP feasible if house load alone is already above the target, but permits no
+controllable battery charging to worsen that baseline. A 16 A setting therefore
+targets 16 A on every phase. Thermal fuse tolerance (for example a brief 25 A
+overshoot) is not treated as schedulable capacity.
+
+Immediately before hardware writes, a second guard uses the newest phase-meter
+snapshot. It removes the currently observed Huawei/PowMr contributions,
+constructs the desired utility/SBU baseline, and allocates charge headroom in
+this order:
+
+1. Huawei receives balanced three-phase headroom, limited by the least-free
+   phase and rounded down to a 100 W command.
+2. PowMr receives only the remaining headroom on its configured phase, rounded
+   down to a supported 10 A step.
+
+The Huawei grid-charge maximum-power number is written and verified before TOU
+forced charging is enabled. If no full PowMr current step fits, PowMr is placed
+in utility mode with grid charging disabled. Missing required telemetry enters
+degraded mode and blocks all writes for that cycle. The runtime guard can correct
+normal telemetry/control lag on the next coordinator cycle, but never budgets a
+sustained overload.
+
 #### Invariants
 
 - When `main_fuse_amps` is `None` or 0, the MILP produces identical
@@ -946,6 +1006,13 @@ added — behaviour is identical to the pre-#567 code.
   the excess — the MILP never becomes infeasible due to fuse constraints.
 - When battery + EV + house load would exceed the fuse, the MILP
   throttles charging to stay within the limit.
+- With phase-aware charging disabled, results remain identical to the aggregate
+  fuse model.
+- With phase-aware charging enabled, planned controllable charging never raises
+  any phase above the configured target (or above an already-unavoidable
+  baseline overload).
+- Huawei is allocated live charge headroom before PowMr; PowMr is constrained to
+  its configured single phase.
 
 ### Grid export power limit (DNO/inverter export cap — issue #726)
 

@@ -31,6 +31,7 @@ class SecondaryStorageConfig:
     replacement_price_per_kwh: float | None = None
     base_load_includes_dedicated_load: bool = False
     allow_primary_battery_transfer: bool = False
+    grid_phase: int = 3
 
     @property
     def current_usable_kwh(self) -> float:
@@ -57,4 +58,5 @@ class SecondaryStorageConfig:
             and 0.0 <= self.min_soc_pct < self.max_soc_pct <= 100.0
             and 0.0 < self.charge_efficiency_pct <= 100.0
             and 0.0 < self.discharge_efficiency_pct <= 100.0
+            and self.grid_phase in {1, 2, 3}
         )

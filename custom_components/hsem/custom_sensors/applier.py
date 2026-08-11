@@ -332,6 +332,7 @@ async def async_apply_battery_settings(
     live: LiveState,
     rec: HourlyRecommendation,
     current_required_battery_kwh: float,
+    grid_charge_power_limit_w: float | None = None,
 ) -> CycleApplySummary:
     """Apply the working mode, TOU periods, and discharge power to the battery pack.
 
@@ -351,6 +352,9 @@ async def async_apply_battery_settings(
         rec: The current-interval recommendation.
         current_required_battery_kwh: Remaining energy required until end of day
             (used when computing forcible-discharge target SoC).
+        grid_charge_power_limit_w: Optional phase-safe Huawei battery charge
+            power command in Watts.  Applied before enabling forced grid
+            charging.  ``None`` retains the legacy hardware behavior.
 
     Returns:
         :class:`CycleApplySummary` with one :class:`ApplyResult` per write
@@ -404,6 +408,41 @@ async def async_apply_battery_settings(
                 return summary
 
     recommendation = rec.recommendation
+
+    if (
+        recommendation == Recommendations.BatteriesChargeGrid.value
+        and grid_charge_power_limit_w is not None
+    ):
+        charge_entity = cfg.huawei_solar_batteries_grid_charge_maximum_power
+        if charge_entity is None:
+            _LOGGER.error(
+                "Phase-aware charge blocked: grid charge maximum power entity "
+                "is not configured"
+            )
+            return summary
+        desired_charge_w = max(grid_charge_power_limit_w, 0.0)
+        if live.huawei_batteries_max_charge_power_w is not None:
+            desired_charge_w = min(
+                desired_charge_w,
+                max(live.huawei_batteries_max_charge_power_w, 0.0),
+            )
+        desired_charge_w = float(int(desired_charge_w // 100.0) * 100)
+        if live.huawei_batteries_grid_charge_max_power_w != desired_charge_w:
+            _gce: str = charge_entity
+            charge_result = await async_write_and_verify(
+                entity_id=_gce,
+                desired=desired_charge_w,
+                writer=lambda: async_set_number_value(sensor, _gce, desired_charge_w),
+                reader=lambda: _read_number_state(sensor, _gce),
+            )
+            summary.results.append(charge_result)
+            if charge_result.status == ApplyStatus.FAILED:
+                _LOGGER.error(
+                    "Phase-aware grid charge power write failed for %s; "
+                    "forced charge was not enabled",
+                    charge_entity,
+                )
+                return summary
 
     # When an EV is actively charging and we are NOT in a forced-discharge
     # or forced-export recommendation, cap the battery discharge power to

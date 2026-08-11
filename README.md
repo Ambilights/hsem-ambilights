@@ -28,7 +28,9 @@
 - **Battery capacity auto-detection** — learns usable capacity from BMS kWh-remaining readings in the 15-85 % SoC range
 - **Cycle cost accounting** — wear-and-tear costs factored into every charge/discharge decision
 - **Battery export minimum price floor** (issue #752) — optional per-slot hard floor below which intentional battery-to-grid export is forbidden (the optimizer still decides above the floor)
-- **Grid overcurrent protection** — respects main fuse rating, caps total grid draw
+- **Grid overcurrent protection** — respects the aggregate main-fuse rating;
+  optional phase-aware charging adds hard per-phase limits and Huawei-first,
+  PowMr-second live charge allocation
 - **Weekday/weekend consumption profiling** — separate EWMA load profiles for workdays and weekends improve prediction accuracy
 
 ### Solar & Forecast

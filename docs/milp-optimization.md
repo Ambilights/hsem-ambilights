@@ -112,6 +112,21 @@ This assumes balanced load at 230 V phase-to-neutral per phase.
 
 The penalty uses the same high coefficient as SoC penalties (`max(p_imp) × 100`), ensuring the solver only exceeds the fuse limit when physically unavoidable (e.g. house base load alone exceeds the rating). When `main_fuse_amps` is `None` or 0, no variables or constraints are added — behaviour is unchanged.
 
+When optional phase-aware charging is enabled on a three-phase installation,
+three additional hard inequality rows are added per slot without adding
+variables. With total signed site flow $G_t=gi_t-ge_t$, fixed live imbalance
+$\Delta_{i,t}$, PowMr site delta $D_t$, and configured PowMr phase $p$:
+
+$$
+F_{i,t}=G_t/3+\Delta_{i,t}+(\mathbf{1}_{i=p}-1/3)D_t
+$$
+
+Each $F_{i,t}$ is capped at the 230 V per-phase fuse target. If uncontrollable
+base load already exceeds that target, the row permits exactly that baseline so
+the model remains feasible while forbidding controllable charge from worsening
+it. Huawei charge is balanced by construction; PowMr charge and Utility/SBU
+load switching affect only its configured phase.
+
 ### Secondary stationary-storage extension (PowMr fork, issue #1)
 
 When a valid `SecondaryStorageConfig` is present, six `n`-slot blocks are
@@ -146,10 +161,12 @@ credit is conservatively capped at `min(dedicated_load, gross_house_load)`.
 Battery draw still serves the full live dedicated load, but incomplete mixed
 Utility/SBU history can never turn that draw into modeled PowMr backfeed.
 
-The secondary AC branch is included in `gi[t]`, so the existing main-fuse row
-also covers its bypass load and charging. Unless explicitly allowed, an extra
-constraint enforces zero Huawei discharge whenever secondary charge mode is on.
-This prevents battery-to-battery transfer through two conversion stages.
+The secondary AC branch is included in `gi[t]`, so the existing aggregate
+main-fuse row covers its bypass load and charging. The optional phase rows move
+that branch delta from the balanced share onto its configured physical phase.
+Unless explicitly allowed, an extra constraint enforces zero Huawei discharge
+whenever secondary charge mode is on. This prevents battery-to-battery transfer
+through two conversion stages.
 
 ---
 

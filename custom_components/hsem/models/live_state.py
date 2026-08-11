@@ -148,6 +148,11 @@ class LiveState:
     solar_production_power_w: float = 0.0
     net_consumption_w: float = 0.0
     net_consumption_with_ev_w: float = 0.0
+    grid_phase_power_w: tuple[float | None, float | None, float | None] = (
+        None,
+        None,
+        None,
+    )
 
     # Huawei Solar battery state
     huawei_batteries_working_mode: str | None = None
@@ -155,6 +160,8 @@ class LiveState:
     huawei_batteries_end_of_discharge_soc_pct: float = 5.0
     huawei_batteries_charging_cutoff_capacity_pct: float | None = None
     huawei_batteries_grid_charge_cutoff_soc_pct: float | None = None
+    huawei_batteries_grid_charge_max_power_w: float | None = None
+    huawei_batteries_charge_discharge_power_w: float | None = None
     huawei_batteries_max_charge_power_w: float | None = None
     huawei_batteries_max_discharge_power_w: float | None = None
     huawei_batteries_rated_capacity_wh: float | None = None

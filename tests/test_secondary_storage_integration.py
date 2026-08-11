@@ -114,6 +114,16 @@ def test_config_reader_uses_verified_powmr_defaults() -> None:
     assert cfg.secondary_storage.nominal_voltage_v == pytest.approx(24.0)
     assert cfg.secondary_storage.min_soc_pct == pytest.approx(20.0)
     assert cfg.secondary_storage.max_charge_current_a == pytest.approx(60.0)
+    assert cfg.secondary_storage.grid_phase == 3
+    assert cfg.phase_aware_charging_enabled is False
+    assert (
+        cfg.huawei_solar_batteries_grid_charge_maximum_power
+        == "number.batteries_grid_charge_maximum_power"
+    )
+    assert (
+        cfg.huawei_solar_batteries_charge_discharge_power
+        == "sensor.batteries_charge_discharge_power"
+    )
 
 
 @pytest.mark.asyncio
@@ -127,6 +137,7 @@ async def test_config_schema_uses_verified_powmr_defaults() -> None:
     assert values["hsem_secondary_storage_capacity_kwh"] == pytest.approx(15.0)
     assert values["hsem_secondary_storage_nominal_voltage_v"] == pytest.approx(24.0)
     assert values["hsem_secondary_storage_max_charge_current_a"] == pytest.approx(60.0)
+    assert values["hsem_secondary_storage_grid_phase"] == pytest.approx(3.0)
     assert values["hsem_secondary_storage_control_enabled"] is False
 
 
@@ -158,6 +169,35 @@ async def test_config_validation_enforces_powmr_current_steps() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_config_validation_rejects_invalid_powmr_grid_phase() -> None:
+    """The single-phase branch must be assigned to physical phase 1, 2, or 3."""
+    user_input = {
+        "hsem_secondary_storage_enabled": True,
+        "hsem_secondary_storage_control_enabled": False,
+        "hsem_secondary_storage_soc_entity": "sensor.powmr_soc",
+        "hsem_secondary_storage_load_power_entity": (
+            "sensor.powmr_load_power_internal"
+        ),
+        "hsem_secondary_storage_min_soc_pct": 20.0,
+        "hsem_secondary_storage_max_soc_pct": 100.0,
+        "hsem_secondary_storage_min_charge_current_a": 10.0,
+        "hsem_secondary_storage_max_charge_current_a": 60.0,
+        "hsem_secondary_storage_grid_phase": 4,
+    }
+
+    with patch(
+        "custom_components.hsem.flows.secondary_storage.async_validate_entity_ids",
+        new_callable=AsyncMock,
+        return_value={},
+    ):
+        errors = await validate_secondary_storage_input(MagicMock(), user_input)
+
+    assert errors["hsem_secondary_storage_grid_phase"] == (
+        "secondary_storage_invalid_grid_phase"
+    )
+
+
 def test_missing_required_telemetry_disables_secondary_planner() -> None:
     """Missing SoC/load may enter degraded mode but must not produce a fake plan."""
     planner_config = _build_secondary_storage_config(_config(), LiveState())
@@ -176,6 +216,20 @@ def test_out_of_range_soc_disables_secondary_planner() -> None:
 
     assert planner_config.enabled is False
     assert planner_config.valid is False
+
+
+def test_secondary_grid_phase_reaches_planner_model() -> None:
+    """The configured physical phase must survive the HA-to-planner bridge."""
+    cfg = _config()
+    cfg.secondary_storage.grid_phase = 2
+    live = LiveState()
+    live.secondary_storage.soc_pct = 50.0
+    live.secondary_storage.load_power_w = 200.0
+
+    planner_config = _build_secondary_storage_config(cfg, live)
+
+    assert planner_config.grid_phase == 2
+    assert planner_config.valid
 
 
 def test_sbu_transition_disables_grid_charging_before_battery_output() -> None:
@@ -240,6 +294,24 @@ def test_charge_transition_quantizes_current_and_enables_utility_last() -> None:
         ("select", POWMR_OUTPUT_UTILITY),
         ("number", 40.0),
         ("select", POWMR_CHARGER_UTILITY),
+    ]
+
+
+def test_zero_phase_limited_current_disables_grid_charge() -> None:
+    """A runtime 0 A limit must not be rounded up to PowMr's 10 A minimum."""
+    cfg = _config()
+    live = LiveState()
+    live.secondary_storage.soc_pct = 50.0
+
+    operations = build_secondary_write_plan(
+        cfg,
+        live,
+        _rec(SECONDARY_MODE_CHARGE, current_a=0.0),
+    )
+
+    assert [op.desired for op in operations] == [
+        POWMR_OUTPUT_UTILITY,
+        POWMR_CHARGER_SOLAR_ONLY,
     ]
 
 

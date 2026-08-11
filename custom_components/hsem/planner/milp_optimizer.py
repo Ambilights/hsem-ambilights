@@ -9,6 +9,7 @@ from custom_components.hsem.models.ev_config import EVConfig
 from custom_components.hsem.utils.datetime_utils import as_tz
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import clamp_efficiency
+from custom_components.hsem.utils.phase_power import PhasePowers
 from custom_components.hsem.utils.units import (
     fuse_max_energy_per_slot_kwh,
     slot_duration_hours,
@@ -52,6 +53,7 @@ def solve_milp(
     no_export: bool = False,
     main_fuse_amps: float | None = None,
     main_fuse_phases: int = 3,
+    phase_power_imbalance_w: PhasePowers | None = None,
     max_grid_export_power_kw: float | None = None,
     battery_export_min_price: float = 0.0,
     secondary_storage: SecondaryStorageConfig | None = None,
@@ -163,6 +165,12 @@ def solve_milp(
             Electrical phase count (1 or 3).  Used as the multiplier in the
             max-grid-import formula above.  Defaults to 3 (three-phase).
             Single-phase installations MUST use 1.
+        phase_power_imbalance_w:
+            Optional signed per-phase offsets in Watts.  When supplied for a
+            three-phase installation with a configured main fuse, the MILP
+            adds hard per-phase import limits.  Huawei charge is modelled as
+            balanced; secondary-storage charge and load switching are placed
+            entirely on ``secondary_storage.grid_phase``.
         max_grid_export_power_kw:
             DNO/inverter grid export cap in kW (issue #726).  When > 0, the
             per-slot ``ge[t]`` is hard-bounded to
@@ -201,7 +209,7 @@ def solve_milp(
         "max_chg=%.3f  max_dis=%s  cycle_cost=%.6f  "
         "chg_eff=%.2f  dis_eff=%.2f  discount=%.4f  repl_price=%s  "
         "no_export=%s  min_export_price=%.4f  battery_export_min_price=%.4f  "
-        "fuse=%s  secondary=%s",
+        "fuse=%s  phase_aware=%s  secondary=%s",
         len(slots),
         current_kwh,
         usable_kwh,
@@ -224,6 +232,7 @@ def solve_milp(
             if main_fuse_amps is not None
             else "disabled"
         ),
+        phase_power_imbalance_w is not None,
         secondary_active,
     )
 
@@ -643,6 +652,40 @@ def solve_milp(
         )
         integrality = _secondary_integrality(n_vars, m, secondary_layout)
 
+    from custom_components.hsem.planner.milp._phase_fuse import (
+        _add_phase_fuse_constraints,
+        _phase_fuse_enabled,
+    )
+
+    phase_fuse_active = _phase_fuse_enabled(
+        main_fuse_amps=main_fuse_amps,
+        main_fuse_phases=main_fuse_phases,
+        phase_power_imbalance_w=phase_power_imbalance_w,
+    )
+    if phase_fuse_active:
+        assert main_fuse_amps is not None
+        assert phase_power_imbalance_w is not None
+        constraints = _add_phase_fuse_constraints(
+            constraints,
+            n_vars=n_vars,
+            m=m,
+            slots=slots,
+            future_idx=future_idx,
+            base_load=base_load,
+            pv_avail=pv_avail,
+            gi_off=gi_off,
+            ge_off=ge_off,
+            main_fuse_amps=main_fuse_amps,
+            phase_power_imbalance_w=phase_power_imbalance_w,
+            secondary_layout=secondary_layout,
+            secondary_storage=secondary_storage,
+        )
+        log_planner(
+            "debug",
+            "[milp] Hard per-phase fuse constraints active: offsets=%s W",
+            tuple(round(value, 1) for value in phase_power_imbalance_w),
+        )
+
     A_eq = constraints["A_eq"]
     b_eq = constraints["b_eq"]
     A_ub = constraints["A_ub"]
@@ -775,6 +818,29 @@ def solve_milp(
         terminal_soc_credit,
         _min_action_kwh=_MIN_ACTION_KWH,
     )
+
+    diagnostics["phase_fuse_active"] = phase_fuse_active
+    if phase_fuse_active:
+        from custom_components.hsem.planner.milp._phase_fuse import (
+            _phase_imports_from_solution_kwh,
+        )
+
+        assert phase_power_imbalance_w is not None
+        phase_imports = _phase_imports_from_solution_kwh(
+            result_x=result.x,
+            m=m,
+            slots=slots,
+            future_idx=future_idx,
+            gi_off=gi_off,
+            ge_off=ge_off,
+            phase_power_imbalance_w=phase_power_imbalance_w,
+            secondary_layout=secondary_layout,
+            secondary_storage=secondary_storage,
+        )
+        diagnostics["max_phase_import_kwh"] = round(
+            max(value for phases in phase_imports for value in phases),
+            6,
+        )
 
     if secondary_active:
         from custom_components.hsem.planner.milp._secondary_storage import (
