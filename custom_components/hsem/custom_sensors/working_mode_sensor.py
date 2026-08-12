@@ -28,6 +28,7 @@ from custom_components.hsem.coordinator import (
     HSEMDataUpdateCoordinator,
 )
 from custom_components.hsem.custom_sensors.applier import (
+    FullyFedDischargeCapState,
     async_apply_battery_settings,
     async_apply_inverter_power_control,
 )
@@ -111,6 +112,7 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         self._active_hardware_intent: tuple[Any, ...] | None = None
         self._unloading = False
         self._write_failure_backoff = WriteFailureBackoff()
+        self._fully_fed_discharge_state = FullyFedDischargeCapState()
         self._last_write_block_signature: tuple[str, tuple[str, ...]] | None = None
 
     # ------------------------------------------------------------------
@@ -341,6 +343,7 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         self._unloading = True
         self._pending_update_data = None
         self._write_failure_backoff.clear()
+        self._fully_fed_discharge_state.reset()
         self._cancel_update_task()
         await super().async_will_remove_from_hass()
 
@@ -514,14 +517,26 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
             return
 
         hourly_rec = data.hourly_recommendation
+        fully_fed_discharge_state = getattr(self, "_fully_fed_discharge_state", None)
+        if not isinstance(fully_fed_discharge_state, FullyFedDischargeCapState):
+            fully_fed_discharge_state = None
+        if hourly_rec is None and fully_fed_discharge_state is not None:
+            # Losing the selected recommendation invalidates the time/capacity
+            # latch. If a plan later reappears in the same slot with the same
+            # coarse capacity sample, it must be recomputed from that point.
+            fully_fed_discharge_state.reset()
 
         # Gate hardware writes on read_only and degraded mode.
         writes_safe = hardware_writes_allowed(live.degraded_mode)
         combined_summary = CycleApplySummary()
         if cfg.read_only:
+            if fully_fed_discharge_state is not None:
+                fully_fed_discharge_state.reset()
             self._last_write_block_signature = None
             _LOGGER.debug("Hardware writes SKIPPED — read_only=True")
         elif not writes_safe:
+            if fully_fed_discharge_state is not None:
+                fully_fed_discharge_state.reset()
             block_signature = (
                 live.degraded_mode.value,
                 tuple(live.missing_entities_list),
@@ -580,6 +595,7 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
                         if phase_commands is not None
                         else None
                     ),
+                    fully_fed_discharge_state=fully_fed_discharge_state,
                 )
                 combined_summary.results.extend(bat_summary.results)
 

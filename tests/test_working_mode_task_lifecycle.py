@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from custom_components.hsem.coordinator import CoordinatorData
+from custom_components.hsem.custom_sensors.applier import FullyFedDischargeCapState
 from custom_components.hsem.custom_sensors.working_mode_sensor import (
     HSEMWorkingModeSensor,
 )
@@ -112,6 +113,7 @@ class TestUpdateTaskTracking:
         """``_update_task`` must be ``None`` before any coordinator update."""
         sensor = _make_sensor()
         assert sensor._update_task is None
+        assert isinstance(sensor._fully_fed_discharge_state, FullyFedDischargeCapState)
 
     @pytest.mark.asyncio
     async def test_update_task_stored_after_coordinator_update(self) -> None:
@@ -250,9 +252,14 @@ class TestTaskCancellationOnUnload:
     async def test_unload_when_no_task_is_safe(self) -> None:
         """``async_will_remove_from_hass`` with no stored task must not raise."""
         sensor = _make_sensor()
+        sensor._fully_fed_discharge_state.commanded_cap_w = 1800
+        sensor._fully_fed_discharge_state.battery_capacity_sample_kwh = 20.0
 
-        # Must complete without error.
+        # Must complete without error and must discard stale control state.
         await sensor.async_will_remove_from_hass()
+
+        assert sensor._fully_fed_discharge_state.commanded_cap_w is None
+        assert sensor._fully_fed_discharge_state.battery_capacity_sample_kwh is None
 
 
 class TestNoWriteAfterUnload:
