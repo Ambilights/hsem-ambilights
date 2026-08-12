@@ -843,6 +843,12 @@ def solve_milp(
         )
 
     if secondary_active:
+        from dataclasses import asdict
+
+        from custom_components.hsem.planner.milp._secondary_diagnostics import (
+            build_secondary_result_summary,
+            log_secondary_result,
+        )
         from custom_components.hsem.planner.milp._secondary_storage import (
             _write_secondary_results,
         )
@@ -858,6 +864,16 @@ def solve_milp(
             minimum_action_kwh=_MIN_ACTION_KWH,
         )
         diagnostics.update(secondary_diagnostics)
+        secondary_result = build_secondary_result_summary(
+            out_slots,
+            result_x=result.x,
+            layout=secondary_layout,
+            config=secondary_storage,
+            future_idx=future_idx,
+            min_export_price=min_export_price,
+        )
+        diagnostics["secondary_result"] = asdict(secondary_result)
+        log_secondary_result(secondary_result)
 
     return out_slots, diagnostics
 
