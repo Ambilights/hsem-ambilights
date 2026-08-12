@@ -16,4 +16,4 @@ class WorkingModes(Enum):
     """Maximise self-consumption: battery prioritises powering the home over export."""
 
     FullyFedToGrid = "fully_fed_to_grid"
-    """Fully fed to grid: all solar production is exported to the grid."""
+    """Fully fed: PV first, then battery fills remaining inverter headroom."""

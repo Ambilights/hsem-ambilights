@@ -75,26 +75,22 @@ class Recommendations(Enum):
     ForceBatteriesDischarge = "force_batteries_discharge"
     """Force battery discharge — cover house AND export excess to grid.
 
-    Battery:   discharge at max rate (up to max_discharge_per_slot)
-    House:     covered by battery first (AC bus)
-    Grid:      EXPORT any battery energy beyond house load;
-               import only if battery cannot fully cover house
-
-    Per Huawei wiki: \"forces the inverter to inject more power to the
-    AC-side than your home electricity usage, which will consequently
-    be pushed onto the grid.\"
+    Hardware:  Fully Fed to Grid with maximum battery-discharge power
+               capped from the planned slot energy
+    Inverter:  PV has priority; battery fills only remaining AC headroom
+    Battery:   discharge cannot exceed the planner's slot-energy decision
+    Grid:      inverter output beyond local load is exported
     """
 
     ForceExport = "force_export"
     """Force PV export to grid — sets inverter to FullyFedToGrid mode.
 
-    Battery:   unchanged (may still charge/discharge per schedule)
-    House:     covered by grid import (PV bypasses house)
-    Grid:      ALL PV production exported to grid
+    Hardware:  Fully Fed to Grid with maximum battery-discharge power 0 W
+    Battery:   discharge blocked; may absorb PV above inverter AC capacity
+    Grid:      PV production is exported up to the inverter/export limit
 
-    Different from ForceBatteriesDischarge: this mode changes the
-    INVERTER behavior (PV routing), not the battery.  The battery
-    continues normal operation.
+    Different from ForceBatteriesDischarge: the same inverter mode is used,
+    but a zero discharge cap makes this a PV-only export action.
     """
 
     # ------------------------------------------------------------------
