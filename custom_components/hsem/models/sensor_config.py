@@ -16,7 +16,10 @@ from dataclasses import dataclass, field
 from datetime import time
 from typing import cast
 
-from custom_components.hsem.const import DEFAULT_CONFIG_VALUES
+from custom_components.hsem.const import (
+    DEFAULT_CONFIG_VALUES,
+    SEASONAL_FILL_MODE_FORECAST,
+)
 from custom_components.hsem.models.secondary_storage_entity_config import (
     SecondaryStorageEntityConfig,
 )
@@ -134,6 +137,9 @@ class SensorConfig:
 
         months_winter: List of month integers (1-12) treated as winter.
         months_summer: List of month integers (1-12) treated as summer.
+        seasonal_fill_mode: Strategy for otherwise-unassigned planner slots.
+            ``forecast`` uses forward PV refill headroom; ``months`` preserves
+            the legacy calendar-only behaviour.
 
         house_consumption_energy_weight_1d: Weight (%) for 1-day consumption average.
         house_consumption_energy_weight_3d: Weight (%) for 3-day consumption average.
@@ -277,6 +283,7 @@ class SensorConfig:
     # Seasonal configuration
     months_winter: list[int] = field(default_factory=list)
     months_summer: list[int] = field(default_factory=list)
+    seasonal_fill_mode: str = SEASONAL_FILL_MODE_FORECAST
 
     # Daily plan-vs-actual tracking — optional cumulative energy meter entities.
     # When not configured, the sensor falls back to Riemann sums from power sensors.

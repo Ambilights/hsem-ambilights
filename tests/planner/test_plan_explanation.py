@@ -233,6 +233,7 @@ class TestStrategyDetection:
             "discharge_only",
             "force_export",
             "force_export_pv",
+            "forecast_wait",
         }
         assert output.explanation.selected_strategy in valid_strategies
 
@@ -245,6 +246,17 @@ class TestStrategyDetection:
         """Summer fixture (June) must include 'summer_month' in constraints."""
         output = run_planner(make_summer_day_input())
         assert "summer_month" in output.explanation.constraints
+
+    def test_default_reports_forecast_seasonal_fill_constraint(self):
+        """Plan explanations expose which idle-slot strategy was configured."""
+        output = run_planner(make_summer_day_input())
+        assert "seasonal_fill_forecast" in output.explanation.constraints
+
+    def test_legacy_mode_reports_months_seasonal_fill_constraint(self):
+        inp = make_summer_day_input()
+        inp.seasonal_fill_mode = "months"
+        output = run_planner(inp)
+        assert "seasonal_fill_months" in output.explanation.constraints
 
     def test_flat_price_reports_no_spread_constraint(self):
         """Flat-price fixture has zero price spread; 'no_price_spread' in constraints."""
@@ -265,6 +277,7 @@ class TestStrategyDetection:
             "solar_charge_only",
             "force_export",
             "force_export_pv",
+            "forecast_wait",
         }
         assert output.explanation.selected_strategy in valid_winter_strategies
 

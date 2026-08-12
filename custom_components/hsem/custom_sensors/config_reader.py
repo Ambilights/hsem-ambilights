@@ -113,6 +113,9 @@ def build_sensor_config(
     cfg.months_summer = (
         convert_months_to_int(months_summer) if isinstance(months_summer, list) else []
     )
+    cfg.seasonal_fill_mode = str(
+        get_config_value(config_entry, "hsem_seasonal_fill_mode")
+    )
 
     # Huawei Solar device IDs
     cfg.huawei_solar_device_id_inverter_1 = get_config_value(

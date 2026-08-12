@@ -35,6 +35,7 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from custom_components.hsem.const import SEASONAL_FILL_MODE_FORECAST
 from custom_components.hsem.models.rejected_plan import RejectedPlan
 from custom_components.hsem.models.secondary_storage_config import (
     SecondaryStorageConfig,
@@ -113,6 +114,7 @@ def select_best_candidate(  # NOSONAR
     required_capacity: float = 0.0,
     months_winter: list[int] | None = None,
     export_min_price: float = 0.0,
+    seasonal_fill_mode: str = SEASONAL_FILL_MODE_FORECAST,
     # Hysteresis parameters (issue #372)
     hysteresis_enabled: bool = False,
     hysteresis_absolute: float = 0.0,
@@ -169,6 +171,16 @@ def select_best_candidate(  # NOSONAR
             to evaluate the terminal-SoC opportunity cost (issue #413).
             A conservative choice is the average future import price across
             the horizon.  ``None`` disables the terminal-SoC term.
+        required_capacity:
+            Battery reserve needed until the next forecast solar surplus.
+        months_winter:
+            Months used by the legacy seasonal-fill rule and forecast outage
+            fallback.
+        export_min_price:
+            Minimum export price for the final ``ForceExport`` fill rule.
+        seasonal_fill_mode:
+            ``forecast`` uses forward PV refill headroom; ``months`` preserves
+            the legacy calendar rule.
         hysteresis_enabled:
             When True, plan-level hysteresis is active.  The previous
             winner's strategy is kept unless a new candidate beats the
@@ -226,6 +238,7 @@ def select_best_candidate(  # NOSONAR
             required_capacity,
             months_winter,
             export_min_price=export_min_price,
+            seasonal_fill_mode=seasonal_fill_mode,
         )
         # Concentrate discharge on expensive slots (per-candidate)
         concentrate_discharge_on_expensive_slots(

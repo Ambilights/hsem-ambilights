@@ -114,6 +114,7 @@ def _select_candidate(
         required_capacity=rc,
         months_winter=inp.months_winter,
         export_min_price=inp.export_min_price,
+        seasonal_fill_mode=inp.seasonal_fill_mode,
         hysteresis_enabled=inp.planner_hysteresis_enabled,
         hysteresis_absolute=inp.planner_hysteresis_absolute,
         hysteresis_percentage=inp.planner_hysteresis_percentage,

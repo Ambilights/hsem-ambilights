@@ -10,6 +10,12 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.selector import selector
 
+from custom_components.hsem.const import (
+    DEFAULT_CONFIG_VALUES,
+    SEASONAL_FILL_MODE_FORECAST,
+    SEASONAL_FILL_MODE_MONTHS,
+    SEASONAL_FILL_MODES,
+)
 from custom_components.hsem.utils.config_validator import validate_months
 from custom_components.hsem.utils.misc import get_config_value
 
@@ -43,6 +49,21 @@ async def get_months_schema(
                     }
                 }
             ),
+            vol.Required(
+                "hsem_seasonal_fill_mode",
+                default=get_config_value(config_entry, "hsem_seasonal_fill_mode"),
+            ): selector(
+                {
+                    "select": {
+                        "options": [
+                            SEASONAL_FILL_MODE_FORECAST,
+                            SEASONAL_FILL_MODE_MONTHS,
+                        ],
+                        "mode": "list",
+                        "translation_key": "seasonal_fill_mode",
+                    }
+                }
+            ),
         }
     )
 
@@ -51,4 +72,11 @@ async def validate_months_input(  # NOSONAR
     _hass: HomeAssistant | None, user_input: dict
 ) -> dict[str, str]:
     """Validate user input for the 'months' step."""
-    return validate_months(user_input)
+    errors = validate_months(user_input)
+    seasonal_fill_mode = user_input.get(
+        "hsem_seasonal_fill_mode",
+        DEFAULT_CONFIG_VALUES["hsem_seasonal_fill_mode"],
+    )
+    if seasonal_fill_mode not in SEASONAL_FILL_MODES:
+        errors["hsem_seasonal_fill_mode"] = "invalid_seasonal_fill_mode"
+    return errors
