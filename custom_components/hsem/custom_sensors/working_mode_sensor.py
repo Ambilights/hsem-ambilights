@@ -42,7 +42,11 @@ from custom_components.hsem.custom_sensors.secondary_storage_applier import (
 )
 from custom_components.hsem.entity import HSEMCoordinatorEntity, HSEMEntity
 from custom_components.hsem.utils.degraded_mode import hardware_writes_allowed
-from custom_components.hsem.utils.inverter_verify import ApplyStatus, CycleApplySummary
+from custom_components.hsem.utils.inverter_verify import (
+    ApplyStatus,
+    CycleApplySummary,
+    WriteFailureBackoff,
+)
 from custom_components.hsem.utils.logger import HSEM_LOGGER as _LOGGER
 from custom_components.hsem.utils.misc import calculate_recommended_threshold
 from custom_components.hsem.utils.phase_power import phase_powers_valid
@@ -99,10 +103,15 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         self.entity_id = get_working_mode_sensor_entity_id()
         self._name = get_working_mode_sensor_name()
 
-        # Tracks the latest background update task so it can be cancelled on
-        # unload.  Only the most-recent task is retained; prior tasks will
-        # have already completed or been replaced.
+        # Hardware writes are serialised through one worker. Coordinator
+        # updates replace the pending snapshot instead of cancelling a write
+        # during its verification delay.
         self._update_task: asyncio.Task | None = None
+        self._pending_update_data: CoordinatorData | None = None
+        self._active_hardware_intent: tuple[Any, ...] | None = None
+        self._unloading = False
+        self._write_failure_backoff = WriteFailureBackoff()
+        self._last_write_block_signature: tuple[str, tuple[str, ...]] | None = None
 
     # ------------------------------------------------------------------
     # HA entity properties
@@ -315,12 +324,12 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
 
     @override
     async def async_added_to_hass(self) -> None:
-        """Register coordinator listener and run an initial hardware-write pass."""
+        """Register the listener and queue an initial hardware-write pass."""
         await super().async_added_to_hass()
-        # If the coordinator already has data (from its first cycle in setup),
-        # apply hardware settings immediately so the entity is not stale.
         if self.coordinator.data is not None:
-            await self._async_apply_hardware_writes(self.coordinator.data)
+            self._resolve_current_state(self.coordinator.data)
+            self.async_write_ha_state()
+            self._queue_hardware_update(self.coordinator.data)
 
     @override
     async def async_will_remove_from_hass(self) -> None:
@@ -329,6 +338,9 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         This prevents a stale task from issuing inverter/battery writes after
         the config entry has been unloaded.
         """
+        self._unloading = True
+        self._pending_update_data = None
+        self._write_failure_backoff.clear()
         self._cancel_update_task()
         await super().async_will_remove_from_hass()
 
@@ -349,15 +361,30 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         uncaught exceptions inside ``_async_on_coordinator_update()`` are
         recorded without breaking the task lifecycle.
 
-        Cancelled tasks are ignored because cancellation is expected when a
-        newer coordinator push arrives or the entity is unloaded.
+        Cancelled tasks are ignored because cancellation is expected on unload
+        or when a materially different hardware intent supersedes a write.
         """
-        if task.cancelled():
-            return
+        is_current_task = self._update_task is task
+        if is_current_task:
+            self._update_task = None
+            self._active_hardware_intent = None
 
-        exc = task.exception()
-        if exc is not None:
-            _LOGGER.error("Unhandled exception in working-mode update task: %s", exc)
+        if task.cancelled():
+            exc = None
+        else:
+            exc = task.exception()
+            if exc is not None:
+                _LOGGER.error(
+                    "Unhandled exception in working-mode update task: %s",
+                    exc,
+                )
+
+        if (
+            is_current_task
+            and not self._unloading
+            and self._pending_update_data is not None
+        ):
+            self._start_update_task()
 
     # ------------------------------------------------------------------
     # Coordinator callback
@@ -365,41 +392,102 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
 
     @override
     def _handle_coordinator_update(self) -> None:
-        """Receive a coordinator push and schedule hardware writes + state flush.
+        """Publish state immediately, then coalesce hardware work in one worker."""
+        data = self.coordinator.data
+        if data is not None:
+            self._resolve_current_state(data)
+        self.async_write_ha_state()
+        if data is not None:
+            self._queue_hardware_update(data)
 
-        Cancels any still-pending previous task before creating the new one so
-        that only one update is in-flight at a time.  The task reference is
-        stored on ``_update_task`` so it can be cancelled on unload.
-        """
-        # Cancel any still-running task from the previous coordinator cycle.
-        self._cancel_update_task()
+    @staticmethod
+    def _resolve_current_state(data: CoordinatorData) -> None:
+        """Apply real-time overrides before publishing or queuing hardware."""
+        live = data.live
+        hourly_rec = data.hourly_recommendation
+        if live is None or hourly_rec is None:
+            return
+
+        resolve_current_recommendation(
+            hourly_rec,
+            live,
+            data.batteries_schedules_remaining_capacity_needed,
+        )
+        data.state = hourly_rec.recommendation
+        _LOGGER.debug(
+            "Current hourly recommendation: state=%s  "
+            "ev_charger_calculated_power=%dW  "
+            "ev_second_charger_calculated_power=%dW  "
+            "ev_total_planned_load_kwh=%.3f  "
+            "ev_planned_load_kwh=%.3f  ev_accounted_load_kwh=%.3f",
+            hourly_rec.recommendation,
+            hourly_rec.ev_charger_calculated_power,
+            hourly_rec.ev_second_charger_calculated_power,
+            hourly_rec.ev_total_planned_load_kwh,
+            hourly_rec.ev_planned_load_kwh,
+            hourly_rec.ev_accounted_load_kwh,
+        )
+
+    def _queue_hardware_update(self, data: CoordinatorData) -> None:
+        """Keep the latest snapshot and start or redirect the write worker."""
+        if self._unloading:
+            return
+
+        self._pending_update_data = data
+        next_intent = self._hardware_intent(data)
+        if self._update_task is not None and not self._update_task.done():
+            if (
+                self._active_hardware_intent is not None
+                and next_intent != self._active_hardware_intent
+            ):
+                self._update_task.cancel()
+            return
+
+        self._start_update_task()
+
+    def _start_update_task(self) -> None:
+        """Create the sole hardware worker when pending data exists."""
+        if self._unloading or self._pending_update_data is None:
+            return
         self._update_task = self.hass.async_create_task(
             self._async_on_coordinator_update(),
             name="hsem_working_mode_update",
         )
         self._update_task.add_done_callback(self._on_update_task_done)
 
+    @staticmethod
+    def _hardware_intent(data: CoordinatorData) -> tuple[Any, ...]:
+        """Return fields whose change makes an in-flight command obsolete."""
+        cfg = data.cfg
+        live = data.live
+        rec = data.hourly_recommendation
+        return (
+            getattr(cfg, "read_only", None),
+            getattr(getattr(live, "degraded_mode", None), "value", None),
+            getattr(rec, "recommendation", data.state),
+            getattr(rec, "secondary_storage_mode", None),
+            getattr(rec, "secondary_storage_charge_current_a", None),
+        )
+
     async def _async_on_coordinator_update(self) -> None:
-        """Apply hardware writes then write state to HA.
-
-        This method runs asynchronously after every coordinator refresh.
-        A ``CancelledError`` is re-raised immediately so that asyncio can
-        clean up the task correctly; no hardware write can occur after
-        cancellation.  Other exceptions are logged so that hardware-write
-        failures are visible in the HA log.
-        """
+        """Drain the latest coordinator snapshots through one write worker."""
         try:
-            data = self.coordinator.data
-            if data is None:
-                return
+            while not self._unloading and self._pending_update_data is not None:
+                data = self._pending_update_data
+                self._pending_update_data = None
+                intent = self._hardware_intent(data)
+                self._active_hardware_intent = intent
 
-            await self._async_apply_hardware_writes(data)
-            self.async_write_ha_state()
+                await self._async_apply_hardware_writes(data)
+
+                current = self.coordinator.data
+                if current is not None and self._hardware_intent(current) == intent:
+                    current.apply_summary = data.apply_summary
+                self.async_write_ha_state()
         except asyncio.CancelledError:
-            # Task was cancelled (entity unloaded) — propagate cleanly.
             raise
         except Exception:
-            _LOGGER.error("Hardware-write task failed during coordinator update")
+            _LOGGER.exception("Hardware-write task failed during coordinator update")
 
     async def _async_apply_hardware_writes(self, data: CoordinatorData | None) -> None:
         """Perform inverter and battery hardware writes for the current slot.
@@ -427,42 +515,26 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
 
         hourly_rec = data.hourly_recommendation
 
-        # Apply real-time override to the active slot.
-        if hourly_rec is not None:
-            resolve_current_recommendation(
-                hourly_rec,
-                live,
-                data.batteries_schedules_remaining_capacity_needed,
-            )
-            # Sync data.state so the sensor's state property reflects the
-            # resolved recommendation (e.g. ev_smart_charging) rather than
-            # the raw planner output (e.g. batteries_charge_solar).
-            data.state = hourly_rec.recommendation
-            _LOGGER.debug(
-                "Current hourly recommendation: state=%s  "
-                "ev_charger_calculated_power=%dW  "
-                "ev_second_charger_calculated_power=%dW  "
-                "ev_total_planned_load_kwh=%.3f  "
-                "ev_planned_load_kwh=%.3f  ev_accounted_load_kwh=%.3f",
-                hourly_rec.recommendation,
-                hourly_rec.ev_charger_calculated_power,
-                hourly_rec.ev_second_charger_calculated_power,
-                hourly_rec.ev_total_planned_load_kwh,
-                hourly_rec.ev_planned_load_kwh,
-                hourly_rec.ev_accounted_load_kwh,
-            )
-
         # Gate hardware writes on read_only and degraded mode.
         writes_safe = hardware_writes_allowed(live.degraded_mode)
         combined_summary = CycleApplySummary()
         if cfg.read_only:
+            self._last_write_block_signature = None
             _LOGGER.debug("Hardware writes SKIPPED — read_only=True")
         elif not writes_safe:
-            _LOGGER.debug(
-                f"Hardware writes BLOCKED — degraded mode: {live.degraded_mode.value}. Missing: {live.missing_entities_list}",
-                "warning",
+            block_signature = (
+                live.degraded_mode.value,
+                tuple(live.missing_entities_list),
             )
+            if getattr(self, "_last_write_block_signature", None) != block_signature:
+                _LOGGER.warning(
+                    "Hardware writes BLOCKED — degraded mode: %s. Missing: %s",
+                    live.degraded_mode.value,
+                    live.missing_entities_list,
+                )
+                self._last_write_block_signature = block_signature
         else:
+            self._last_write_block_signature = None
             inv_summary = await async_apply_inverter_power_control(self, cfg, live)
             combined_summary.results.extend(inv_summary.results)
 
@@ -492,7 +564,7 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
 
             # Block battery writes if the inverter write already failed.
             if (
-                inv_summary.overall_status != ApplyStatus.FAILED
+                inv_summary.overall_status in {ApplyStatus.OK, ApplyStatus.SKIPPED}
                 and hourly_rec is not None
             ):
                 bat_summary = await async_apply_battery_settings(

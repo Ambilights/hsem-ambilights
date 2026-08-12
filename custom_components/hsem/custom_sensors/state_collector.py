@@ -44,6 +44,7 @@ from custom_components.hsem.utils.conversion import (
 from custom_components.hsem.utils.ha_helpers import (
     EntityNotFoundError,
     async_resolve_entity_id_from_unique_id,
+    entity_service_target_available,
     ha_get_entity_state_and_convert,
 )
 from custom_components.hsem.utils.logger import HSEM_LOGGER as _LOGGER
@@ -112,18 +113,37 @@ async def async_collect_live_state(
         label: str = "",
         *,
         required: bool = True,
+        service_target: bool = False,
     ) -> Any:  # NOSONAR -- return type varies by conv_type
         """Read one entity state, recording it as missing on any failure."""
         if not entity_id:
             if required:
                 state.add_missing_entity(f"Missing entity: {label or entity_id}")
             return None
+
+        target_problem_recorded = False
+        if service_target and not entity_service_target_available(
+            sensor.hass,
+            entity_id,
+        ):
+            if required:
+                state.add_missing_entity(
+                    f"Inactive service target: {label or entity_id} "
+                    f"(entity_id={entity_id})"
+                )
+                target_problem_recorded = True
         try:
-            return ha_get_entity_state_and_convert(
+            value = ha_get_entity_state_and_convert(
                 sensor, entity_id, conv_type, decimals
             )
+            if value is None and required and not target_problem_recorded:
+                state.add_missing_entity(
+                    f"Error reading {label or entity_id} (entity_id={entity_id}): "
+                    "state unavailable or invalid"
+                )
+            return value
         except (HomeAssistantError, ValueError, TypeError, AttributeError) as exc:
-            if required:
+            if required and not target_problem_recorded:
                 state.add_missing_entity(
                     f"Error reading {label or entity_id} (entity_id={entity_id}): "
                     f"{type(exc).__name__}: {exc}"
@@ -285,12 +305,13 @@ async def async_collect_live_state(
             )
         )
 
-        control_required = cfg.secondary_storage.control_enabled
+        control_required = cfg.secondary_storage.control_enabled and not cfg.read_only
         raw_output_priority = _read(
             cfg.secondary_storage.output_source_priority_entity,
             "string",
             label="secondary_storage_output_source_priority",
             required=control_required,
+            service_target=control_required,
         )
         secondary.output_source_priority = (
             str(raw_output_priority) if raw_output_priority is not None else None
@@ -300,6 +321,7 @@ async def async_collect_live_state(
             "string",
             label="secondary_storage_charger_source_priority",
             required=control_required,
+            service_target=control_required,
         )
         secondary.charger_source_priority = (
             str(raw_charger_priority) if raw_charger_priority is not None else None
@@ -310,6 +332,7 @@ async def async_collect_live_state(
                 "float",
                 label="secondary_storage_max_charge_current",
                 required=control_required,
+                service_target=control_required,
             )
         )
         state.secondary_storage = secondary
@@ -320,7 +343,8 @@ async def async_collect_live_state(
     _raw_excess = _read(
         cfg.huawei_solar_batteries_excess_pv_energy_use_in_tou,
         "string",
-        label="excess_pv_energy_use_in_tou",
+        label="batteries_excess_pv_energy_use_in_tou",
+        service_target=not cfg.read_only,
     )
     state.huawei_batteries_excess_pv_use_in_tou = (
         str(_raw_excess) if _raw_excess is not None else None
@@ -337,19 +361,16 @@ async def async_collect_live_state(
         cfg.huawei_solar_batteries_working_mode,
         "string",
         label="batteries_working_mode",
+        service_target=not cfg.read_only,
     )
     state.huawei_batteries_working_mode = str(_raw_wm) if _raw_wm is not None else None
     soc_pct = convert_to_float(
         _read(
             cfg.huawei_solar_batteries_state_of_capacity,
             "float",
-            label="state_of_capacity",
+            label="batteries_state_of_capacity",
         )
     )
-    if soc_pct is None:
-        state.add_missing_entity(
-            "Critical: battery SoC returned None (unavailable/invalid)"
-        )
     state.huawei_batteries_soc_pct = soc_pct
 
     eod_soc = convert_to_float(
@@ -385,7 +406,8 @@ async def async_collect_live_state(
             _read(
                 cfg.huawei_solar_batteries_grid_charge_maximum_power,
                 "float",
-                label="grid_charge_maximum_power",
+                label="batteries_grid_charge_maximum_power",
+                service_target=not cfg.read_only,
             )
         )
         state.huawei_batteries_charge_discharge_power_w = convert_to_float(
@@ -400,39 +422,28 @@ async def async_collect_live_state(
         _read(
             cfg.huawei_solar_batteries_maximum_charging_power,
             "float",
-            label="max_charging_power",
+            label="batteries_maximum_charging_power",
         )
     )
-    if max_charge_w is None:
-        state.add_missing_entity(
-            "Critical: battery max charge power returned None (unavailable/invalid)"
-        )
     state.huawei_batteries_max_charge_power_w = max_charge_w
 
     max_discharge_w = convert_to_float(
         _read(
             cfg.huawei_solar_batteries_maximum_discharging_power,
             "float",
-            label="max_discharging_power",
+            label="batteries_maximum_discharging_power",
+            service_target=not cfg.read_only,
         )
     )
-    if max_discharge_w is None:
-        state.add_missing_entity(
-            "Critical: battery max discharge power returned None (unavailable/invalid)"
-        )
     state.huawei_batteries_max_discharge_power_w = max_discharge_w
 
     rated_capacity_wh = convert_to_float(
         _read(
             cfg.huawei_solar_batteries_rated_capacity,
             "float",
-            label="batteries_rated_capacity_max",
+            label="batteries_rated_capacity",
         )
     )
-    if rated_capacity_wh is None:
-        state.add_missing_entity(
-            "Critical: battery rated capacity returned None (unavailable/invalid)"
-        )
     state.huawei_batteries_rated_capacity_wh = rated_capacity_wh
     _raw_apc = _read(
         cfg.huawei_solar_inverter_active_power_control,

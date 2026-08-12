@@ -31,6 +31,7 @@ from custom_components.hsem.utils.ha_helpers import (
     EntityNotFoundError,
     async_set_number_value,
     async_set_select_option,
+    entity_service_target_available,
     ha_get_entity_state_and_convert,
 )
 
@@ -95,6 +96,22 @@ class TestSensorReadFailures:
         result = ha_get_entity_state_and_convert(sensor, "sensor.offline", "float")
         assert result is None
 
+    @pytest.mark.parametrize("output_type", ["int", "boolean", "string"])
+    def test_unavailable_state_returns_none_for_every_conversion(
+        self,
+        output_type: str,
+    ) -> None:
+        """Unavailable sentinels never become valid strings or booleans."""
+        sensor = _make_sensor("sensor.offline", "unavailable")
+
+        result = ha_get_entity_state_and_convert(
+            sensor,
+            "sensor.offline",
+            output_type,
+        )
+
+        assert result is None
+
     def test_non_numeric_float_returns_none(self):
         """A non-numeric string for a float entity returns None."""
         sensor = _make_sensor("sensor.weird", "not-a-number")
@@ -113,6 +130,46 @@ class TestSensorReadFailures:
     def test_entity_not_found_is_homeassistant_error(self):
         """``EntityNotFoundError`` must be a subclass of ``HomeAssistantError``."""
         assert issubclass(EntityNotFoundError, HomeAssistantError)
+
+
+class TestServiceTargetAvailability:
+    """Writable entities must be live members of an active HA platform."""
+
+    def test_active_entity_is_available(self):
+        hass = MagicMock()
+        state = MagicMock()
+        state.state = "5000"
+        hass.states.get.return_value = state
+
+        with patch(
+            "custom_components.hsem.utils.ha_helpers.entity_sources",
+            return_value={"number.charge_power": {"domain": "test"}},
+        ):
+            assert (
+                entity_service_target_available(
+                    hass,
+                    "number.charge_power",
+                )
+                is True
+            )
+
+    def test_restored_state_without_entity_source_is_unavailable(self):
+        hass = MagicMock()
+        state = MagicMock()
+        state.state = "5000"
+        hass.states.get.return_value = state
+
+        with patch(
+            "custom_components.hsem.utils.ha_helpers.entity_sources",
+            return_value={},
+        ):
+            assert (
+                entity_service_target_available(
+                    hass,
+                    "number.charge_power",
+                )
+                is False
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +285,10 @@ class TestAsyncSetNumberValueFailures:
         # async_get_hass() outside the HA event loop during log formatting.
         with (
             patch("custom_components.hsem.utils.ha_helpers._LOGGER"),
+            patch(
+                "custom_components.hsem.utils.ha_helpers.entity_service_target_available",
+                return_value=True,
+            ),
             pytest.raises(ServiceNotFound),
         ):
             await async_set_number_value(sensor, "number.charge_power", 3000)
@@ -241,7 +302,13 @@ class TestAsyncSetNumberValueFailures:
             side_effect=ServiceValidationError("number", "set_value")
         )
 
-        with pytest.raises(ServiceValidationError):
+        with (
+            patch(
+                "custom_components.hsem.utils.ha_helpers.entity_service_target_available",
+                return_value=True,
+            ),
+            pytest.raises(ServiceValidationError),
+        ):
             await async_set_number_value(sensor, "number.charge_power", 9999)
 
     @pytest.mark.asyncio
@@ -253,18 +320,43 @@ class TestAsyncSetNumberValueFailures:
             side_effect=HomeAssistantError("inverter rejected write")
         )
 
-        with pytest.raises(HomeAssistantError, match="inverter rejected write"):
+        with (
+            patch(
+                "custom_components.hsem.utils.ha_helpers.entity_service_target_available",
+                return_value=True,
+            ),
+            pytest.raises(HomeAssistantError, match="inverter rejected write"),
+        ):
             await async_set_number_value(sensor, "number.charge_power", 500)
 
     @pytest.mark.asyncio
-    async def test_missing_entity_exits_early(self):
-        """When the entity is absent, async_set_number_value returns without raising."""
+    async def test_missing_entity_raises_before_service_call(self):
+        """A missing number target raises and never reaches HA services."""
         sensor = MagicMock()
         sensor.hass.states.get.return_value = None  # entity missing
         sensor.hass.services.async_call = AsyncMock()
 
-        # Must NOT raise
-        await async_set_number_value(sensor, "number.nonexistent", 100)
+        with pytest.raises(EntityNotFoundError):
+            await async_set_number_value(sensor, "number.nonexistent", 100)
+        sensor.hass.services.async_call.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_restored_state_without_active_platform_raises(self):
+        """A stale restored state is not treated as a writable entity."""
+        sensor = MagicMock()
+        state = MagicMock()
+        state.state = "5000"
+        sensor.hass.states.get.return_value = state
+        sensor.hass.services.async_call = AsyncMock()
+
+        with (
+            patch(
+                "custom_components.hsem.utils.ha_helpers.entity_service_target_available",
+                return_value=False,
+            ),
+            pytest.raises(EntityNotFoundError),
+        ):
+            await async_set_number_value(sensor, "number.charge_power", 3000)
         sensor.hass.services.async_call.assert_not_called()
 
 
@@ -287,6 +379,10 @@ class TestAsyncSetSelectOptionFailures:
 
         with (
             patch("custom_components.hsem.utils.ha_helpers._LOGGER"),
+            patch(
+                "custom_components.hsem.utils.ha_helpers.entity_service_target_available",
+                return_value=True,
+            ),
             pytest.raises(ServiceNotFound),
         ):
             await async_set_select_option(sensor, "select.working_mode", "TimeOfUse")
@@ -300,19 +396,26 @@ class TestAsyncSetSelectOptionFailures:
             side_effect=HomeAssistantError("mode change rejected")
         )
 
-        with pytest.raises(HomeAssistantError, match="mode change rejected"):
+        with (
+            patch(
+                "custom_components.hsem.utils.ha_helpers.entity_service_target_available",
+                return_value=True,
+            ),
+            pytest.raises(HomeAssistantError, match="mode change rejected"),
+        ):
             await async_set_select_option(
                 sensor, "select.working_mode", "Maximise Self Consumption"
             )
 
     @pytest.mark.asyncio
-    async def test_missing_entity_exits_early(self):
-        """When entity is absent, async_set_select_option returns without raising."""
+    async def test_missing_entity_raises_before_service_call(self):
+        """A missing select target raises and never reaches HA services."""
         sensor = MagicMock()
         sensor.hass.states.get.return_value = None
         sensor.hass.services.async_call = AsyncMock()
 
-        await async_set_select_option(sensor, "select.missing", "SomeMode")
+        with pytest.raises(EntityNotFoundError):
+            await async_set_select_option(sensor, "select.missing", "SomeMode")
         sensor.hass.services.async_call.assert_not_called()
 
 

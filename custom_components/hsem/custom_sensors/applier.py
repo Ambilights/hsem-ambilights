@@ -63,6 +63,7 @@ from custom_components.hsem.utils.inverter_verify import (
     ApplyStatus,
     CycleApplySummary,
     async_write_and_verify,
+    get_write_failure_backoff,
 )
 from custom_components.hsem.utils.logger import HSEM_LOGGER as _LOGGER
 from custom_components.hsem.utils.misc import (
@@ -233,9 +234,8 @@ async def async_apply_inverter_power_control(
         _LOGGER.debug("async_apply_inverter_power_control: skipped — read_only=True")
         return summary
     if not hardware_writes_allowed(live.degraded_mode):
-        _LOGGER.debug(
+        _LOGGER.warning(
             f"async_apply_inverter_power_control: skipped — degraded mode: {live.degraded_mode.value}",
-            "warning",
         )
         return summary
 
@@ -293,6 +293,7 @@ async def async_apply_inverter_power_control(
                     sensor, _id, _w
                 ),
                 reader=reader_fn,
+                backoff=get_write_failure_backoff(sensor),
             )
         else:
             # export_pct == 100 — Allow full export.
@@ -310,17 +311,12 @@ async def async_apply_inverter_power_control(
                     async_set_grid_export_power_pct(sensor, _id, _pct)
                 ),
                 reader=reader_fn,
+                backoff=get_write_failure_backoff(sensor),
             )
 
         summary.results.append(result)
 
-        if result.status == ApplyStatus.FAILED:
-            mode = "W" if export_pct == 0 else "%"
-            _LOGGER.debug(
-                f"Export power {mode} write FAILED for inverter {inv_id} after all retries. "
-                f"Blocking further writes this cycle.",
-                "error",
-            )
+        if result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
             return summary
 
     return summary
@@ -367,9 +363,8 @@ async def async_apply_battery_settings(
         _LOGGER.debug("async_apply_battery_settings: skipped — read_only=True")
         return summary
     if not hardware_writes_allowed(live.degraded_mode):
-        _LOGGER.debug(
+        _LOGGER.warning(
             f"async_apply_battery_settings: skipped — degraded mode: {live.degraded_mode.value}",
-            "warning",
         )
         return summary
 
@@ -386,9 +381,8 @@ async def async_apply_battery_settings(
         if live.huawei_batteries_max_discharge_power_w != max_discharge_power:
             discharge_entity = cfg.huawei_solar_batteries_maximum_discharging_power
             if discharge_entity is None:
-                _LOGGER.debug(
+                _LOGGER.warning(
                     "Max discharge power entity not configured; skipping write.",
-                    "warning",
                 )
                 return summary
             _de: str = discharge_entity  # narrowed for closure
@@ -397,14 +391,10 @@ async def async_apply_battery_settings(
                 desired=max_discharge_power,
                 writer=lambda: async_set_number_value(sensor, _de, max_discharge_power),
                 reader=lambda: _read_number_state(sensor, _de),
+                backoff=get_write_failure_backoff(sensor),
             )
             summary.results.append(result)
-            if result.status == ApplyStatus.FAILED:
-                _LOGGER.debug(
-                    f"Max discharge power write FAILED for {discharge_entity}. "
-                    "Blocking further battery writes this cycle.",
-                    "error",
-                )
+            if result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
                 return summary
 
     recommendation = rec.recommendation
@@ -434,14 +424,10 @@ async def async_apply_battery_settings(
                 desired=desired_charge_w,
                 writer=lambda: async_set_number_value(sensor, _gce, desired_charge_w),
                 reader=lambda: _read_number_state(sensor, _gce),
+                backoff=get_write_failure_backoff(sensor),
             )
             summary.results.append(charge_result)
-            if charge_result.status == ApplyStatus.FAILED:
-                _LOGGER.error(
-                    "Phase-aware grid charge power write failed for %s; "
-                    "forced charge was not enabled",
-                    charge_entity,
-                )
+            if charge_result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
                 return summary
 
     # When an EV is actively charging and we are NOT in a forced-discharge
@@ -538,6 +524,7 @@ async def async_apply_battery_settings(
                     desired=cap_w,
                     writer=lambda: async_set_number_value(sensor, _de3, cap_w),
                     reader=lambda: _read_number_state(sensor, _de3),
+                    backoff=get_write_failure_backoff(sensor),
                 )
                 summary.results.append(ev_discharge_result)
                 _LOGGER.debug(
@@ -554,11 +541,10 @@ async def async_apply_battery_settings(
                     _fmt_live_power_w(live.ev_second.power_w),
                     rec.avg_house_consumption_kwh,
                 )
-                if ev_discharge_result.status == ApplyStatus.FAILED:
-                    _LOGGER.debug(
-                        f"EV discharge cap write FAILED for {discharge_entity}.",
-                        "error",
-                    )
+                if ev_discharge_result.status not in {
+                    ApplyStatus.OK,
+                    ApplyStatus.SKIPPED,
+                }:
                     return summary
 
     # If we're switching away from force discharge, explicitly stop any
@@ -660,10 +646,9 @@ async def async_apply_battery_settings(
         if live.huawei_batteries_max_discharge_power_w != cap_w:
             discharge_entity = cfg.huawei_solar_batteries_maximum_discharging_power
             if discharge_entity is None:
-                _LOGGER.debug(
+                _LOGGER.warning(
                     "Wait mode self-consumption discharge power entity not configured; "
                     "skipping write.",
-                    "warning",
                 )
                 return summary
             _de_wait: str = discharge_entity  # narrowed for closure
@@ -672,6 +657,7 @@ async def async_apply_battery_settings(
                 desired=cap_w,
                 writer=lambda: async_set_number_value(sensor, _de_wait, cap_w),
                 reader=lambda: _read_number_state(sensor, _de_wait),
+                backoff=get_write_failure_backoff(sensor),
             )
             summary.results.append(wait_cap_result)
             _LOGGER.debug(
@@ -684,13 +670,10 @@ async def async_apply_battery_settings(
                 surplus,
                 slot_hours,
             )
-            if wait_cap_result.status == ApplyStatus.FAILED:
-                _LOGGER.debug(
-                    "Wait mode self-consumption discharge cap write FAILED for %s. "
-                    "Blocking further battery writes this cycle.",
-                    discharge_entity,
-                    "error",
-                )
+            if wait_cap_result.status not in {
+                ApplyStatus.OK,
+                ApplyStatus.SKIPPED,
+            }:
                 return summary
 
     # Override discharge power when EV uses V2H
@@ -704,9 +687,8 @@ async def async_apply_battery_settings(
         if live.huawei_batteries_max_discharge_power_w != ev_max:
             discharge_entity = cfg.huawei_solar_batteries_maximum_discharging_power
             if discharge_entity is None:
-                _LOGGER.debug(
+                _LOGGER.warning(
                     "EV V2H discharge power entity not configured; skipping write.",
-                    "warning",
                 )
                 return summary
             _de2: str = discharge_entity  # narrowed for closure
@@ -715,14 +697,10 @@ async def async_apply_battery_settings(
                 desired=ev_max,
                 writer=lambda: async_set_number_value(sensor, _de2, ev_max),
                 reader=lambda: _read_number_state(sensor, _de2),
+                backoff=get_write_failure_backoff(sensor),
             )
             summary.results.append(ev_result)
-            if ev_result.status == ApplyStatus.FAILED:
-                _LOGGER.debug(
-                    f"EV V2H discharge power write FAILED for {discharge_entity}. "
-                    "Blocking further battery writes this cycle.",
-                    "error",
-                )
+            if ev_result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
                 return summary
 
     # Excess PV use in TOU — fed_to_grid for strict wait/fully-fed modes, charge
@@ -746,9 +724,7 @@ async def async_apply_battery_settings(
     if live.huawei_batteries_excess_pv_use_in_tou != desired_excess:
         excess_entity = cfg.huawei_solar_batteries_excess_pv_energy_use_in_tou
         if excess_entity is None:
-            _LOGGER.debug(
-                "Excess PV use entity not configured; skipping write.", "warning"
-            )
+            _LOGGER.warning("Excess PV use entity not configured; skipping write.")
             return summary
         _ee: str = excess_entity  # narrowed for closure
         excess_result = await async_write_and_verify(
@@ -756,14 +732,10 @@ async def async_apply_battery_settings(
             desired=desired_excess,
             writer=lambda: async_set_select_option(sensor, _ee, desired_excess),
             reader=lambda: _read_select_state(sensor, _ee),
+            backoff=get_write_failure_backoff(sensor),
         )
         summary.results.append(excess_result)
-        if excess_result.status == ApplyStatus.FAILED:
-            _LOGGER.debug(
-                f"Excess PV use write FAILED for {excess_entity}. "
-                "Blocking further battery writes this cycle.",
-                "error",
-            )
+        if excess_result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
             return summary
 
     # TOU periods — no read-back verification (TOU period state is complex JSON;
@@ -777,9 +749,8 @@ async def async_apply_battery_settings(
         tou_entity = cfg.huawei_solar_batteries_tou_charging_and_discharging_periods
         battery_device_id = cfg.huawei_solar_device_id_batteries
         if tou_entity is None or battery_device_id is None:
-            _LOGGER.debug(
+            _LOGGER.warning(
                 "TOU entity or battery device ID not configured; skipping write.",
-                "warning",
             )
             return summary
         result = await async_write_and_verify(
@@ -797,23 +768,17 @@ async def async_apply_battery_settings(
             # since we always write when the hash differs.
             skip_if_equal=False,
             max_retries=2,
+            backoff=get_write_failure_backoff(sensor),
         )
         summary.results.append(result)
-        if result.status == ApplyStatus.FAILED:
-            _LOGGER.debug(
-                f"TOU period write FAILED for device {cfg.huawei_solar_device_id_batteries}. "
-                "Blocking further battery writes this cycle.",
-                "error",
-            )
+        if result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
             return summary
 
     # Working mode
     if working_mode and live.huawei_batteries_working_mode != working_mode:
         mode_entity = cfg.huawei_solar_batteries_working_mode
         if mode_entity is None:
-            _LOGGER.debug(
-                "Working mode entity not configured; skipping write.", "warning"
-            )
+            _LOGGER.warning("Working mode entity not configured; skipping write.")
             return summary
         _me: str = mode_entity  # narrowed for closure
         mode_result = await async_write_and_verify(
@@ -821,14 +786,10 @@ async def async_apply_battery_settings(
             desired=working_mode,
             writer=lambda: async_set_select_option(sensor, _me, working_mode),
             reader=lambda: _read_select_state(sensor, _me),
+            backoff=get_write_failure_backoff(sensor),
         )
         summary.results.append(mode_result)
-        if mode_result.status == ApplyStatus.FAILED:
-            _LOGGER.debug(
-                f"Working mode write FAILED for {mode_entity}. "
-                "Blocking further battery writes this cycle.",
-                "error",
-            )
+        if mode_result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
             return summary
 
     return summary
@@ -894,12 +855,14 @@ async def _async_apply_forcible_discharge(
         # command is accepted — no need for wide tolerance or retries.
         tolerance=0.0,
         max_retries=3,
+        backoff=get_write_failure_backoff(sensor),
     )
 
-    _LOGGER.debug(
-        f"Excess battery export: Set forcible discharge to {target_soc}% SOC "
-        f"at {max_discharge_power}W power. Verify result: {result.status.value}"
-    )
+    if result.attempts > 0:
+        _LOGGER.debug(
+            f"Excess battery export: Set forcible discharge to {target_soc}% SOC "
+            f"at {max_discharge_power}W power. Verify result: {result.status.value}"
+        )
     return result
 
 

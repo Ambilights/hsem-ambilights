@@ -47,6 +47,9 @@ class TestClassifyDegradedMode:
             "batteries_maximum_charging_power",
             "batteries_maximum_discharging_power",
             "batteries_rated_capacity",
+            "batteries_working_mode",
+            "batteries_excess_pv_energy_use_in_tou",
+            "batteries_grid_charge_maximum_power",
             "house_consumption_power",
             # Mixed case must still match
             "BATTERIES_STATE_OF_CAPACITY",

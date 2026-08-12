@@ -63,6 +63,10 @@ _CRITICAL_KEYWORDS: frozenset[str] = frozenset(
         "batteries_maximum_charging_power",
         "batteries_maximum_discharging_power",
         "batteries_rated_capacity",
+        # Actuator entities — restored states are not sufficient for writes
+        "batteries_working_mode",
+        "batteries_excess_pv_energy_use_in_tou",
+        "batteries_grid_charge_maximum_power",
         # House load — needed to compute net consumption correctly
         "house_consumption_power",
         # Optional secondary storage becomes critical only when its collector

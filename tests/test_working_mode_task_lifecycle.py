@@ -1,4 +1,4 @@
-"""Regression tests for P0-17: track and cancel working-mode update task on unload.
+"""Regression tests for the working-mode hardware worker lifecycle.
 
 Acceptance criteria (issue #369)
 ---------------------------------
@@ -8,8 +8,9 @@ Acceptance criteria (issue #369)
 4. No inverter/battery write can occur after the entity is unloaded.
 5. A completed task is NOT cancelled again (``cancel()`` is a no-op on done tasks).
 6. Calling ``_cancel_update_task`` when ``_update_task`` is ``None`` is safe.
-7. ``_handle_coordinator_update`` cancels the *previous* task before creating a
-   new one, so at most one task is in-flight at any time.
+7. Routine coordinator pushes are coalesced without cancelling verification.
+8. A changed hardware intent cancels the obsolete in-flight command.
+9. HA state is published before any potentially slow hardware operation.
 """
 
 from __future__ import annotations
@@ -19,9 +20,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from custom_components.hsem.coordinator import CoordinatorData
 from custom_components.hsem.custom_sensors.working_mode_sensor import (
     HSEMWorkingModeSensor,
 )
+from custom_components.hsem.utils.degraded_mode import DegradedMode
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -62,7 +65,39 @@ def _make_sensor() -> HSEMWorkingModeSensor:
 
     hass.async_create_task = MagicMock(side_effect=_fake_create_task)
     sensor.hass = hass
+    object.__setattr__(sensor, "async_write_ha_state", MagicMock())
     return sensor
+
+
+def _make_data(
+    recommendation: str = "batteries_wait_mode",
+    *,
+    secondary_mode: str = "utility",
+) -> CoordinatorData:
+    """Build a coordinator snapshot with a deterministic hardware intent."""
+    cfg = MagicMock()
+    cfg.read_only = False
+    live = MagicMock()
+    live.degraded_mode = DegradedMode.OK
+    live.import_electricity_price = 1.0
+    live.ev.is_charging = False
+    live.ev_second.is_charging = False
+    live.battery_current_capacity_kwh = 0.0
+    rec = MagicMock()
+    rec.recommendation = recommendation
+    rec.ev_charger_calculated_power = 0.0
+    rec.ev_second_charger_calculated_power = 0.0
+    rec.ev_total_planned_load_kwh = 0.0
+    rec.ev_planned_load_kwh = 0.0
+    rec.ev_accounted_load_kwh = 0.0
+    rec.secondary_storage_mode = secondary_mode
+    rec.secondary_storage_charge_current_a = 0.0
+    return CoordinatorData(
+        cfg=cfg,
+        live=live,
+        hourly_recommendation=rec,
+        state=recommendation,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +117,7 @@ class TestUpdateTaskTracking:
     async def test_update_task_stored_after_coordinator_update(self) -> None:
         """``_update_task`` is populated after ``_handle_coordinator_update``."""
         sensor = _make_sensor()
+        sensor.coordinator.data = _make_data()
 
         with patch.object(
             sensor,
@@ -96,6 +132,7 @@ class TestUpdateTaskTracking:
     async def test_update_task_is_asyncio_task(self) -> None:
         """The stored task must be an ``asyncio.Task`` instance."""
         sensor = _make_sensor()
+        sensor.coordinator.data = _make_data()
 
         with patch.object(
             sensor,
@@ -238,6 +275,7 @@ class TestNoWriteAfterUnload:
             write_called = True
 
         sensor._async_apply_hardware_writes = _spy_write  # type: ignore[method-assign]  # test monkey-patch
+        sensor.coordinator.data = _make_data()
 
         # Create a task that yields control once, giving us the window to cancel.
         event = asyncio.Event()
@@ -277,7 +315,9 @@ class TestNoWriteAfterUnload:
             await event.wait()
 
         sensor._async_apply_hardware_writes = _hanging_apply  # type: ignore[method-assign]  # test monkey-patch
-        sensor.coordinator.data = MagicMock()
+        data = _make_data()
+        sensor.coordinator.data = data
+        sensor._pending_update_data = data
 
         task = asyncio.get_event_loop().create_task(
             sensor._async_on_coordinator_update()
@@ -292,42 +332,141 @@ class TestNoWriteAfterUnload:
 
 
 class TestSingleTaskInFlight:
-    """At most one update task is in-flight at a time."""
+    """Coordinator pushes are safely coalesced through one worker."""
 
     @pytest.mark.asyncio
-    async def test_previous_task_cancelled_on_new_coordinator_update(self) -> None:
-        """A second coordinator push must cancel the first still-pending task."""
+    async def test_same_intent_does_not_cancel_inflight_task(self) -> None:
+        """A routine push must not reset an in-progress verification delay."""
         sensor = _make_sensor()
-
         event = asyncio.Event()
 
         async def _hanging_coro():
             await event.wait()
 
-        # Simulate first coordinator push — create a slow task.
+        data = _make_data()
         first_task = asyncio.get_event_loop().create_task(_hanging_coro())
         sensor._update_task = first_task
+        sensor._active_hardware_intent = sensor._hardware_intent(data)
 
-        # Yield so the first task can start and block at ``await event.wait()``.
+        await asyncio.sleep(0)
+        sensor.coordinator.data = data
+        sensor._handle_coordinator_update()
         await asyncio.sleep(0)
 
-        # Simulate second coordinator push via _handle_coordinator_update.
-        with patch.object(
-            sensor,
-            "_async_on_coordinator_update",
-            new_callable=AsyncMock,
-        ):
-            sensor._handle_coordinator_update()
+        assert not first_task.cancelled()
+        assert sensor._update_task is first_task
+        assert sensor._pending_update_data is data
 
-        # Allow the event loop to process the cancellation and schedule the new task.
+        first_task.cancel()
+        await asyncio.gather(first_task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_changed_intent_cancels_inflight_task(self) -> None:
+        """A changed recommendation cancels an obsolete command immediately."""
+        sensor = _make_sensor()
+        event = asyncio.Event()
+
+        async def _hanging_coro():
+            await event.wait()
+
+        old_data = _make_data("batteries_wait_mode")
+        new_data = _make_data("batteries_charge_grid")
+        first_task = asyncio.get_event_loop().create_task(_hanging_coro())
+        sensor._update_task = first_task
+        sensor._active_hardware_intent = sensor._hardware_intent(old_data)
         await asyncio.sleep(0)
 
-        # First task must now be cancelled; new task is in-flight.
+        sensor.coordinator.data = new_data
+        sensor._handle_coordinator_update()
+        await asyncio.sleep(0)
+
         assert first_task.cancelled()
-        assert sensor._update_task is not first_task
-        assert sensor._update_task is not None
+        assert sensor._pending_update_data is new_data
+        await asyncio.gather(first_task, return_exceptions=True)
 
-        # Clean up the new task.
-        if sensor._update_task and not sensor._update_task.done():
-            sensor._update_task.cancel()
-        await asyncio.gather(sensor._update_task, return_exceptions=True)
+    @pytest.mark.asyncio
+    async def test_latest_snapshot_is_processed_after_inflight_write(self) -> None:
+        """Many routine pushes collapse to the latest pending snapshot."""
+        sensor = _make_sensor()
+        first_data = _make_data()
+        middle_data = _make_data()
+        latest_data = _make_data()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        applied: list[CoordinatorData] = []
+
+        async def _apply(data: CoordinatorData | None) -> None:
+            assert data is not None
+            applied.append(data)
+            if data is first_data:
+                started.set()
+                await release.wait()
+
+        object.__setattr__(sensor, "_async_apply_hardware_writes", _apply)
+        sensor.coordinator.data = first_data
+        sensor._handle_coordinator_update()
+        task = sensor._update_task
+        assert task is not None
+        await started.wait()
+
+        sensor.coordinator.data = middle_data
+        sensor._handle_coordinator_update()
+        sensor.coordinator.data = latest_data
+        sensor._handle_coordinator_update()
+        release.set()
+        await task
+
+        assert applied == [first_data, latest_data]
+
+    @pytest.mark.asyncio
+    async def test_state_is_published_before_hardware_apply(self) -> None:
+        """Slow or failed writes cannot leave the working-mode sensor stale."""
+        sensor = _make_sensor()
+        data = _make_data()
+        events: list[str] = []
+
+        object.__setattr__(
+            sensor,
+            "async_write_ha_state",
+            MagicMock(side_effect=lambda: events.append("state")),
+        )
+
+        async def _apply(_data: CoordinatorData | None) -> None:
+            events.append("apply")
+
+        object.__setattr__(sensor, "_async_apply_hardware_writes", _apply)
+        sensor.coordinator.data = data
+        sensor._handle_coordinator_update()
+        task = sensor._update_task
+        assert task is not None
+        await task
+
+        assert events[0] == "state"
+        assert "apply" in events
+
+    @pytest.mark.asyncio
+    async def test_published_state_uses_resolved_recommendation(self) -> None:
+        """The first state flush contains the real-time override, not raw plan."""
+        sensor = _make_sensor()
+        data = _make_data("batteries_wait_mode")
+        assert data.live is not None
+        data.live.import_electricity_price = -0.1
+        published: list[str | None] = []
+
+        object.__setattr__(
+            sensor,
+            "async_write_ha_state",
+            MagicMock(side_effect=lambda: published.append(sensor.state)),
+        )
+
+        async def _apply(_data: CoordinatorData | None) -> None:
+            return None
+
+        object.__setattr__(sensor, "_async_apply_hardware_writes", _apply)
+        sensor.coordinator.data = data
+        sensor._handle_coordinator_update()
+        task = sensor._update_task
+        assert task is not None
+        await task
+
+        assert published[0] == "force_export"

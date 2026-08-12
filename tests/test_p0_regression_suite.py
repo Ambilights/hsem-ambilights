@@ -914,6 +914,10 @@ class TestP009ExceptionHandling:
 
         with (
             patch("custom_components.hsem.utils.ha_helpers._LOGGER"),
+            patch(
+                "custom_components.hsem.utils.ha_helpers.entity_service_target_available",
+                return_value=True,
+            ),
             pytest.raises(ServiceNotFound),
         ):
             await async_set_number_value(sensor, "number.inverter_charge_power", 2500)
@@ -938,7 +942,11 @@ class TestP009ExceptionHandling:
 
         with (
             patch("custom_components.hsem.utils.ha_helpers._LOGGER"),
-            pytest.raises(HomeAssistantError),
+            patch(
+                "custom_components.hsem.utils.ha_helpers.entity_service_target_available",
+                return_value=True,
+            ),
+            pytest.raises(HomeAssistantError, match="inverter offline"),
         ):
             await async_set_select_option(
                 sensor, "select.inverter_working_mode", "Manual"
