@@ -45,7 +45,10 @@ On this installation, Huawei's Fully Fed to Grid mode gives PV priority and lets
 only the inverter's remaining AC headroom. HSEM combines that mode with
 `number.batteries_maximum_discharging_power`: `force_batteries_discharge` reconciles the energy
 remaining above the selected slot's planned end capacity over the time remaining in the slot. The
-command never exceeds either the original planned power or the Huawei hardware maximum. PV-only
+command never exceeds either the original planned power or the Huawei hardware maximum. Because
+Huawei reports usable capacity in coarse SoC steps, HSEM holds that command across time-only
+coordinator wakes and recomputes it only when the selected plan or reported capacity sample changes.
+Reaching the planned endpoint or the slot end still commands 0 W immediately. PV-only
 `force_export` uses a 0 W battery cap.
 
 The selected slot's end capacity is authoritative for executing planned export. The separate

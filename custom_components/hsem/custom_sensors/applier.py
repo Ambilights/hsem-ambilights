@@ -32,6 +32,7 @@ to Home Assistant.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -74,6 +75,36 @@ from custom_components.hsem.utils.misc import (
 from custom_components.hsem.utils.recommendations import Recommendations
 from custom_components.hsem.utils.units import hours_ahead, slot_duration_hours
 from custom_components.hsem.utils.workingmodes import WorkingModes
+
+
+@dataclass
+class FullyFedDischargeCapState:
+    """Per-entity state for reconciling a planned Fully Fed discharge cap.
+
+    Huawei reports usable battery capacity in coarse steps. Recomputing from
+    the same capacity sample on every coordinator wake makes the shrinking
+    slot duration raise the cap repeatedly until the next sample arrives.
+    This state latches the command until either the selected plan or the
+    reported capacity sample changes.
+    """
+
+    slot_start: datetime | None = None
+    slot_end: datetime | None = None
+    planned_discharge_kwh: float | None = None
+    planned_end_capacity_kwh: float | None = None
+    max_discharge_power_w: int | None = None
+    battery_capacity_sample_kwh: float | None = None
+    commanded_cap_w: int | None = None
+
+    def reset(self) -> None:
+        """Forget the prior Fully Fed plan and capacity sample."""
+        self.slot_start = None
+        self.slot_end = None
+        self.planned_discharge_kwh = None
+        self.planned_end_capacity_kwh = None
+        self.max_discharge_power_w = None
+        self.battery_capacity_sample_kwh = None
+        self.commanded_cap_w = None
 
 
 def _fmt_live_power_w(power_w: float | None) -> str:
@@ -164,6 +195,107 @@ def _fully_fed_discharge_cap_w(
     return int(max(safe_power_w, 0.0) + 1e-6)
 
 
+def _fully_fed_plan_is_unchanged(
+    state: FullyFedDischargeCapState,
+    rec: HourlyRecommendation,
+    max_discharge_power_w: int,
+) -> bool:
+    """Return whether *state* describes the same selected export plan."""
+    if (
+        state.planned_discharge_kwh is None
+        or state.planned_end_capacity_kwh is None
+        or state.max_discharge_power_w is None
+    ):
+        return False
+    return (
+        state.slot_start == rec.start
+        and state.slot_end == rec.end
+        and abs(state.planned_discharge_kwh - rec.batteries_discharged_kwh) <= 1e-9
+        and abs(state.planned_end_capacity_kwh - rec.estimated_battery_capacity_kwh)
+        <= 1e-9
+        and state.max_discharge_power_w == max_discharge_power_w
+    )
+
+
+def _record_fully_fed_cap_state(
+    state: FullyFedDischargeCapState,
+    rec: HourlyRecommendation,
+    *,
+    max_discharge_power_w: int,
+    battery_capacity_kwh: float,
+    commanded_cap_w: int,
+) -> None:
+    """Record the plan, Huawei capacity sample, and resulting command."""
+    state.slot_start = rec.start
+    state.slot_end = rec.end
+    state.planned_discharge_kwh = rec.batteries_discharged_kwh
+    state.planned_end_capacity_kwh = rec.estimated_battery_capacity_kwh
+    state.max_discharge_power_w = max_discharge_power_w
+    state.battery_capacity_sample_kwh = battery_capacity_kwh
+    state.commanded_cap_w = commanded_cap_w
+
+
+def _reconciled_fully_fed_discharge_cap_w(
+    *,
+    rec: HourlyRecommendation,
+    remaining_slot_hours: float,
+    battery_capacity_kwh: float,
+    max_discharge_power_w: int,
+    state: FullyFedDischargeCapState | None,
+) -> tuple[int, str]:
+    """Return a chatter-free cap and the reconciliation trigger.
+
+    The cap is recomputed only for a new/changed plan or a new Huawei capacity
+    sample. Time-only coordinator wakeups reuse the prior command because the
+    capacity sample contains no new energy information. Slot completion and a
+    reached capacity target always force an immediate zero-cap safety command.
+    """
+    slot_hours = slot_duration_hours(rec.start, rec.end)
+    computed_cap_w = _fully_fed_discharge_cap_w(
+        planned_discharge_kwh=rec.batteries_discharged_kwh,
+        slot_hours=slot_hours,
+        remaining_slot_hours=remaining_slot_hours,
+        battery_capacity_kwh=battery_capacity_kwh,
+        planned_end_capacity_kwh=rec.estimated_battery_capacity_kwh,
+        max_discharge_power_w=max_discharge_power_w,
+    )
+    if state is None:
+        return computed_cap_w, "stateless"
+
+    plan_unchanged = _fully_fed_plan_is_unchanged(state, rec, max_discharge_power_w)
+    capacity_unchanged = (
+        state.battery_capacity_sample_kwh is not None
+        and abs(state.battery_capacity_sample_kwh - battery_capacity_kwh) <= 1e-9
+    )
+    target_reached = (
+        battery_capacity_kwh <= max(rec.estimated_battery_capacity_kwh, 0.0) + 1e-9
+    )
+    safety_stop = remaining_slot_hours <= 1e-9 or target_reached
+
+    if safety_stop or computed_cap_w <= 0:
+        _record_fully_fed_cap_state(
+            state,
+            rec,
+            max_discharge_power_w=max_discharge_power_w,
+            battery_capacity_kwh=battery_capacity_kwh,
+            commanded_cap_w=0,
+        )
+        return 0, "safety_stop"
+
+    if plan_unchanged and capacity_unchanged and state.commanded_cap_w is not None:
+        return min(state.commanded_cap_w, max_discharge_power_w), "cached_sample"
+
+    trigger = "capacity_changed" if plan_unchanged else "plan_changed"
+    _record_fully_fed_cap_state(
+        state,
+        rec,
+        max_discharge_power_w=max_discharge_power_w,
+        battery_capacity_kwh=battery_capacity_kwh,
+        commanded_cap_w=computed_cap_w,
+    )
+    return computed_cap_w, trigger
+
+
 def _is_forcible_discharge_active(state: str | None) -> bool:
     """Return whether Huawei reports a legacy forcible battery command."""
     if not state:
@@ -237,6 +369,7 @@ def _desired_battery_discharge_cap_w(
     now: datetime,
     current_required_battery_kwh: float,
     max_discharge_power_w: int,
+    fully_fed_discharge_state: FullyFedDischargeCapState | None,
 ) -> tuple[int, str]:
     """Return the desired Huawei discharge cap and a diagnostic reason."""
     recommendation = rec.recommendation
@@ -244,13 +377,12 @@ def _desired_battery_discharge_cap_w(
     if recommendation == Recommendations.ForceBatteriesDischarge.value:
         slot_hours = slot_duration_hours(rec.start, rec.end)
         remaining_slot_hours = hours_ahead(now, rec.end)
-        cap_w = _fully_fed_discharge_cap_w(
-            planned_discharge_kwh=rec.batteries_discharged_kwh,
-            slot_hours=slot_hours,
+        cap_w, control = _reconciled_fully_fed_discharge_cap_w(
+            rec=rec,
             remaining_slot_hours=remaining_slot_hours,
             battery_capacity_kwh=live.battery_current_capacity_kwh,
-            planned_end_capacity_kwh=rec.estimated_battery_capacity_kwh,
             max_discharge_power_w=max_discharge_power_w,
+            state=fully_fed_discharge_state,
         )
         return (
             cap_w,
@@ -258,7 +390,7 @@ def _desired_battery_discharge_cap_w(
             f"(planned={rec.batteries_discharged_kwh:.3f} kWh, "
             f"slot={slot_hours:.3f} h, live={live.battery_current_capacity_kwh:.3f} "
             f"kWh, planned_end={rec.estimated_battery_capacity_kwh:.3f} kWh, "
-            f"remaining={remaining_slot_hours:.3f} h)",
+            f"remaining={remaining_slot_hours:.3f} h, control={control})",
         )
 
     if recommendation == Recommendations.ForceExport.value:
@@ -495,6 +627,7 @@ async def async_apply_battery_settings(
     grid_charge_power_limit_w: float | None = None,
     *,
     now: datetime | None = None,
+    fully_fed_discharge_state: FullyFedDischargeCapState | None = None,
 ) -> CycleApplySummary:
     """Apply the working mode, TOU periods, and discharge power to the battery pack.
 
@@ -520,6 +653,9 @@ async def async_apply_battery_settings(
             charging. ``None`` retains the legacy hardware behavior.
         now: Optional timezone-aware application time for deterministic tests.
             Defaults to Home Assistant's current local time.
+        fully_fed_discharge_state: Per-entity reconciliation state used to
+            suppress writes caused only by the passage of time between coarse
+            Huawei capacity samples.
 
     Returns:
         :class:`CycleApplySummary` with one :class:`ApplyResult` per write
@@ -529,9 +665,13 @@ async def async_apply_battery_settings(
 
     # Defense-in-depth: block writes if read_only or degraded mode is Error.
     if cfg.read_only:
+        if fully_fed_discharge_state is not None:
+            fully_fed_discharge_state.reset()
         _LOGGER.debug("async_apply_battery_settings: skipped — read_only=True")
         return summary
     if not hardware_writes_allowed(live.degraded_mode):
+        if fully_fed_discharge_state is not None:
+            fully_fed_discharge_state.reset()
         _LOGGER.warning(
             f"async_apply_battery_settings: skipped — degraded mode: {live.degraded_mode.value}",
         )
@@ -541,6 +681,11 @@ async def async_apply_battery_settings(
     working_mode = None
     recommendation = rec.recommendation
     ev_active = live.any_ev_charging
+    if (
+        recommendation != Recommendations.ForceBatteriesDischarge.value
+        and fully_fed_discharge_state is not None
+    ):
+        fully_fed_discharge_state.reset()
 
     _rated_capacity = convert_to_int(live.huawei_batteries_rated_capacity_wh)
     max_discharge_power = get_max_discharge_power(
@@ -649,6 +794,7 @@ async def async_apply_battery_settings(
         now=now or dt_util.now(),
         current_required_battery_kwh=current_required_battery_kwh,
         max_discharge_power_w=max_discharge_power,
+        fully_fed_discharge_state=fully_fed_discharge_state,
     )
     current_discharge_cap_w = live.huawei_batteries_max_discharge_power_w
     leaving_fully_fed = (
