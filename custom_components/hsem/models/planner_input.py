@@ -6,7 +6,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, cast
 
-from custom_components.hsem.const import DEFAULT_CONFIG_VALUES
+from custom_components.hsem.const import (
+    DEFAULT_CONFIG_VALUES,
+    SEASONAL_FILL_MODE_FORECAST,
+)
 from custom_components.hsem.models.battery_schedule_input import BatteryScheduleInput
 from custom_components.hsem.models.hourly_consumption_average import (
     HourlyConsumptionAverage,
@@ -103,6 +106,9 @@ class PlannerInput:
             inverter export is throttled to zero).
         months_winter:
             Month numbers (1-12) classified as winter.
+        seasonal_fill_mode:
+            ``forecast`` uses forward PV refill headroom for otherwise-idle
+            slots; ``months`` preserves the legacy calendar-only fallback.
         house_power_includes_ev:
             Whether the house-consumption sensor already includes EV charger
             power.  Affects net-consumption calculation.
@@ -209,6 +215,7 @@ class PlannerInput:
 
     # --- seasonal / mode config ---
     months_winter: list[int] = field(default_factory=lambda: [1, 2, 3, 4, 10, 11, 12])
+    seasonal_fill_mode: str = SEASONAL_FILL_MODE_FORECAST
     house_power_includes_ev: bool = True
     is_read_only: bool = False  # False = hardware writes enabled; set True only in dry-run/test scenarios
 

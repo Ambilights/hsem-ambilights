@@ -15,6 +15,7 @@
       "invalid_month_value": "En eller flere månedsværdier er ugyldige. Måneder skal være heltal mellem 1 og 12.",
       "invalid_power_value": "Ugyldig effektværdi - indtast et tal.",
       "invalid_price_value": "Ugyldig prisværdi - indtast et tal.",
+      "invalid_seasonal_fill_mode": "Ugyldig strategi for ledige tidsrum. Vælg prognosestyret eller kalendermåneder.",
       "invalid_sensor": "Ugyldig input-sensor. Vælg en gyldig sensor.",
       "invalid_time_format": "Ugyldigt tidsformat - forventet HH:MM:SS.",
       "months_winter_empty": "Vintersæsonen skal have mindst én måned.",
@@ -281,13 +282,15 @@
       },
       "months": {
         "data": {
-          "hsem_months_winter": "Måneder betragtet som vinter/forår"
+          "hsem_months_winter": "Måneder betragtet som vinter/forår",
+          "hsem_seasonal_fill_mode": "Strategi for ledige tidsrum"
         },
         "data_description": {
-          "hsem_months_winter": "Vælg de måneder, der skal betragtes som vinter/forår for sæsonbestemt arbejdstilstandsjustering."
+          "hsem_months_winter": "Vælg de måneder, som kalender-reserven bruger. I disse måneder gemmes batterienergien; de øvrige måneder bruger normalt selvforbrug.",
+          "hsem_seasonal_fill_mode": "Prognosestyret bruger forventet netto-PV-overskud til at afgøre, om ledige tidsrum må aflade, og falder automatisk tilbage til de valgte måneder, når fremadrettede Solcast-data ikke kan bruges. Kalendermåneder bruger altid den tidligere månedsregel."
         },
-        "description": "Konfigurer de måneder, der betragtes som vinter/forår. I disse måneder prioriterer systemet opladning af batterierne fra netstrøm.",
-        "title": "Vinter/forår-måneder"
+        "description": "Vælg, hvordan ellers ikke-tildelte batteritidsrum udfyldes. Prognosestyret anbefales; vintermånederne forbliver sikker reserve, når Solcast ikke er tilgængelig.",
+        "title": "Strategi for ledige tidsrum"
       },
       "power": {
         "data": {
@@ -559,6 +562,7 @@
       "invalid_month_value": "En eller flere månedsværdier er ugyldige. Måneder skal være heltal mellem 1 og 12.",
       "invalid_power_value": "Ugyldig effektværdi - indtast et tal.",
       "invalid_price_value": "Ugyldig prisværdi - indtast et tal.",
+      "invalid_seasonal_fill_mode": "Ugyldig strategi for ledige tidsrum. Vælg prognosestyret eller kalendermåneder.",
       "invalid_sensor": "Ugyldig input-sensor. Vælg en gyldig sensor.",
       "invalid_time_format": "Ugyldigt tidsformat - forventet HH:MM:SS.",
       "months_winter_empty": "Vintersæsonen skal have mindst én måned.",
@@ -805,13 +809,15 @@
       },
       "months": {
         "data": {
-          "hsem_months_winter": "Months considered as Winter/Spring"
+          "hsem_months_winter": "Måneder betragtet som vinter/forår",
+          "hsem_seasonal_fill_mode": "Strategi for ledige tidsrum"
         },
         "data_description": {
-          "hsem_months_winter": "Select the months that should be considered as Winter/Spring for the seasonal working mode adjustments. You can select multiple months. Selecting all 12 months is allowed — this keeps Winter/Spring (TOU) mode active year-round."
+          "hsem_months_winter": "Vælg de måneder, som kalender-reserven bruger. I disse måneder gemmes batterienergien; de øvrige måneder bruger normalt selvforbrug.",
+          "hsem_seasonal_fill_mode": "Prognosestyret bruger forventet netto-PV-overskud til at afgøre, om ledige tidsrum må aflade, og falder automatisk tilbage til de valgte måneder, når fremadrettede Solcast-data ikke kan bruges. Kalendermåneder bruger altid den tidligere månedsregel."
         },
-        "description": "Configure the months that are considered as Winter/Spring. During these months, the system will prioritize charging the batteries from grid energy to ensure sufficient battery levels during periods of lower solar production. Remaining months will be considered as Summer/Autum months.",
-        "title": "Winter/Spring Months"
+        "description": "Vælg, hvordan ellers ikke-tildelte batteritidsrum udfyldes. Prognosestyret anbefales; vintermånederne forbliver sikker reserve, når Solcast ikke er tilgængelig.",
+        "title": "Strategi for ledige tidsrum"
       },
       "power": {
         "data": {
@@ -1079,6 +1085,12 @@
       "options": {
         "strict": "Streng ventetilstand — batteriet forbliver inaktivt",
         "self_consumption_with_reserve": "Selvforbrug med reserve — brug overskud over planlæggerens reserve"
+      }
+    },
+    "seasonal_fill_mode": {
+      "options": {
+        "forecast": "Prognosestyret (anbefalet)",
+        "months": "Kalendermåneder (tidligere adfærd)"
       }
     }
   },

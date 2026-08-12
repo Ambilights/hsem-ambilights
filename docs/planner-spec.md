@@ -79,14 +79,59 @@ in the same layer must not change it.
 1. Export price > import price AND export price ≥ `export_min_price` → `force_export`
 2. Actual PV surplus (`estimated_net_consumption_kwh < 0`) and battery not full → `batteries_charge_solar`
 3. Future `force_batteries_discharge` AND battery > required → `batteries_wait_mode`
-4. Winter month → `batteries_wait_mode`
-5. Summer month, actual PV surplus → `batteries_charge_solar`; else → `batteries_discharge_mode`
+4. With `hsem_seasonal_fill_mode = forecast` (default), use the forward
+   refill-headroom decision below.
+5. With `hsem_seasonal_fill_mode = months`, or when the forward Solcast
+   window is unusable, use the legacy rule: winter month →
+   `batteries_wait_mode`; otherwise actual PV surplus →
+   `batteries_charge_solar`, and positive/zero net load →
+   `batteries_discharge_mode`.
+
+For each idle slot, the forecast window contains slots strictly after it and
+ends immediately before the next slot already marked
+`force_batteries_discharge` (or at the planning-horizon end).  The scheduler
+computes the window values with one reverse suffix pass that resets at each
+forced-discharge boundary, so the full calculation is O(n):
+
+```text
+refill_forecast_kwh
+    = Σ max(-estimated_net_consumption_kwh, 0) over the forecast window
+
+headroom_kwh
+    = refill_forecast_kwh - (required_capacity - current_capacity)
+```
+
+The forecast-mode decision is:
+
+1. Current slot has actual PV surplus → `batteries_charge_solar`
+2. Otherwise `headroom_kwh > 0` → `batteries_discharge_mode`
+3. Otherwise → `batteries_wait_mode`
+
+The forward forecast is usable only when at least one slot in that bounded
+window has `solcast_pv_estimate_kwh > 0`.  Missing or all-zero forward Solcast
+therefore invokes the legacy month rule instead of being interpreted as a real
+zero-PV forecast.  An invalid configured mode also falls back to `months` and
+emits a planner warning.  Every forecast decision logs its net consumption,
+refill forecast, required/current capacity, headroom, and recommendation with
+the `[disch] seasonal_fill` prefix.
 
 > **Note:** `BatteriesChargeSolar` is only assigned when there is a genuine PV
 > surplus (negative net consumption).  A small positive house load with zero PV
 > must not be mislabeled as solar charging — that would cause the applier to
 > write `MaximizeSelfConsumption` instead of `TimeOfUse` + charge TOU
 > (issue #720).
+
+**Seasonal-fill invariants:**
+
+- Existing non-`None` recommendations are never changed.
+- The future forced-export reserve rule above remains higher priority than
+  forecast headroom.
+- PV forecast after the next forced battery-discharge slot is not counted as
+  refill headroom for an earlier slot.
+- A sunny winter forecast and an identical sunny summer forecast produce the
+  same idle-slot decision; likewise for identical usable low-refill forecasts.
+- `months` mode and unusable forward Solcast preserve the legacy calendar
+  behaviour.
 
 ### Layer 2 — EV planned load labelling (post-simulation)
 

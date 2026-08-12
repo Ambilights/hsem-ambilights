@@ -12,6 +12,11 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 
+from custom_components.hsem.const import (
+    SEASONAL_FILL_MODE_FORECAST,
+    SEASONAL_FILL_MODE_MONTHS,
+    SEASONAL_FILL_MODES,
+)
 from custom_components.hsem.models.battery_schedule_input import BatteryScheduleInput
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.utils.datetime_utils import as_tz
@@ -469,6 +474,61 @@ def concentrate_discharge_on_expensive_slots(
 # ---------------------------------------------------------------------------
 
 
+def _forward_refill_forecast(
+    slots: list[PlannedSlot],
+) -> tuple[list[float], list[bool]]:
+    """Return forward PV-surplus energy and Solcast usability per slot.
+
+    Each value describes slots strictly *after* the corresponding slot and
+    stops before the next ``ForceBatteriesDischarge`` recommendation.  A
+    reverse pass resets both running values at each boundary, keeping the
+    calculation O(n) for the full horizon.
+
+    Args:
+        slots: Chronologically ordered planner slots.
+
+    Returns:
+        Two lists aligned with ``slots``: forecast refill energy in kWh and a
+        flag indicating whether any positive Solcast value exists in that
+        forward window.
+    """
+    refill_after_kwh = [0.0] * len(slots)
+    forecast_usable_after = [False] * len(slots)
+    running_refill_kwh = 0.0
+    running_forecast_usable = False
+    forced_discharge = Recommendations.ForceBatteriesDischarge.value
+
+    for index in range(len(slots) - 1, -1, -1):
+        refill_after_kwh[index] = running_refill_kwh
+        forecast_usable_after[index] = running_forecast_usable
+
+        slot = slots[index]
+        if slot.recommendation == forced_discharge:
+            running_refill_kwh = 0.0
+            running_forecast_usable = False
+            continue
+
+        running_refill_kwh += max(-slot.estimated_net_consumption_kwh, 0.0)
+        running_forecast_usable = (
+            running_forecast_usable or slot.solcast_pv_estimate_kwh > 0.0
+        )
+
+    return refill_after_kwh, forecast_usable_after
+
+
+def _month_based_fill_recommendation(
+    rec: PlannedSlot,
+    current_month: int,
+    months_winter: list[int],
+) -> str:
+    """Return the legacy calendar-based recommendation for one idle slot."""
+    if current_month in months_winter:
+        return Recommendations.BatteriesWaitMode.value
+    if rec.estimated_net_consumption_kwh < 0.0:
+        return Recommendations.BatteriesChargeSolar.value
+    return Recommendations.BatteriesDischargeMode.value
+
+
 def apply_optimization_strategy(
     slots: list[PlannedSlot],
     now: datetime,
@@ -477,8 +537,9 @@ def apply_optimization_strategy(
     required_capacity: float,
     months_winter: list[int],
     export_min_price: float = 0.0,
+    seasonal_fill_mode: str = SEASONAL_FILL_MODE_FORECAST,
 ) -> None:
-    """Apply seasonal optimization logic to remaining unassigned slots.
+    """Apply final optimization logic to remaining unassigned slots.
 
     Decision priority per unassigned slot:
 
@@ -486,8 +547,10 @@ def apply_optimization_strategy(
        → ``ForceExport``
     2. Solar surplus → ``BatteriesChargeSolar`` (until battery full)
     3. Future forced export pending and battery above required → ``BatteriesWaitMode``
-    4. Winter month → ``BatteriesWaitMode``
-    5. Summer month with solar → ``BatteriesChargeSolar``; else ``BatteriesDischargeMode``
+    4. In forecast mode, discharge when forward PV refill headroom is positive;
+       otherwise wait.  A current genuine PV surplus still charges from solar.
+    5. In months mode, or when forward Solcast is unusable, apply the legacy
+       winter-wait / summer-self-consumption rule.
 
     Args:
         slots: Mutable list of planned slots.
@@ -500,18 +563,30 @@ def apply_optimization_strategy(
             ``ForceExport``.  Slots where export price is below this
             threshold are not marked for export even if export > import.
             Defaults to ``0.0`` (any positive export price qualifies).
+        seasonal_fill_mode: ``forecast`` (default) uses forward PV refill
+            headroom.  ``months`` preserves the legacy calendar rule.
     """
+    effective_fill_mode = seasonal_fill_mode
+    if effective_fill_mode not in SEASONAL_FILL_MODES:
+        log_planner(
+            "warning",
+            "[disch] invalid seasonal_fill_mode=%s; falling back to %s",
+            effective_fill_mode,
+            SEASONAL_FILL_MODE_MONTHS,
+        )
+        effective_fill_mode = SEASONAL_FILL_MODE_MONTHS
+
     log_planner(
         "debug",
         "[disch] apply_optimization_strategy  current=%.3f  usable=%.3f  "
-        "required=%.3f  export_min_price=%.4f",
+        "required=%.3f  export_min_price=%.4f  seasonal_fill_mode=%s",
         current_capacity,
         usable_capacity,
         required_capacity,
         export_min_price,
+        effective_fill_mode,
     )
     current_month = now.month
-    months_summer = [m for m in range(1, 13) if m not in months_winter]
 
     # ForceExport when export > import AND export >= export_min_price (A3 fix)
     for rec in slots:
@@ -549,8 +624,13 @@ def apply_optimization_strategy(
                 rec.recommendation = Recommendations.BatteriesChargeSolar.value
                 rec.batteries_charged_kwh = round(slot_energy, 3)
 
-    # Seasonal fill for remaining unassigned slots
-    for rec in slots:
+    # Precompute the forward refill signal once.  The running sum resets at
+    # each forced battery-discharge slot, so later PV cannot be promised
+    # across a planned export event.
+    refill_after_kwh, forecast_usable_after = _forward_refill_forecast(slots)
+
+    # Fill remaining unassigned slots.
+    for index, rec in enumerate(slots):
         if rec.recommendation is not None:
             continue
 
@@ -563,15 +643,50 @@ def apply_optimization_strategy(
             rec.recommendation = Recommendations.BatteriesWaitMode.value
             continue
 
-        if current_month in months_winter:
-            rec.recommendation = Recommendations.BatteriesWaitMode.value
-        elif current_month in months_summer:
-            # Only charge from solar when there is an actual PV surplus
-            # (negative net consumption).  A small positive house load
-            # must not be treated as a solar-charging opportunity —
-            # otherwise the planner labels grid-charging slots as
-            # BatteriesChargeSolar (issue #720).
+        if effective_fill_mode == SEASONAL_FILL_MODE_FORECAST and (
+            rec.estimated_net_consumption_kwh < 0.0 or forecast_usable_after[index]
+        ):
+            refill_forecast_kwh = refill_after_kwh[index]
+            headroom_kwh = refill_forecast_kwh - (required_capacity - current_capacity)
             if rec.estimated_net_consumption_kwh < 0.0:
-                rec.recommendation = Recommendations.BatteriesChargeSolar.value
+                recommendation = Recommendations.BatteriesChargeSolar.value
+            elif headroom_kwh > 0.0:
+                recommendation = Recommendations.BatteriesDischargeMode.value
             else:
-                rec.recommendation = Recommendations.BatteriesDischargeMode.value
+                recommendation = Recommendations.BatteriesWaitMode.value
+
+            rec.recommendation = recommendation
+            log_planner(
+                "debug",
+                "[disch] seasonal_fill slot=%s  net=%.3f  "
+                "refill_forecast=%.3f  required=%.3f  current=%.3f  "
+                "headroom=%.3f  -> %s",
+                rec.start.isoformat(),
+                rec.estimated_net_consumption_kwh,
+                refill_forecast_kwh,
+                required_capacity,
+                current_capacity,
+                headroom_kwh,
+                recommendation,
+            )
+            continue
+
+        fallback_reason = (
+            "configured_months"
+            if effective_fill_mode == SEASONAL_FILL_MODE_MONTHS
+            else "forecast_unusable"
+        )
+        recommendation = _month_based_fill_recommendation(
+            rec,
+            current_month,
+            months_winter,
+        )
+        rec.recommendation = recommendation
+        log_planner(
+            "debug",
+            "[disch] seasonal_fill slot=%s  mode=months  reason=%s  net=%.3f  -> %s",
+            rec.start.isoformat(),
+            fallback_reason,
+            rec.estimated_net_consumption_kwh,
+            recommendation,
+        )

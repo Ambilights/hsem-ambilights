@@ -169,6 +169,10 @@ class TestBuildSensorConfig:
         assert 1 in cfg.months_winter
         assert 2 in cfg.months_winter
 
+    def test_seasonal_fill_mode_propagates(self):
+        cfg = build_sensor_config(_make_config_entry(hsem_seasonal_fill_mode="months"))
+        assert cfg.seasonal_fill_mode == "months"
+
     def test_excess_export_settings(self):
         cfg = build_sensor_config(
             _make_config_entry(

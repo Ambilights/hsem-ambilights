@@ -27,6 +27,8 @@ Additional diagnostic attributes are merged from the coordinator snapshot:
 - ``planning_interval_minutes`` — width of each planning slot in minutes.
 - ``forecast_mode`` — ``"winter"`` or ``"summer"`` based on the configured
   month ranges.
+- ``seasonal_fill_mode`` — configured idle-slot strategy (``"forecast"`` or
+  ``"months"``).
 - ``current_slot_start`` / ``current_slot_end`` / ``current_slot_recommendation``
   — the active time-slot boundaries and its recommendation.
 - ``last_apply_status`` — outcome of the most recent hardware-write cycle.
@@ -172,8 +174,9 @@ class HSEMPlanExplanationSensor(
 
         Context attributes from the coordinator snapshot include:
         *planning_horizon_hours*, *planning_interval_minutes*, *forecast_mode*,
-        *current_slot_start*, *current_slot_end*, *current_slot_recommendation*,
-        *last_apply_status*, and *data_quality_complete*.
+        *seasonal_fill_mode*, *current_slot_start*, *current_slot_end*,
+        *current_slot_recommendation*, *last_apply_status*, and
+        *data_quality_complete*.
         """
         data: CoordinatorData | None = self.coordinator.data
         explanation: PlanExplanation = (
@@ -191,6 +194,7 @@ class HSEMPlanExplanationSensor(
 
             # Forecast mode (winter / summer)
             d["forecast_mode"] = _determine_forecast_mode(cfg, now)
+            d["seasonal_fill_mode"] = cfg.seasonal_fill_mode
 
             # Current slot info
             rec = data.hourly_recommendation

@@ -15,6 +15,7 @@
       "invalid_month_value": "One or more month values are invalid. Months must be integers between 1 and 12.",
       "invalid_power_value": "Invalid power value — please enter a number.",
       "invalid_price_value": "Invalid price value — please enter a number.",
+      "invalid_seasonal_fill_mode": "Invalid seasonal fill mode. Choose Forecast-driven or Calendar months.",
       "invalid_sensor": "Invalid input sensor. Please choose a valid sensor.",
       "invalid_time_format": "Invalid time format — expected HH:MM:SS.",
       "months_winter_empty": "Winter season must have at least one month.",
@@ -400,13 +401,15 @@
       },
       "months": {
         "data": {
-          "hsem_months_winter": "Months considered as Winter/Spring"
+          "hsem_months_winter": "Months considered as Winter/Spring",
+          "hsem_seasonal_fill_mode": "Idle-slot fill strategy"
         },
         "data_description": {
-          "hsem_months_winter": "Select the months that should be considered as Winter/Spring for the seasonal working mode adjustments. You can select multiple months. Selecting all 12 months is allowed — this keeps Winter/Spring (TOU) mode active year-round. Selecting all 12 months is allowed — this keeps Winter/Spring (TOU) mode active year-round."
+          "hsem_months_winter": "Select the months used by the calendar fallback. These months wait with stored energy; remaining months use normal self-consumption.",
+          "hsem_seasonal_fill_mode": "Forecast-driven uses expected net PV surplus to decide whether idle slots may discharge and automatically falls back to the selected months when forward Solcast data is unusable. Calendar months always uses the legacy month rule."
         },
-        "description": "Configure the months that are considered as Winter/Spring. During these months, the system will prioritize charging the batteries from grid energy to ensure sufficient battery levels during periods of lower solar production. Remaining months will be considered as Summer/Autum months.",
-        "title": "Winter/Spring Months"
+        "description": "Choose how otherwise-unassigned battery slots are filled. Forecast-driven is recommended; the winter-month selection remains the safe fallback when Solcast is unavailable.",
+        "title": "Idle-slot Fill Strategy"
       },
       "power": {
         "data": {
@@ -568,6 +571,7 @@
       "invalid_month_value": "One or more month values are invalid. Months must be integers between 1 and 12.",
       "invalid_power_value": "Invalid power value — please enter a number.",
       "invalid_price_value": "Invalid price value — please enter a number.",
+      "invalid_seasonal_fill_mode": "Invalid seasonal fill mode. Choose Forecast-driven or Calendar months.",
       "invalid_sensor": "Invalid input sensor. Please choose a valid sensor.",
       "invalid_time_format": "Invalid time format — expected HH:MM:SS.",
       "months_winter_empty": "Winter season must have at least one month.",
@@ -953,13 +957,15 @@
       },
       "months": {
         "data": {
-          "hsem_months_winter": "Months considered as Winter/Spring"
+          "hsem_months_winter": "Months considered as Winter/Spring",
+          "hsem_seasonal_fill_mode": "Idle-slot fill strategy"
         },
         "data_description": {
-          "hsem_months_winter": "Select the months that should be considered as Winter/Spring for the seasonal working mode adjustments. You can select multiple months. Selecting all 12 months is allowed — this keeps Winter/Spring (TOU) mode active year-round. Selecting all 12 months is allowed — this keeps Winter/Spring (TOU) mode active year-round."
+          "hsem_months_winter": "Select the months used by the calendar fallback. These months wait with stored energy; remaining months use normal self-consumption.",
+          "hsem_seasonal_fill_mode": "Forecast-driven uses expected net PV surplus to decide whether idle slots may discharge and automatically falls back to the selected months when forward Solcast data is unusable. Calendar months always uses the legacy month rule."
         },
-        "description": "Configure the months that are considered as Winter/Spring. During these months, the system will prioritize charging the batteries from grid energy to ensure sufficient battery levels during periods of lower solar production. Remaining months will be considered as Summer/Autum months.",
-        "title": "Winter/Spring Months"
+        "description": "Choose how otherwise-unassigned battery slots are filled. Forecast-driven is recommended; the winter-month selection remains the safe fallback when Solcast is unavailable.",
+        "title": "Idle-slot Fill Strategy"
       },
       "power": {
         "data": {
@@ -1097,6 +1103,12 @@
       "options": {
         "strict": "Strict wait — battery remains idle",
         "self_consumption_with_reserve": "Self-consumption with reserve — use surplus above the planner reserve"
+      }
+    },
+    "seasonal_fill_mode": {
+      "options": {
+        "forecast": "Forecast-driven (recommended)",
+        "months": "Calendar months (legacy)"
       }
     }
   },

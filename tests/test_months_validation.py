@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+import voluptuous as vol
 
 from custom_components.hsem.flows.months import get_months_schema, validate_months_input
 from custom_components.hsem.utils.conversion import convert_months_to_int
@@ -198,6 +199,32 @@ class TestGetMonthsSchema:
         # const default is [1, 2, 3, 4, 10, 11, 12] — must come back as strings
         assert set(default) == {"1", "2", "3", "4", "10", "11", "12"}
         assert all(isinstance(m, str) for m in default)
+
+    async def test_schema_defaults_to_forecast_fill_mode(self):
+        """New and upgraded entries default to forecast-driven fill."""
+        schema = await get_months_schema(None)
+        for key in schema.schema:
+            if (
+                isinstance(key, vol.Required)
+                and key.schema == "hsem_seasonal_fill_mode"
+            ):
+                assert key.default() == "forecast"  # type: ignore[operator]
+                break
+        else:
+            raise AssertionError("hsem_seasonal_fill_mode not found in schema")
+
+
+@pytest.mark.asyncio
+async def test_invalid_seasonal_fill_mode_is_rejected() -> None:
+    """Only forecast and months are accepted by the options flow."""
+    errors = await validate_months_input(
+        None,
+        {
+            "hsem_months_winter": ["1", "2"],
+            "hsem_seasonal_fill_mode": "automatic",
+        },
+    )
+    assert errors["hsem_seasonal_fill_mode"] == "invalid_seasonal_fill_mode"
 
 
 class TestMonthMembership:

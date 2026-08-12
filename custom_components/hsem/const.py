@@ -5,6 +5,12 @@ import voluptuous as vol
 DOMAIN = "hsem"  # Domain name for the integration.
 NAME = "Huawei Solar Energy Management"  # Display name for the integration.
 
+SEASONAL_FILL_MODE_FORECAST = "forecast"
+SEASONAL_FILL_MODE_MONTHS = "months"
+SEASONAL_FILL_MODES = frozenset(
+    {SEASONAL_FILL_MODE_FORECAST, SEASONAL_FILL_MODE_MONTHS}
+)
+
 # Default TOU modes for EV charger when charging.
 DEFAULT_HSEM_EV_CHARGER_TOU_MODES = ["00:00-00:01/1234567/+"]
 
@@ -153,6 +159,7 @@ DEFAULT_CONFIG_VALUES = {
     "hsem_huawei_solar_power_meter_phase_c_active_power": "sensor.power_meter_phase_c_active_power",
     "hsem_months_summer": [5, 6, 7, 8, 9],
     "hsem_months_winter": [1, 2, 3, 4, 10, 11, 12],
+    "hsem_seasonal_fill_mode": SEASONAL_FILL_MODE_FORECAST,
     "hsem_read_only": False,
     "hsem_recommendation_interval_length": 48,
     "hsem_recommendation_interval_minutes": 15,

@@ -287,6 +287,7 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
             "solar_production_power_state": live.solar_production_power_w,
             "months_winter": cfg.months_winter,
             "months_summer": cfg.months_summer,
+            "seasonal_fill_mode": cfg.seasonal_fill_mode,
             "batteries_enable_excess_export": cfg.batteries_enable_excess_export,
             "batteries_excess_export_discharge_buffer": cfg.batteries_excess_export_discharge_buffer,
             "main_fuse_amps": cfg.main_fuse_amps,

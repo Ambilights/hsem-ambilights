@@ -11,6 +11,11 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from custom_components.hsem.const import (
+    SEASONAL_FILL_MODE_FORECAST,
+    SEASONAL_FILL_MODE_MONTHS,
+    SEASONAL_FILL_MODES,
+)
 from custom_components.hsem.models.charge_window import ChargeWindow
 from custom_components.hsem.models.discharge_window import DischargeWindow
 from custom_components.hsem.models.plan_explanation import PlanExplanation
@@ -174,6 +179,7 @@ def _build_explanation(
     # --- Forecast metrics ------------------------------------------------
     forecast_pv = round(sum(s.solcast_pv_estimate_kwh for s in future_slots), 3)
     forecast_net = round(sum(s.estimated_net_consumption_kwh for s in future_slots), 3)
+    forecast_usable = any(s.solcast_pv_estimate_kwh > 0.0 for s in future_slots)
 
     # --- Cost of the selected plan ---------------------------------------
     selected_cost = round(sum(s.estimated_cost_currency for s in future_slots), 4)
@@ -217,6 +223,11 @@ def _build_explanation(
 
     current_month = now.month
     is_winter = current_month in inp.months_winter
+    effective_seasonal_fill_mode = (
+        inp.seasonal_fill_mode
+        if inp.seasonal_fill_mode in SEASONAL_FILL_MODES
+        else SEASONAL_FILL_MODE_MONTHS
+    )
 
     if has_grid_charge and has_discharge:
         selected_strategy = "charge_grid_discharge_peak"
@@ -253,6 +264,20 @@ def _build_explanation(
             f"Battery will be discharged during scheduled windows; "
             f"no cheap charging slots available (spread {price_spread:.3f})."
         )
+    elif has_solar_charge:
+        selected_strategy = "solar_charge_only"
+        summary = (
+            f"Battery will charge only from genuine solar surplus "
+            f"({forecast_pv:.1f} kWh PV forecast); no discharge is scheduled."
+        )
+    elif (
+        effective_seasonal_fill_mode == SEASONAL_FILL_MODE_FORECAST and forecast_usable
+    ):
+        selected_strategy = "forecast_wait"
+        summary = (
+            "Forward solar refill headroom is insufficient for idle-slot "
+            "discharge, so the battery is held in reserve."
+        )
     elif is_winter:
         selected_strategy = "winter_wait"
         summary = (
@@ -272,6 +297,7 @@ def _build_explanation(
         constraints.append("winter_month")
     else:
         constraints.append("summer_month")
+    constraints.append(f"seasonal_fill_{effective_seasonal_fill_mode}")
     if abs(price_spread) < 1e-9:
         constraints.append("no_price_spread")
     if inp.excess_export_enabled:

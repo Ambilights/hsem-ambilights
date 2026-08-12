@@ -64,6 +64,7 @@ _CONTEXT_ATTR_KEYS = {
     "planning_horizon_hours",
     "planning_interval_minutes",
     "forecast_mode",
+    "seasonal_fill_mode",
     "current_slot_start",
     "current_slot_end",
     "current_slot_recommendation",
@@ -375,6 +376,11 @@ class TestSensorContextAttributes:
         sensor = _make_sensor(_make_coordinator_data(has_context=True))
         mode = sensor.extra_state_attributes["forecast_mode"]
         assert mode in ("winter", "summer")
+
+    def test_seasonal_fill_mode_is_exposed(self):
+        """The configured idle-slot strategy is visible for diagnostics."""
+        sensor = _make_sensor(_make_coordinator_data(has_context=True))
+        assert sensor.extra_state_attributes["seasonal_fill_mode"] == "forecast"
 
     def test_current_slot_recommendation(self):
         """current_slot_recommendation must match the hourly_recommendation."""

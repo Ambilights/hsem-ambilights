@@ -142,6 +142,7 @@ def _schedule_slots(
         required_capacity,
         inp.months_winter,
         export_min_price=inp.export_min_price,
+        seasonal_fill_mode=inp.seasonal_fill_mode,
     )
     log_planner(
         "debug",
