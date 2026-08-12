@@ -39,6 +39,17 @@
 | Working mode | `select.batteries_working_mode` | ✅ `hsem_huawei_solar_batteries_working_mode` |
 | Excess PV energy use in TOU | `select.batteries_excess_pv_energy_use_in_tou` | ✅ `hsem_huawei_solar_batteries_excess_pv_energy_use_in_tou` |
 
+### Fully Fed to Grid control behavior
+
+On this installation, Huawei's Fully Fed to Grid mode gives PV priority and lets the battery fill
+only the inverter's remaining AC headroom. HSEM combines that mode with
+`number.batteries_maximum_discharging_power`: `force_batteries_discharge` uses the plan-derived
+battery cap, while PV-only `force_export` uses a 0 W cap.
+
+`number.batteries_end_of_discharge_soc` exposes only 0–20% here. It remains the inverter's static
+hardware floor; planner reserves above 20% are enforced by the live cap/reconciliation loop rather
+than by writing this entity.
+
 ---
 
 ## Inverter

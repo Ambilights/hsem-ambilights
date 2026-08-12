@@ -26,6 +26,7 @@ safety-gate assertions from log-formatting changes.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -84,6 +85,50 @@ def _make_rec(recommendation: str = "batteries_discharge_mode") -> HourlyRecomme
     rec = HourlyRecommendation.__new__(HourlyRecommendation)
     object.__setattr__(rec, "recommendation", recommendation)
     return rec
+
+
+def _make_planned_rec(
+    recommendation: str,
+    *,
+    discharged_kwh: float = 0.45,
+    end_capacity_kwh: float = 19.55,
+) -> HourlyRecommendation:
+    """Return a complete 15-minute recommendation for applier sequencing tests."""
+    start = datetime(2026, 8, 12, 15, 45, tzinfo=UTC)
+    return HourlyRecommendation(
+        start=start,
+        end=start + timedelta(minutes=15),
+        avg_house_consumption_kwh=0.25,
+        avg_house_consumption_1d_kwh=0.25,
+        avg_house_consumption_3d_kwh=0.25,
+        avg_house_consumption_7d_kwh=0.25,
+        avg_house_consumption_14d_kwh=0.25,
+        batteries_charged_kwh=0.0,
+        batteries_discharged_kwh=discharged_kwh,
+        estimated_battery_capacity_kwh=end_capacity_kwh,
+        estimated_battery_soc_pct=70.0,
+        estimated_cost_currency=0.0,
+        estimated_net_consumption_kwh=-2.0,
+        export_price=1.0,
+        grid_export_kwh=2.0,
+        grid_import_kwh=0.0,
+        import_price=1.0,
+        recommendation=recommendation,
+        solcast_pv_estimate_kwh=2.25,
+    )
+
+
+def _ok_apply_result(**kwargs):
+    """Build a successful result matching an async_write_and_verify call."""
+    from custom_components.hsem.utils.inverter_verify import ApplyResult
+
+    return ApplyResult(
+        entity_id=kwargs["entity_id"],
+        desired=kwargs["desired"],
+        actual=kwargs["desired"],
+        status=ApplyStatus.OK,
+        attempts=1,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +490,203 @@ class TestBatterySettingsSafetyGate:
 
         assert verifier.await_count == 1
         assert summary.overall_status == ApplyStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# Fully Fed battery-export control
+# ---------------------------------------------------------------------------
+
+
+class TestFullyFedBatteryExportControl:
+    """Verify bounded power and fail-safe ordering around Fully Fed mode."""
+
+    @staticmethod
+    def _cfg() -> SensorConfig:
+        cfg = _make_cfg(read_only=False)
+        cfg.huawei_solar_device_id_batteries = "battery_device"
+        cfg.huawei_solar_batteries_forcible_charge = "sensor.batteries_forcible"
+        cfg.huawei_solar_batteries_maximum_discharging_power = (
+            "number.batteries_max_discharge"
+        )
+        cfg.huawei_solar_batteries_working_mode = "select.batteries_working_mode"
+        cfg.huawei_solar_batteries_excess_pv_energy_use_in_tou = (
+            "select.batteries_excess_pv"
+        )
+        return cfg
+
+    @staticmethod
+    def _live() -> LiveState:
+        live = _make_live(degraded_mode=DegradedMode.OK)
+        live.huawei_batteries_rated_capacity_wh = 30000.0
+        live.huawei_batteries_max_discharge_power_w = 10000.0
+        live.huawei_batteries_working_mode = "time_of_use_luna2000"
+        live.huawei_batteries_excess_pv_use_in_tou = "fed_to_grid"
+        live.huawei_batteries_forcible_charge_state = "Stopped"
+        live.battery_current_capacity_kwh = 20.0
+        live.battery_usable_capacity_kwh = 25.5
+        live.huawei_batteries_soc_pct = 75.0
+        return live
+
+    @pytest.mark.asyncio
+    async def test_planned_export_caps_power_before_fully_fed_mode(self):
+        """0.45 kWh in 15 minutes becomes 1.8 kW before mode selection."""
+        sensor = _make_sensor()
+        cfg = self._cfg()
+        live = self._live()
+        rec = _make_planned_rec("force_batteries_discharge")
+
+        with (
+            patch(_LOGGER_PATCH, new_callable=MagicMock),
+            patch(
+                "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+                new_callable=AsyncMock,
+                side_effect=_ok_apply_result,
+            ) as verifier,
+            patch(
+                "custom_components.hsem.custom_sensors.applier.async_stop_forcible_discharge",
+                new_callable=AsyncMock,
+            ) as stop_force,
+        ):
+            summary = await async_apply_battery_settings(sensor, cfg, live, rec, 10.0)
+
+        writes = [
+            (call.kwargs["entity_id"], call.kwargs["desired"])
+            for call in verifier.await_args_list
+        ]
+        assert writes == [
+            ("number.batteries_max_discharge", 1800),
+            ("select.batteries_working_mode", "fully_fed_to_grid"),
+        ]
+        assert summary.overall_status == ApplyStatus.OK
+        stop_force.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pv_only_force_export_uses_zero_battery_cap(self):
+        sensor = _make_sensor()
+        cfg = self._cfg()
+        live = self._live()
+        rec = _make_planned_rec("force_export")
+
+        with patch(
+            "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+            new_callable=AsyncMock,
+            side_effect=_ok_apply_result,
+        ) as verifier:
+            await async_apply_battery_settings(sensor, cfg, live, rec, 10.0)
+
+        assert [call.kwargs["desired"] for call in verifier.await_args_list] == [
+            0,
+            "fully_fed_to_grid",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_live_plan_target_stops_battery_but_keeps_pv_export(self):
+        sensor = _make_sensor()
+        cfg = self._cfg()
+        live = self._live()
+        live.battery_current_capacity_kwh = 19.55
+        rec = _make_planned_rec("force_batteries_discharge")
+
+        with patch(
+            "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+            new_callable=AsyncMock,
+            side_effect=_ok_apply_result,
+        ) as verifier:
+            await async_apply_battery_settings(sensor, cfg, live, rec, 10.0)
+
+        assert [call.kwargs["desired"] for call in verifier.await_args_list] == [
+            0,
+            "fully_fed_to_grid",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_exit_fails_closed_then_restores_normal_cap(self):
+        sensor = _make_sensor()
+        cfg = self._cfg()
+        live = self._live()
+        live.huawei_batteries_working_mode = "fully_fed_to_grid"
+        live.huawei_batteries_max_discharge_power_w = 1800.0
+        live.huawei_batteries_excess_pv_use_in_tou = "charge"
+        rec = _make_planned_rec("batteries_discharge_mode")
+
+        with patch(
+            "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+            new_callable=AsyncMock,
+            side_effect=_ok_apply_result,
+        ) as verifier:
+            await async_apply_battery_settings(sensor, cfg, live, rec, 10.0)
+
+        assert [call.kwargs["desired"] for call in verifier.await_args_list] == [
+            0,
+            "maximise_self_consumption",
+            10000,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_failed_zero_cap_blocks_mode_exit_and_restore(self):
+        from custom_components.hsem.utils.inverter_verify import ApplyResult
+
+        sensor = _make_sensor()
+        cfg = self._cfg()
+        live = self._live()
+        live.huawei_batteries_working_mode = "fully_fed_to_grid"
+        live.huawei_batteries_max_discharge_power_w = 1800.0
+        rec = _make_planned_rec("batteries_discharge_mode")
+        failed = ApplyResult(
+            entity_id="number.batteries_max_discharge",
+            desired=0,
+            actual=1800,
+            status=ApplyStatus.FAILED,
+            attempts=3,
+        )
+
+        with patch(
+            "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+            new_callable=AsyncMock,
+            return_value=failed,
+        ) as verifier:
+            summary = await async_apply_battery_settings(sensor, cfg, live, rec, 10.0)
+
+        assert verifier.await_count == 1
+        assert verifier.await_args is not None
+        assert verifier.await_args.kwargs["desired"] == 0
+        assert summary.overall_status == ApplyStatus.FAILED
+
+    @pytest.mark.asyncio
+    async def test_active_legacy_force_is_stopped_once(self):
+        sensor = _make_sensor()
+        cfg = self._cfg()
+        live = self._live()
+        live.huawei_batteries_forcible_charge_state = "Discharging at 10000W until 5.0%"
+        rec = _make_planned_rec("force_batteries_discharge")
+
+        async def execute_writer(**kwargs):
+            await kwargs["writer"]()
+            return _ok_apply_result(**kwargs)
+
+        with (
+            patch(
+                "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+                new_callable=AsyncMock,
+                side_effect=execute_writer,
+            ) as verifier,
+            patch(
+                "custom_components.hsem.custom_sensors.applier.async_stop_forcible_discharge",
+                new_callable=AsyncMock,
+            ) as stop_force,
+            patch(
+                "custom_components.hsem.custom_sensors.applier.async_set_number_value",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "custom_components.hsem.custom_sensors.applier.async_set_select_option",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await async_apply_battery_settings(sensor, cfg, live, rec, 10.0)
+
+        stop_force.assert_awaited_once_with(sensor, "battery_device")
+        assert verifier.await_args_list[0].kwargs["desired"] == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------

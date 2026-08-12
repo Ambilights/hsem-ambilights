@@ -232,3 +232,108 @@ class TestWaitModeSelfConsumptionCapW:
             max_discharge_power_w=5000,
         )
         assert cap == 0
+
+
+# ---------------------------------------------------------------------------
+# Fully Fed export power cap
+# ---------------------------------------------------------------------------
+
+
+class TestFullyFedDischargeCapW:
+    """The Fully Fed battery contribution is bounded by plan and reserve."""
+
+    @staticmethod
+    def _cap(**kwargs):
+        from custom_components.hsem.custom_sensors.applier import (
+            _fully_fed_discharge_cap_w,
+        )
+
+        return _fully_fed_discharge_cap_w(**kwargs)
+
+    def test_planned_slot_energy_becomes_power_cap(self):
+        cap = self._cap(
+            planned_discharge_kwh=0.45,
+            slot_hours=0.25,
+            battery_capacity_kwh=20.0,
+            planned_end_capacity_kwh=19.55,
+            required_capacity_kwh=10.0,
+            max_discharge_power_w=10000,
+        )
+        assert cap == 1800
+
+    def test_hardware_maximum_is_respected(self):
+        cap = self._cap(
+            planned_discharge_kwh=2.5,
+            slot_hours=0.25,
+            battery_capacity_kwh=20.0,
+            planned_end_capacity_kwh=17.5,
+            required_capacity_kwh=0.0,
+            max_discharge_power_w=5000,
+        )
+        assert cap == 5000
+
+    def test_live_energy_above_planned_end_is_an_upper_bound(self):
+        cap = self._cap(
+            planned_discharge_kwh=0.5,
+            slot_hours=0.25,
+            battery_capacity_kwh=10.5,
+            planned_end_capacity_kwh=10.25,
+            required_capacity_kwh=5.0,
+            max_discharge_power_w=10000,
+        )
+        assert cap == 1000
+
+    def test_required_reserve_can_raise_the_stop_target(self):
+        cap = self._cap(
+            planned_discharge_kwh=0.5,
+            slot_hours=0.25,
+            battery_capacity_kwh=10.5,
+            planned_end_capacity_kwh=10.0,
+            required_capacity_kwh=10.5,
+            max_discharge_power_w=10000,
+        )
+        assert cap == 0
+
+    def test_invalid_duration_fails_closed(self):
+        cap = self._cap(
+            planned_discharge_kwh=0.5,
+            slot_hours=0.0,
+            battery_capacity_kwh=10.5,
+            planned_end_capacity_kwh=10.0,
+            required_capacity_kwh=0.0,
+            max_discharge_power_w=10000,
+        )
+        assert cap == 0
+
+    def test_non_positive_plan_fails_closed(self):
+        cap = self._cap(
+            planned_discharge_kwh=0.0,
+            slot_hours=0.25,
+            battery_capacity_kwh=10.5,
+            planned_end_capacity_kwh=10.0,
+            required_capacity_kwh=0.0,
+            max_discharge_power_w=10000,
+        )
+        assert cap == 0
+
+
+class TestForcibleDischargeState:
+    """Legacy cleanup runs only for a genuinely active command."""
+
+    @staticmethod
+    def _active(state):
+        from custom_components.hsem.custom_sensors.applier import (
+            _is_forcible_discharge_active,
+        )
+
+        return _is_forcible_discharge_active(state)
+
+    def test_stopped_and_missing_are_inactive(self):
+        assert self._active(None) is False
+        assert self._active("") is False
+        assert self._active("Stopped") is False
+        assert self._active("unknown") is False
+        assert self._active("unavailable") is False
+
+    def test_active_discharge_summary_is_detected(self):
+        assert self._active("Discharging at 10000W until 5.0%") is True

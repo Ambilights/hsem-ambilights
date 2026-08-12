@@ -52,7 +52,6 @@ from custom_components.hsem.utils.ha_helpers import (
     async_set_select_option,
 )
 from custom_components.hsem.utils.huawei import (
-    async_set_forcible_discharge,
     async_set_grid_export_power_pct,
     async_set_grid_export_power_watt,
     async_set_tou_periods,
@@ -117,6 +116,52 @@ def _wait_mode_self_consumption_cap_w(
     return min(cap_w, max_discharge_power_w)
 
 
+def _fully_fed_discharge_cap_w(
+    *,
+    planned_discharge_kwh: float,
+    slot_hours: float,
+    battery_capacity_kwh: float,
+    planned_end_capacity_kwh: float,
+    required_capacity_kwh: float,
+    max_discharge_power_w: int,
+) -> int:
+    """Return a safe battery-power cap for a Fully Fed to Grid slot.
+
+    Huawei's Fully Fed to Grid mode gives PV first use of the inverter's AC
+    capacity and lets the battery fill only the remaining headroom. The
+    maximum-discharge entity therefore acts as an upper bound on battery power.
+    This helper also bounds slot energy by both the MILP decision and the live
+    energy available above the larger of the planned end capacity and the
+    planner's required reserve.
+
+    The full slot duration is deliberately used even when HSEM enters the slot
+    late. Late application may undershoot the plan, but it cannot compensate by
+    exceeding the planner's intended battery power.
+    """
+    if slot_hours <= 1e-9 or max_discharge_power_w <= 0:
+        return 0
+
+    reserve_kwh = max(planned_end_capacity_kwh, required_capacity_kwh, 0.0)
+    available_kwh = max(battery_capacity_kwh - reserve_kwh, 0.0)
+    bounded_discharge_kwh = min(max(planned_discharge_kwh, 0.0), available_kwh)
+    if bounded_discharge_kwh <= 1e-9:
+        return 0
+
+    planned_power_w = int(bounded_discharge_kwh / slot_hours * 1000.0 + 1e-6)
+    return min(planned_power_w, max_discharge_power_w)
+
+
+def _is_forcible_discharge_active(state: str | None) -> bool:
+    """Return whether Huawei reports a legacy forcible battery command."""
+    if not state:
+        return False
+    return state.lower().strip() not in {
+        "stopped",
+        STATE_UNAVAILABLE,
+        STATE_UNKNOWN,
+    }
+
+
 def compute_ev_discharge_cap_w(
     *,
     live_net_w: float | None,
@@ -169,6 +214,110 @@ def compute_ev_discharge_cap_w(
         if w > 0 and (best_w == 0 or w < best_w):
             best_w = w
     return best_w
+
+
+def _desired_battery_discharge_cap_w(
+    *,
+    cfg: SensorConfig,
+    live: LiveState,
+    rec: HourlyRecommendation,
+    current_required_battery_kwh: float,
+    max_discharge_power_w: int,
+) -> tuple[int, str]:
+    """Return the desired Huawei discharge cap and a diagnostic reason."""
+    recommendation = rec.recommendation
+
+    if recommendation == Recommendations.ForceBatteriesDischarge.value:
+        slot_hours = slot_duration_hours(rec.start, rec.end)
+        cap_w = _fully_fed_discharge_cap_w(
+            planned_discharge_kwh=rec.batteries_discharged_kwh,
+            slot_hours=slot_hours,
+            battery_capacity_kwh=live.battery_current_capacity_kwh,
+            planned_end_capacity_kwh=rec.estimated_battery_capacity_kwh,
+            required_capacity_kwh=current_required_battery_kwh,
+            max_discharge_power_w=max_discharge_power_w,
+        )
+        return (
+            cap_w,
+            "fully-fed battery export "
+            f"(planned={rec.batteries_discharged_kwh:.3f} kWh, "
+            f"slot={slot_hours:.3f} h, live={live.battery_current_capacity_kwh:.3f} "
+            f"kWh, planned_end={rec.estimated_battery_capacity_kwh:.3f} kWh, "
+            f"required={current_required_battery_kwh:.3f} kWh)",
+        )
+
+    if recommendation == Recommendations.ForceExport.value:
+        return 0, "PV-only fully-fed export"
+
+    if recommendation == Recommendations.EVSmartCharging.value and (
+        live.ev.force_max_discharge_power or live.ev_second.force_max_discharge_power
+    ):
+        return (
+            int(
+                max(
+                    live.ev.max_discharge_power_w,
+                    live.ev_second.max_discharge_power_w,
+                )
+            ),
+            "EV V2H override",
+        )
+
+    if live.any_ev_charging:
+        slot_hours = slot_duration_hours(rec.start, rec.end)
+        historical_w = (
+            int(rec.avg_house_consumption_kwh / slot_hours * 1000.0)
+            if slot_hours > 1e-9 and rec.avg_house_consumption_kwh > 1e-9
+            else 0
+        )
+        live_net_w = live.net_consumption_w
+        ev_power_available = (
+            live.ev.power_w is not None and live.ev.power_w > 1e-9
+        ) or (live.ev_second.power_w is not None and live.ev_second.power_w > 1e-9)
+        sub_window_ws = [
+            int(window_kwh / slot_hours * 1000.0)
+            for window_kwh in (
+                rec.avg_house_consumption_1d_kwh,
+                rec.avg_house_consumption_3d_kwh,
+                rec.avg_house_consumption_7d_kwh,
+                rec.avg_house_consumption_14d_kwh,
+                rec.avg_house_consumption_kwh,
+            )
+            if window_kwh > 1e-9 and slot_hours > 1e-9
+        ]
+        cap_w = compute_ev_discharge_cap_w(
+            live_net_w=live_net_w,
+            ev_power_available=ev_power_available,
+            historical_w=historical_w,
+            sub_window_ws=sub_window_ws,
+        )
+        if (
+            cap_w > 0
+            and current_required_battery_kwh > 1e-9
+            and live.battery_current_capacity_kwh > 1e-9
+            and live.battery_current_capacity_kwh <= current_required_battery_kwh
+        ):
+            cap_w = 0
+        planned = (
+            rec.ev_charger_calculated_power > 1e-9
+            or rec.ev_second_charger_calculated_power > 1e-9
+            or rec.ev_total_planned_load_kwh > 1e-9
+        )
+        return cap_w, "EV active" if planned else "EV active (unplanned)"
+
+    if (
+        recommendation == Recommendations.BatteriesWaitMode.value
+        and cfg.batteries_wait_mode_behavior == "self_consumption_with_reserve"
+    ):
+        slot_hours = slot_duration_hours(rec.start, rec.end)
+        cap_w = _wait_mode_self_consumption_cap_w(
+            battery_capacity_kwh=live.battery_current_capacity_kwh,
+            required_capacity_kwh=current_required_battery_kwh,
+            slot_hours=slot_hours,
+            max_discharge_power_w=max_discharge_power_w,
+        )
+        return cap_w, "wait-mode self-consumption reserve"
+
+    return max_discharge_power_w, "normal hardware maximum"
 
 
 def _should_force_export_for_ev(
@@ -346,8 +495,8 @@ async def async_apply_battery_settings(
         cfg: Current sensor configuration.
         live: Live state snapshot.
         rec: The current-interval recommendation.
-        current_required_battery_kwh: Remaining energy required until end of day
-            (used when computing forcible-discharge target SoC).
+        current_required_battery_kwh: Planner reserve in usable kWh. Fully
+            Fed export and EV discharge caps may not consume this reserve.
         grid_charge_power_limit_w: Optional phase-safe Huawei battery charge
             power command in Watts.  Applied before enabling forced grid
             charging.  ``None`` retains the legacy hardware behavior.
@@ -370,34 +519,13 @@ async def async_apply_battery_settings(
 
     tou_modes = None
     working_mode = None
+    recommendation = rec.recommendation
+    ev_active = live.any_ev_charging
 
     _rated_capacity = convert_to_int(live.huawei_batteries_rated_capacity_wh)
     max_discharge_power = get_max_discharge_power(
         _rated_capacity if _rated_capacity is not None else 0
     )
-
-    # Set maximum discharging power unless EV is charging
-    if not live.ev.is_charging and not live.ev_second.is_charging:
-        if live.huawei_batteries_max_discharge_power_w != max_discharge_power:
-            discharge_entity = cfg.huawei_solar_batteries_maximum_discharging_power
-            if discharge_entity is None:
-                _LOGGER.warning(
-                    "Max discharge power entity not configured; skipping write.",
-                )
-                return summary
-            _de: str = discharge_entity  # narrowed for closure
-            result = await async_write_and_verify(
-                entity_id=_de,
-                desired=max_discharge_power,
-                writer=lambda: async_set_number_value(sensor, _de, max_discharge_power),
-                reader=lambda: _read_number_state(sensor, _de),
-                backoff=get_write_failure_backoff(sensor),
-            )
-            summary.results.append(result)
-            if result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
-                return summary
-
-    recommendation = rec.recommendation
 
     if (
         recommendation == Recommendations.BatteriesChargeGrid.value
@@ -430,145 +558,6 @@ async def async_apply_battery_settings(
             if charge_result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
                 return summary
 
-    # When an EV is actively charging and we are NOT in a forced-discharge
-    # or forced-export recommendation, cap the battery discharge power to
-    # prevent the Huawei inverter from physically discharging into the EV.
-    #
-    # The inverter's CT clamp sees the full EV load as demand and will
-    # offset it from the battery unless the discharge power is explicitly
-    # restricted.  The cap is the house-only consumption — the battery
-    # still covers normal house load while 100 % of the EV load goes to
-    # the grid.  This applies identically to HSEM-planned and unplanned
-    # ("ghost") EV charging (issue #592).
-    ev_active = live.any_ev_charging
-    if ev_active and recommendation not in (
-        Recommendations.ForceBatteriesDischarge.value,
-        Recommendations.ForceExport.value,
-    ):
-        discharge_entity = cfg.huawei_solar_batteries_maximum_discharging_power
-        if discharge_entity is not None:
-            # Determine whether HSEM actually planned EV charging.
-            # Fields come from the planner output; they are 0 when the
-            # planner decided NOT to charge the EV in this slot.
-            hsem_planned_ev = (
-                rec.ev_charger_calculated_power > 1e-9
-                or rec.ev_second_charger_calculated_power > 1e-9
-                or rec.ev_total_planned_load_kwh > 1e-9
-            )
-
-            # Cap to the house-only consumption using live data when
-            # available (already has EV power subtracted — unaffected
-            # by polluted v5 upgrade history).  Falls back to historical
-            # average.  Applies to both HSEM-planned and unplanned EV
-            # charging — the cap limits to house-only load in both cases.
-            slot_hours = slot_duration_hours(rec.start, rec.end)
-            historical_w = (
-                int(rec.avg_house_consumption_kwh / slot_hours * 1000.0)
-                if slot_hours > 1e-9 and rec.avg_house_consumption_kwh > 1e-9
-                else 0
-            )
-            live_net_w = live.net_consumption_w
-            # Only trust net_consumption_w if the EV power sensor actually
-            # provided a value.  When ev.power_w is 0/None but is_charging
-            # is True (e.g. boolean-only sensor, or sensor unavailable),
-            # net_consumption_w == house_w (no EV subtraction happened).
-            ev_power_available = (
-                live.ev.power_w is not None and live.ev.power_w > 1e-9
-            ) or (live.ev_second.power_w is not None and live.ev_second.power_w > 1e-9)
-            sub_window_ws = [
-                int(sw / slot_hours * 1000.0)
-                for sw in (
-                    rec.avg_house_consumption_1d_kwh,
-                    rec.avg_house_consumption_3d_kwh,
-                    rec.avg_house_consumption_7d_kwh,
-                    rec.avg_house_consumption_14d_kwh,
-                    rec.avg_house_consumption_kwh,
-                )
-                if sw > 1e-9 and slot_hours > 1e-9
-            ]
-            cap_w = compute_ev_discharge_cap_w(
-                live_net_w=live_net_w,
-                ev_power_available=ev_power_available,
-                historical_w=historical_w,
-                sub_window_ws=sub_window_ws,
-            )
-            cap_reason = "EV active" if hsem_planned_ev else "EV active (unplanned)"
-
-            # SoC guard (issue #592, v6.2.0-beta1): never let the EV cap
-            # drain the battery below the energy the planner has reserved
-            # for upcoming scheduled discharge windows.  When the remaining
-            # usable energy is at or below the required reserve, force the
-            # cap to 0 — the battery is preserved for its schedule and the
-            # house load (like the EV) is served from the grid until the
-            # battery recovers above the reserve.
-            if (
-                cap_w > 0
-                and current_required_battery_kwh > 1e-9
-                and live.battery_current_capacity_kwh > 1e-9
-                and live.battery_current_capacity_kwh <= current_required_battery_kwh
-            ):
-                _LOGGER.debug(
-                    "%s — battery reserve reached (%.2f kWh left, %.2f kWh "
-                    "reserved for scheduled plans) — forcing EV discharge "
-                    "cap to 0 W to protect the schedule",
-                    cap_reason,
-                    live.battery_current_capacity_kwh,
-                    current_required_battery_kwh,
-                )
-                cap_w = 0
-
-            if live.huawei_batteries_max_discharge_power_w != cap_w:
-                _de3: str = discharge_entity  # narrowed for closure
-                ev_discharge_result = await async_write_and_verify(
-                    entity_id=_de3,
-                    desired=cap_w,
-                    writer=lambda: async_set_number_value(sensor, _de3, cap_w),
-                    reader=lambda: _read_number_state(sensor, _de3),
-                    backoff=get_write_failure_backoff(sensor),
-                )
-                summary.results.append(ev_discharge_result)
-                _LOGGER.debug(
-                    "%s — capped max discharge power to %d W "
-                    "(planned_ev_power=%dW planned_ev2_power=%dW "
-                    "ev_total_load=%.3fkWh live_ev_power=%s live_ev2_power=%s "
-                    "house_avg=%.3f kWh/slot)",
-                    cap_reason,
-                    cap_w,
-                    rec.ev_charger_calculated_power,
-                    rec.ev_second_charger_calculated_power,
-                    rec.ev_total_planned_load_kwh,
-                    _fmt_live_power_w(live.ev.power_w),
-                    _fmt_live_power_w(live.ev_second.power_w),
-                    rec.avg_house_consumption_kwh,
-                )
-                if ev_discharge_result.status not in {
-                    ApplyStatus.OK,
-                    ApplyStatus.SKIPPED,
-                }:
-                    return summary
-
-    # If we're switching away from force discharge, explicitly stop any
-    # active forcible charge/discharge before applying the new mode.
-    if recommendation not in (
-        Recommendations.ForceBatteriesDischarge.value,
-        Recommendations.ForceExport.value,
-    ):
-        fc_state = live.huawei_batteries_forcible_charge_state or ""
-        if (
-            fc_state
-            and fc_state.lower()
-            not in (
-                "stopped",
-                STATE_UNAVAILABLE,
-                STATE_UNKNOWN,
-                "",
-            )
-            and cfg.huawei_solar_device_id_batteries is not None
-        ):
-            await async_stop_forcible_discharge(
-                sensor, cfg.huawei_solar_device_id_batteries
-            )
-
     match recommendation:
         case Recommendations.ForceExport.value:
             working_mode = WorkingModes.FullyFedToGrid.value
@@ -594,12 +583,7 @@ async def async_apply_battery_settings(
             working_mode = WorkingModes.MaximizeSelfConsumption.value
 
         case Recommendations.ForceBatteriesDischarge.value:
-            forcible_result = await _async_apply_forcible_discharge(
-                sensor, cfg, live, current_required_battery_kwh, max_discharge_power
-            )
-            if forcible_result is not None:
-                summary.results.append(forcible_result)
-            return summary
+            working_mode = WorkingModes.FullyFedToGrid.value
 
         case Recommendations.BatteriesWaitMode.value:
             # Strict wait keeps the battery idle in TOU mode.  Self-consumption
@@ -622,92 +606,59 @@ async def async_apply_battery_settings(
             # Unrecognised recommendation — nothing to apply.
             return summary
 
-    # Wait mode self-consumption: cap discharge power so only surplus energy
-    # above the planner's required reserve can be used.  This preserves the
-    # reserve for future scheduled discharge windows while still allowing the
-    # house to cover normal self-consumption from the surplus.
     wait_mode_self_consumption = (
         recommendation == Recommendations.BatteriesWaitMode.value
         and cfg.batteries_wait_mode_behavior == "self_consumption_with_reserve"
         and working_mode == WorkingModes.MaximizeSelfConsumption.value
         and not ev_active
     )
-    if wait_mode_self_consumption:
-        slot_hours = slot_duration_hours(rec.start, rec.end)
-        surplus = max(
-            live.battery_current_capacity_kwh - current_required_battery_kwh, 0.0
-        )
-        cap_w = _wait_mode_self_consumption_cap_w(
-            battery_capacity_kwh=live.battery_current_capacity_kwh,
-            required_capacity_kwh=current_required_battery_kwh,
-            slot_hours=slot_hours,
-            max_discharge_power_w=max_discharge_power,
-        )
-        if live.huawei_batteries_max_discharge_power_w != cap_w:
-            discharge_entity = cfg.huawei_solar_batteries_maximum_discharging_power
-            if discharge_entity is None:
-                _LOGGER.warning(
-                    "Wait mode self-consumption discharge power entity not configured; "
-                    "skipping write.",
-                )
-                return summary
-            _de_wait: str = discharge_entity  # narrowed for closure
-            wait_cap_result = await async_write_and_verify(
-                entity_id=_de_wait,
-                desired=cap_w,
-                writer=lambda: async_set_number_value(sensor, _de_wait, cap_w),
-                reader=lambda: _read_number_state(sensor, _de_wait),
-                backoff=get_write_failure_backoff(sensor),
-            )
-            summary.results.append(wait_cap_result)
-            _LOGGER.debug(
-                "Wait mode self-consumption — capped max discharge power to %d W "
-                "(capacity=%.2f kWh, required=%.2f kWh, surplus=%.2f kWh, "
-                "slot_hours=%.3f)",
-                cap_w,
-                live.battery_current_capacity_kwh,
-                current_required_battery_kwh,
-                surplus,
-                slot_hours,
-            )
-            if wait_cap_result.status not in {
-                ApplyStatus.OK,
-                ApplyStatus.SKIPPED,
-            }:
-                return summary
 
-    # Override discharge power when EV uses V2H
-    if recommendation == Recommendations.EVSmartCharging.value and (
-        live.ev.force_max_discharge_power or live.ev_second.force_max_discharge_power
+    # The new Fully Fed path never starts forcible discharge. Clean up only a
+    # command left active by an older release, a manual action, or a failed
+    # transition before applying any new battery mode.
+    stale_force_result = await _async_stop_stale_forcible_discharge(sensor, cfg, live)
+    if stale_force_result is not None:
+        summary.results.append(stale_force_result)
+        if stale_force_result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
+            return summary
+
+    desired_discharge_cap_w, discharge_cap_reason = _desired_battery_discharge_cap_w(
+        cfg=cfg,
+        live=live,
+        rec=rec,
+        current_required_battery_kwh=current_required_battery_kwh,
+        max_discharge_power_w=max_discharge_power,
+    )
+    current_discharge_cap_w = live.huawei_batteries_max_discharge_power_w
+    leaving_fully_fed = (
+        live.huawei_batteries_working_mode == WorkingModes.FullyFedToGrid.value
+        and working_mode != WorkingModes.FullyFedToGrid.value
+    )
+
+    # Entering/staying Fully Fed: apply the plan cap before the mode can draw
+    # from the battery. Leaving Fully Fed: fail closed at 0 W; the normal cap is
+    # restored only after the mode change has been verified.
+    pre_mode_cap_w = 0 if leaving_fully_fed else desired_discharge_cap_w
+    if (
+        current_discharge_cap_w is None
+        or abs(current_discharge_cap_w - pre_mode_cap_w) > 1.0
     ):
-        ev_max = max(
-            live.ev.max_discharge_power_w,
-            live.ev_second.max_discharge_power_w,
+        cap_result = await _async_write_discharge_cap(sensor, cfg, pre_mode_cap_w)
+        summary.results.append(cap_result)
+        _LOGGER.debug(
+            "Battery max discharge cap set to %d W before mode change (%s)",
+            pre_mode_cap_w,
+            "fail-safe Fully Fed exit" if leaving_fully_fed else discharge_cap_reason,
         )
-        if live.huawei_batteries_max_discharge_power_w != ev_max:
-            discharge_entity = cfg.huawei_solar_batteries_maximum_discharging_power
-            if discharge_entity is None:
-                _LOGGER.warning(
-                    "EV V2H discharge power entity not configured; skipping write.",
-                )
-                return summary
-            _de2: str = discharge_entity  # narrowed for closure
-            ev_result = await async_write_and_verify(
-                entity_id=_de2,
-                desired=ev_max,
-                writer=lambda: async_set_number_value(sensor, _de2, ev_max),
-                reader=lambda: _read_number_state(sensor, _de2),
-                backoff=get_write_failure_backoff(sensor),
-            )
-            summary.results.append(ev_result)
-            if ev_result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
-                return summary
+        if cap_result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
+            return summary
+        current_discharge_cap_w = float(pre_mode_cap_w)
 
     # Excess PV use in TOU — fed_to_grid for strict wait/fully-fed modes, charge
     # otherwise.  Wait-mode self-consumption keeps excess PV in the battery so
     # the surplus above the reserve can be used for household self-consumption.
-    # ForceExport maps to WorkingModes.FullyFedToGrid at the hardware level so we
-    # check both BatteriesWaitMode and ForceExport recommendations here.
+    # Both export recommendations map to FullyFedToGrid. The power cap
+    # distinguishes PV-only export from planned battery export.
     desired_excess = (
         "charge"
         if wait_mode_self_consumption
@@ -717,6 +668,7 @@ async def async_apply_battery_settings(
             in (
                 Recommendations.BatteriesWaitMode.value,
                 Recommendations.ForceExport.value,
+                Recommendations.ForceBatteriesDischarge.value,
             )
             else "charge"
         )
@@ -792,6 +744,22 @@ async def async_apply_battery_settings(
         if mode_result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
             return summary
 
+    if leaving_fully_fed and (
+        current_discharge_cap_w is None
+        or abs(current_discharge_cap_w - desired_discharge_cap_w) > 1.0
+    ):
+        restore_result = await _async_write_discharge_cap(
+            sensor, cfg, desired_discharge_cap_w
+        )
+        summary.results.append(restore_result)
+        _LOGGER.debug(
+            "Battery max discharge cap restored to %d W after Fully Fed exit (%s)",
+            desired_discharge_cap_w,
+            discharge_cap_reason,
+        )
+        if restore_result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
+            return summary
+
     return summary
 
 
@@ -800,68 +768,84 @@ async def async_apply_battery_settings(
 # ---------------------------------------------------------------------------
 
 
-async def _async_apply_forcible_discharge(
+async def _async_write_discharge_cap(
+    sensor: Any,  # NOSONAR -- HA internal type; circular import risk
+    cfg: SensorConfig,
+    desired_cap_w: int,
+) -> ApplyResult:
+    """Write and verify the Huawei maximum battery-discharge power."""
+    entity_id = cfg.huawei_solar_batteries_maximum_discharging_power
+    if entity_id is None:
+        message = "Maximum battery discharging power entity is not configured"
+        _LOGGER.error(message)
+        return ApplyResult(
+            entity_id="number:maximum_discharging_power",
+            desired=desired_cap_w,
+            actual=None,
+            status=ApplyStatus.FAILED,
+            attempts=0,
+            error_message=message,
+        )
+
+    return await async_write_and_verify(
+        entity_id=entity_id,
+        desired=desired_cap_w,
+        writer=lambda: async_set_number_value(sensor, entity_id, desired_cap_w),
+        reader=lambda: _read_number_state(sensor, entity_id),
+        backoff=get_write_failure_backoff(sensor),
+    )
+
+
+async def _async_stop_stale_forcible_discharge(
     sensor: Any,  # NOSONAR -- HA internal type; circular import risk
     cfg: SensorConfig,
     live: LiveState,
-    current_required_kwh: float,
-    max_discharge_power: int,
 ) -> ApplyResult | None:
-    """Issue a forcible-discharge command to the battery pack and verify acceptance.
-
-    Returns:
-        :class:`ApplyResult` with the outcome, or ``None`` if the preconditions
-        were not met and no write was attempted.
-    """
-    if (
-        live.battery_usable_capacity_kwh <= 0
-        or current_required_kwh < 0
-        or not cfg.huawei_solar_device_id_batteries
-    ):
+    """Stop and verify only a forcible command already active on Huawei."""
+    if not _is_forcible_discharge_active(live.huawei_batteries_forcible_charge_state):
         return None
 
-    target_soc = int(
-        live.huawei_batteries_end_of_discharge_soc_pct
-    )  # discharge to floor
-    target_soc = max(5, min(100, target_soc))  # clamp 5-100 for safety
-
-    bat_fc_entity = cfg.huawei_solar_batteries_forcible_charge
     device_id = cfg.huawei_solar_device_id_batteries
+    entity_id = cfg.huawei_solar_batteries_forcible_charge
+    if device_id is None:
+        message = "Cannot stop stale forcible discharge: battery device ID is missing"
+        _LOGGER.error(message)
+        return ApplyResult(
+            entity_id=entity_id or "forcible:batteries",
+            desired=0.0,
+            actual=1.0,
+            status=ApplyStatus.FAILED,
+            attempts=0,
+            error_message=message,
+        )
 
-    def _read_fc_accepted() -> float | None:
-        """Return 1.0 if forcible charge state is active (not stopped/empty),
-        None otherwise.  The forcible_charge sensor reports a string like
-        'Discharging at 5000W until 5.0%' when active, or 'Stopped' when idle."""
-        if not bat_fc_entity:
+    def _read_stopped() -> float | None:
+        if entity_id is None:
             return None
-        state = sensor.hass.states.get(bat_fc_entity)
-        if state is None or state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE, ""):
+        state = sensor.hass.states.get(entity_id)
+        if state is None or state.state in (
+            STATE_UNKNOWN,
+            STATE_UNAVAILABLE,
+            "",
+            None,
+        ):
             return None
-        if state.state.lower() == "stopped":
-            return None
-        return 1.0
+        return 1.0 if _is_forcible_discharge_active(str(state.state)) else 0.0
 
     result = await async_write_and_verify(
-        entity_id=bat_fc_entity or f"forcible:{device_id}",
-        desired=1.0,
-        writer=lambda: async_set_forcible_discharge(
-            sensor,
-            device_id,
-            target_soc,
-            max_discharge_power,
-        ),
-        reader=_read_fc_accepted,
-        # The forcible_charge sensor changes state immediately when the
-        # command is accepted — no need for wide tolerance or retries.
+        entity_id=entity_id or f"forcible:{device_id}",
+        desired=0.0,
+        writer=lambda: async_stop_forcible_discharge(sensor, device_id),
+        reader=_read_stopped,
         tolerance=0.0,
         max_retries=3,
         backoff=get_write_failure_backoff(sensor),
     )
-
     if result.attempts > 0:
-        _LOGGER.debug(
-            f"Excess battery export: Set forcible discharge to {target_soc}% SOC "
-            f"at {max_discharge_power}W power. Verify result: {result.status.value}"
+        _LOGGER.warning(
+            "Stopped legacy forcible battery command before applying %s: %s",
+            live.huawei_batteries_working_mode or "next mode",
+            result.status.value,
         )
     return result
 
