@@ -2,10 +2,41 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.planner.cost_helpers import compute_charge_premium
 from custom_components.hsem.planner.cost_types import CostWeights
 from custom_components.hsem.utils.misc import clamp_efficiency
+
+
+@dataclass
+class SecondaryCostAccumulator:
+    """Accumulate authoritative secondary-storage cost terms."""
+
+    conversion_loss_cost: float = 0.0
+    cycle_cost: float = 0.0
+    terminal_soc_value: float = 0.0
+
+    def add_slot(
+        self,
+        slot: PlannedSlot,
+        weights: CostWeights,
+        *,
+        import_price: float,
+        export_price: float,
+    ) -> tuple[float, float, float]:
+        """Add and return one slot's conversion, cycle, and terminal terms."""
+        conversion, cycle, terminal = secondary_slot_cost(
+            slot,
+            weights,
+            import_price=import_price,
+            export_price=export_price,
+        )
+        self.conversion_loss_cost += conversion
+        self.cycle_cost += cycle
+        self.terminal_soc_value += terminal
+        return conversion, cycle, terminal
 
 
 def secondary_slot_cost(

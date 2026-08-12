@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -10,6 +11,12 @@ import pytest
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.secondary_storage_config import (
     SecondaryStorageConfig,
+)
+from custom_components.hsem.planner import milp_optimizer
+from custom_components.hsem.planner.cost_function import CostWeights, score_plan
+from custom_components.hsem.planner.milp import _secondary_diagnostics
+from custom_components.hsem.planner.milp._secondary_diagnostics import (
+    SecondaryResultSummary,
 )
 from custom_components.hsem.planner.milp_optimizer import (
     is_scipy_available,
@@ -296,3 +303,168 @@ def test_disabled_secondary_preserves_existing_solution() -> None:
         )
         for slot in disabled_slots
     ]
+
+
+def test_secondary_result_log_has_one_line_per_successful_solve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One enabled successful solve must emit one compact aggregate line."""
+    solve_lines: list[str] = []
+    result_lines: list[str] = []
+
+    def capture_solve(_level: str, message: str, *args: object) -> None:
+        rendered = message % args
+        if "[milp] solve_milp" in rendered:
+            solve_lines.append(rendered)
+
+    def capture_result(_level: str, message: str, *args: object) -> None:
+        rendered = message % args
+        if "[milp] secondary_result" in rendered:
+            result_lines.append(rendered)
+
+    monkeypatch.setattr(milp_optimizer, "log_planner", capture_solve)
+    monkeypatch.setattr(_secondary_diagnostics, "log_planner", capture_result)
+
+    _solve(
+        _slots([0.05, 0.05, 1.00, 1.00]),
+        _powmr(),
+    )
+
+    assert len(solve_lines) == 1
+    assert len(result_lines) == 1
+    line = result_lines[0]
+    assert "sbu_slots=" in line
+    assert "charge_slots=" in line
+    assert "utility_slots=" in line
+    assert "terminal_credit=" in line
+    assert "reason=scheduled" in line
+    assert "\n" not in line
+
+
+def test_secondary_result_log_absent_when_secondary_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An inactive secondary model must not emit a zero-valued result line."""
+    result_lines: list[str] = []
+
+    def capture_result(_level: str, message: str, *args: object) -> None:
+        rendered = message % args
+        if "[milp] secondary_result" in rendered:
+            result_lines.append(rendered)
+
+    monkeypatch.setattr(_secondary_diagnostics, "log_planner", capture_result)
+    result = solve_milp(
+        _slots([0.05, 1.00]),
+        _NOW,
+        current_kwh=0.0,
+        usable_kwh=9.0,
+        max_charge_per_slot=2.0,
+        max_discharge_per_slot=2.0,
+        no_export=True,
+        secondary_storage=SecondaryStorageConfig(enabled=False),
+    )
+
+    assert result is not None
+    assert result_lines == []
+
+
+def test_secondary_result_costs_match_authoritative_scorer() -> None:
+    """Logged loss, wear, and terminal terms must equal ``score_plan``."""
+    config = _powmr(cycle_cost_per_kwh=0.05)
+    planned, diagnostics = _solve(
+        _slots([0.05, 0.05, 1.00, 1.00]),
+        config,
+    )
+    breakdown = score_plan(
+        planned,
+        CostWeights(
+            secondary_storage_enabled=True,
+            secondary_storage_charge_efficiency_pct=(config.charge_efficiency_pct),
+            secondary_storage_discharge_efficiency_pct=(
+                config.discharge_efficiency_pct
+            ),
+            secondary_storage_cycle_cost_per_kwh=config.cycle_cost_per_kwh,
+            secondary_storage_replacement_price_per_kwh=(
+                config.replacement_price_per_kwh
+            ),
+        ),
+        now=_NOW,
+    )
+    summary = diagnostics["secondary_result"]
+
+    assert summary["conversion_loss"] == pytest.approx(
+        breakdown.secondary_conversion_loss_cost,
+        abs=1e-6,
+    )
+    assert summary["cycle_cost"] == pytest.approx(
+        breakdown.secondary_cycle_cost,
+        abs=1e-6,
+    )
+    assert summary["terminal_credit"] == pytest.approx(
+        -breakdown.secondary_terminal_soc_value,
+        abs=1e-6,
+    )
+    assert summary["net"] == pytest.approx(
+        summary["sbu_saving"]
+        - summary["charge_cost"]
+        - summary["cycle_cost"]
+        - summary["conversion_loss"]
+        + summary["terminal_credit"],
+    )
+    assert summary["sbu_slots"] + summary["charge_slots"] + summary[
+        "utility_slots"
+    ] == len(planned)
+
+
+def test_secondary_result_summary_does_not_change_solved_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replacing diagnostics with a no-op summary must leave slots identical."""
+    slots = _slots([0.05, 0.05, 1.00, 1.00])
+    config = _powmr(cycle_cost_per_kwh=0.05)
+    with_summary, _diagnostics = _solve(slots, config)
+
+    dummy = SecondaryResultSummary(
+        sbu_slots=0,
+        charge_slots=0,
+        utility_slots=0,
+        sbu_energy_kwh=0.0,
+        charge_energy_kwh=0.0,
+        sbu_saving=0.0,
+        charge_cost=0.0,
+        cycle_cost=0.0,
+        conversion_loss=0.0,
+        terminal_credit=0.0,
+        net=0.0,
+        soc_start_pct=0.0,
+        soc_end_pct=0.0,
+        reason="unknown",
+    )
+    monkeypatch.setattr(
+        _secondary_diagnostics,
+        "build_secondary_result_summary",
+        lambda *_args, **_kwargs: dummy,
+    )
+    monkeypatch.setattr(_secondary_diagnostics, "log_secondary_result", lambda _s: None)
+
+    without_summary, _diagnostics = _solve(slots, config)
+
+    assert [asdict(slot) for slot in with_summary] == [
+        asdict(slot) for slot in without_summary
+    ]
+
+
+def test_parked_secondary_identifies_terminal_value_as_dominant() -> None:
+    """A terminal penalty that blocks otherwise useful SBU is explained."""
+    planned, diagnostics = _solve(
+        _slots([1.00, 1.00, 1.00], house_load_kwh=0.10),
+        _powmr(
+            current_soc_pct=80.0,
+            cycle_cost_per_kwh=0.05,
+            replacement_price_per_kwh=2.0,
+            base_load_includes_dedicated_load=True,
+        ),
+    )
+
+    assert all(slot.secondary_storage_mode == "utility" for slot in planned)
+    assert diagnostics["secondary_result"]["reason"] == "terminal_credit_wins"

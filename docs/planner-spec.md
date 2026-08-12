@@ -351,6 +351,28 @@ loss, cycle wear, time discount, and a horizon-tail value for stored energy.
 Non-MILP candidates receive a physically valid utility-bypass plan so candidate
 comparison never leaves the dedicated load unaccounted.
 
+Each successful MILP solve with valid secondary storage emits exactly one
+aggregate debug record with the prefix ``[milp] secondary_result``.  Disabled
+secondary storage emits no result record.  The line contains solved ternary-mode
+counts, stored charge and discharge energy, isolated grid-import saving/cost,
+secondary conversion loss, cycle wear, terminal credit, net diagnostic value,
+start/end SoC, and a conservative reason slug.  It is deliberately one line per
+solve rather than one line per slot so verbose logging remains usable on
+15-minute, multi-day horizons.
+
+The conversion-loss, cycle-cost, and terminal-value fields use the same shared
+secondary cost accumulator as :func:`score_plan`; diagnostics must never
+introduce a parallel cost formula.  ``terminal_credit`` is the sign-inverted
+``secondary_terminal_soc_value`` so a credit is positive in the logged net:
+
+```text
+net = sbu_saving - charge_cost - cycle_cost - conversion_loss
+      + terminal_credit
+```
+
+Summary generation is read-only and must not change any recommendation, mode,
+charge-current command, energy flow, or SoC trajectory.
+
 ### Secondary-storage control safety
 
 Planning and control are separate opt-ins. `hsem_secondary_storage_enabled`
@@ -383,6 +405,11 @@ the PowMr adapter for that cycle.
 - disabled secondary storage is numerically identical to the upstream planner
 - missing required PowMr telemetry produces no secondary plan and blocks control
 - global read-only and the feature control switch each independently block writes
+- successful enabled MILP solves emit one ``secondary_result`` line each
+- disabled or invalid secondary storage emits no ``secondary_result`` line
+- logged secondary conversion, cycle, and terminal terms equal the authoritative
+  candidate scorer's terms for the same solved slots
+- building or logging the summary leaves the solved slot list unchanged
 
 ## Battery efficiency
 
