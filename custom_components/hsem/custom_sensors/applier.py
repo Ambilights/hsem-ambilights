@@ -32,9 +32,11 @@ to Home Assistant.
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any
 
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.util import dt as dt_util
 
 from custom_components.hsem.const import (
     DEFAULT_HSEM_BATTERIES_WAIT_MODE,
@@ -70,7 +72,7 @@ from custom_components.hsem.utils.misc import (
     get_max_discharge_power,
 )
 from custom_components.hsem.utils.recommendations import Recommendations
-from custom_components.hsem.utils.units import slot_duration_hours
+from custom_components.hsem.utils.units import hours_ahead, slot_duration_hours
 from custom_components.hsem.utils.workingmodes import WorkingModes
 
 
@@ -120,9 +122,9 @@ def _fully_fed_discharge_cap_w(
     *,
     planned_discharge_kwh: float,
     slot_hours: float,
+    remaining_slot_hours: float,
     battery_capacity_kwh: float,
     planned_end_capacity_kwh: float,
-    required_capacity_kwh: float,
     max_discharge_power_w: int,
 ) -> int:
     """Return a safe battery-power cap for a Fully Fed to Grid slot.
@@ -130,25 +132,36 @@ def _fully_fed_discharge_cap_w(
     Huawei's Fully Fed to Grid mode gives PV first use of the inverter's AC
     capacity and lets the battery fill only the remaining headroom. The
     maximum-discharge entity therefore acts as an upper bound on battery power.
-    This helper also bounds slot energy by both the MILP decision and the live
-    energy available above the larger of the planned end capacity and the
-    planner's required reserve.
+    The original planned power is a hard ceiling. Within that ceiling, the live
+    controller divides the energy remaining above the selected slot's end
+    capacity by the time remaining in the slot. This keeps the cap stable when
+    energy and time fall proportionally, then tapers it near the target.
 
-    The full slot duration is deliberately used even when HSEM enters the slot
-    late. Late application may undershoot the plan, but it cannot compensate by
-    exceeding the planner's intended battery power.
+    The selected recommendation's ``planned_end_capacity_kwh`` is authoritative
+    here. ``required_capacity_kwh`` is a pre-candidate scheduling heuristic,
+    not a constraint on the selected MILP winner; using it as a second floor
+    can contradict and under-deliver the winning plan.
     """
-    if slot_hours <= 1e-9 or max_discharge_power_w <= 0:
+    if slot_hours <= 1e-9 or remaining_slot_hours <= 1e-9 or max_discharge_power_w <= 0:
         return 0
 
-    reserve_kwh = max(planned_end_capacity_kwh, required_capacity_kwh, 0.0)
-    available_kwh = max(battery_capacity_kwh - reserve_kwh, 0.0)
-    bounded_discharge_kwh = min(max(planned_discharge_kwh, 0.0), available_kwh)
-    if bounded_discharge_kwh <= 1e-9:
+    planned_discharge_kwh = max(planned_discharge_kwh, 0.0)
+    if planned_discharge_kwh <= 1e-9:
         return 0
 
-    planned_power_w = int(bounded_discharge_kwh / slot_hours * 1000.0 + 1e-6)
-    return min(planned_power_w, max_discharge_power_w)
+    planned_power_w = planned_discharge_kwh / slot_hours * 1000.0
+    target_capacity_kwh = max(planned_end_capacity_kwh, 0.0)
+    remaining_energy_kwh = max(battery_capacity_kwh - target_capacity_kwh, 0.0)
+    if remaining_energy_kwh <= 1e-9:
+        return 0
+
+    # A callback can race slightly ahead of the slot start. Never stretch the
+    # target over more than the full slot, and never let a near-zero remaining
+    # duration inflate the command above the original planned power.
+    effective_remaining_hours = min(remaining_slot_hours, slot_hours)
+    target_power_w = remaining_energy_kwh / effective_remaining_hours * 1000.0
+    safe_power_w = min(planned_power_w, target_power_w, max_discharge_power_w)
+    return int(max(safe_power_w, 0.0) + 1e-6)
 
 
 def _is_forcible_discharge_active(state: str | None) -> bool:
@@ -221,6 +234,7 @@ def _desired_battery_discharge_cap_w(
     cfg: SensorConfig,
     live: LiveState,
     rec: HourlyRecommendation,
+    now: datetime,
     current_required_battery_kwh: float,
     max_discharge_power_w: int,
 ) -> tuple[int, str]:
@@ -229,12 +243,13 @@ def _desired_battery_discharge_cap_w(
 
     if recommendation == Recommendations.ForceBatteriesDischarge.value:
         slot_hours = slot_duration_hours(rec.start, rec.end)
+        remaining_slot_hours = hours_ahead(now, rec.end)
         cap_w = _fully_fed_discharge_cap_w(
             planned_discharge_kwh=rec.batteries_discharged_kwh,
             slot_hours=slot_hours,
+            remaining_slot_hours=remaining_slot_hours,
             battery_capacity_kwh=live.battery_current_capacity_kwh,
             planned_end_capacity_kwh=rec.estimated_battery_capacity_kwh,
-            required_capacity_kwh=current_required_battery_kwh,
             max_discharge_power_w=max_discharge_power_w,
         )
         return (
@@ -243,7 +258,7 @@ def _desired_battery_discharge_cap_w(
             f"(planned={rec.batteries_discharged_kwh:.3f} kWh, "
             f"slot={slot_hours:.3f} h, live={live.battery_current_capacity_kwh:.3f} "
             f"kWh, planned_end={rec.estimated_battery_capacity_kwh:.3f} kWh, "
-            f"required={current_required_battery_kwh:.3f} kWh)",
+            f"remaining={remaining_slot_hours:.3f} h)",
         )
 
     if recommendation == Recommendations.ForceExport.value:
@@ -478,6 +493,8 @@ async def async_apply_battery_settings(
     rec: HourlyRecommendation,
     current_required_battery_kwh: float,
     grid_charge_power_limit_w: float | None = None,
+    *,
+    now: datetime | None = None,
 ) -> CycleApplySummary:
     """Apply the working mode, TOU periods, and discharge power to the battery pack.
 
@@ -495,11 +512,14 @@ async def async_apply_battery_settings(
         cfg: Current sensor configuration.
         live: Live state snapshot.
         rec: The current-interval recommendation.
-        current_required_battery_kwh: Planner reserve in usable kWh. Fully
-            Fed export and EV discharge caps may not consume this reserve.
+        current_required_battery_kwh: Planner reserve in usable kWh. Used by
+            wait-mode and EV reserve protection; the selected slot end capacity
+            is authoritative for Fully Fed planned export.
         grid_charge_power_limit_w: Optional phase-safe Huawei battery charge
-            power command in Watts.  Applied before enabling forced grid
-            charging.  ``None`` retains the legacy hardware behavior.
+            power command in Watts. Applied before enabling forced grid
+            charging. ``None`` retains the legacy hardware behavior.
+        now: Optional timezone-aware application time for deterministic tests.
+            Defaults to Home Assistant's current local time.
 
     Returns:
         :class:`CycleApplySummary` with one :class:`ApplyResult` per write
@@ -626,6 +646,7 @@ async def async_apply_battery_settings(
         cfg=cfg,
         live=live,
         rec=rec,
+        now=now or dt_util.now(),
         current_required_battery_kwh=current_required_battery_kwh,
         max_discharge_power_w=max_discharge_power,
     )

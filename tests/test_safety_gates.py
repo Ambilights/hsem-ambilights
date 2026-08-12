@@ -547,7 +547,9 @@ class TestFullyFedBatteryExportControl:
                 new_callable=AsyncMock,
             ) as stop_force,
         ):
-            summary = await async_apply_battery_settings(sensor, cfg, live, rec, 10.0)
+            summary = await async_apply_battery_settings(
+                sensor, cfg, live, rec, 20.0, now=rec.start
+            )
 
         writes = [
             (call.kwargs["entity_id"], call.kwargs["desired"])
@@ -561,6 +563,34 @@ class TestFullyFedBatteryExportControl:
         stop_force.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_repeated_callback_does_not_ratchet_planned_cap(self):
+        """Proportional live energy/time changes keep the same command."""
+        sensor = _make_sensor()
+        cfg = self._cfg()
+        live = self._live()
+        live.huawei_batteries_working_mode = "fully_fed_to_grid"
+        live.huawei_batteries_max_discharge_power_w = 1800.0
+        live.battery_current_capacity_kwh = 19.91
+        rec = _make_planned_rec("force_batteries_discharge")
+
+        with patch(
+            "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+            new_callable=AsyncMock,
+            side_effect=_ok_apply_result,
+        ) as verifier:
+            summary = await async_apply_battery_settings(
+                sensor,
+                cfg,
+                live,
+                rec,
+                20.0,
+                now=rec.start + timedelta(minutes=3),
+            )
+
+        verifier.assert_not_awaited()
+        assert summary.overall_status == ApplyStatus.SKIPPED
+
+    @pytest.mark.asyncio
     async def test_pv_only_force_export_uses_zero_battery_cap(self):
         sensor = _make_sensor()
         cfg = self._cfg()
@@ -572,7 +602,9 @@ class TestFullyFedBatteryExportControl:
             new_callable=AsyncMock,
             side_effect=_ok_apply_result,
         ) as verifier:
-            await async_apply_battery_settings(sensor, cfg, live, rec, 10.0)
+            await async_apply_battery_settings(
+                sensor, cfg, live, rec, 20.0, now=rec.start
+            )
 
         assert [call.kwargs["desired"] for call in verifier.await_args_list] == [
             0,
@@ -592,7 +624,9 @@ class TestFullyFedBatteryExportControl:
             new_callable=AsyncMock,
             side_effect=_ok_apply_result,
         ) as verifier:
-            await async_apply_battery_settings(sensor, cfg, live, rec, 10.0)
+            await async_apply_battery_settings(
+                sensor, cfg, live, rec, 20.0, now=rec.start
+            )
 
         assert [call.kwargs["desired"] for call in verifier.await_args_list] == [
             0,
@@ -614,7 +648,9 @@ class TestFullyFedBatteryExportControl:
             new_callable=AsyncMock,
             side_effect=_ok_apply_result,
         ) as verifier:
-            await async_apply_battery_settings(sensor, cfg, live, rec, 10.0)
+            await async_apply_battery_settings(
+                sensor, cfg, live, rec, 20.0, now=rec.start
+            )
 
         assert [call.kwargs["desired"] for call in verifier.await_args_list] == [
             0,
@@ -645,7 +681,9 @@ class TestFullyFedBatteryExportControl:
             new_callable=AsyncMock,
             return_value=failed,
         ) as verifier:
-            summary = await async_apply_battery_settings(sensor, cfg, live, rec, 10.0)
+            summary = await async_apply_battery_settings(
+                sensor, cfg, live, rec, 20.0, now=rec.start
+            )
 
         assert verifier.await_count == 1
         assert verifier.await_args is not None
@@ -683,7 +721,9 @@ class TestFullyFedBatteryExportControl:
                 new_callable=AsyncMock,
             ),
         ):
-            await async_apply_battery_settings(sensor, cfg, live, rec, 10.0)
+            await async_apply_battery_settings(
+                sensor, cfg, live, rec, 20.0, now=rec.start
+            )
 
         stop_force.assert_awaited_once_with(sensor, "battery_device")
         assert verifier.await_args_list[0].kwargs["desired"] == pytest.approx(0.0)
