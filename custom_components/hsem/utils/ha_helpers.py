@@ -15,6 +15,7 @@ from homeassistant.exceptions import (
     ServiceValidationError,
 )
 from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers.entity import entity_sources
 
 from custom_components.hsem.const import DOMAIN
 from custom_components.hsem.utils.conversion import (
@@ -22,13 +23,39 @@ from custom_components.hsem.utils.conversion import (
     convert_to_float,
     convert_to_int,
 )
+from custom_components.hsem.utils.inverter_verify import NonRetryableWriteError
 from custom_components.hsem.utils.logger import HSEM_LOGGER as _LOGGER
 
 _entity_id_from_unique_id_cache: dict[tuple[str, str, str], str] = {}
 
 
-class EntityNotFoundError(HomeAssistantError):
+class EntityNotFoundError(HomeAssistantError, NonRetryableWriteError):
     """Exception raised when an entity is not found."""
+
+
+def entity_service_target_available(hass: Any, entity_id: str) -> bool:
+    """Return whether an entity is live and registered for service dispatch.
+
+    Home Assistant may retain a restored state after an integration unloads.
+    Such a state is readable but cannot receive ``number`` or ``select``
+    service calls. ``entity_sources`` tracks only entities currently attached
+    to an active platform and is therefore the authoritative service-target
+    check.
+    """
+    state = hass.states.get(entity_id)
+    if state is None or state.state in {STATE_UNKNOWN, STATE_UNAVAILABLE}:
+        return False
+    return entity_id in entity_sources(hass)
+
+
+def _require_active_service_target(hass: Any, entity_id: str) -> None:
+    """Raise when an entity cannot currently receive a platform service call."""
+    if entity_service_target_available(hass, entity_id):
+        return
+    _LOGGER.warning("Hardware write blocked — target unavailable: %s", entity_id)
+    raise EntityNotFoundError(
+        f"Entity '{entity_id}' is unavailable or not attached to an active platform."
+    )
 
 
 async def async_resolve_entity_id_from_unique_id(  # NOSONAR
@@ -96,11 +123,7 @@ async def async_set_number_value(self: Any, entity_id: str, value: float | int) 
         ServiceNotFound: If the ``number.set_value`` service is not registered.
         HomeAssistantError: On any other HA-level write failure.
     """
-    entity = self.hass.states.get(entity_id)
-
-    if entity is None:
-        _LOGGER.error("Entity with id %s not found", entity_id)
-        return
+    _require_active_service_target(self.hass, entity_id)
 
     try:
         await self.hass.services.async_call(
@@ -135,12 +158,7 @@ async def async_set_select_option(self: Any, entity_id: str, option: str) -> Non
         HomeAssistantError: On any other HA-level write failure.
     """
 
-    # Check if entity_id exists
-    entity = self.hass.states.get(entity_id)
-
-    if entity is None:
-        _LOGGER.error("Entity with id %s not found", entity_id)
-        return  # Exit the method if entity_id does not exist
+    _require_active_service_target(self.hass, entity_id)
 
     try:
         # Make the service call to set the option
@@ -195,29 +213,24 @@ def ha_get_entity_state_and_convert(
     state = self.hass.states.get(entity_id)
 
     try:
-        if output_type is None:
-            if state.state == STATE_UNKNOWN:
-                raise EntityNotFoundError(f"Entity '{entity_id}' state unknown.")
+        if state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+            if output_type is None:
+                raise EntityNotFoundError(f"Entity '{entity_id}' state {state.state}.")
+            return None
 
+        if output_type is None:
             return cast("float | int | bool | str | None", state)
 
         if output_type.lower() == "float":
-            if state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
-                return None
             value = convert_to_float(state.state)
             if value is None:
                 return None
             return cast(float, round(value, float_precision))
 
         if output_type.lower() == "int":
-            if state.state == STATE_UNKNOWN:
-                raise EntityNotFoundError(f"Entity '{entity_id}' state unknown.")
             return convert_to_int(state.state)
 
         if output_type.lower() == "boolean":
-            if state.state == STATE_UNKNOWN:
-                raise EntityNotFoundError(f"Entity '{entity_id}' state unknown.")
-
             return convert_to_boolean(state.state)
 
         if output_type.lower() == "string":

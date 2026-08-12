@@ -25,6 +25,7 @@ from custom_components.hsem.utils.inverter_verify import (
     ApplyStatus,
     CycleApplySummary,
     async_write_and_verify,
+    get_write_failure_backoff,
 )
 from custom_components.hsem.utils.logger import HSEM_LOGGER as _LOGGER
 from custom_components.hsem.utils.phase_power import (
@@ -190,12 +191,9 @@ async def async_apply_secondary_storage(
             desired=operation.desired,
             writer=partial(_execute_write, sensor, operation),
             reader=partial(_read_entity, sensor, operation.entity_id, numeric),
+            backoff=get_write_failure_backoff(sensor),
         )
         summary.results.append(result)
         if result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
-            _LOGGER.error(
-                "PowMr write not verified for %s; remaining transition steps blocked",
-                operation.entity_id,
-            )
             break
     return summary

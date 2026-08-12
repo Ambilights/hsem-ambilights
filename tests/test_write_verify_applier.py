@@ -10,7 +10,7 @@ These tests cover:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -18,8 +18,11 @@ from custom_components.hsem.utils.inverter_verify import (
     ApplyResult,
     ApplyStatus,
     CycleApplySummary,
+    NonRetryableWriteError,
+    WriteFailureBackoff,
     _values_match,
     async_write_and_verify,
+    get_write_failure_backoff,
 )
 
 # ---------------------------------------------------------------------------
@@ -489,6 +492,146 @@ class TestWriteAndVerifyFailure:
             max_retries=1,
         )
         assert result.status == ApplyStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# Per-target write failure backoff
+# ---------------------------------------------------------------------------
+
+
+class TestWriteFailureBackoff:
+    """Failed targets cool down without delaying changed safety commands."""
+
+    @pytest.mark.asyncio
+    async def test_second_failed_write_is_suppressed_during_cooldown(self):
+        """A coordinator storm cannot repeatedly call a failed HA target."""
+        now = [100.0]
+        backoff = WriteFailureBackoff(clock=lambda: now[0])
+        writer = AsyncMock()
+
+        with patch("custom_components.hsem.utils.inverter_verify._LOGGER") as logger:
+            first = await async_write_and_verify(
+                entity_id="number.bat",
+                desired=5000,
+                writer=writer,
+                reader=_const_reader(1000),
+                settle_seconds=0,
+                max_retries=1,
+                backoff=backoff,
+            )
+            second = await async_write_and_verify(
+                entity_id="number.bat",
+                desired=5000,
+                writer=writer,
+                reader=_const_reader(1000),
+                settle_seconds=0,
+                max_retries=1,
+                backoff=backoff,
+            )
+
+        assert first.status == ApplyStatus.FAILED
+        assert second.status == ApplyStatus.FAILED
+        assert second.attempts == 0
+        assert "backoff" in second.error_message.lower()
+        assert writer.await_count == 1
+        logger.error.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_retry_resumes_after_cooldown(self):
+        """The same target is retried when its scheduled cooldown expires."""
+        now = [100.0]
+        backoff = WriteFailureBackoff(clock=lambda: now[0])
+        writer = AsyncMock()
+
+        await async_write_and_verify(
+            entity_id="select.mode",
+            desired="TimeOfUse",
+            writer=writer,
+            reader=_const_reader("Other"),
+            settle_seconds=0,
+            max_retries=1,
+            backoff=backoff,
+        )
+        now[0] += 30.0
+        result = await async_write_and_verify(
+            entity_id="select.mode",
+            desired="TimeOfUse",
+            writer=writer,
+            reader=_const_reader("Other"),
+            settle_seconds=0,
+            max_retries=1,
+            backoff=backoff,
+        )
+
+        assert result.attempts == 1
+        assert writer.await_count == 2
+        assert backoff.remaining_seconds("select.mode", "TimeOfUse") == pytest.approx(
+            60.0
+        )
+
+    @pytest.mark.asyncio
+    async def test_changed_desired_value_bypasses_cooldown(self):
+        """A new safety intent is attempted immediately after an old failure."""
+        backoff = WriteFailureBackoff()
+        writer = AsyncMock()
+
+        await async_write_and_verify(
+            entity_id="select.mode",
+            desired="TimeOfUse",
+            writer=writer,
+            reader=_const_reader("Other"),
+            settle_seconds=0,
+            max_retries=1,
+            backoff=backoff,
+        )
+        result = await async_write_and_verify(
+            entity_id="select.mode",
+            desired="MaximizeSelfConsumption",
+            writer=writer,
+            reader=_const_reader("Other"),
+            settle_seconds=0,
+            max_retries=1,
+            backoff=backoff,
+        )
+
+        assert result.attempts == 1
+        assert writer.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_non_retryable_target_failure_enters_backoff_immediately(self):
+        """A missing HA entity is attempted once, not three times per cycle."""
+        backoff = WriteFailureBackoff()
+        writer = AsyncMock(side_effect=NonRetryableWriteError("inactive target"))
+
+        result = await async_write_and_verify(
+            entity_id="number.bat",
+            desired=5000,
+            writer=writer,
+            reader=_const_reader(1000),
+            settle_seconds=0,
+            max_retries=3,
+            backoff=backoff,
+        )
+
+        assert result.status == ApplyStatus.FAILED
+        assert result.attempts == 1
+        assert writer.await_count == 1
+        assert backoff.remaining_seconds("number.bat", 5000) > 0
+
+    def test_exponential_delay_is_capped(self):
+        """Repeated failures use 30, 60, 120, 240, then 300 seconds."""
+        now = [0.0]
+        backoff = WriteFailureBackoff(clock=lambda: now[0])
+        delays = []
+        for _ in range(6):
+            delays.append(backoff.record_failure("number.bat", 5000))
+            now[0] += delays[-1]
+
+        assert delays == pytest.approx([30.0, 60.0, 120.0, 240.0, 300.0, 300.0])
+
+    def test_loose_mock_is_not_treated_as_backoff(self):
+        """Legacy MagicMock sensors do not accidentally activate cooldowns."""
+        assert get_write_failure_backoff(MagicMock()) is None
 
 
 # ---------------------------------------------------------------------------

@@ -628,9 +628,17 @@ class TestMockServiceCalls:
         sensor_stub = MagicMock()
         sensor_stub.hass = hass
 
-        with patch.object(
-            hass.services, "async_call", new_callable=AsyncMock
-        ) as mock_call:
+        with (
+            patch.object(
+                hass.services,
+                "async_call",
+                new_callable=AsyncMock,
+            ) as mock_call,
+            patch(
+                "custom_components.hsem.utils.ha_helpers.entity_service_target_available",
+                return_value=True,
+            ),
+        ):
             await async_set_select_option(
                 sensor_stub,
                 "select.batteries_working_mode",
@@ -648,9 +656,17 @@ class TestMockServiceCalls:
         sensor_stub = MagicMock()
         sensor_stub.hass = hass
 
-        with patch.object(
-            hass.services, "async_call", new_callable=AsyncMock
-        ) as mock_call:
+        with (
+            patch.object(
+                hass.services,
+                "async_call",
+                new_callable=AsyncMock,
+            ) as mock_call,
+            patch(
+                "custom_components.hsem.utils.ha_helpers.entity_service_target_available",
+                return_value=True,
+            ),
+        ):
             await async_set_number_value(
                 sensor_stub,
                 "number.batteries_maximum_charging_power",
@@ -807,7 +823,7 @@ class TestDryRunCycle:
 
     @pytest.mark.asyncio
     async def test_missing_critical_entity_triggers_degraded_mode(self) -> None:
-        """When battery SoC is unavailable, degraded must be Degraded (Error requires entity not found)."""
+        """An unavailable battery SoC is critical and must block writes."""
         states = dict(_BASE_ENTITY_STATES)
         states["sensor.batteries_state_of_capacity"] = "unavailable"
 
@@ -825,7 +841,7 @@ class TestDryRunCycle:
         live = captured[0].live
         assert live is not None
         assert live.missing_entities is True
-        assert live.degraded_mode == DegradedMode.Degraded
+        assert live.degraded_mode == DegradedMode.Error
 
     @pytest.mark.asyncio
     async def test_missing_price_entity_triggers_degraded_mode(self) -> None:

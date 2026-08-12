@@ -522,7 +522,10 @@ class TestWorkingModeSensorTopLevelGate:
         )
 
         with (
-            patch(_LOGGER_PATCH, new_callable=MagicMock),
+            patch(
+                "custom_components.hsem.custom_sensors.working_mode_sensor._LOGGER",
+                new_callable=MagicMock,
+            ) as mock_logger,
             patch(
                 "custom_components.hsem.custom_sensors.working_mode_sensor.async_apply_inverter_power_control",
                 new_callable=AsyncMock,
@@ -540,9 +543,11 @@ class TestWorkingModeSensorTopLevelGate:
             sensor.hass = MagicMock()
 
             await HSEMWorkingModeSensor._async_apply_hardware_writes(sensor, data)
+            await HSEMWorkingModeSensor._async_apply_hardware_writes(sensor, data)
 
         mock_inv.assert_not_called()
         mock_bat.assert_not_called()
+        mock_logger.warning.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_degraded_mode_calls_inverter_applier(self):
