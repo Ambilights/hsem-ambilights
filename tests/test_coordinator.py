@@ -29,16 +29,25 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from custom_components.hsem.coordinator import (
     CoordinatorData,
     HSEMDataUpdateCoordinator,
+    _force_discharge_live_metrics,
+    _select_corrective_planner_output,
 )
 from custom_components.hsem.coordinator_builder import generate_recommendation_intervals
+from custom_components.hsem.models.live_state import LiveState
+from custom_components.hsem.models.plan_explanation import PlanExplanation
+from custom_components.hsem.models.planned_slot import PlannedSlot
+from custom_components.hsem.models.planner_output import PlannerOutput
+from custom_components.hsem.utils.recommendations import Recommendations
 
 # ---------------------------------------------------------------------------
 # Helper: build a bare coordinator instance without calling __init__
@@ -57,6 +66,7 @@ def _make_bare_coordinator() -> HSEMDataUpdateCoordinator:
     coord._update_lock = asyncio.Lock()
     coord._interval_timer_unsub = None
     coord._hourly_timer_unsub = None
+    coord._force_discharge_monitor_unsub = None
     coord._listener_unsubs = []
     coord._timer_interval = None
     coord._next_update = None
@@ -70,6 +80,12 @@ def _make_bare_coordinator() -> HSEMDataUpdateCoordinator:
     coord._cfg = cfg
     coord._options_update_task = None
     coord._options_update_debounce_task = None
+    coord._last_planner_output = None
+    coord._live = None
+    coord._force_discharge_excess_since = None
+    coord._force_discharge_excess_slot_start = None
+    coord._force_discharge_replanned_slot_start = None
+    coord._force_discharge_live_replan_pending_slot = None
     return coord
 
 
@@ -134,6 +150,7 @@ class TestCoordinatorConstruction:
         coord = _make_bare_coordinator()
         assert coord._interval_timer_unsub is None
         assert coord._hourly_timer_unsub is None
+        assert coord._force_discharge_monitor_unsub is None
 
 
 # ---------------------------------------------------------------------------
@@ -207,20 +224,24 @@ class TestCoordinatorTeardown:
 
     @pytest.mark.asyncio
     async def test_teardown_cancels_timers(self) -> None:
-        """async_teardown must call the unsub callables for both timers."""
+        """async_teardown must call every timer unsubscribe callback."""
         coordinator = _make_bare_coordinator()
 
         interval_unsub = MagicMock()
         hourly_unsub = MagicMock()
+        monitor_unsub = MagicMock()
         coordinator._interval_timer_unsub = interval_unsub
         coordinator._hourly_timer_unsub = hourly_unsub
+        coordinator._force_discharge_monitor_unsub = monitor_unsub
 
         await coordinator.async_teardown()
 
         interval_unsub.assert_called_once()
         hourly_unsub.assert_called_once()
+        monitor_unsub.assert_called_once()
         assert coordinator._interval_timer_unsub is None
         assert coordinator._hourly_timer_unsub is None
+        assert coordinator._force_discharge_monitor_unsub is None
 
     @pytest.mark.asyncio
     async def test_teardown_safe_when_no_timers(self) -> None:
@@ -367,6 +388,349 @@ class TestOptionsUpdateBackgroundTask:
 
         assert task.cancelling() or task.cancelled() or task.done()
         assert coordinator._options_update_task is None
+
+
+# ---------------------------------------------------------------------------
+# Forced-discharge live-demand corrective replan
+# ---------------------------------------------------------------------------
+
+
+def _force_discharge_slot(start: datetime) -> PlannedSlot:
+    """Build a 15-minute forced-discharge slot with 1 kW battery-side power."""
+    return PlannedSlot(
+        start=start,
+        end=start + timedelta(minutes=15),
+        recommendation=Recommendations.ForceBatteriesDischarge.value,
+        batteries_discharged_kwh=0.25,
+    )
+
+
+def _configure_force_discharge_monitor(
+    coordinator: HSEMDataUpdateCoordinator, slot: PlannedSlot
+) -> tuple[dict[str, SimpleNamespace], MagicMock]:
+    """Populate the minimal coordinator/live/HA state used by monitor tests."""
+    coordinator._last_planner_output = SimpleNamespace(slots=[slot])  # type: ignore[assignment]
+    coordinator._live = LiveState(missing_entities=False)
+    coordinator._cfg.house_consumption_power = "sensor.house"
+    coordinator._cfg.solar_production_power = "sensor.solar"
+    coordinator._cfg.house_power_includes_ev_charger_power = False
+    coordinator._cfg.batteries_discharge_efficiency = 98.0
+    states = {
+        "sensor.house": SimpleNamespace(state="2200"),
+        "sensor.solar": SimpleNamespace(state="100"),
+    }
+    coordinator.hass = MagicMock()
+    state_get = MagicMock(side_effect=states.get)
+    coordinator.hass.states.get = state_get
+    return states, state_get
+
+
+class TestForceDischargeLiveDemandMonitor:
+    """Validate the lightweight, debounced once-per-slot corrective trigger."""
+
+    def test_metrics_compare_ac_side_power_and_use_hybrid_threshold(self) -> None:
+        """Battery-side slot energy is efficiency-adjusted before comparison."""
+        start = datetime(2026, 8, 13, 20, 0, tzinfo=UTC)
+        metrics = _force_discharge_live_metrics(
+            _force_discharge_slot(start),
+            discharge_efficiency_pct=98.0,
+            house_power_w=2200.0,
+            solar_power_w=100.0,
+        )
+
+        assert metrics is not None
+        planned_ac_w, live_residual_w, threshold_w, excess_w = metrics
+        assert planned_ac_w == pytest.approx(980.0)
+        assert live_residual_w == pytest.approx(2100.0)
+        assert threshold_w == pytest.approx(150.0)
+        assert excess_w == pytest.approx(1120.0)
+
+    def test_live_incident_exceeds_threshold_after_efficiency(self) -> None:
+        """The reported 0.358-kWh plan versus 1.59-kW load is material."""
+        start = datetime(2026, 8, 13, 20, 0, tzinfo=UTC)
+        slot = _force_discharge_slot(start)
+        slot.batteries_discharged_kwh = 0.358
+
+        metrics = _force_discharge_live_metrics(
+            slot,
+            discharge_efficiency_pct=98.0,
+            house_power_w=1590.0,
+            solar_power_w=0.0,
+        )
+
+        assert metrics is not None
+        planned_ac_w, live_residual_w, threshold_w, excess_w = metrics
+        assert planned_ac_w == pytest.approx(1403.36)
+        assert live_residual_w == pytest.approx(1590.0)
+        assert threshold_w == pytest.approx(150.0)
+        assert excess_w == pytest.approx(186.64)
+
+    def test_threshold_equality_is_not_material(self) -> None:
+        """The trigger requires excess strictly above the noise threshold."""
+        start = datetime(2026, 8, 13, 20, 0, tzinfo=UTC)
+        metrics = _force_discharge_live_metrics(
+            _force_discharge_slot(start),
+            discharge_efficiency_pct=100.0,
+            house_power_w=1150.0,
+            solar_power_w=0.0,
+        )
+
+        assert metrics is not None
+        assert metrics[2] == pytest.approx(150.0)
+        assert metrics[3] == pytest.approx(150.0)
+
+    @pytest.mark.asyncio
+    async def test_triggers_after_30_seconds_and_only_once_per_slot(self) -> None:
+        """Four 10-second samples trigger one completed corrective attempt."""
+        coordinator = _make_bare_coordinator()
+        start = datetime(2026, 8, 13, 20, 0, tzinfo=UTC)
+        _configure_force_discharge_monitor(coordinator, _force_discharge_slot(start))
+
+        async def _complete_corrective_update(event: Any = None) -> None:
+            coordinator._force_discharge_replanned_slot_start = (
+                coordinator._force_discharge_live_replan_pending_slot
+            )
+            coordinator._force_discharge_live_replan_pending_slot = None
+            coordinator._clear_force_discharge_excess_window()
+
+        coordinator._async_handle_update = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_complete_corrective_update
+        )
+
+        for seconds in (0, 10, 20):
+            await coordinator._async_monitor_force_discharge_load(
+                start + timedelta(seconds=seconds)
+            )
+        coordinator._async_handle_update.assert_not_awaited()  # type: ignore[attr-defined]
+
+        await coordinator._async_monitor_force_discharge_load(
+            start + timedelta(seconds=30)
+        )
+        coordinator._async_handle_update.assert_awaited_once()  # type: ignore[attr-defined]
+        assert coordinator._force_discharge_replanned_slot_start == start
+
+        await coordinator._async_monitor_force_discharge_load(
+            start + timedelta(seconds=40)
+        )
+        coordinator._async_handle_update.assert_awaited_once()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_below_threshold_sample_restarts_debounce(self) -> None:
+        """One normal sample breaks continuity; three later samples are insufficient."""
+        coordinator = _make_bare_coordinator()
+        start = datetime(2026, 8, 13, 20, 0, tzinfo=UTC)
+        (states, _) = _configure_force_discharge_monitor(
+            coordinator, _force_discharge_slot(start)
+        )
+        coordinator._async_handle_update = AsyncMock()  # type: ignore[method-assign]
+
+        await coordinator._async_monitor_force_discharge_load(start)
+        states["sensor.house"].state = "1050"
+        states["sensor.solar"].state = "0"
+        await coordinator._async_monitor_force_discharge_load(
+            start + timedelta(seconds=10)
+        )
+        states["sensor.house"].state = "2200"
+        states["sensor.solar"].state = "100"
+        for seconds in (20, 30, 40):
+            await coordinator._async_monitor_force_discharge_load(
+                start + timedelta(seconds=seconds)
+            )
+
+        coordinator._async_handle_update.assert_not_awaited()  # type: ignore[attr-defined]
+        await coordinator._async_monitor_force_discharge_load(
+            start + timedelta(seconds=50)
+        )
+        coordinator._async_handle_update.assert_awaited_once()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_busy_update_defers_pending_request(self) -> None:
+        """A busy coordinator keeps the request pending for the next monitor tick."""
+        coordinator = _make_bare_coordinator()
+        start = datetime(2026, 8, 13, 20, 0, tzinfo=UTC)
+        _configure_force_discharge_monitor(coordinator, _force_discharge_slot(start))
+        coordinator._async_handle_update = AsyncMock()  # type: ignore[method-assign]
+
+        await coordinator._update_lock.acquire()
+        try:
+            for seconds in (0, 10, 20, 30):
+                await coordinator._async_monitor_force_discharge_load(
+                    start + timedelta(seconds=seconds)
+                )
+        finally:
+            coordinator._update_lock.release()
+
+        coordinator._async_handle_update.assert_not_awaited()  # type: ignore[attr-defined]
+        assert coordinator._force_discharge_live_replan_pending_slot == start
+
+        await coordinator._async_monitor_force_discharge_load(
+            start + timedelta(seconds=40)
+        )
+        coordinator._async_handle_update.assert_awaited_once()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_non_force_slot_never_reads_live_power(self) -> None:
+        """The lightweight timer stays dormant outside forced battery export."""
+        coordinator = _make_bare_coordinator()
+        start = datetime(2026, 8, 13, 20, 0, tzinfo=UTC)
+        slot = _force_discharge_slot(start)
+        slot.recommendation = Recommendations.BatteriesDischargeMode.value
+        _, state_get = _configure_force_discharge_monitor(coordinator, slot)
+        coordinator._async_handle_update = AsyncMock()  # type: ignore[method-assign]
+
+        await coordinator._async_monitor_force_discharge_load(start)
+
+        state_get.assert_not_called()
+        coordinator._async_handle_update.assert_not_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_ev_inclusive_house_meter_fails_closed_while_ev_charges(
+        self,
+    ) -> None:
+        """An EV included in house power cannot trigger a corrective replan."""
+        coordinator = _make_bare_coordinator()
+        start = datetime(2026, 8, 13, 20, 0, tzinfo=UTC)
+        _, state_get = _configure_force_discharge_monitor(
+            coordinator, _force_discharge_slot(start)
+        )
+        coordinator._cfg.house_power_includes_ev_charger_power = True
+        assert coordinator._live is not None
+        coordinator._live.ev.is_charging = True
+        coordinator._async_handle_update = AsyncMock()  # type: ignore[method-assign]
+
+        await coordinator._async_monitor_force_discharge_load(start)
+
+        state_get.assert_not_called()
+        coordinator._async_handle_update.assert_not_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_does_not_start_inside_last_minute(self) -> None:
+        """A correction is skipped when less than 60 seconds remains."""
+        coordinator = _make_bare_coordinator()
+        start = datetime(2026, 8, 13, 20, 0, tzinfo=UTC)
+        _, state_get = _configure_force_discharge_monitor(
+            coordinator, _force_discharge_slot(start)
+        )
+        coordinator._async_handle_update = AsyncMock()  # type: ignore[method-assign]
+
+        await coordinator._async_monitor_force_discharge_load(
+            start + timedelta(minutes=14, seconds=1)
+        )
+
+        state_get.assert_not_called()
+        coordinator._async_handle_update.assert_not_awaited()  # type: ignore[attr-defined]
+
+    def test_pending_request_is_a_material_replan_event(self) -> None:
+        """The pending flag bypasses ordinary event-driven plan reuse."""
+        coordinator = _make_bare_coordinator()
+        start = datetime(2026, 8, 13, 20, 0, tzinfo=UTC)
+        coordinator._last_planner_output = SimpleNamespace(slots=[])  # type: ignore[assignment]
+        coordinator._force_discharge_live_replan_pending_slot = start
+
+        assert coordinator._should_replan(MagicMock(), start) is True
+
+    @pytest.mark.parametrize(
+        "solver_status", ["optimal", "time_limit_feasible_incumbent"]
+    )
+    def test_authoritative_corrective_milp_can_replace_force_with_msc(
+        self, solver_status: str
+    ) -> None:
+        """A validated corrected plan may replace Fully Fed intent with MSC."""
+        start = datetime(2026, 8, 13, 20, 0, tzinfo=UTC)
+        forced = _force_discharge_slot(start)
+        corrected = _force_discharge_slot(start)
+        corrected.recommendation = Recommendations.BatteriesDischargeMode.value
+        corrected.grid_export_kwh = 0.0
+
+        previous = PlannerOutput(slots=[forced], winner_name="milp")
+        candidate = PlannerOutput(
+            slots=[corrected],
+            winner_name="milp",
+            explanation=PlanExplanation(solver_status=solver_status),
+        )
+
+        selected, accepted, rejection = _select_corrective_planner_output(
+            previous, candidate, start
+        )
+
+        assert accepted is True
+        assert rejection == ""
+        assert selected is candidate
+        assert selected.slots[0].recommendation == (
+            Recommendations.BatteriesDischargeMode.value
+        )
+        assert selected.slots[0].grid_export_kwh == 0.0
+
+    def test_corrective_fallback_keeps_previous_force_plan(self) -> None:
+        """A passive fallback cannot replace a previously validated MILP plan."""
+        start = datetime(2026, 8, 13, 20, 0, tzinfo=UTC)
+        previous = PlannerOutput(
+            slots=[_force_discharge_slot(start)], winner_name="milp"
+        )
+        fallback = PlannerOutput(
+            slots=[],
+            winner_name="passive",
+            explanation=PlanExplanation(
+                solver_status="time_limit_no_incumbent",
+                fallback_reason="time_limit_no_incumbent",
+            ),
+        )
+
+        selected, accepted, rejection = _select_corrective_planner_output(
+            previous, fallback, start
+        )
+
+        assert accepted is False
+        assert rejection == "winner_not_milp"
+        assert selected is previous
+
+    def test_corrective_partial_msc_is_accepted_for_bounded_execution(self) -> None:
+        """A partial MSC plan is safe once the applier enforces its energy cap."""
+        start = datetime(2026, 8, 13, 20, 0, tzinfo=UTC)
+        previous = PlannerOutput(
+            slots=[_force_discharge_slot(start)], winner_name="milp"
+        )
+        partial = _force_discharge_slot(start)
+        partial.recommendation = Recommendations.BatteriesDischargeMode.value
+        partial.batteries_discharged_kwh = 0.25
+        partial.grid_import_kwh = 0.10
+        candidate = PlannerOutput(
+            slots=[partial],
+            winner_name="milp",
+            explanation=PlanExplanation(solver_status="optimal"),
+        )
+
+        selected, accepted, rejection = _select_corrective_planner_output(
+            previous, candidate, start
+        )
+
+        assert accepted is True
+        assert rejection == ""
+        assert selected is candidate
+
+    def test_corrective_cycle_bypasses_both_hysteresis_layers(self) -> None:
+        """Candidate and current-window hysteresis cannot restore stale intent."""
+        source = inspect.getsource(HSEMDataUpdateCoordinator._async_run_update_cycle)
+        assert (
+            "if corrective_live_replan\n                            else self._previous_planner_winner_name"
+            in source
+        )
+        assert (
+            "if corrective_live_replan\n                            else self._window_hys_previous_rec"
+            in source
+        )
+        assert (
+            "if corrective_live_replan\n                            else self._window_hys_previous_slot_start"
+            in source
+        )
+
+    def test_attempt_is_consumed_only_after_planner_returns(self) -> None:
+        """A failed cycle cannot consume the request before publication."""
+        source = inspect.getsource(HSEMDataUpdateCoordinator._async_run_update_cycle)
+        planner_call = source.index("run_planner, planner_input")
+        publication = source.index("self.async_set_updated_data(data)")
+        completed_marker = source.index("self._force_discharge_replanned_slot_start =")
+        assert planner_call < publication < completed_marker
 
 
 # ---------------------------------------------------------------------------

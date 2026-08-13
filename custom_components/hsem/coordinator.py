@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, override
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import (
     async_track_time_change,
     async_track_time_interval,
@@ -74,6 +75,7 @@ from custom_components.hsem.models.financial_tracker import FinancialTracker
 from custom_components.hsem.models.hourly_recommendation import HourlyRecommendation
 from custom_components.hsem.models.live_state import LiveState
 from custom_components.hsem.models.plan_explanation import PlanExplanation
+from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.planner_input import PlannerInput
 from custom_components.hsem.models.planner_output import PlannerOutput
 from custom_components.hsem.models.savings_tracker import SavingsTracker
@@ -95,20 +97,28 @@ from custom_components.hsem.utils.forecast_tracker import (
     ForecastTracker,
     compute_accumulated_energy,
 )
+from custom_components.hsem.utils.ha_helpers import ha_get_entity_state_and_convert
 from custom_components.hsem.utils.inverter_verify import CycleApplySummary
 from custom_components.hsem.utils.logger import (
     HSEM_LOGGER as _LOGGER,
     async_log,
     set_hsem_verbose,
 )
-from custom_components.hsem.utils.misc import ema_filter, get_config_value
+from custom_components.hsem.utils.misc import (
+    clamp_efficiency,
+    ema_filter,
+    get_config_value,
+)
 from custom_components.hsem.utils.prediction_tracker import (
     PredictionTracker,
     _action_label,
 )
 from custom_components.hsem.utils.recommendations import Recommendations
 from custom_components.hsem.utils.solar_corrector import SolarForecastCorrector
-from custom_components.hsem.utils.units import usable_kwh_from_rated
+from custom_components.hsem.utils.units import (
+    slot_duration_hours,
+    usable_kwh_from_rated,
+)
 from custom_components.hsem.utils.weekday_profile import weekday_profile
 
 if TYPE_CHECKING:
@@ -119,6 +129,92 @@ if TYPE_CHECKING:
 # run.  Rapid switch/number/time toggles restart this timer, so the planner
 # only rebuilds once after the user stops clicking.
 OPTIONS_UPDATE_DEBOUNCE_SECONDS = 0.25
+
+# Lightweight live-demand monitor for an active forced-discharge slot.  It is
+# deliberately separate from the normal coordinator interval: only two HA
+# states are read on each tick, and the expensive collection/planner pipeline
+# runs only after a material excess has persisted for the debounce period.
+FORCE_DISCHARGE_MONITOR_INTERVAL_SECONDS = 10
+FORCE_DISCHARGE_EXCESS_DEBOUNCE_SECONDS = 30
+FORCE_DISCHARGE_EXCESS_MIN_W = 150.0
+FORCE_DISCHARGE_EXCESS_RELATIVE = 0.10
+FORCE_DISCHARGE_REPLAN_MIN_REMAINING_SECONDS = 60
+CORRECTIVE_MILP_SOLVER_STATUSES = frozenset(
+    {"optimal", "time_limit_feasible_incumbent"}
+)
+
+
+def _force_discharge_live_metrics(
+    slot: PlannedSlot,
+    *,
+    discharge_efficiency_pct: float,
+    house_power_w: float,
+    solar_power_w: float,
+) -> tuple[float, float, float, float] | None:
+    """Return planned delivery, live residual, threshold, and excess in watts.
+
+    ``batteries_discharged_kwh`` is battery-side energy.  The live comparison
+    is AC-side house demand after PV, so the planned delivery is multiplied by
+    discharge efficiency before conversion to average slot power.
+    """
+    duration_h = slot_duration_hours(slot.start, slot.end)
+    discharged_kwh = max(float(slot.batteries_discharged_kwh), 0.0)
+    if duration_h <= 0.0 or discharged_kwh <= 1e-9:
+        return None
+
+    planned_ac_w = (
+        discharged_kwh
+        * clamp_efficiency(discharge_efficiency_pct)
+        / duration_h
+        * 1000.0
+    )
+    live_residual_w = max(house_power_w - solar_power_w, 0.0)
+    threshold_w = max(
+        FORCE_DISCHARGE_EXCESS_MIN_W,
+        FORCE_DISCHARGE_EXCESS_RELATIVE * planned_ac_w,
+    )
+    excess_w = live_residual_w - planned_ac_w
+    return planned_ac_w, live_residual_w, threshold_w, excess_w
+
+
+def _corrective_output_rejection_reason(
+    output: PlannerOutput,
+    slot_start: datetime,
+) -> str:
+    """Return why a live-demand candidate must not replace the active plan."""
+    if output.winner_name != "milp":
+        return "winner_not_milp"
+    if output.explanation.solver_status not in CORRECTIVE_MILP_SOLVER_STATUSES:
+        return f"solver_{output.explanation.solver_status}"
+    if output.explanation.fallback_reason:
+        return f"fallback_{output.explanation.fallback_reason}"
+
+    slot = next(
+        (item for item in output.slots if utc_key(item.start) == utc_key(slot_start)),
+        None,
+    )
+    if slot is None:
+        return "active_slot_missing"
+
+    if slot.recommendation == Recommendations.BatteriesDischargeMode.value:
+        # Only switch Force -> MSC when the solved current slot allocates real
+        # battery discharge. A partial allocation that intentionally retains
+        # grid import is executable because the applier caps MSC to the solved
+        # discharge energy; a zero-discharge label is not executable intent.
+        if slot.batteries_discharged_kwh <= 1e-9:
+            return "msc_without_planned_discharge"
+    return ""
+
+
+def _select_corrective_planner_output(
+    previous: PlannerOutput,
+    candidate: PlannerOutput,
+    slot_start: datetime,
+) -> tuple[PlannerOutput, bool, str]:
+    """Keep the prior plan unless the corrective candidate is authoritative."""
+    rejection_reason = _corrective_output_rejection_reason(candidate, slot_start)
+    accepted = not rejection_reason
+    return (candidate if accepted else previous), accepted, rejection_reason
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +459,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         # Timer handles — cancelled/re-registered when the interval changes.
         self._interval_timer_unsub: Callable[[], None] | None = None
         self._hourly_timer_unsub: Callable[[], None] | None = None
+        self._force_discharge_monitor_unsub: Callable[[], None] | None = None
         self._timer_interval: timedelta | None = None
 
         # Per-cycle mutable state (not exposed directly; packaged into CoordinatorData).
@@ -444,6 +541,17 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._last_plan_secondary_soc_pct: float | None = None
         self._last_plan_secondary_load_power_w: float | None = None
         self._last_plan_secondary_output_priority: str | None = None
+
+        # A 10-second lightweight monitor can request one corrective replan in
+        # an active force-discharge slot when live residual house demand stays
+        # materially above the slot's planned AC battery delivery for 30 s.
+        # The completed-slot marker is written only after the corrected
+        # coordinator snapshot is published, so a busy coordinator or failed
+        # update cannot consume the slot's one permitted attempt.
+        self._force_discharge_excess_since: datetime | None = None
+        self._force_discharge_excess_slot_start: datetime | None = None
+        self._force_discharge_replanned_slot_start: datetime | None = None
+        self._force_discharge_live_replan_pending_slot: datetime | None = None
 
         # Solar forecast accuracy auto-corrector (issue #602).
         self._solar_corrector: SolarForecastCorrector = SolarForecastCorrector()
@@ -552,6 +660,11 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             minute=0,
             second=10,
         )
+        self._force_discharge_monitor_unsub = async_track_time_interval(
+            self.hass,
+            self._async_monitor_force_discharge_load,
+            timedelta(seconds=FORCE_DISCHARGE_MONITOR_INTERVAL_SECONDS),
+        )
 
     async def async_teardown(self) -> None:
         """Cancel all registered timers and state-change listeners.
@@ -570,6 +683,9 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         if self._interval_timer_unsub is not None:
             self._interval_timer_unsub()
             self._interval_timer_unsub = None
+        if self._force_discharge_monitor_unsub is not None:
+            self._force_discharge_monitor_unsub()
+            self._force_discharge_monitor_unsub = None
         for unsub in self._listener_unsubs:
             unsub()
         self._listener_unsubs.clear()
@@ -688,6 +804,12 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         """
         async_log("debug", "------ HSEM Coordinator: starting update cycle")
         now = hsem_now()
+        corrective_live_replan = False
+        corrective_request_slot: datetime | None = None
+        corrective_output_accepted = False
+        corrective_rejection_reason = ""
+        corrective_candidate_winner = ""
+        corrective_candidate_solver = "not_run"
 
         try:
             # 1. Reload config from the config entry.
@@ -1027,6 +1149,25 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                     ) / 1000.0
 
                 # Determine whether a full re-plan is needed.
+                pending_force_slot = self._force_discharge_live_replan_pending_slot
+                active_force_slot = self._active_force_discharge_slot(now)
+                corrective_live_replan = (
+                    pending_force_slot is not None
+                    and active_force_slot is not None
+                    and active_force_slot.start == pending_force_slot
+                    and (as_tz(active_force_slot.end, now.tzinfo) - now).total_seconds()
+                    >= FORCE_DISCHARGE_REPLAN_MIN_REMAINING_SECONDS
+                    and not live.missing_entities
+                    and not (
+                        cfg.house_power_includes_ev_charger_power
+                        and live.any_ev_charging
+                    )
+                )
+                if corrective_live_replan:
+                    corrective_request_slot = pending_force_slot
+                if pending_force_slot is not None and not corrective_live_replan:
+                    self._force_discharge_live_replan_pending_slot = None
+                    self._clear_force_discharge_excess_window()
                 should_replan = self._should_replan(live, now)
 
                 if should_replan:
@@ -1035,8 +1176,16 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                         live=self._live,
                         hourly_recommendations=self._hourly_recommendations,
                         batteries_schedules=self._batteries_schedules,
-                        previous_winner_name=self._previous_planner_winner_name,
-                        previous_winner_score=self._previous_planner_winner_score,
+                        previous_winner_name=(
+                            None
+                            if corrective_live_replan
+                            else self._previous_planner_winner_name
+                        ),
+                        previous_winner_score=(
+                            0.0
+                            if corrective_live_replan
+                            else self._previous_planner_winner_score
+                        ),
                         ev_session_kw=ev_session_kw if ev_session_kw else None,
                         dynamic_discharge_floor_pct=_dynamic_floor_pct,
                         capacity_learner=getattr(
@@ -1073,14 +1222,53 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                     # Run the planner in HA's executor pool.  The MILP/ML
                     # solver is CPU-bound; running it in the event-loop
                     # thread blocks the HA UI for the full solve duration.
-                    planner_output = await self.hass.async_add_executor_job(
+                    candidate_planner_output = await self.hass.async_add_executor_job(
                         run_planner, planner_input
                     )
-                    self._last_planner_output = planner_output
+                    if corrective_live_replan:
+                        corrective_candidate_winner = (
+                            candidate_planner_output.winner_name
+                        )
+                        corrective_candidate_solver = (
+                            candidate_planner_output.explanation.solver_status
+                        )
+                        assert self._last_planner_output is not None
+                        assert corrective_request_slot is not None
+                        (
+                            planner_output,
+                            corrective_output_accepted,
+                            corrective_rejection_reason,
+                        ) = _select_corrective_planner_output(
+                            self._last_planner_output,
+                            candidate_planner_output,
+                            corrective_request_slot,
+                        )
+                        if not corrective_output_accepted:
+                            # A passive/no-action fallback is not an economic
+                            # correction. Keep executing the last validated
+                            # plan and consume this slot's attempt only after
+                            # the retained plan is successfully republished.
+                            async_log(
+                                "warning",
+                                "[replan] Live-demand corrective solve did not "
+                                "produce an authoritative MILP plan "
+                                "(winner=%s solver=%s fallback=%s rejection=%s); "
+                                "retaining "
+                                "the previous plan for this slot.",
+                                corrective_candidate_winner or "(none)",
+                                corrective_candidate_solver,
+                                candidate_planner_output.explanation.fallback_reason
+                                or "(none)",
+                                corrective_rejection_reason,
+                            )
+                    else:
+                        planner_output = candidate_planner_output
+                        self._last_planner_output = planner_output
 
                     # Record the time this plan was created so the slot-boundary
                     # check in _should_replan uses the actual plan time.
-                    self._last_plan_slot_start = now
+                    if not corrective_live_replan:
+                        self._last_plan_slot_start = now
 
                     for warning in planner_output.warnings:
                         async_log("debug", "[planner] %s", warning)
@@ -1144,9 +1332,15 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                         planner_output.slots,
                         now,
                         window_hysteresis_minutes=window_hys_minutes,
-                        previous_current_recommendation=(self._window_hys_previous_rec),
+                        previous_current_recommendation=(
+                            None
+                            if corrective_live_replan
+                            else self._window_hys_previous_rec
+                        ),
                         previous_current_slot_start=(
-                            self._window_hys_previous_slot_start
+                            None
+                            if corrective_live_replan
+                            else self._window_hys_previous_slot_start
                         ),
                     )
                     self._window_hys_previous_rec = held_rec
@@ -1381,6 +1575,39 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
         # Notify all subscriber entities atomically.
         self.async_set_updated_data(data)
+        if corrective_live_replan and corrective_request_slot is not None:
+            # Commit the corrected plan and consume the once-per-slot request
+            # only after the complete coordinator update was successfully
+            # packaged and published. Any exception before this point leaves
+            # the old cached plan and pending request intact for a later retry.
+            if corrective_output_accepted:
+                self._last_planner_output = planner_output
+                self._last_plan_slot_start = now
+            self._force_discharge_replanned_slot_start = corrective_request_slot
+            self._force_discharge_live_replan_pending_slot = None
+            self._clear_force_discharge_excess_window()
+
+            effective_rec = self._hourly_recommendation
+            async_log(
+                "debug",
+                "[replan] Live-demand correction published: slot=%s "
+                "accepted=%s candidate_winner=%s candidate_solver=%s "
+                "rejection=%s planned_recommendation=%s discharge=%.3f kWh "
+                "import=%.3f kWh export=%.3f kWh.",
+                corrective_request_slot.isoformat(),
+                corrective_output_accepted,
+                corrective_candidate_winner or "(none)",
+                corrective_candidate_solver,
+                corrective_rejection_reason or "(none)",
+                effective_rec.recommendation if effective_rec is not None else "(none)",
+                (
+                    effective_rec.batteries_discharged_kwh
+                    if effective_rec is not None
+                    else 0.0
+                ),
+                effective_rec.grid_import_kwh if effective_rec is not None else 0.0,
+                effective_rec.grid_export_kwh if effective_rec is not None else 0.0,
+            )
         async_log("debug", "------ HSEM Coordinator: update cycle complete")
 
     # ------------------------------------------------------------------
@@ -1440,6 +1667,145 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             interval,
         )
 
+    def _active_force_discharge_slot(self, now: datetime) -> PlannedSlot | None:
+        """Return the active planned forced-discharge slot, if any."""
+        output = self._last_planner_output
+        if output is None or now.tzinfo is None:
+            return None
+        return next(
+            (
+                slot
+                for slot in output.slots
+                if slot.recommendation == Recommendations.ForceBatteriesDischarge.value
+                and slot.batteries_discharged_kwh > 1e-9
+                and as_tz(slot.start, now.tzinfo) <= now < as_tz(slot.end, now.tzinfo)
+            ),
+            None,
+        )
+
+    def _clear_force_discharge_excess_window(self, reason: str | None = None) -> None:
+        """Clear only the in-progress 30-second excess-demand debounce."""
+        if reason is not None and self._force_discharge_excess_since is not None:
+            async_log(
+                "debug",
+                "[replan] Forced-discharge live-demand debounce cleared: %s.",
+                reason,
+            )
+        self._force_discharge_excess_since = None
+        self._force_discharge_excess_slot_start = None
+
+    async def _async_monitor_force_discharge_load(self, now: datetime) -> None:
+        """Request one corrective replan for sustained excess live demand.
+
+        This timer is intentionally lightweight. It reads only the configured
+        house and PV power states, and invokes the full coordinator pipeline
+        only after the excess survives three 10-second samples (30 seconds).
+        """
+        slot = self._active_force_discharge_slot(now)
+        live = self._live
+        if slot is None or live is None or live.missing_entities:
+            self._force_discharge_live_replan_pending_slot = None
+            self._clear_force_discharge_excess_window()
+            return
+
+        # Never let an EV already included in the house-power sensor masquerade
+        # as an unplanned base-load increase. EV state changes have their own
+        # listeners and independently produce a fresh plan.
+        if self._cfg.house_power_includes_ev_charger_power and live.any_ev_charging:
+            self._force_discharge_live_replan_pending_slot = None
+            self._clear_force_discharge_excess_window("EV load is ambiguous")
+            return
+
+        slot_start = slot.start
+        if self._force_discharge_replanned_slot_start == slot_start:
+            self._clear_force_discharge_excess_window()
+            return
+
+        remaining_seconds = (as_tz(slot.end, now.tzinfo) - now).total_seconds()
+        if remaining_seconds < FORCE_DISCHARGE_REPLAN_MIN_REMAINING_SECONDS:
+            self._force_discharge_live_replan_pending_slot = None
+            self._clear_force_discharge_excess_window("less than 60 s remains")
+            return
+
+        # A pending request remains pending until run_planner returns. If the
+        # update lock was busy or a previous update failed, retry on this tick
+        # without consuming the slot's one successful attempt.
+        if self._force_discharge_live_replan_pending_slot == slot_start:
+            if not self._update_lock.locked():
+                await self._async_handle_update(None)
+            return
+
+        try:
+            house_power = ha_get_entity_state_and_convert(
+                self, self._cfg.house_consumption_power, "float", 3
+            )
+            solar_power = ha_get_entity_state_and_convert(
+                self, self._cfg.solar_production_power, "float", 3
+            )
+        except HomeAssistantError:
+            self._clear_force_discharge_excess_window("live power is unavailable")
+            return
+
+        if not isinstance(house_power, int | float) or not isinstance(
+            solar_power, int | float
+        ):
+            self._clear_force_discharge_excess_window("live power is unavailable")
+            return
+
+        metrics = _force_discharge_live_metrics(
+            slot,
+            discharge_efficiency_pct=self._cfg.batteries_discharge_efficiency,
+            house_power_w=float(house_power),
+            solar_power_w=float(solar_power),
+        )
+        if metrics is None:
+            self._clear_force_discharge_excess_window()
+            return
+        planned_ac_w, live_residual_w, threshold_w, excess_w = metrics
+
+        if excess_w <= threshold_w:
+            self._clear_force_discharge_excess_window(
+                "demand returned within threshold"
+            )
+            return
+
+        if self._force_discharge_excess_slot_start != slot_start:
+            self._force_discharge_excess_slot_start = slot_start
+            self._force_discharge_excess_since = now
+            async_log(
+                "debug",
+                "[replan] Forced-discharge live demand exceeds plan: "
+                "slot=%s planned_ac=%.0fW live_residual=%.0fW excess=%.0fW "
+                "threshold=%.0fW; starting 30 s debounce.",
+                slot_start.isoformat(),
+                planned_ac_w,
+                live_residual_w,
+                excess_w,
+                threshold_w,
+            )
+            return
+
+        excess_since = self._force_discharge_excess_since
+        if (
+            excess_since is None
+            or (now - excess_since).total_seconds()
+            < FORCE_DISCHARGE_EXCESS_DEBOUNCE_SECONDS
+        ):
+            return
+
+        self._force_discharge_live_replan_pending_slot = slot_start
+        async_log(
+            "debug",
+            "[replan] Sustained forced-discharge live demand exceeded plan for "
+            "30 s: slot=%s planned_ac=%.0fW live_residual=%.0fW; requesting "
+            "one corrective replan.",
+            slot_start.isoformat(),
+            planned_ac_w,
+            live_residual_w,
+        )
+        if not self._update_lock.locked():
+            await self._async_handle_update(None)
+
     # ------------------------------------------------------------------
     # Planner bridge helpers
     # ------------------------------------------------------------------
@@ -1461,6 +1827,14 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         """
         # First run — always plan.
         if self._last_planner_output is None:
+            return True
+
+        if self._force_discharge_live_replan_pending_slot is not None:
+            async_log(
+                "debug",
+                "[replan] Sustained live demand exceeded forced-discharge plan — "
+                "re-planning.",
+            )
             return True
 
         # Slot boundary crossed — new slot needs a fresh plan.

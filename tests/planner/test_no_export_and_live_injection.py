@@ -145,18 +145,20 @@ class _Inp:
         *,
         live_house_w: float,
         live_solar_w: float = 0.0,
+        live_solar_available: bool = False,
         includes_ev: bool = True,
         ev_kw: float | None = None,
     ) -> None:
         self.interval_minutes = 60
         self.live_solar_production_w = live_solar_w
+        self.live_solar_production_available = live_solar_available
         self.live_house_consumption_w = live_house_w
         self.house_power_includes_ev = includes_ev
         self.ev_session_charge_kw = ev_kw
         self.ev_second_session_charge_kw = None
 
 
-def _current_slot(forecast_kwh: float) -> PlannedSlot:
+def _current_slot(forecast_kwh: float, pv_forecast_kwh: float = 0.0) -> PlannedSlot:
     start = datetime(2024, 6, 15, 12, 0, tzinfo=_TZ)
     s = PlannedSlot(
         start=start,
@@ -164,8 +166,46 @@ def _current_slot(forecast_kwh: float) -> PlannedSlot:
         price=SlotPrice(import_price=0.5, export_price=0.4),
     )
     s.avg_house_consumption_kwh = forecast_kwh
-    s.solcast_pv_estimate_kwh = 0.0
+    s.solcast_pv_estimate_kwh = pv_forecast_kwh
     return s
+
+
+def test_available_zero_live_pv_overwrites_current_forecast():
+    """A measured 0 W is authoritative and removes stale current-slot PV."""
+    slot = _current_slot(forecast_kwh=0.4, pv_forecast_kwh=0.8)
+    inp = _Inp(
+        live_house_w=400.0,
+        live_solar_w=0.0,
+        live_solar_available=True,
+    )
+
+    _inject_live_data_into_current_slot([slot], inp, _NOW)  # type: ignore[arg-type]
+
+    assert slot.solcast_pv_estimate_kwh == pytest.approx(0.0)
+
+
+def test_unavailable_default_zero_live_pv_preserves_current_forecast():
+    """PlannerInput's default 0 W must not erase Solcast without a reading."""
+    slot = _current_slot(forecast_kwh=0.4, pv_forecast_kwh=0.8)
+    inp = _Inp(live_house_w=400.0)
+
+    _inject_live_data_into_current_slot([slot], inp, _NOW)  # type: ignore[arg-type]
+
+    assert slot.solcast_pv_estimate_kwh == pytest.approx(0.8)
+
+
+def test_available_positive_live_pv_overwrites_current_forecast():
+    """An available nonzero measurement retains the existing behavior."""
+    slot = _current_slot(forecast_kwh=0.4, pv_forecast_kwh=0.8)
+    inp = _Inp(
+        live_house_w=400.0,
+        live_solar_w=500.0,
+        live_solar_available=True,
+    )
+
+    _inject_live_data_into_current_slot([slot], inp, _NOW)  # type: ignore[arg-type]
+
+    assert slot.solcast_pv_estimate_kwh == pytest.approx(0.5)
 
 
 def test_live_injection_caps_spike_at_forecast():

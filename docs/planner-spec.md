@@ -616,6 +616,37 @@ accepted plan already at its endpoint is rejected, and an expired slot commands
 0 W on the next applier callback. Accurate adaptive tapering would require
 integrated primary-battery energy.
 
+While such a slot is active, a separate lightweight coordinator timer samples
+only live house and PV power every 10 seconds. It compares residual AC demand
+(`max(house_power - solar_power, 0)`) with the slot's planned AC battery
+delivery (`batteries_discharged_kwh * discharge_efficiency / slot_hours`). When
+the residual exceeds planned delivery by more than `max(150 W, 10%)`
+continuously for 30 seconds, HSEM requests one corrective planner run for that
+slot. The trigger is disabled with less than 60 seconds remaining, when required
+live state is unavailable/degraded, and while an EV is charging if the house
+meter includes EV power. This monitor never changes the v13 latched hardware
+cap directly.
+
+The corrective planner run receives current live house/PV inputs and bypasses
+both candidate hysteresis and current-window hysteresis for that one run; stale
+plan preference must not restore the recommendation that caused the correction.
+The planner remains authoritative: it may keep forced export if profitable
+battery export remains, or choose normal self-consumption when live house demand
+uses the available discharge. Only an optimal MILP or a fully validated
+time-limit incumbent may replace the active plan. A passive/no-action fallback
+is logged but cannot replace the previous validated plan; the attempt is then
+closed for that slot to avoid repeated solver timeouts. The
+normal-self-consumption transition requires a real solved battery-discharge
+allocation. When the solved slot deliberately retains some grid import, Huawei
+MSC is bounded to `batteries_discharged_kwh / slot_hours` (and the physical
+maximum), so it cannot consume energy the MILP reserved for later. When modeled
+grid import is zero, MSC retains the normal hardware maximum and follows live
+house demand without exporting. The
+once-per-slot attempt is otherwise consumed only after the complete coordinator
+snapshot is successfully published. A busy or failed update leaves the request
+pending for the next 10-second monitor tick. Read-only and degraded-mode
+hardware-write gates remain unchanged.
+
 For non-MILP candidates (`milp_prepopulated=False`, the default),
 the simulation continues to derive discharge and grid flows greedily
 from the recommendation label and net demand — unchanged behaviour.
