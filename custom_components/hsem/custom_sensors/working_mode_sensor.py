@@ -522,9 +522,8 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         if not isinstance(fully_fed_discharge_state, FullyFedDischargeCapState):
             fully_fed_discharge_state = None
         if hourly_rec is None and fully_fed_discharge_state is not None:
-            # Losing the selected recommendation invalidates the time/capacity
-            # latch. If a plan later reappears in the same slot with the same
-            # coarse capacity sample, it must be recomputed from that point.
+            # Losing the selected recommendation invalidates the plan-derived
+            # cap. If a plan later reappears, it must be accepted afresh.
             fully_fed_discharge_state.reset()
 
         # Gate hardware writes on read_only and degraded mode.

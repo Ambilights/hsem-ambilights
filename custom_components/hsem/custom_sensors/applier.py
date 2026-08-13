@@ -81,11 +81,10 @@ from custom_components.hsem.utils.workingmodes import WorkingModes
 class FullyFedDischargeCapState:
     """Per-entity state for reconciling a planned Fully Fed discharge cap.
 
-    Huawei reports usable battery capacity in coarse steps. Recomputing from
-    the same capacity sample on every coordinator wake makes the shrinking
-    slot duration raise the cap repeatedly until the next sample arrives.
-    This state latches the command until either the selected plan or the
-    reported capacity sample changes.
+    Huawei reports battery SoC only in coarse one-percent steps. Those samples
+    are not precise enough to pace a 15-minute energy allocation, so this state
+    latches the plan-derived command until the selected plan or hardware limit
+    changes.
     """
 
     slot_start: datetime | None = None
@@ -93,17 +92,15 @@ class FullyFedDischargeCapState:
     planned_discharge_kwh: float | None = None
     planned_end_capacity_kwh: float | None = None
     max_discharge_power_w: int | None = None
-    battery_capacity_sample_kwh: float | None = None
     commanded_cap_w: int | None = None
 
     def reset(self) -> None:
-        """Forget the prior Fully Fed plan and capacity sample."""
+        """Forget the prior Fully Fed plan and command."""
         self.slot_start = None
         self.slot_end = None
         self.planned_discharge_kwh = None
         self.planned_end_capacity_kwh = None
         self.max_discharge_power_w = None
-        self.battery_capacity_sample_kwh = None
         self.commanded_cap_w = None
 
 
@@ -154,24 +151,18 @@ def _fully_fed_discharge_cap_w(
     planned_discharge_kwh: float,
     slot_hours: float,
     remaining_slot_hours: float,
-    battery_capacity_kwh: float,
-    planned_end_capacity_kwh: float,
     max_discharge_power_w: int,
 ) -> int:
-    """Return a safe battery-power cap for a Fully Fed to Grid slot.
+    """Return the stable plan-derived cap for a Fully Fed to Grid slot.
 
     Huawei's Fully Fed to Grid mode gives PV first use of the inverter's AC
     capacity and lets the battery fill only the remaining headroom. The
     maximum-discharge entity therefore acts as an upper bound on battery power.
-    The original planned power is a hard ceiling. Within that ceiling, the live
-    controller divides the energy remaining above the selected slot's end
-    capacity by the time remaining in the slot. This keeps the cap stable when
-    energy and time fall proportionally, then tapers it near the target.
-
-    The selected recommendation's ``planned_end_capacity_kwh`` is authoritative
-    here. ``required_capacity_kwh`` is a pre-candidate scheduling heuristic,
-    not a constraint on the selected MILP winner; using it as a second floor
-    can contradict and under-deliver the winning plan.
+    Dividing the planned battery energy by the full slot duration ensures that
+    even a full-slot command cannot exceed the selected plan. The cap stays
+    stable within the slot: Huawei's integer SoC samples represent about
+    0.3 kWh on a 30 kWh battery and must not be mistaken for precise delivered
+    energy when pacing a much smaller slot allocation.
     """
     if slot_hours <= 1e-9 or remaining_slot_hours <= 1e-9 or max_discharge_power_w <= 0:
         return 0
@@ -181,24 +172,13 @@ def _fully_fed_discharge_cap_w(
         return 0
 
     planned_power_w = planned_discharge_kwh / slot_hours * 1000.0
-    target_capacity_kwh = max(planned_end_capacity_kwh, 0.0)
-    remaining_energy_kwh = max(battery_capacity_kwh - target_capacity_kwh, 0.0)
-    if remaining_energy_kwh <= 1e-9:
-        return 0
-
-    # A callback can race slightly ahead of the slot start. Never stretch the
-    # target over more than the full slot, and never let a near-zero remaining
-    # duration inflate the command above the original planned power.
-    effective_remaining_hours = min(remaining_slot_hours, slot_hours)
-    target_power_w = remaining_energy_kwh / effective_remaining_hours * 1000.0
-    safe_power_w = min(planned_power_w, target_power_w, max_discharge_power_w)
+    safe_power_w = min(planned_power_w, max_discharge_power_w)
     return int(max(safe_power_w, 0.0) + 1e-6)
 
 
 def _fully_fed_plan_is_unchanged(
     state: FullyFedDischargeCapState,
     rec: HourlyRecommendation,
-    max_discharge_power_w: int,
 ) -> bool:
     """Return whether *state* describes the same selected export plan."""
     if (
@@ -213,7 +193,6 @@ def _fully_fed_plan_is_unchanged(
         and abs(state.planned_discharge_kwh - rec.batteries_discharged_kwh) <= 1e-9
         and abs(state.planned_end_capacity_kwh - rec.estimated_battery_capacity_kwh)
         <= 1e-9
-        and state.max_discharge_power_w == max_discharge_power_w
     )
 
 
@@ -222,16 +201,14 @@ def _record_fully_fed_cap_state(
     rec: HourlyRecommendation,
     *,
     max_discharge_power_w: int,
-    battery_capacity_kwh: float,
     commanded_cap_w: int,
 ) -> None:
-    """Record the plan, Huawei capacity sample, and resulting command."""
+    """Record the selected plan and resulting command."""
     state.slot_start = rec.start
     state.slot_end = rec.end
     state.planned_discharge_kwh = rec.batteries_discharged_kwh
     state.planned_end_capacity_kwh = rec.estimated_battery_capacity_kwh
     state.max_discharge_power_w = max_discharge_power_w
-    state.battery_capacity_sample_kwh = battery_capacity_kwh
     state.commanded_cap_w = commanded_cap_w
 
 
@@ -243,54 +220,68 @@ def _reconciled_fully_fed_discharge_cap_w(
     max_discharge_power_w: int,
     state: FullyFedDischargeCapState | None,
 ) -> tuple[int, str]:
-    """Return a chatter-free cap and the reconciliation trigger.
+    """Return a stable cap and the reconciliation trigger.
 
-    The cap is recomputed only for a new/changed plan or a new Huawei capacity
-    sample. Time-only coordinator wakeups reuse the prior command because the
-    capacity sample contains no new energy information. Slot completion and a
-    reached capacity target always force an immediate zero-cap safety command.
+    A selected plan's original average battery power is held for the slot.
+    Coarse Huawei SoC changes are deliberately ignored after the plan is
+    latched. A callback at or after slot completion forces a zero-cap command.
+    A newly selected plan that is already at or below its planned endpoint is
+    rejected once as a stale-plan safety check.
     """
     slot_hours = slot_duration_hours(rec.start, rec.end)
-    computed_cap_w = _fully_fed_discharge_cap_w(
-        planned_discharge_kwh=rec.batteries_discharged_kwh,
-        slot_hours=slot_hours,
-        remaining_slot_hours=remaining_slot_hours,
-        battery_capacity_kwh=battery_capacity_kwh,
-        planned_end_capacity_kwh=rec.estimated_battery_capacity_kwh,
-        max_discharge_power_w=max_discharge_power_w,
+    plan_unchanged = state is not None and _fully_fed_plan_is_unchanged(state, rec)
+    hardware_limit_unchanged = (
+        state is not None and state.max_discharge_power_w == max_discharge_power_w
     )
-    if state is None:
-        return computed_cap_w, "stateless"
 
-    plan_unchanged = _fully_fed_plan_is_unchanged(state, rec, max_discharge_power_w)
-    capacity_unchanged = (
-        state.battery_capacity_sample_kwh is not None
-        and abs(state.battery_capacity_sample_kwh - battery_capacity_kwh) <= 1e-9
-    )
-    target_reached = (
-        battery_capacity_kwh <= max(rec.estimated_battery_capacity_kwh, 0.0) + 1e-9
-    )
-    safety_stop = remaining_slot_hours <= 1e-9 or target_reached
-
-    if safety_stop or computed_cap_w <= 0:
+    if remaining_slot_hours <= 1e-9:
+        if state is None:
+            return 0, "slot_finished"
         _record_fully_fed_cap_state(
             state,
             rec,
             max_discharge_power_w=max_discharge_power_w,
-            battery_capacity_kwh=battery_capacity_kwh,
             commanded_cap_w=0,
         )
-        return 0, "safety_stop"
+        return 0, "slot_finished"
 
-    if plan_unchanged and capacity_unchanged and state.commanded_cap_w is not None:
-        return min(state.commanded_cap_w, max_discharge_power_w), "cached_sample"
+    if (
+        plan_unchanged
+        and hardware_limit_unchanged
+        and state is not None
+        and state.commanded_cap_w is not None
+    ):
+        return min(state.commanded_cap_w, max_discharge_power_w), "cached_plan"
 
-    trigger = "capacity_changed" if plan_unchanged else "plan_changed"
+    computed_cap_w = _fully_fed_discharge_cap_w(
+        planned_discharge_kwh=rec.batteries_discharged_kwh,
+        slot_hours=slot_hours,
+        remaining_slot_hours=remaining_slot_hours,
+        max_discharge_power_w=max_discharge_power_w,
+    )
+    target_reached_on_new_plan = (
+        not plan_unchanged
+        and battery_capacity_kwh <= max(rec.estimated_battery_capacity_kwh, 0.0) + 1e-9
+    )
+    if target_reached_on_new_plan:
+        computed_cap_w = 0
+        trigger = "new_plan_at_endpoint"
+    else:
+        trigger = (
+            "stateless"
+            if state is None
+            else "hardware_limit_changed"
+            if plan_unchanged
+            else "plan_changed"
+        )
+
+    if state is None:
+        return computed_cap_w, trigger
+
     _record_fully_fed_cap_state(
         state,
         rec,
         max_discharge_power_w=max_discharge_power_w,
-        battery_capacity_kwh=battery_capacity_kwh,
         commanded_cap_w=computed_cap_w,
     )
     return computed_cap_w, trigger
@@ -651,16 +642,17 @@ async def async_apply_battery_settings(
         live: Live state snapshot.
         rec: The current-interval recommendation.
         current_required_battery_kwh: Planner reserve in usable kWh. Used by
-            wait-mode and EV reserve protection; the selected slot end capacity
-            is authoritative for Fully Fed planned export.
+            wait-mode and EV reserve protection. Fully Fed export follows the
+            selected slot's planned discharge energy; its end capacity is used
+            only to reject a newly accepted stale plan.
         grid_charge_power_limit_w: Optional phase-safe Huawei battery charge
             power command in Watts. Applied before enabling forced grid
             charging. ``None`` retains the legacy hardware behavior.
         now: Optional timezone-aware application time for deterministic tests.
             Defaults to Home Assistant's current local time.
         fully_fed_discharge_state: Per-entity reconciliation state used to
-            suppress writes caused only by the passage of time between coarse
-            Huawei capacity samples.
+            keep the selected plan-derived cap stable across coordinator wakes
+            and coarse Huawei SoC changes.
 
     Returns:
         :class:`CycleApplySummary` with one :class:`ApplyResult` per write

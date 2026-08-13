@@ -255,8 +255,6 @@ class TestFullyFedDischargeCapW:
             planned_discharge_kwh=0.45,
             slot_hours=0.25,
             remaining_slot_hours=0.25,
-            battery_capacity_kwh=20.0,
-            planned_end_capacity_kwh=19.55,
             max_discharge_power_w=10000,
         )
         assert cap == 1800
@@ -266,50 +264,40 @@ class TestFullyFedDischargeCapW:
             planned_discharge_kwh=2.5,
             slot_hours=0.25,
             remaining_slot_hours=0.25,
-            battery_capacity_kwh=20.0,
-            planned_end_capacity_kwh=17.5,
             max_discharge_power_w=5000,
         )
         assert cap == 5000
 
-    def test_proportional_energy_and_time_do_not_ratchet_cap(self):
+    def test_remaining_time_does_not_change_planned_cap(self):
         initial_cap = self._cap(
-            planned_discharge_kwh=2.5,
+            planned_discharge_kwh=0.458,
             slot_hours=0.25,
-            remaining_slot_hours=0.25,
-            battery_capacity_kwh=28.2,
-            planned_end_capacity_kwh=25.7,
+            remaining_slot_hours=0.139,
             max_discharge_power_w=10000,
         )
-        three_minutes_later_cap = self._cap(
-            planned_discharge_kwh=2.5,
+        later_cap = self._cap(
+            planned_discharge_kwh=0.458,
             slot_hours=0.25,
-            remaining_slot_hours=0.20,
-            battery_capacity_kwh=27.7,
-            planned_end_capacity_kwh=25.7,
+            remaining_slot_hours=0.131,
             max_discharge_power_w=10000,
         )
-        assert initial_cap == 10000
-        assert three_minutes_later_cap == 10000
+        assert initial_cap == 1832
+        assert later_cap == 1832
 
-    def test_remaining_energy_tapers_power_near_target(self):
+    def test_small_slot_plan_stays_at_average_planned_power(self):
         cap = self._cap(
-            planned_discharge_kwh=2.5,
+            planned_discharge_kwh=0.358,
             slot_hours=0.25,
             remaining_slot_hours=0.10,
-            battery_capacity_kwh=25.8,
-            planned_end_capacity_kwh=25.7,
             max_discharge_power_w=10000,
         )
-        assert cap == 1000
+        assert cap == 1432
 
     def test_near_zero_remaining_time_cannot_exceed_planned_power(self):
         cap = self._cap(
             planned_discharge_kwh=2.5,
             slot_hours=0.25,
             remaining_slot_hours=1.0 / 3600.0,
-            battery_capacity_kwh=25.8,
-            planned_end_capacity_kwh=25.7,
             max_discharge_power_w=30000,
         )
         assert cap == 10000
@@ -319,38 +307,32 @@ class TestFullyFedDischargeCapW:
             planned_discharge_kwh=2.5,
             slot_hours=0.25,
             remaining_slot_hours=0.50,
-            battery_capacity_kwh=28.2,
-            planned_end_capacity_kwh=25.7,
             max_discharge_power_w=10000,
         )
         assert cap == 10000
 
-    def test_live_capacity_at_plan_target_stops_battery(self):
+    def test_cap_cannot_authorize_more_than_planned_slot_energy(self):
+        planned_kwh = 0.4579
+        slot_hours = 0.25
         cap = self._cap(
-            planned_discharge_kwh=0.5,
-            slot_hours=0.25,
+            planned_discharge_kwh=planned_kwh,
+            slot_hours=slot_hours,
             remaining_slot_hours=0.10,
-            battery_capacity_kwh=10.25,
-            planned_end_capacity_kwh=10.25,
             max_discharge_power_w=10000,
         )
-        assert cap == 0
+        assert cap * slot_hours / 1000.0 <= planned_kwh
 
     def test_invalid_or_finished_duration_fails_closed(self):
         invalid_slot_cap = self._cap(
             planned_discharge_kwh=0.5,
             slot_hours=0.0,
             remaining_slot_hours=0.10,
-            battery_capacity_kwh=10.5,
-            planned_end_capacity_kwh=10.0,
             max_discharge_power_w=10000,
         )
         finished_slot_cap = self._cap(
             planned_discharge_kwh=0.5,
             slot_hours=0.25,
             remaining_slot_hours=0.0,
-            battery_capacity_kwh=10.5,
-            planned_end_capacity_kwh=10.0,
             max_discharge_power_w=10000,
         )
         assert invalid_slot_cap == 0
@@ -361,8 +343,6 @@ class TestFullyFedDischargeCapW:
             planned_discharge_kwh=0.0,
             slot_hours=0.25,
             remaining_slot_hours=0.25,
-            battery_capacity_kwh=10.5,
-            planned_end_capacity_kwh=10.0,
             max_discharge_power_w=10000,
         )
         assert cap == 0

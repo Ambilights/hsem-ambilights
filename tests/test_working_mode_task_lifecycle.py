@@ -255,13 +255,11 @@ class TestTaskCancellationOnUnload:
         """``async_will_remove_from_hass`` with no stored task must not raise."""
         sensor = _make_sensor()
         sensor._fully_fed_discharge_state.commanded_cap_w = 1800
-        sensor._fully_fed_discharge_state.battery_capacity_sample_kwh = 20.0
 
         # Must complete without error and must discard stale control state.
         await sensor.async_will_remove_from_hass()
 
         assert sensor._fully_fed_discharge_state.commanded_cap_w is None
-        assert sensor._fully_fed_discharge_state.battery_capacity_sample_kwh is None
 
 
 class TestNoWriteAfterUnload:

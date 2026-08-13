@@ -606,6 +606,16 @@ that hold in Time-of-Use mode with a 0 W discharge cap and preserves incidental
 PV export, even when the configured fallback wait behaviour permits
 self-consumption or an EV display relabel is active.
 
+For an explicit `force_batteries_discharge` slot, the runtime converts the
+selected battery energy into a stable upper bound:
+`floor(batteries_discharged_kwh / slot_hours * 1000)`, limited by the Huawei
+hardware maximum. The bound is latched for the selected plan and is not tapered
+from Huawei's integer SoC updates; their resolution is too coarse for sub-slot
+energy accounting. A changed plan or hardware limit recomputes it, a newly
+accepted plan already at its endpoint is rejected, and an expired slot commands
+0 W on the next applier callback. Accurate adaptive tapering would require
+integrated primary-battery energy.
+
 For non-MILP candidates (`milp_prepopulated=False`, the default),
 the simulation continues to derive discharge and grid flows greedily
 from the recommendation label and net demand — unchanged behaviour.
