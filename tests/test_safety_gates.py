@@ -85,6 +85,8 @@ def _make_rec(recommendation: str = "batteries_discharge_mode") -> HourlyRecomme
     """Return a minimal :class:`HourlyRecommendation` for testing."""
     rec = HourlyRecommendation.__new__(HourlyRecommendation)
     object.__setattr__(rec, "recommendation", recommendation)
+    object.__setattr__(rec, "batteries_discharged_kwh", 0.0)
+    object.__setattr__(rec, "grid_import_kwh", 0.0)
     return rec
 
 
@@ -993,6 +995,123 @@ class TestFullyFedBatteryExportControl:
             0,
             "maximise_self_consumption",
             10000,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_partial_msc_restores_plan_cap_after_fully_fed_exit(self):
+        """Modeled import keeps MSC bounded to the solved battery allocation."""
+        sensor = _make_sensor()
+        cfg = self._cfg()
+        live = self._live()
+        live.huawei_batteries_working_mode = "fully_fed_to_grid"
+        live.huawei_batteries_max_discharge_power_w = 1800.0
+        live.huawei_batteries_excess_pv_use_in_tou = "charge"
+        rec = _make_planned_rec(
+            "batteries_discharge_mode",
+            discharged_kwh=0.10,
+        )
+        rec.grid_export_kwh = 0.0
+        rec.grid_import_kwh = 0.20
+
+        with patch(
+            "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+            new_callable=AsyncMock,
+            side_effect=_ok_apply_result,
+        ) as verifier:
+            await async_apply_battery_settings(
+                sensor, cfg, live, rec, 20.0, now=rec.start
+            )
+
+        assert [call.kwargs["desired"] for call in verifier.await_args_list] == [
+            0,
+            "maximise_self_consumption",
+            400,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_partial_msc_plan_cap_respects_hardware_maximum(self):
+        """A large partial allocation cannot exceed the physical battery limit."""
+        sensor = _make_sensor()
+        cfg = self._cfg()
+        live = self._live()
+        live.huawei_batteries_max_discharge_power_w = 10000.0
+        live.huawei_batteries_excess_pv_use_in_tou = "charge"
+        rec = _make_planned_rec(
+            "batteries_discharge_mode",
+            discharged_kwh=3.0,
+        )
+        rec.grid_export_kwh = 0.0
+        rec.grid_import_kwh = 0.20
+
+        with patch(
+            "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+            new_callable=AsyncMock,
+            side_effect=_ok_apply_result,
+        ) as verifier:
+            await async_apply_battery_settings(
+                sensor, cfg, live, rec, 20.0, now=rec.start
+            )
+
+        assert [call.kwargs["desired"] for call in verifier.await_args_list] == [
+            "maximise_self_consumption",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_partial_msc_cap_also_bounds_unplanned_ev_session(self):
+        """EV load protection cannot bypass a solved partial-discharge cap."""
+        sensor = _make_sensor()
+        cfg = self._cfg()
+        live = self._live()
+        live.huawei_batteries_working_mode = "maximise_self_consumption"
+        live.huawei_batteries_max_discharge_power_w = 1800.0
+        live.huawei_batteries_excess_pv_use_in_tou = "charge"
+        live.ev.is_charging = True
+        live.ev.power_w = 7000.0
+        live.net_consumption_w = 1000.0
+        rec = _make_planned_rec(
+            "batteries_discharge_mode",
+            discharged_kwh=0.10,
+        )
+        rec.grid_export_kwh = 0.0
+        rec.grid_import_kwh = 0.20
+
+        with patch(
+            "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+            new_callable=AsyncMock,
+            side_effect=_ok_apply_result,
+        ) as verifier:
+            await async_apply_battery_settings(
+                sensor, cfg, live, rec, 5.0, now=rec.start
+            )
+
+        assert [call.kwargs["desired"] for call in verifier.await_args_list] == [400]
+
+    @pytest.mark.asyncio
+    async def test_label_only_msc_override_keeps_hardware_maximum(self):
+        """A runtime schedule relabel without planned discharge is not capped."""
+        sensor = _make_sensor()
+        cfg = self._cfg()
+        live = self._live()
+        live.huawei_batteries_max_discharge_power_w = 10000.0
+        live.huawei_batteries_excess_pv_use_in_tou = "charge"
+        rec = _make_planned_rec(
+            "batteries_discharge_mode",
+            discharged_kwh=0.0,
+        )
+        rec.grid_export_kwh = 0.0
+        rec.grid_import_kwh = 0.20
+
+        with patch(
+            "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+            new_callable=AsyncMock,
+            side_effect=_ok_apply_result,
+        ) as verifier:
+            await async_apply_battery_settings(
+                sensor, cfg, live, rec, 20.0, now=rec.start
+            )
+
+        assert [call.kwargs["desired"] for call in verifier.await_args_list] == [
+            "maximise_self_consumption",
         ]
 
     @pytest.mark.asyncio

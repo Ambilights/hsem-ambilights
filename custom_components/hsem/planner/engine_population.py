@@ -142,8 +142,11 @@ def _inject_live_data_into_current_slot(
 
     The current (partially-elapsed) slot's ``solcast_pv_estimate_kwh`` and
     ``avg_house_consumption_kwh`` are overwritten with values derived from
-    live power sensors.  This ensures the MILP and all candidates use
-    measured (not forecast) data for the slot that is already in progress.
+    live power sensors. PV is overwritten only when the separate availability
+    flag is true: an available 0 W reading is authoritative, while the default
+    0.0 value without a live reading preserves the populated forecast. This
+    ensures the MILP and all candidates use measured data for the slot already
+    in progress without treating a missing measurement as zero generation.
 
     The live power in Watts is converted to kWh by multiplying by the
     slot's full duration in hours.  This gives the *projected* full-slot
@@ -163,8 +166,10 @@ def _inject_live_data_into_current_slot(
         s_end = as_tz(slot.end, now.tzinfo)
         if s_start <= now < s_end:
             # Convert live Watts to projected full-slot kWh.
-            if inp.live_solar_production_w > 1e-9:
-                live_pv_kwh = (inp.live_solar_production_w / 1000.0) * slot_hours
+            if inp.live_solar_production_available:
+                live_pv_kwh = (
+                    max(inp.live_solar_production_w, 0.0) / 1000.0
+                ) * slot_hours
                 log_planner(
                     "debug",
                     "[core] _inject_live_data  slot=%s  "

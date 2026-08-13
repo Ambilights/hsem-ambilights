@@ -8,8 +8,88 @@ from __future__ import annotations
 
 import pytest
 
-from custom_components.hsem.coordinator_builder import _resolve_max_discharge_power_w
+from custom_components.hsem.coordinator_builder import (
+    _resolve_live_solar_measurement,
+    _resolve_max_discharge_power_w,
+    build_planner_input,
+)
 from custom_components.hsem.models.live_state import LiveState
+from custom_components.hsem.models.sensor_config import SensorConfig
+
+
+class TestResolveLiveSolarMeasurement:
+    """Distinguish a real zero-PV reading from the unavailable-state fallback."""
+
+    @staticmethod
+    def _cfg(entity_id: str | None = "sensor.solar") -> SensorConfig:
+        cfg = SensorConfig()
+        cfg.solar_production_power = entity_id
+        return cfg
+
+    def test_configured_zero_measurement_is_available(self) -> None:
+        live = LiveState()
+        live.solar_production_power_w = 0.0
+
+        value, available = _resolve_live_solar_measurement(self._cfg(), live)
+
+        assert value == pytest.approx(0.0)
+        assert available is True
+
+    def test_read_failure_fallback_zero_is_unavailable(self) -> None:
+        live = LiveState()
+        live.solar_production_power_w = 0.0
+        live.add_missing_entity(
+            "Error reading solar_production_power (entity_id=sensor.solar): "
+            "state unavailable or invalid"
+        )
+
+        value, available = _resolve_live_solar_measurement(self._cfg(), live)
+
+        assert value == pytest.approx(0.0)
+        assert available is False
+
+    def test_unconfigured_default_zero_is_unavailable(self) -> None:
+        live = LiveState()
+
+        value, available = _resolve_live_solar_measurement(self._cfg(None), live)
+
+        assert value == pytest.approx(0.0)
+        assert available is False
+
+    def test_builder_plumbs_available_zero_into_planner_input(self) -> None:
+        cfg = self._cfg()
+        live = LiveState()
+        live.solar_production_power_w = 0.0
+
+        planner_input = build_planner_input(
+            cfg=cfg,
+            live=live,
+            hourly_recommendations=[],
+            batteries_schedules=[],
+            previous_winner_name=None,
+            previous_winner_score=0.0,
+        )
+
+        assert planner_input.live_solar_production_w == pytest.approx(0.0)
+        assert planner_input.live_solar_production_available is True
+
+    def test_builder_plumbs_read_failure_as_unavailable(self) -> None:
+        cfg = self._cfg()
+        live = LiveState()
+        live.solar_production_power_w = 0.0
+        live.add_missing_entity("Error reading solar_production_power: unavailable")
+
+        planner_input = build_planner_input(
+            cfg=cfg,
+            live=live,
+            hourly_recommendations=[],
+            batteries_schedules=[],
+            previous_winner_name=None,
+            previous_winner_score=0.0,
+        )
+
+        assert planner_input.live_solar_production_w == pytest.approx(0.0)
+        assert planner_input.live_solar_production_available is False
 
 
 class TestResolveMaxDischargePowerW:

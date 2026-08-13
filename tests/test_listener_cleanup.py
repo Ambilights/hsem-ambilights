@@ -286,6 +286,7 @@ class TestCoordinatorListenerCleanup:
         coord._listener_unsubs = []
         coord._hourly_timer_unsub = None
         coord._interval_timer_unsub = None
+        coord._force_discharge_monitor_unsub = None
 
         return coord
 
@@ -311,19 +312,23 @@ class TestCoordinatorListenerCleanup:
 
         timer_unsub = MagicMock()
         interval_unsub = MagicMock()
+        monitor_unsub = MagicMock()
         listener_unsub = MagicMock()
 
         coord._hourly_timer_unsub = timer_unsub
         coord._interval_timer_unsub = interval_unsub
+        coord._force_discharge_monitor_unsub = monitor_unsub
         coord._listener_unsubs = [listener_unsub]
 
         await coord.async_teardown()
 
         timer_unsub.assert_called_once()
         interval_unsub.assert_called_once()
+        monitor_unsub.assert_called_once()
         listener_unsub.assert_called_once()
         assert coord._hourly_timer_unsub is None
         assert coord._interval_timer_unsub is None
+        assert coord._force_discharge_monitor_unsub is None
         assert coord._listener_unsubs == []
 
     @pytest.mark.asyncio

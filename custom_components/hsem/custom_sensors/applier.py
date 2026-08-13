@@ -406,6 +406,29 @@ def _desired_battery_discharge_cap_w(
         # below otherwise derives a non-zero cap from historical house load.
         return 0, "planned battery hold"
 
+    planned_discharge_kwh = float(getattr(rec, "batteries_discharged_kwh", 0.0) or 0.0)
+    planned_grid_import_kwh = float(getattr(rec, "grid_import_kwh", 0.0) or 0.0)
+    partial_self_consumption_cap_w: int | None = None
+    if (
+        recommendation == Recommendations.BatteriesDischargeMode.value
+        and planned_discharge_kwh > 1e-9
+        and planned_grid_import_kwh > 1e-9
+    ):
+        # MSC normally follows live house demand up to the Huawei hardware
+        # maximum. When the selected plan deliberately retains grid import,
+        # however, unrestricted MSC could consume battery energy that the MILP
+        # reserved for a later slot. Reuse the stable full-slot energy cap so
+        # the physical inverter cannot exceed the solved partial-discharge
+        # allocation. A label-only runtime discharge override with no planned
+        # energy, and zero-import MSC, keep the normal hardware maximum below.
+        slot_hours = slot_duration_hours(rec.start, rec.end)
+        partial_self_consumption_cap_w = _fully_fed_discharge_cap_w(
+            planned_discharge_kwh=planned_discharge_kwh,
+            slot_hours=slot_hours,
+            remaining_slot_hours=hours_ahead(now, rec.end),
+            max_discharge_power_w=max_discharge_power_w,
+        )
+
     if live.any_ev_charging:
         slot_hours = slot_duration_hours(rec.start, rec.end)
         historical_w = (
@@ -441,12 +464,20 @@ def _desired_battery_discharge_cap_w(
             and live.battery_current_capacity_kwh <= current_required_battery_kwh
         ):
             cap_w = 0
+        if partial_self_consumption_cap_w is not None:
+            cap_w = min(cap_w, partial_self_consumption_cap_w)
         planned = (
             rec.ev_charger_calculated_power > 1e-9
             or rec.ev_second_charger_calculated_power > 1e-9
             or rec.ev_total_planned_load_kwh > 1e-9
         )
-        return cap_w, "EV active" if planned else "EV active (unplanned)"
+        reason = "EV active" if planned else "EV active (unplanned)"
+        if partial_self_consumption_cap_w is not None:
+            reason += "; planned partial self-consumption"
+        return cap_w, reason
+
+    if partial_self_consumption_cap_w is not None:
+        return partial_self_consumption_cap_w, "planned partial self-consumption"
 
     if recommendation == Recommendations.BatteriesWaitMode.value:
         if cfg.batteries_wait_mode_behavior == "self_consumption_with_reserve":

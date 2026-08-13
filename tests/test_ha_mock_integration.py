@@ -207,6 +207,7 @@ def make_bare_coordinator(
     coord._update_lock = asyncio.Lock()
     coord._interval_timer_unsub = None
     coord._hourly_timer_unsub = None
+    coord._force_discharge_monitor_unsub = None
     coord._listener_unsubs = []
     coord._timer_interval = None
     coord._next_update = None
@@ -226,6 +227,12 @@ def make_bare_coordinator(
     coord._live = None
     coord._snapshot = None
     coord._net_consumption_ema = None
+    coord._last_planner_output = None
+    coord._last_plan_slot_start = None
+    coord._force_discharge_excess_since = None
+    coord._force_discharge_excess_slot_start = None
+    coord._force_discharge_replanned_slot_start = None
+    coord._force_discharge_live_replan_pending_slot = None
     # Issue #738: per-slot EV charger power freeze state.
     coord._current_slot_start = None
     coord._current_slot_ev_power_w = 0.0

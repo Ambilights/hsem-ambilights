@@ -103,6 +103,25 @@ def _resolve_max_discharge_power_w(live: LiveState) -> float | None:
     return convert_to_float(live.huawei_batteries_max_discharge_power_w) or None
 
 
+def _resolve_live_solar_measurement(
+    cfg: SensorConfig,
+    live: LiveState,
+) -> tuple[float, bool]:
+    """Return the live PV power and whether that reading is authoritative.
+
+    State collection preserves backward-compatible numeric defaults by
+    coercing an unavailable PV sensor to 0 W, while recording the read failure
+    in ``missing_entities_list``.  The planner therefore needs this separate
+    availability bit to distinguish a real 0 W measurement from that fallback.
+    """
+    value = convert_to_float(live.solar_production_power_w)
+    missing = any(
+        "solar_production_power" in item for item in live.missing_entities_list
+    )
+    available = bool(cfg.solar_production_power) and value is not None and not missing
+    return (value if value is not None else 0.0), available
+
+
 def _build_secondary_storage_config(
     cfg: SensorConfig,
     live: LiveState,
@@ -306,6 +325,8 @@ def build_planner_input(
             secondary_grid_phase=secondary_storage.grid_phase,
         )
 
+    live_solar_w, live_solar_available = _resolve_live_solar_measurement(cfg, live)
+
     return PlannerInput(
         now_iso=now.isoformat(),
         interval_minutes=cfg.recommendation_interval_minutes,
@@ -380,7 +401,8 @@ def build_planner_input(
         batteries_wait_mode_behavior=cfg.batteries_wait_mode_behavior,
         milp_solver_timeout_seconds=cfg.milp_solver_timeout_seconds,
         house_power_includes_ev=bool(cfg.house_power_includes_ev_charger_power),
-        live_solar_production_w=convert_to_float(live.solar_production_power_w) or 0.0,
+        live_solar_production_w=live_solar_w,
+        live_solar_production_available=live_solar_available,
         live_house_consumption_w=convert_to_float(live.house_consumption_power_w)
         or 0.0,
         is_read_only=bool(cfg.read_only),

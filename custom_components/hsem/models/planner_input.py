@@ -228,6 +228,13 @@ class PlannerInput:
     #: partially-elapsed slot.
     live_solar_production_w: float = 0.0
 
+    #: True when ``live_solar_production_w`` came from an available live
+    #: measurement.  This is separate from the numeric value because 0 W is a
+    #: valid authoritative reading (for example after sunset), while the
+    #: dataclass default 0.0 means no live measurement was supplied and must
+    #: not erase the populated Solcast forecast.
+    live_solar_production_available: bool = False
+
     #: Live house consumption power in Watts from the house power meter.
     #: Injected into the current slot's avg_house_consumption_kwh so the
     #: MILP and all candidates use measured (not forecast) load for the
