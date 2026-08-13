@@ -13,7 +13,9 @@ def update_manifest():
 
     for index, value in enumerate(sys.argv):
         if value in ["--version", "-V"]:
-            version = str(sys.argv[index + 1]).replace("v", "")
+            # Git tags conventionally carry one leading ``v``. Removing every
+            # occurrence corrupts prerelease identifiers such as ``dev``.
+            version = str(sys.argv[index + 1]).removeprefix("v")
         if value in ["--path", "-P"]:
             manifest_path = str(sys.argv[index + 1])[1:-1]
         if value in ["--requirements", "-R"]:
