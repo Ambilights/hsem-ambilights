@@ -335,6 +335,99 @@ class TestSimulateSocUnit:
         assert s.batteries_discharged_kwh == pytest.approx(0.0)
         assert s.grid_import_kwh == pytest.approx(1.0)
 
+    def test_strict_wait_mode_keeps_battery_idle(self) -> None:
+        """The default strict wait behavior remains backward compatible."""
+        from datetime import datetime
+
+        t0 = datetime.fromisoformat("2024-06-15T00:00:00+02:00").replace(tzinfo=_TZ)
+        slot = PlannedSlot(
+            start=t0,
+            end=t0 + timedelta(hours=1),
+            recommendation=Recommendations.BatteriesWaitMode.value,
+        )
+        slot.avg_house_consumption_kwh = 1.0
+
+        simulate_soc(
+            [slot],
+            t0,
+            current_kwh=4.0,
+            usable_kwh=9.0,
+            max_capacity_kwh=9.0,
+            max_charge_per_slot=5.0,
+            max_discharge_per_slot=5.0,
+            wait_mode_behavior="strict",
+            required_capacity_kwh=2.0,
+        )
+
+        assert slot.batteries_discharged_kwh == pytest.approx(0.0)
+        assert slot.grid_import_kwh == pytest.approx(1.0)
+        assert slot.estimated_battery_capacity_kwh == pytest.approx(4.0)
+
+    def test_wait_self_consumption_stops_exactly_at_reserve(self) -> None:
+        """Fallback scoring uses surplus energy for the house, then holds reserve."""
+        from datetime import datetime
+
+        t0 = datetime.fromisoformat("2024-06-15T00:00:00+02:00").replace(tzinfo=_TZ)
+        slots: list[PlannedSlot] = []
+        for hour in range(4):
+            slot = PlannedSlot(
+                start=t0 + timedelta(hours=hour),
+                end=t0 + timedelta(hours=hour + 1),
+                recommendation=Recommendations.BatteriesWaitMode.value,
+            )
+            slot.avg_house_consumption_kwh = 1.0
+            slots.append(slot)
+
+        simulate_soc(
+            slots,
+            t0,
+            current_kwh=4.0,
+            usable_kwh=9.0,
+            max_capacity_kwh=9.0,
+            max_charge_per_slot=5.0,
+            max_discharge_per_slot=5.0,
+            wait_mode_behavior="self_consumption_with_reserve",
+            required_capacity_kwh=2.0,
+        )
+
+        assert [slot.batteries_discharged_kwh for slot in slots] == pytest.approx(
+            [1.0, 1.0, 0.0, 0.0]
+        )
+        assert [slot.estimated_battery_capacity_kwh for slot in slots] == pytest.approx(
+            [3.0, 2.0, 2.0, 2.0]
+        )
+        assert sum(slot.grid_import_kwh for slot in slots) == pytest.approx(2.0)
+        assert sum(slot.grid_export_kwh for slot in slots) == pytest.approx(0.0)
+
+    def test_ev_still_blocks_wait_mode_self_consumption(self) -> None:
+        """The existing EV anti-roundtrip guard takes priority over wait mode."""
+        from datetime import datetime
+
+        t0 = datetime.fromisoformat("2024-06-15T00:00:00+02:00").replace(tzinfo=_TZ)
+        slot = PlannedSlot(
+            start=t0,
+            end=t0 + timedelta(hours=1),
+            recommendation=Recommendations.BatteriesWaitMode.value,
+        )
+        slot.avg_house_consumption_kwh = 1.0
+        slot.ev_planned_load_kwh = 0.5
+
+        simulate_soc(
+            [slot],
+            t0,
+            current_kwh=4.0,
+            usable_kwh=9.0,
+            max_capacity_kwh=9.0,
+            max_charge_per_slot=5.0,
+            max_discharge_per_slot=5.0,
+            wait_mode_behavior="self_consumption_with_reserve",
+            required_capacity_kwh=2.0,
+        )
+
+        assert slot.batteries_discharged_kwh == pytest.approx(0.0)
+        assert slot.grid_import_kwh == pytest.approx(1.5)
+        assert slot.estimated_battery_capacity_kwh == pytest.approx(4.0)
+
     def test_past_slots_get_zero_fields(self):
         """Slots entirely before ``now`` should have all SoC fields zeroed."""
         from datetime import datetime

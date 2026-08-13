@@ -11,6 +11,10 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfTime
 from homeassistant.helpers.selector import selector
 
+from custom_components.hsem.const import (
+    MILP_SOLVER_TIMEOUT_MAX_SECONDS,
+    MILP_SOLVER_TIMEOUT_MIN_SECONDS,
+)
 from custom_components.hsem.utils.misc import get_config_value
 
 
@@ -35,6 +39,22 @@ async def get_init_step_schema(
                         "step": 1,
                         "unit_of_measurement": UnitOfTime.MINUTES,
                         "mode": "slider",
+                    }
+                }
+            ),
+            vol.Required(
+                "hsem_milp_solver_timeout_seconds",
+                default=get_config_value(
+                    config_entry, "hsem_milp_solver_timeout_seconds"
+                ),
+            ): selector(
+                {
+                    "number": {
+                        "min": MILP_SOLVER_TIMEOUT_MIN_SECONDS,
+                        "max": MILP_SOLVER_TIMEOUT_MAX_SECONDS,
+                        "step": 1,
+                        "unit_of_measurement": UnitOfTime.SECONDS,
+                        "mode": "box",
                     }
                 }
             ),
@@ -110,6 +130,7 @@ async def validate_init_step_input(
         "hsem_verbose_logging",
         "hsem_extended_attributes",
         "hsem_update_interval",
+        "hsem_milp_solver_timeout_seconds",
         "hsem_recommendation_interval_minutes",
         "hsem_recommendation_interval_length",
     ]

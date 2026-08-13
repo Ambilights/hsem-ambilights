@@ -16,6 +16,7 @@ from typing import Any, cast
 
 import voluptuous as vol
 
+from custom_components.hsem.const import MILP_SOLVER_TIMEOUT_DEFAULT_SECONDS
 from custom_components.hsem.models.battery_schedule import BatterySchedule
 from custom_components.hsem.models.secondary_storage_entity_config import (
     SecondaryStorageEntityConfig,
@@ -103,7 +104,14 @@ def build_sensor_config(
     cfg.electricity_price_update_interval = (
         _price_update_interval if _price_update_interval is not None else 15
     )
-
+    _milp_solver_timeout = convert_to_float(
+        get_config_value(config_entry, "hsem_milp_solver_timeout_seconds")
+    )
+    cfg.milp_solver_timeout_seconds = (
+        _milp_solver_timeout
+        if _milp_solver_timeout is not None
+        else MILP_SOLVER_TIMEOUT_DEFAULT_SECONDS
+    )
     # Seasonal months
     months_winter = get_config_value(config_entry, "hsem_months_winter")
     months_summer = get_config_value(config_entry, "hsem_months_summer")

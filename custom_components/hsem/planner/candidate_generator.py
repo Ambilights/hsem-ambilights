@@ -288,6 +288,7 @@ def generate_candidates(
             user_margin=inp.battery_cycle_cost_per_kwh,
         )
 
+        milp_attempt: dict = {}
         milp_result = solve_milp(
             baseline_slots,
             now,
@@ -322,6 +323,8 @@ def generate_candidates(
             secondary_storage=inp.secondary_storage,
             battery_export_min_price=inp.battery_export_min_price,
             excess_export_discharge_buffer_pct=(inp.excess_export_discharge_buffer_pct),
+            solver_time_limit_seconds=inp.milp_solver_timeout_seconds,
+            attempt_diagnostics=milp_attempt,
         )
         log_planner(
             "debug",
@@ -353,16 +356,39 @@ def generate_candidates(
             log_planner(
                 "debug",
                 "[gen] MILP candidate added (scipy available and solver succeeded)"
-                "  penalty_violations=%s  total_violation=%.4f",
+                "  status=%s  penalty_violations=%s  total_violation=%.4f",
+                milp_diag.get("solver_status", "unknown"),
                 milp_diag.get("has_violations", False),
                 milp_diag.get("total_violation_kwh", 0.0),
             )
         else:
+            for candidate in candidates:
+                candidate.diagnostics = {"milp_attempt": dict(milp_attempt)}
+            status = str(milp_attempt.get("solver_status", "unknown"))
+            fallback_reason = str(
+                milp_attempt.get("fallback_reason", "milp_candidate_unavailable")
+            )
             log_planner(
-                "debug",
-                "[gen] MILP candidate skipped — solver returned None (infeasible or timeout)",
+                ("warning" if status.startswith(("time_limit", "solver")) else "debug"),
+                "[gen] MILP candidate skipped status=%s fallback=%s",
+                status,
+                fallback_reason,
             )
     else:
+        unavailable_attempt = {
+            "solver_status": "scipy_unavailable",
+            "solver_optimal": False,
+            "solver_status_code": None,
+            "solver_message": "scipy is not available",
+            "solver_time_limit_seconds": inp.milp_solver_timeout_seconds,
+            "solver_elapsed_seconds": 0.0,
+            "solver_mip_gap": None,
+            "incumbent_used": False,
+            "incumbent_validation": "not_run",
+            "fallback_reason": "scipy_unavailable",
+        }
+        for candidate in candidates:
+            candidate.diagnostics = {"milp_attempt": dict(unavailable_attempt)}
         log_planner("debug", "[gen] MILP candidate skipped — scipy not available")
 
     # Log candidate slot-level recommendations for debugging

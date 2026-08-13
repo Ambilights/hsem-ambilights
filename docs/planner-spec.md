@@ -600,6 +600,81 @@ For non-MILP candidates (`milp_prepopulated=False`, the default),
 the simulation continues to derive discharge and grid flows greedily
 from the recommendation label and net demand — unchanged behaviour.
 
+### Fallback wait-mode fidelity
+
+For non-MILP candidates, SoC simulation must model the configured
+``batteries_wait_mode`` hardware behaviour rather than assuming every wait
+slot is idle.  This keeps passive fallback scoring aligned with the mode the
+runtime applier will actually select when a solver result is unavailable.
+
+The simulator therefore:
+
+- leaves wait slots idle when ``hsem_batteries_wait_mode_behavior = strict``;
+- with ``self_consumption_with_reserve``, lets the battery serve only the
+  house-load deficit while its usable energy remains above
+  ``required_capacity``;
+- never exports battery energy from a wait slot;
+- keeps the existing EV anti-roundtrip guard, so EV load remains grid/PV-fed;
+- respects charge/discharge efficiency and the per-slot discharge limit.
+
+This rule affects candidate simulation and scoring only.  It does not change
+the recommendation label or bypass any hardware-write safety gate.
+
+### MILP solve time limit and graceful fallback
+
+``hsem_milp_solver_timeout_seconds`` configures the HiGHS wall-clock budget
+(default 15 seconds, constrained to 1-60 seconds).  The same configured
+budget is used whether phase-aware fuse constraints, export reserve, EV, or
+secondary storage are active.
+
+Solver outcomes follow three explicit tiers:
+
+1. **Optimal MILP** — HiGHS proves optimality and the solution is accepted.
+2. **Validated time-limit incumbent** — HiGHS reaches the configured time
+   limit after finding an integer-feasible solution.  HSEM validates the full
+   returned decision vector before accepting it as the normal ``milp``
+   candidate.
+3. **Explicit passive fallback** — no incumbent exists, validation fails, or
+   another solver failure prevents a safe MILP candidate.  The passive
+   candidate remains available and the failure reason is surfaced.
+
+A time-limited incumbent must pass all of these checks against the final model:
+
+- one-dimensional, exact-length, finite decision vector;
+- future-slot count and indices align with the planning horizon;
+- every per-slot decision-variable block has exactly the active slot count;
+- variable bounds are satisfied;
+- all equality and inequality rows are satisfied within solver tolerance;
+- every integer/binary variable is integral within tolerance.
+
+Any failure rejects the incumbent closed; partially decoded plans are never
+used.  The candidate name intentionally remains exactly ``milp`` for both
+optimal and accepted-incumbent results because that name is a control-flow
+key: it preserves pre-populated primary/PowMr flows and prevents the
+secondary-storage utility bypass from overwriting the solved PowMr schedule.
+
+The plan explanation sensor surfaces the most recent solve outcome through:
+
+- ``solver_status`` and ``solver_optimal``;
+- ``solver_time_limit_seconds`` and ``solver_elapsed_seconds``;
+- ``solver_mip_gap`` and ``solver_message``;
+- ``incumbent_used`` and ``incumbent_validation``;
+- ``fallback_reason``.
+
+A non-MILP winner adds ``milp_fallback`` to ``constraints``; an accepted
+time-limit incumbent adds ``milp_time_limit_incumbent``.
+
+**Invariants:**
+
+- A time-limit result without a complete feasible incumbent never becomes a
+  ``milp`` candidate.
+- An accepted incumbent satisfies the same complete model used by HiGHS,
+  including SoC, fuse, phase, export-reserve, EV, and PowMr constraints.
+- Optimal and accepted-incumbent candidates both retain the name ``milp``.
+- A fallback retains the failed MILP diagnostics even though the winning
+  candidate is passive.
+- No solver-status field changes energy allocation or hardware behaviour.
+
 ## MILP soft constraints (penalty approach)
 
 The MILP optimizer (`milp_optimizer.py`) uses **soft constraints** with penalty

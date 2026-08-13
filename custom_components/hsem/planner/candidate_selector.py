@@ -115,6 +115,7 @@ def select_best_candidate(  # NOSONAR
     months_winter: list[int] | None = None,
     export_min_price: float = 0.0,
     seasonal_fill_mode: str = SEASONAL_FILL_MODE_FORECAST,
+    wait_mode_behavior: str = "strict",
     # Hysteresis parameters (issue #372)
     hysteresis_enabled: bool = False,
     hysteresis_absolute: float = 0.0,
@@ -181,6 +182,9 @@ def select_best_candidate(  # NOSONAR
         seasonal_fill_mode:
             ``forecast`` uses forward PV refill headroom; ``months`` preserves
             the legacy calendar rule.
+        wait_mode_behavior:
+            Controls whether simulated wait slots stay idle or serve house
+            demand from energy above ``required_capacity``.
         hysteresis_enabled:
             When True, plan-level hysteresis is active.  The previous
             winner's strategy is kept unless a new candidate beats the
@@ -265,6 +269,8 @@ def select_best_candidate(  # NOSONAR
             charge_efficiency_pct=charge_efficiency_pct,
             discharge_efficiency_pct=discharge_efficiency_pct,
             milp_prepopulated=(candidate.name == CANDIDATE_MILP),
+            wait_mode_behavior=wait_mode_behavior,
+            required_capacity_kwh=required_capacity,
         )
         if (
             secondary_storage is not None

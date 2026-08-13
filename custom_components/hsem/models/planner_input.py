@@ -8,6 +8,7 @@ from typing import Any, cast
 
 from custom_components.hsem.const import (
     DEFAULT_CONFIG_VALUES,
+    MILP_SOLVER_TIMEOUT_DEFAULT_SECONDS,
     SEASONAL_FILL_MODE_FORECAST,
 )
 from custom_components.hsem.models.battery_schedule_input import BatteryScheduleInput
@@ -216,6 +217,8 @@ class PlannerInput:
     # --- seasonal / mode config ---
     months_winter: list[int] = field(default_factory=lambda: [1, 2, 3, 4, 10, 11, 12])
     seasonal_fill_mode: str = SEASONAL_FILL_MODE_FORECAST
+    batteries_wait_mode_behavior: str = "strict"
+    milp_solver_timeout_seconds: float = MILP_SOLVER_TIMEOUT_DEFAULT_SECONDS
     house_power_includes_ev: bool = True
     is_read_only: bool = False  # False = hardware writes enabled; set True only in dry-run/test scenarios
 

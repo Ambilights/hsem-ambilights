@@ -377,6 +377,8 @@ def build_planner_input(
         ),
         months_winter=list(cfg.months_winter or []),
         seasonal_fill_mode=cfg.seasonal_fill_mode,
+        batteries_wait_mode_behavior=cfg.batteries_wait_mode_behavior,
+        milp_solver_timeout_seconds=cfg.milp_solver_timeout_seconds,
         house_power_includes_ev=bool(cfg.house_power_includes_ev_charger_power),
         live_solar_production_w=convert_to_float(live.solar_production_power_w) or 0.0,
         live_house_consumption_w=convert_to_float(live.house_consumption_power_w)

@@ -265,6 +265,7 @@
           "hsem_read_only": "Kun læsning",
           "hsem_recommendation_interval_length": "Anbefalingsinterval-længde",
           "hsem_recommendation_interval_minutes": "Anbefalingsinterval-minutter",
+          "hsem_milp_solver_timeout_seconds": "MILP-løsertidsgrænse",
           "hsem_update_interval": "Opdateringsinterval",
           "hsem_verbose_logging": "Detaljeret logning"
         },
@@ -274,6 +275,7 @@
           "hsem_read_only": "Aktiver denne mulighed for at sætte integrationen i skrivebeskyttet tilstand, så den ikke sender kommandoer til enheder.",
           "hsem_recommendation_interval_length": "Længden i minutter af hvert anbefalingsinterval, der bruges til at beregne optimal batteribrug.",
           "hsem_recommendation_interval_minutes": "Antallet af anbefalingsintervaller, der skal overvejes ved beregning af optimal batteribrug.",
+          "hsem_milp_solver_timeout_seconds": "Maksimal tid i sekunder for hver HiGHS-optimering. Hvis tidsgrænsen nås, bruger HSEM en valideret gennemførlig løsning, når den findes; ellers markeres tilbagefaldet til den passive plan tydeligt.",
           "hsem_update_interval": "Opdateringsintervallet i minutter for arbejdstilstandssensoren.",
           "hsem_verbose_logging": "Aktiver detaljeret fejlfindingslogning til fejlfinding."
         },
@@ -383,6 +385,7 @@
           "hsem_read_only": "Kun læsning",
           "hsem_recommendation_interval_length": "Anbefalingsinterval-længde",
           "hsem_recommendation_interval_minutes": "Anbefalingsinterval-minutter",
+          "hsem_milp_solver_timeout_seconds": "MILP-løsertidsgrænse",
           "hsem_update_interval": "Opdateringsinterval",
           "hsem_verbose_logging": "Detaljeret logning"
         },
@@ -392,6 +395,7 @@
           "hsem_read_only": "Aktiver denne mulighed for at sætte integrationen i skrivebeskyttet tilstand, så den ikke sender kommandoer til enheder.",
           "hsem_recommendation_interval_length": "Længden i minutter af hvert anbefalingsinterval, der bruges til at beregne optimal batteribrug.",
           "hsem_recommendation_interval_minutes": "Antallet af anbefalingsintervaller, der skal overvejes ved beregning af optimal batteribrug.",
+          "hsem_milp_solver_timeout_seconds": "Maksimal tid i sekunder for hver HiGHS-optimering. Hvis tidsgrænsen nås, bruger HSEM en valideret gennemførlig løsning, når den findes; ellers markeres tilbagefaldet til den passive plan tydeligt.",
           "hsem_update_interval": "Opdateringsintervallet i minutter for arbejdstilstandssensoren.",
           "hsem_verbose_logging": "Aktiver detaljeret fejlfindingslogning til fejlfinding."
         },
@@ -792,6 +796,7 @@
           "hsem_read_only": "Read Only",
           "hsem_recommendation_interval_length": "Recommendation Interval Length",
           "hsem_recommendation_interval_minutes": "Recommendation Interval Minutes",
+          "hsem_milp_solver_timeout_seconds": "MILP Solver Time Limit",
           "hsem_update_interval": "Update interval",
           "hsem_verbose_logging": "Verbose Logging"
         },
@@ -801,6 +806,7 @@
           "hsem_read_only": "Enable this option to set the integration to read-only mode, preventing it from sending commands to devices.",
           "hsem_recommendation_interval_length": "The length in minutes of each recommendation interval used to calculate optimal battery usage.",
           "hsem_recommendation_interval_minutes": "The number of recommendation intervals to consider when calculating optimal battery usage.",
+          "hsem_milp_solver_timeout_seconds": "Maximum time in seconds for each HiGHS optimisation. If the limit is reached, HSEM uses a validated feasible incumbent when available; otherwise it explicitly falls back to the passive plan.",
           "hsem_update_interval": "The update interval in minutes for the working mode sensor.",
           "hsem_verbose_logging": "Enable verbose debug logging for troubleshooting purposes."
         },

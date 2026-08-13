@@ -58,6 +58,17 @@ class PlanExplanation:
         rejected_plans:
             Alternative plans that were evaluated and rejected, each with a
             name, reason, and estimated cost.
+        solver_status:
+            ``optimal``, ``time_limit_feasible_incumbent``, or a specific
+            failure/skip status from the most recent HiGHS attempt.
+        solver_optimal:
+            Whether HiGHS proved the selected MILP solution optimal.
+        incumbent_used:
+            Whether a fully validated time-limit incumbent supplied the MILP
+            candidate. The candidate name remains ``milp`` by design.
+        fallback_reason:
+            Machine-readable reason a non-MILP plan was used. Empty when the
+            selected plan is a successful MILP result.
         hysteresis_active:
             ``True`` when plan-level hysteresis was applied and the previous
             plan was kept despite a new candidate having a slightly better score.
@@ -83,6 +94,16 @@ class PlanExplanation:
     battery_soc_at_end_pct: float = 0.0
     constraints: list[str] = field(default_factory=list)
     rejected_plans: list[RejectedPlan] = field(default_factory=list)
+    # MILP solve/fallback observability.
+    solver_status: str = "not_run"
+    solver_optimal: bool = False
+    solver_time_limit_seconds: float = 0.0
+    solver_elapsed_seconds: float = 0.0
+    solver_mip_gap: float | None = None
+    solver_message: str = ""
+    incumbent_used: bool = False
+    incumbent_validation: str = ""
+    fallback_reason: str = ""
     # Hysteresis fields (issue #372)
     hysteresis_active: bool = False
     hysteresis_reason: str = ""
@@ -107,6 +128,19 @@ class PlanExplanation:
             "forecast_net_consumption_kwh": round(self.forecast_net_consumption_kwh, 3),
             "battery_soc_pct": round(self.battery_soc_pct, 1),
             "battery_soc_at_end_pct": round(self.battery_soc_at_end_pct, 1),
+            "solver_status": self.solver_status,
+            "solver_optimal": self.solver_optimal,
+            "solver_time_limit_seconds": round(self.solver_time_limit_seconds, 3),
+            "solver_elapsed_seconds": round(self.solver_elapsed_seconds, 3),
+            "solver_mip_gap": (
+                round(self.solver_mip_gap, 6)
+                if self.solver_mip_gap is not None
+                else None
+            ),
+            "solver_message": self.solver_message,
+            "incumbent_used": self.incumbent_used,
+            "incumbent_validation": self.incumbent_validation,
+            "fallback_reason": self.fallback_reason,
             "constraints": list(self.constraints),
             "rejected_plans": [
                 {
