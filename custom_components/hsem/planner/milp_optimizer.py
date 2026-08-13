@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
-from typing import TYPE_CHECKING
+from time import perf_counter
+from typing import TYPE_CHECKING, Any
 
+from custom_components.hsem.const import (
+    MILP_SOLVER_TIMEOUT_DEFAULT_SECONDS,
+    MILP_SOLVER_TIMEOUT_MAX_SECONDS,
+    MILP_SOLVER_TIMEOUT_MIN_SECONDS,
+)
 from custom_components.hsem.models.ev_config import EVConfig
 from custom_components.hsem.utils.datetime_utils import as_tz
 from custom_components.hsem.utils.logger import log_planner
@@ -25,11 +32,6 @@ if TYPE_CHECKING:
 # Name exported so the engine and tests can reference it without re-defining
 CANDIDATE_MILP = "milp"
 
-# Solver timeout in seconds — HiGHS respects this via ``options``.
-# Increased from 0.5 to 2.0 to handle 192-slot (768 variable) problems
-# where preprocessing overhead alone can reach 200-400ms.
-_SOLVER_TIME_LIMIT_S = 2.0
-
 # Minimum energy threshold below which a slot is treated as zero-charge/discharge
 # to avoid writing tiny floating-point artefacts into recommendations.
 _MIN_ACTION_KWH = 1e-4
@@ -38,6 +40,32 @@ _MIN_ACTION_KWH = 1e-4
 # feasible. This is far below any material energy cost but makes diagnostics
 # deterministic and prevents reserve rows activating without battery export.
 _EXPORT_MODE_TIEBREAK_COST = 1e-6
+
+
+def _normalise_solver_timeout(value: float) -> float:
+    """Clamp a configured solver budget to the supported safe range."""
+    try:
+        timeout = float(value)
+    except TypeError, ValueError:
+        timeout = MILP_SOLVER_TIMEOUT_DEFAULT_SECONDS
+    if not math.isfinite(timeout):
+        timeout = MILP_SOLVER_TIMEOUT_DEFAULT_SECONDS
+    return min(
+        max(timeout, MILP_SOLVER_TIMEOUT_MIN_SECONDS),
+        MILP_SOLVER_TIMEOUT_MAX_SECONDS,
+    )
+
+
+def _sync_attempt_diagnostics(
+    attempt: dict[str, Any],
+    target: dict[str, Any] | None,
+    **updates: Any,
+) -> None:
+    """Update local diagnostics and the optional caller-owned snapshot."""
+    attempt.update(updates)
+    if target is not None:
+        target.clear()
+        target.update(attempt)
 
 
 def solve_milp(
@@ -63,6 +91,8 @@ def solve_milp(
     battery_export_min_price: float = 0.0,
     excess_export_discharge_buffer_pct: float = 0.0,
     secondary_storage: SecondaryStorageConfig | None = None,
+    solver_time_limit_seconds: float = MILP_SOLVER_TIMEOUT_DEFAULT_SECONDS,
+    attempt_diagnostics: dict[str, Any] | None = None,
 ) -> tuple[list[PlannedSlot], dict] | None:
     """Solve the horizon and return independent result slots plus diagnostics.
 
@@ -191,6 +221,14 @@ def solve_milp(
             battery-to-grid export must leave at the next forecast solar-refill
             checkpoint. The reserve is conditional and does not restrict
             ordinary house self-consumption. `0.0` disables it.
+        solver_time_limit_seconds:
+            Maximum wall-clock budget passed to HiGHS, clamped to the
+            supported 1-60 second range. A time-limited solution is used only
+            when its full decision vector passes HSEM's feasibility checks.
+        attempt_diagnostics:
+            Optional caller-owned dictionary populated with solver status,
+            elapsed time, MIP gap, incumbent validation, and fallback reason.
+            This remains available when no MILP candidate can be returned.
 
     Returns:
         A tuple ``(slots, diagnostics)`` where:
@@ -202,6 +240,21 @@ def solve_milp(
         Returns ``None`` if the solver fails (unrelated to constraint
         violations — e.g., solver crash or numerical issue).
     """
+    solver_time_limit = _normalise_solver_timeout(solver_time_limit_seconds)
+    attempt: dict[str, Any] = {
+        "solver_status": "not_started",
+        "solver_optimal": False,
+        "solver_status_code": None,
+        "solver_message": "",
+        "solver_time_limit_seconds": solver_time_limit,
+        "solver_elapsed_seconds": 0.0,
+        "solver_mip_gap": None,
+        "incumbent_used": False,
+        "incumbent_validation": "not_run",
+        "fallback_reason": "",
+    }
+    _sync_attempt_diagnostics(attempt, attempt_diagnostics)
+
     secondary_active = secondary_storage is not None and secondary_storage.valid
     if secondary_active:
         import copy
@@ -221,7 +274,7 @@ def solve_milp(
         "chg_eff=%.2f  dis_eff=%.2f  discount=%.4f  repl_price=%s  "
         "no_export=%s  min_export_price=%.4f  battery_export_min_price=%.4f  "
         "export_buffer=%.2f%%  "
-        "fuse=%s  phase_aware=%s  secondary=%s",
+        "fuse=%s  phase_aware=%s  secondary=%s  timeout=%.1fs",
         len(slots),
         current_kwh,
         usable_kwh,
@@ -247,12 +300,19 @@ def solve_milp(
         ),
         phase_power_imbalance_w is not None,
         secondary_active,
+        solver_time_limit,
     )
 
     try:
         import numpy as np
         from scipy.optimize import linprog
     except ImportError:
+        _sync_attempt_diagnostics(
+            attempt,
+            attempt_diagnostics,
+            solver_status="scipy_unavailable",
+            fallback_reason="scipy_unavailable",
+        )
         log_planner("debug", "[milp] scipy/numpy not available — MILP disabled")
         return None
 
@@ -263,10 +323,22 @@ def solve_milp(
             usable_kwh,
             max_charge_per_slot,
         )
+        _sync_attempt_diagnostics(
+            attempt,
+            attempt_diagnostics,
+            solver_status="skipped_invalid_battery",
+            fallback_reason="invalid_battery_limits",
+        )
         return None
 
     n = len(slots)
     if n == 0:
+        _sync_attempt_diagnostics(
+            attempt,
+            attempt_diagnostics,
+            solver_status="skipped_empty_horizon",
+            fallback_reason="empty_horizon",
+        )
         return None
 
     max_dis = (
@@ -281,6 +353,12 @@ def solve_milp(
     future_idx = [i for i, m in enumerate(future_mask) if m]
 
     if not future_idx:
+        _sync_attempt_diagnostics(
+            attempt,
+            attempt_diagnostics,
+            solver_status="skipped_no_future_slots",
+            fallback_reason="no_future_slots",
+        )
         return None
 
     # ------------------------------------------------------------------
@@ -756,17 +834,40 @@ def solve_milp(
     b_ub = constraints["b_ub"]
     bounds = constraints["bounds"]
 
+    # Every per-slot decision block must align with the active horizon before
+    # a time-limited incumbent may be decoded. Single scalar penalty variables
+    # are covered by the full-vector length, bound, and matrix checks.
+    variable_blocks: dict[str, tuple[int, int]] = {
+        "primary_charge": (ec_off, m),
+        "primary_discharge": (ed_off, m),
+        "grid_import": (gi_off, m),
+        "grid_export": (ge_off, m),
+        "pv": (pv_off, m),
+        "primary_throughput": (m_off, m),
+        "soc_max_penalty": (s_max_off, m),
+        "soc_min_penalty": (s_min_off, m),
+        "curtailment": (curt_off, m),
+    }
+    for ev_index, offset in enumerate(ev_var_offsets):
+        variable_blocks[f"ev_{ev_index}_charge"] = (offset, m)
+    if fuse_active:
+        variable_blocks["grid_import_penalty"] = (gi_pen_off, m)
+    if export_mode_off is not None:
+        variable_blocks["battery_export_mode"] = (export_mode_off, m)
+    if secondary_layout is not None:
+        for name, offset in secondary_layout.items():
+            variable_blocks[f"secondary_{name}"] = (offset, m)
+
     # ------------------------------------------------------------------
     # Solve using HiGHS
     # ------------------------------------------------------------------
     solver_options: dict[str, float | bool] = {
-        "time_limit": (
-            5.0 if secondary_active or export_reserve_active else _SOLVER_TIME_LIMIT_S
-        ),
+        "time_limit": solver_time_limit,
         "disp": False,
     }
     if secondary_active or export_reserve_active:
         solver_options["mip_rel_gap"] = 0.005
+    solve_started = perf_counter()
     try:
         result = linprog(
             c_obj,
@@ -780,17 +881,139 @@ def solve_milp(
             options=solver_options,
         )
     except Exception as exc:
+        elapsed = perf_counter() - solve_started
+        _sync_attempt_diagnostics(
+            attempt,
+            attempt_diagnostics,
+            solver_status="solver_exception",
+            solver_message=str(exc),
+            solver_elapsed_seconds=round(elapsed, 3),
+            fallback_reason="solver_exception",
+        )
         log_planner("warning", "[milp] Solver raised an exception: %s", exc)
         return None
 
-    if not result.success:
+    elapsed = perf_counter() - solve_started
+    status_code = int(getattr(result, "status", -1))
+    solver_message = str(getattr(result, "message", ""))
+    raw_mip_gap = getattr(result, "mip_gap", None)
+    try:
+        mip_gap = float(raw_mip_gap) if raw_mip_gap is not None else None
+    except TypeError, ValueError:
+        mip_gap = None
+    if mip_gap is not None and not math.isfinite(mip_gap):
+        mip_gap = None
+
+    is_time_limit = status_code == 1 and "time limit" in solver_message.casefold()
+    if not result.success and not is_time_limit:
+        _sync_attempt_diagnostics(
+            attempt,
+            attempt_diagnostics,
+            solver_status="solver_failed",
+            solver_status_code=status_code,
+            solver_message=solver_message,
+            solver_elapsed_seconds=round(elapsed, 3),
+            solver_mip_gap=mip_gap,
+            fallback_reason=f"solver_status_{status_code}",
+        )
         log_planner(
-            "debug",
-            "[milp] Solver returned status=%s (%s)",
-            result.status,
-            result.message,
+            "warning",
+            "[milp] Solver failed status=%s elapsed=%.3fs (%s); using fallback",
+            status_code,
+            elapsed,
+            solver_message,
         )
         return None
+
+    from custom_components.hsem.planner.milp._incumbent import validate_incumbent
+
+    validation = validate_incumbent(
+        getattr(result, "x", None),
+        n_vars=n_vars,
+        slot_count=len(slots),
+        future_idx=future_idx,
+        m=m,
+        variable_blocks=variable_blocks,
+        a_eq=A_eq,
+        b_eq=b_eq,
+        a_ub=A_ub,
+        b_ub=b_ub,
+        bounds=bounds,
+        integrality=integrality,
+    )
+    if not validation.valid:
+        if is_time_limit and validation.reason == "missing_solution_vector":
+            solver_status = "time_limit_no_incumbent"
+        elif is_time_limit:
+            solver_status = "time_limit_invalid_incumbent"
+        else:
+            solver_status = "solver_invalid_solution"
+        _sync_attempt_diagnostics(
+            attempt,
+            attempt_diagnostics,
+            solver_status=solver_status,
+            solver_status_code=status_code,
+            solver_message=solver_message,
+            solver_elapsed_seconds=round(elapsed, 3),
+            solver_mip_gap=mip_gap,
+            incumbent_validation=validation.reason,
+            solution_validation=validation.as_dict(),
+            fallback_reason=solver_status,
+        )
+        log_planner(
+            "warning",
+            "[milp] Rejected solver solution status=%s elapsed=%.3fs "
+            "validation=%s; using fallback",
+            status_code,
+            elapsed,
+            validation.reason,
+        )
+        return None
+
+    # A time limit means only that optimality was not proven. The candidate
+    # name intentionally remains exactly ``milp`` because it is a control-flow
+    # key: the selector must trust its pre-populated primary and PowMr flows.
+    solver_status = "time_limit_feasible_incumbent" if is_time_limit else "optimal"
+    _sync_attempt_diagnostics(
+        attempt,
+        attempt_diagnostics,
+        solver_status=solver_status,
+        solver_optimal=not is_time_limit and status_code == 0,
+        solver_status_code=status_code,
+        solver_message=solver_message,
+        solver_elapsed_seconds=round(elapsed, 3),
+        solver_mip_gap=mip_gap,
+        incumbent_used=is_time_limit,
+        incumbent_validation=validation.reason,
+        solution_validation=validation.as_dict(),
+        fallback_reason="",
+    )
+
+    objective = getattr(result, "fun", None)
+    try:
+        objective_value = float(objective) if objective is not None else math.nan
+    except TypeError, ValueError:
+        objective_value = math.nan
+    if not math.isfinite(objective_value):
+        objective_value = float(np.dot(c_obj, result.x))
+        result.fun = objective_value
+
+    if is_time_limit:
+        log_planner(
+            "warning",
+            "[milp] Time limit reached after %.3fs; using validated feasible "
+            "incumbent gap=%s candidate=%s",
+            elapsed,
+            f"{mip_gap:.6f}" if mip_gap is not None else "n/a",
+            CANDIDATE_MILP,
+        )
+    else:
+        log_planner(
+            "debug",
+            "[milp] Optimal solution accepted elapsed=%.3fs gap=%s",
+            elapsed,
+            f"{mip_gap:.6f}" if mip_gap is not None else "n/a",
+        )
 
     # ------------------------------------------------------------------
     # Compute terminal-SoC credit at end-of-horizon (diagnostic).
@@ -884,6 +1107,7 @@ def solve_milp(
         terminal_soc_credit,
         _min_action_kwh=_MIN_ACTION_KWH,
     )
+    diagnostics.update(attempt)
 
     diagnostics["phase_fuse_active"] = phase_fuse_active
 

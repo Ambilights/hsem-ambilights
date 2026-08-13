@@ -11,6 +11,10 @@ SEASONAL_FILL_MODES = frozenset(
     {SEASONAL_FILL_MODE_FORECAST, SEASONAL_FILL_MODE_MONTHS}
 )
 
+MILP_SOLVER_TIMEOUT_DEFAULT_SECONDS = 15.0
+MILP_SOLVER_TIMEOUT_MIN_SECONDS = 1.0
+MILP_SOLVER_TIMEOUT_MAX_SECONDS = 60.0
+
 # Default TOU modes for EV charger when charging.
 DEFAULT_HSEM_EV_CHARGER_TOU_MODES = ["00:00-00:01/1234567/+"]
 
@@ -97,6 +101,9 @@ DEFAULT_CONFIG_VALUES = {
     "hsem_planner_hysteresis_enabled": True,
     "hsem_planner_hysteresis_absolute": 0.0,
     "hsem_planner_hysteresis_percentage": 5.0,
+    # HiGHS solve budget. A time-limited feasible incumbent is validated and
+    # may be used; otherwise the planner falls back to its passive candidate.
+    "hsem_milp_solver_timeout_seconds": MILP_SOLVER_TIMEOUT_DEFAULT_SECONDS,
     # Window-level hysteresis — prevent rapid recommendation toggles
     # (e.g. ev_smart_charging ↔ batteries_charge_solar) by enforcing a
     # minimum hold time (minutes).  0 disables the feature.

@@ -18,6 +18,7 @@ from typing import cast
 
 from custom_components.hsem.const import (
     DEFAULT_CONFIG_VALUES,
+    MILP_SOLVER_TIMEOUT_DEFAULT_SECONDS,
     SEASONAL_FILL_MODE_FORECAST,
 )
 from custom_components.hsem.models.secondary_storage_entity_config import (
@@ -135,6 +136,9 @@ class SensorConfig:
             allows normal household self-consumption while protecting the
             planner's required battery reserve.
 
+        milp_solver_timeout_seconds: Maximum HiGHS wall-clock budget in seconds.
+            Time-limited incumbents are accepted only after complete model
+            validation.
         months_winter: List of month integers (1-12) treated as winter.
         months_summer: List of month integers (1-12) treated as summer.
         seasonal_fill_mode: Strategy for otherwise-unassigned planner slots.
@@ -266,6 +270,9 @@ class SensorConfig:
 
     # Wait mode behaviour
     batteries_wait_mode_behavior: str = "strict"
+
+    # HiGHS MILP solve budget in seconds.
+    milp_solver_timeout_seconds: float = MILP_SOLVER_TIMEOUT_DEFAULT_SECONDS
 
     # EV planned load integration — primary EV (optional, disabled by default)
     ev_planned_load_enabled: bool = False

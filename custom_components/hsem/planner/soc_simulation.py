@@ -55,6 +55,8 @@ def simulate_soc(
     discharge_efficiency_pct: float = 100.0,
     *,
     milp_prepopulated: bool = False,
+    wait_mode_behavior: str = "strict",
+    required_capacity_kwh: float = 0.0,
 ) -> None:
     """Forward-simulate battery SoC through all planning slots.
 
@@ -114,6 +116,13 @@ def simulate_soc(
         discharge_efficiency_pct: Discharge-side efficiency as a percentage
             (0-100).  Energy to house = battery_removed × (discharge_efficiency_pct / 100).
             Defaults to 100 % (no discharge-side loss) for backward compatibility.
+        wait_mode_behavior: ``"strict"`` keeps wait slots idle.
+            ``"self_consumption_with_reserve"`` lets wait slots serve the
+            house from energy above ``required_capacity_kwh``, matching the
+            runtime inverter mode and power cap.
+        required_capacity_kwh: Battery energy above the discharge floor that
+            wait-mode self-consumption must preserve. Ignored for strict wait
+            and MILP-prepopulated candidates.
         milp_prepopulated: When ``True``, the slot's ``batteries_discharged_kwh``,
             ``grid_import_kwh``, and ``grid_export_kwh`` fields are already
             populated by the MILP LP solution and must be used verbatim.
@@ -243,23 +252,22 @@ def simulate_soc(
             # Instead, cover everything (house + EV + scheduled charge) from
             # the grid when EV is active.
             #
-            # Additionally, only discharge when the slot's recommendation
-            # explicitly calls for it — BatteriesDischargeMode or
-            # ForceBatteriesDischarge.  Slots with other recommendations
-            # (e.g. BatteriesWaitMode, None) should NOT drain the battery
-            # even if capacity is available, preserving stored energy for
-            # more expensive future slots.
+            # Strict wait mode remains idle. Self-consumption-with-reserve
+            # mirrors the live applier: it may serve house demand, never
+            # export, and may use only energy above the required reserve.
             #
             # Discharge efficiency: to deliver `net_demand` kWh to the house
             # the battery must release `net_demand / discharge_eff` kWh.
             # We cap to available capacity and per-slot limit then compute
             # what the house actually receives from that draw.
-            if (
-                ev_load > 1e-9
-                or slot.recommendation == Recommendations.BatteriesWaitMode.value
-            ):
-                # EV is charging or slot is in wait mode — no battery discharge.
-                # Everything from grid.
+            is_wait_mode = (
+                slot.recommendation == Recommendations.BatteriesWaitMode.value
+            )
+            wait_self_consumption = (
+                is_wait_mode and wait_mode_behavior == "self_consumption_with_reserve"
+            )
+            if ev_load > 1e-9 or (is_wait_mode and not wait_self_consumption):
+                # EV is charging or strict wait is active: everything from grid.
                 discharge = 0.0
                 house_grid_import = net_demand
                 grid_import = (
@@ -270,6 +278,12 @@ def simulate_soc(
                 max_discharge_cap = cap
                 if max_discharge_per_slot is not None:
                     max_discharge_cap = min(max_discharge_cap, max_discharge_per_slot)
+                if wait_self_consumption:
+                    reserve_kwh = max(required_capacity_kwh, 0.0)
+                    max_discharge_cap = min(
+                        max_discharge_cap,
+                        max(cap - reserve_kwh, 0.0),
+                    )
 
                 # Force discharge: pump battery at max rate to AC bus.
                 # House takes what it needs, excess goes to grid.
