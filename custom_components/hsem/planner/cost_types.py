@@ -74,18 +74,10 @@ class CostWeights:
         time_discount_rate:
             Per-hour exponential discount factor applied to the ``score``
             (selector objective) but **not** to ``total_cost`` (auditable
-            (auditable money).  A value of ``1.0`` disables the discount
-            entirely.  Default ``0.995`` gives:
-
-            | Horizon | Factor |
-            |---|---|
-            | 1 hour | 0.995 |
-            | 6 hours | 0.970 |
-            | 24 hours | 0.887 |
-            | 48 hours | 0.787 |
-
-            This prevents the selector from preferring plans that look cheap
-            only because they rely on uncertain distant-future slots.
+            money). A value of ``1.0`` disables the discount
+            entirely. The default is ``1.0`` because published day-ahead
+            prices are known values; discounting them can incorrectly prefer
+            immediate export over avoiding a later, more expensive import.
     """
 
     # SoC guard penalties
@@ -135,7 +127,7 @@ class CostWeights:
     max_charge_per_slot_kwh: float = 0.0
 
     # Time discount for selector score (1.0 = no discount)
-    time_discount_rate: float = 0.995
+    time_discount_rate: float = 1.0
 
     # Optional dedicated-load secondary storage.
     secondary_storage_enabled: bool = False

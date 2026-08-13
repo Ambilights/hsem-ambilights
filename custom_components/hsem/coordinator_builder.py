@@ -464,7 +464,10 @@ def build_planner_input(
             cfg.ev_second.past_target_confidence_factor
         )
         or 0.9,
-        time_discount_rate=0.995,
+        # Nord Pool day-ahead prices are already known values. Discounting
+        # later slots makes a marginal export now look better than avoiding a
+        # known import later, so monetary slot values remain undiscounted.
+        time_discount_rate=1.0,
         # Planner hysteresis (issue #372)
         planner_hysteresis_enabled=bool(cfg.planner_hysteresis_enabled),
         planner_hysteresis_absolute=(

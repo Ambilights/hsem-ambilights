@@ -3475,3 +3475,192 @@ def test_export_cap_battery_export_displaces_pv_at_cap():
             f"Slot {i}: battery discharged {s.batteries_discharged_kwh:.3f} kWh "
             "into a saturated export cap"
         )
+
+
+# ---------------------------------------------------------------------------
+# Conditional excess-export reserve
+# ---------------------------------------------------------------------------
+
+
+@_scipy_skip()
+def test_export_reserve_is_retained_before_next_solar_surplus() -> None:
+    """Battery export must leave the configured buffer before the next refill."""
+    slots = [
+        _make_slot(hour=0, import_price=5.0, export_price=5.0, consumption_kwh=0.0),
+        _make_slot(hour=1, import_price=10.0, export_price=0.0, consumption_kwh=0.0),
+        _make_slot(hour=2, import_price=10.0, export_price=0.0, consumption_kwh=0.0),
+        _make_slot(
+            hour=3,
+            import_price=10.0,
+            export_price=0.0,
+            consumption_kwh=0.0,
+            pv_kwh=3.0,
+        ),
+    ]
+
+    result = solve_milp(
+        slots,
+        _NOW,
+        current_kwh=5.0,
+        usable_kwh=5.0,
+        max_charge_per_slot=5.0,
+        max_discharge_per_slot=5.0,
+        charge_efficiency_pct=100.0,
+        discharge_efficiency_pct=100.0,
+        excess_export_discharge_buffer_pct=20.0,
+    )
+
+    assert result is not None
+    planned, diagnostics = result
+    assert diagnostics["battery_export_reserve_active"] is True
+    assert diagnostics["battery_export_reserve_kwh"] == pytest.approx(1.0)
+    assert diagnostics["battery_export_reserve_slots"] >= 1
+    assert diagnostics[
+        "battery_export_reserve_min_checkpoint_soc_kwh"
+    ] == pytest.approx(1.0, abs=1e-5)
+    assert planned[0].batteries_discharged_kwh == pytest.approx(4.0, abs=1e-4)
+
+
+@_scipy_skip()
+def test_export_reserve_detects_daytime_discharge_beyond_load_left_after_pv() -> None:
+    """PV-covered load must not hide battery export or solar displacement."""
+    slots = [
+        _make_slot(
+            hour=0,
+            import_price=5.0,
+            export_price=5.0,
+            consumption_kwh=1.0,
+            pv_kwh=0.8,
+        ),
+        _make_slot(hour=1, import_price=10.0, export_price=0.0, consumption_kwh=0.0),
+        _make_slot(hour=2, import_price=10.0, export_price=0.0, consumption_kwh=0.0),
+        _make_slot(
+            hour=3,
+            import_price=10.0,
+            export_price=0.0,
+            consumption_kwh=0.0,
+            pv_kwh=3.0,
+        ),
+    ]
+
+    result = solve_milp(
+        slots,
+        _NOW,
+        current_kwh=1.0,
+        usable_kwh=1.0,
+        max_charge_per_slot=1.0,
+        max_discharge_per_slot=1.0,
+        charge_efficiency_pct=100.0,
+        discharge_efficiency_pct=100.0,
+        excess_export_discharge_buffer_pct=50.0,
+    )
+
+    assert result is not None
+    planned, diagnostics = result
+    assert planned[0].batteries_discharged_kwh == pytest.approx(0.5, abs=1e-5)
+    assert diagnostics["battery_export_reserve_slots"] >= 1
+    assert diagnostics[
+        "battery_export_reserve_min_checkpoint_soc_kwh"
+    ] == pytest.approx(0.5, abs=1e-5)
+
+
+@_scipy_skip()
+def test_export_reserve_does_not_block_ordinary_self_consumption() -> None:
+    """The conditional buffer is not a hard minimum SoC for house load."""
+    slots = [
+        _make_slot(hour=0, import_price=5.0, export_price=0.0, consumption_kwh=1.0),
+        _make_slot(hour=1, import_price=5.0, export_price=0.0, consumption_kwh=1.0),
+    ]
+
+    result = solve_milp(
+        slots,
+        _NOW,
+        current_kwh=2.0,
+        usable_kwh=5.0,
+        max_charge_per_slot=5.0,
+        max_discharge_per_slot=5.0,
+        charge_efficiency_pct=100.0,
+        discharge_efficiency_pct=100.0,
+        excess_export_discharge_buffer_pct=50.0,
+    )
+
+    assert result is not None
+    planned, diagnostics = result
+    assert sum(slot.batteries_discharged_kwh for slot in planned) == pytest.approx(
+        2.0, abs=1e-5
+    )
+    assert diagnostics["battery_export_reserve_slots"] == 0
+    assert diagnostics["battery_export_reserve_min_checkpoint_soc_kwh"] is None
+
+
+@_scipy_skip()
+def test_export_reserve_can_be_restored_by_later_cheap_grid_charge() -> None:
+    """A profitable export remains valid when cheap charging restores the buffer."""
+    slots = [
+        _make_slot(hour=0, import_price=5.0, export_price=5.0, consumption_kwh=0.0),
+        _make_slot(hour=1, import_price=1.0, export_price=0.0, consumption_kwh=0.0),
+        _make_slot(hour=2, import_price=5.0, export_price=0.0, consumption_kwh=0.0),
+    ]
+
+    result = solve_milp(
+        slots,
+        _NOW,
+        current_kwh=5.0,
+        usable_kwh=5.0,
+        max_charge_per_slot=5.0,
+        max_discharge_per_slot=5.0,
+        charge_efficiency_pct=100.0,
+        discharge_efficiency_pct=100.0,
+        excess_export_discharge_buffer_pct=20.0,
+    )
+
+    assert result is not None
+    planned, diagnostics = result
+    assert planned[0].batteries_discharged_kwh == pytest.approx(5.0, abs=1e-4)
+    assert planned[1].batteries_charged_kwh == pytest.approx(1.0, abs=1e-4)
+    assert diagnostics[
+        "battery_export_reserve_min_checkpoint_soc_kwh"
+    ] == pytest.approx(1.0, abs=1e-5)
+
+
+@_scipy_skip()
+def test_known_future_import_is_not_discounted_below_current_export() -> None:
+    """Retain energy when avoiding a later known import beats exporting now."""
+    slots = [
+        _make_slot(hour=0, import_price=2.9, export_price=2.9, consumption_kwh=0.0),
+        _make_slot(hour=23, import_price=3.0, export_price=0.0, consumption_kwh=1.0),
+    ]
+
+    undiscounted = solve_milp(
+        slots,
+        _NOW,
+        current_kwh=1.0,
+        usable_kwh=1.0,
+        max_charge_per_slot=1.0,
+        max_discharge_per_slot=1.0,
+        cycle_cost_per_kwh=0.1,
+        charge_efficiency_pct=100.0,
+        discharge_efficiency_pct=100.0,
+    )
+    discounted = solve_milp(
+        slots,
+        _NOW,
+        current_kwh=1.0,
+        usable_kwh=1.0,
+        max_charge_per_slot=1.0,
+        max_discharge_per_slot=1.0,
+        cycle_cost_per_kwh=0.1,
+        charge_efficiency_pct=100.0,
+        discharge_efficiency_pct=100.0,
+        time_discount_rate=0.995,
+    )
+
+    assert undiscounted is not None
+    assert discounted is not None
+    undiscounted_slots, _ = undiscounted
+    discounted_slots, _ = discounted
+    assert undiscounted_slots[0].batteries_discharged_kwh == pytest.approx(0.0)
+    assert undiscounted_slots[1].batteries_discharged_kwh == pytest.approx(1.0)
+    assert discounted_slots[0].batteries_discharged_kwh == pytest.approx(1.0)
+    assert PlannerInput().time_discount_rate == pytest.approx(1.0)
+    assert CostWeights().time_discount_rate == pytest.approx(1.0)

@@ -321,6 +321,7 @@ def generate_candidates(
             max_grid_export_power_kw=inp.max_grid_export_power_kw,
             secondary_storage=inp.secondary_storage,
             battery_export_min_price=inp.battery_export_min_price,
+            excess_export_discharge_buffer_pct=(inp.excess_export_discharge_buffer_pct),
         )
         log_planner(
             "debug",

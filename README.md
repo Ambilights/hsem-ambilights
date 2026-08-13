@@ -20,7 +20,7 @@
 - **MILP-based planner** — global optimal charge/discharge scheduling via linear programming (HiGHS solver)
 - **8-term cost function** — rigorous mathematical formulation with formal invariants
 - **Multiple candidate strategies** — baseline, passive, aggressive, partial-SoC, and MILP-optimal plans
-- **Time-discounted candidate selection** — prefers near-term savings over far-future gains
+- **Undiscounted known-price optimisation** — compares published day-ahead prices at full value
 
 ### Battery Intelligence
 - **Dynamic self-learning discharge floor** — reserves enough energy to bridge the house to the next solar surplus or cheap grid window, with self-correcting safety margin

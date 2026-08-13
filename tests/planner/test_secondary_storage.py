@@ -255,6 +255,39 @@ def test_secondary_solves_full_192_slot_horizon() -> None:
     assert diagnostics["secondary_sbu_slots"] > 0
 
 
+def test_secondary_and_primary_export_reserve_share_one_milp() -> None:
+    """PowMr integer variables and the primary export binary must coexist."""
+    slots = _slots([5.0, 10.0, 10.0, 10.0])
+    slots[0].price = SlotPrice(import_price=5.0, export_price=5.0)
+
+    solved = solve_milp(
+        slots,
+        _NOW,
+        current_kwh=9.0,
+        usable_kwh=9.0,
+        max_charge_per_slot=2.0,
+        max_discharge_per_slot=2.0,
+        charge_efficiency_pct=97.0,
+        discharge_efficiency_pct=97.0,
+        time_discount_rate=1.0,
+        excess_export_discharge_buffer_pct=15.0,
+        secondary_storage=_powmr(),
+    )
+
+    assert solved is not None
+    result, diagnostics = solved
+    assert len(result) == len(slots)
+    assert diagnostics["battery_export_reserve_active"] is True
+    assert diagnostics["battery_export_reserve_slots"] >= 1
+    reserve_shortfall = max(
+        diagnostics["battery_export_reserve_kwh"]
+        - diagnostics["battery_export_reserve_min_checkpoint_soc_kwh"],
+        0.0,
+    )
+    assert reserve_shortfall == pytest.approx(0.0, abs=1e-6)
+    assert "secondary_result" in diagnostics
+
+
 def test_disabled_secondary_preserves_existing_solution() -> None:
     """A disabled config must be numerically identical to no secondary config."""
     slots = _slots([0.05, 0.50, 1.00], house_load_kwh=0.4)
