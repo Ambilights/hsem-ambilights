@@ -2251,14 +2251,15 @@ def test_terminal_soc_objective_preserves_charge_with_high_replacement_price():
     # Note: the LP may find a degenerate optimum with simultaneous
     # ec=ed>0 (zero net SoC change) since the terminal-SoC terms
     # cancel.  The post-processing resolves this by zeroing both.
-    # What matters is that no discharge/export recommendation is set
-    # and no grid export occurs.
+    # What matters is that the slot is finalized as an explicit idle hold
+    # (not discharge/export) and no grid export occurs.
     rec = out_slots[0].recommendation
     exp = out_slots[0].grid_export_kwh
-    assert rec is None, (
+    assert rec == Recommendations.BatteriesWaitMode.value, (
         f"LP must not recommend discharge/export when replacement_price >> export, "
         f"got recommendation={rec}"
     )
+    assert out_slots[0].primary_battery_hold is True
     assert exp < 1e-6, (
         f"LP must not export when replacement_price=2.00 >> export=0.05, "
         f"got grid_export_kwh={exp:.6f}"

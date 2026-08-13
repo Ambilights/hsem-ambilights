@@ -378,6 +378,7 @@ Each `PlannedSlot` in the output list covers one time interval and carries:
 | `ev_total_planned_load_kwh` | kWh | Total planned EV AC load: `ev_planned_load_kwh + ev_accounted_load_kwh`. Non-zero whenever EV charging is planned, regardless of `base_load_includes_ev` |
 | `estimated_cost` | currency | Net grid cost this slot (positive = import, negative = export) |
 | `recommendation` | string | The action chosen for this slot (see below) |
+| `primary_battery_hold` | boolean | `true` when an idle MILP slot explicitly holds the Huawei battery while preserving its solved grid/PV flow |
 
 #### Recommendation values
 
@@ -437,6 +438,11 @@ recommendation it is not changed by later rules in the same layer.
 
 **Seasonal optimisation fill** (`apply_optimization_strategy`) — for all remaining `None` slots:
 
+This heuristic runs only for non-MILP candidates. A validated MILP result is
+already a complete energy allocation; its idle slots receive a label-only
+`batteries_wait_mode` plus `primary_battery_hold = true`, without changing
+battery charge/discharge or grid import/export.
+
 | Priority | Condition | Recommendation |
 |---|---|---|
 | 1 | Export price > import price AND export price ≥ `export_min_price` | `force_export` |
@@ -458,6 +464,8 @@ recommendation it is not changed by later rules in the same layer.
 > `MaximizeSelfConsumption` and caps discharge power so only surplus energy above
 > the planner's required reserve is used.  This reduces unnecessary grid import
 > while still preserving capacity for future scheduled discharge windows.
+> An explicit MILP `primary_battery_hold` takes precedence over that fallback:
+> it uses Time of Use, a 0 W discharge cap, and exports incidental surplus PV.
 
 **Discharge concentration** (`concentrate_discharge_on_expensive_slots`) runs after the
 seasonal fill but before candidate generation. It re-evaluates all discharge-mode
@@ -502,12 +510,15 @@ output with live sensor readings that were unknown at planning time.
 | 1 (highest) | Live import price < 0 | → `force_export` |
 | 2 | Current recommendation = `batteries_charge_grid` | Kept — grid charge never overridden |
 | 3 | Any EV (primary or second) is actively charging right now | → `ev_smart_charging` |
-| 4 | Battery energy > remaining discharge-schedule need | → `batteries_discharge_mode` |
+| 4 | Battery energy > remaining discharge-schedule need, unless `primary_battery_hold` is set | → `batteries_discharge_mode` |
 | — | None of the above | Planner recommendation kept unchanged |
 
 > **Note:** Priorities 1 and 3 interact. A negative import price always wins — even
 > when an EV is charging. However, a grid-charge slot (priority 2) is never overridden
 > by an actively charging EV (priority 3).
+> Display relabelling and window hysteresis preserve an explicit
+> `primary_battery_hold`; neither may introduce battery energy absent from the
+> solved MILP allocation.
 
 ---
 

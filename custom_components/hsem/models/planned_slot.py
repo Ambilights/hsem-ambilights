@@ -70,6 +70,11 @@ class PlannedSlot:
             The ``Recommendations`` enum value chosen for this slot
             (stored as its string value so the output stays framework-free)
             or ``None`` if no decision has been made.
+        primary_battery_hold:
+            ``True`` when the optimiser explicitly allocated zero primary
+            battery charge and discharge. The hardware applier uses this
+            control intent to keep an idle MILP slot strict even when the
+            configurable fallback wait mode allows self-consumption.
         ev_planned_load_kwh:
             Extra EV AC load that must be added to base house consumption for
             planner math.  Zero when ``base_load_includes_ev`` is True (EV
@@ -142,3 +147,4 @@ class PlannedSlot:
     grid_import_kwh: float = 0.0
     grid_export_kwh: float = 0.0
     recommendation: str | None = None
+    primary_battery_hold: bool = False

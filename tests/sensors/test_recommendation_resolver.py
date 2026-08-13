@@ -192,6 +192,19 @@ class TestBatteryAboveScheduleNeed:
         )
         assert rec.recommendation == Recommendations.BatteriesWaitMode.value
 
+    def test_optimizer_hold_is_not_overridden_by_schedule_surplus(self):
+        """A solved zero-discharge allocation remains authoritative at runtime."""
+        rec = _make_rec(recommendation=Recommendations.BatteriesWaitMode.value)
+        rec.primary_battery_hold = True
+        live = _make_live(battery_kwh=8.0)
+
+        resolve_current_recommendation(
+            rec, live, batteries_schedules_remaining_capacity_needed=5.0
+        )
+
+        assert rec.recommendation == Recommendations.BatteriesWaitMode.value
+        assert rec.primary_battery_hold is True
+
 
 # ---------------------------------------------------------------------------
 # None rec safety

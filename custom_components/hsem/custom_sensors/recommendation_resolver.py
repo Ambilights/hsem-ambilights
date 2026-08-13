@@ -38,7 +38,8 @@ def resolve_current_recommendation(
     1. **Negative import price** → force export everything to earn money.
     2. **Grid charge active** → grid charging takes priority over EV smart charge.
     3. **EV actively charging** → switch to EV smart charging mode.
-    4. **Battery above remaining schedule need** → switch to discharge mode.
+    4. **Battery above remaining schedule need** → switch to discharge mode,
+       unless the optimiser explicitly allocated a primary-battery hold.
 
     The recommendation is modified **in-place** on ``rec``.
 
@@ -122,7 +123,8 @@ def resolve_current_recommendation(
 
     # 4. Battery has enough energy to cover remaining scheduled discharge needs
     if (
-        batteries_schedules_remaining_capacity_needed > 0
+        not rec.primary_battery_hold
+        and batteries_schedules_remaining_capacity_needed > 0
         and live.battery_current_capacity_kwh
         > batteries_schedules_remaining_capacity_needed
     ):

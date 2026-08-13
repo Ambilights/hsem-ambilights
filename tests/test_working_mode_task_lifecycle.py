@@ -74,6 +74,7 @@ def _make_data(
     recommendation: str = "batteries_wait_mode",
     *,
     secondary_mode: str = "utility",
+    primary_battery_hold: bool = False,
 ) -> CoordinatorData:
     """Build a coordinator snapshot with a deterministic hardware intent."""
     cfg = MagicMock()
@@ -86,6 +87,7 @@ def _make_data(
     live.battery_current_capacity_kwh = 0.0
     rec = MagicMock()
     rec.recommendation = recommendation
+    rec.primary_battery_hold = primary_battery_hold
     rec.ev_charger_calculated_power = 0.0
     rec.ev_second_charger_calculated_power = 0.0
     rec.ev_total_planned_load_kwh = 0.0
@@ -378,6 +380,30 @@ class TestSingleTaskInFlight:
 
         old_data = _make_data("batteries_wait_mode")
         new_data = _make_data("batteries_charge_grid")
+        first_task = asyncio.get_event_loop().create_task(_hanging_coro())
+        sensor._update_task = first_task
+        sensor._active_hardware_intent = sensor._hardware_intent(old_data)
+        await asyncio.sleep(0)
+
+        sensor.coordinator.data = new_data
+        sensor._handle_coordinator_update()
+        await asyncio.sleep(0)
+
+        assert first_task.cancelled()
+        assert sensor._pending_update_data is new_data
+        await asyncio.gather(first_task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_changed_primary_hold_cancels_inflight_task(self) -> None:
+        """A new optimiser hold supersedes a same-label hardware command."""
+        sensor = _make_sensor()
+        event = asyncio.Event()
+
+        async def _hanging_coro():
+            await event.wait()
+
+        old_data = _make_data(primary_battery_hold=False)
+        new_data = _make_data(primary_battery_hold=True)
         first_task = asyncio.get_event_loop().create_task(_hanging_coro())
         sensor._update_task = first_task
         sensor._active_hardware_intent = sensor._hardware_intent(old_data)

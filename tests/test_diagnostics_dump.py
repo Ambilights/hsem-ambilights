@@ -262,6 +262,8 @@ class TestBuildDiagnosticsDump:
         assert "start" in first_slot
         assert "recommendation" in first_slot
         assert "import_price" in first_slot
+        assert "primary_battery_hold" in first_slot
+        assert isinstance(first_slot["primary_battery_hold"], bool)
 
     def test_entity_ids_in_extra_are_redacted(self) -> None:
         inp = _make_minimal_input()

@@ -456,6 +456,7 @@ class TestFinalRecommendationIncludesEvLoad:
             grid_import_kwh=0.0,
             grid_export_kwh=0.5,
             recommendation=Recommendations.EVSmartCharging.value,
+            primary_battery_hold=True,
         )
 
         # Simulate the coordinator's _apply_planner_output field copy.
@@ -492,12 +493,14 @@ class TestFinalRecommendationIncludesEvLoad:
         hrec.estimated_battery_soc_pct = slot.estimated_battery_soc_pct
         hrec.grid_import_kwh = slot.grid_import_kwh
         hrec.grid_export_kwh = slot.grid_export_kwh
+        hrec.primary_battery_hold = slot.primary_battery_hold
         hrec.solcast_pv_estimate_kwh = slot.solcast_pv_estimate_kwh
 
         assert hrec.recommendation == Recommendations.EVSmartCharging.value
         assert abs(hrec.ev_planned_load_kwh - 2.5) < 1e-9
         assert abs(hrec.estimated_net_consumption_kwh - 0.0) < 1e-9
         assert abs(hrec.solcast_pv_estimate_kwh - 3.5) < 1e-9
+        assert hrec.primary_battery_hold is True
 
 
 # ===========================================================================

@@ -21,12 +21,14 @@ Acceptance criteria
 from __future__ import annotations
 
 from datetime import time
+from unittest.mock import patch
 
 from custom_components.hsem.models.battery_schedule_input import BatteryScheduleInput
 from custom_components.hsem.models.hourly_consumption_average import (
     HourlyConsumptionAverage,
 )
 from custom_components.hsem.models.planner_input import PlannerInput
+from custom_components.hsem.models.planner_output import PlannerOutput
 from custom_components.hsem.models.price_point import PricePoint
 from custom_components.hsem.models.solcast_slot import SolcastSlot
 from custom_components.hsem.planner import run_planner
@@ -37,6 +39,15 @@ from custom_components.hsem.utils.recommendations import Recommendations
 # ---------------------------------------------------------------------------
 
 _SOLAR_CHARGE_VALUE = Recommendations.BatteriesChargeSolar.value
+
+
+def _run_heuristic_planner(inp: PlannerInput) -> PlannerOutput:
+    """Run without SciPy so this suite isolates seasonal-fill semantics."""
+    with patch(
+        "custom_components.hsem.planner.candidate_generator.is_scipy_available",
+        return_value=False,
+    ):
+        return run_planner(inp)
 
 
 def _make_solar_only_input(
@@ -126,7 +137,7 @@ class TestSolarChargePerSlotSemantics:
     def test_per_slot_value_does_not_exceed_slot_solar_surplus(self):
         """Each solar-charge slot must not charge more than its own solar surplus."""
         inp = _make_solar_only_input(battery_soc_pct=0.0, solar_per_hour=3.0)
-        result = run_planner(inp)
+        result = _run_heuristic_planner(inp)
 
         solar_slots = [
             s for s in result.slots if s.recommendation == _SOLAR_CHARGE_VALUE
@@ -144,7 +155,7 @@ class TestSolarChargePerSlotSemantics:
     def test_sum_matches_total_charged_energy_kwh(self):
         """Summing batteries_charged_kwh across all slots must equal total_charged_energy_kwh."""
         inp = _make_solar_only_input(battery_soc_pct=0.0, solar_per_hour=3.0)
-        result = run_planner(inp)
+        result = _run_heuristic_planner(inp)
 
         manual_sum = round(sum(s.batteries_charged_kwh for s in result.slots), 3)
         reported = result.total_charged_energy_kwh()
@@ -168,7 +179,7 @@ class TestSolarChargePerSlotSemantics:
             battery_end_of_discharge_soc_pct=eod_pct,
             solar_per_hour=5.0,  # abundant solar
         )
-        result = run_planner(inp)
+        result = _run_heuristic_planner(inp)
 
         total = result.total_charged_energy_kwh()
         assert total <= headroom + 1e-3, (
@@ -186,7 +197,7 @@ class TestSolarChargePerSlotSemantics:
             solar_per_hour=2.0,
             consumption_per_hour=0.3,
         )
-        result = run_planner(inp)
+        result = _run_heuristic_planner(inp)
 
         solar_slots = [
             s for s in result.slots if s.recommendation == _SOLAR_CHARGE_VALUE
@@ -211,7 +222,7 @@ class TestSolarChargePerSlotSemantics:
             battery_rated_capacity_kwh=10.0,
             battery_end_of_discharge_soc_pct=10.0,
         )
-        result = run_planner(inp)
+        result = _run_heuristic_planner(inp)
 
         solar_slots = [
             s for s in result.slots if s.recommendation == _SOLAR_CHARGE_VALUE
@@ -246,7 +257,7 @@ class TestSolarChargePerSlotSemantics:
             battery_end_of_discharge_soc_pct=eod_pct,
             solar_per_hour=5.0,  # 8 h × 5 kWh = 40 kWh >> battery
         )
-        result = run_planner(inp)
+        result = _run_heuristic_planner(inp)
 
         total = result.total_charged_energy_kwh()
         # Total charged must not exceed rated capacity (usable + reserve) as an

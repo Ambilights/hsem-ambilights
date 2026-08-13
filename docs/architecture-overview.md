@@ -235,7 +235,7 @@ Battery scheduling is globally an NP-hard combinatorial problem. HSEM solves it 
 
 Recommendations are assigned in three consecutive layers, each with strict priority rules:
 
-- **Layer 1** — Planner engine: discharge schedules → charge schedules → excess export → seasonal fill
+- **Layer 1** — Planner engine: discharge schedules → charge schedules → excess export → seasonal fill (heuristic candidates only; solved MILP flows are immutable)
 - **Layer 2** — EV labelling: post-simulation re-label of EV-charging slots
 - **Layer 3** — Runtime resolver: current-slot overrides based on live sensor data
 

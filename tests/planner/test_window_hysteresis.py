@@ -135,6 +135,24 @@ class TestWindowHysteresis:
             "ev_smart_charging → batteries_charge_solar must be held within hold window"
         )
 
+    def test_optimizer_hold_bypasses_previous_actionable_label(self):
+        """Label hysteresis must not add energy to a solved MILP hold slot."""
+        slots = _make_slots(Recommendations.EVSmartCharging.value)
+        slots[0].primary_battery_hold = True
+
+        rec, start = apply_window_hysteresis(
+            slots,
+            _NOW,
+            window_hysteresis_minutes=30,
+            previous_current_recommendation=Recommendations.BatteriesChargeGrid.value,
+            previous_current_slot_start=_NOW - timedelta(minutes=2),
+        )
+
+        assert rec == Recommendations.EVSmartCharging.value
+        assert start == _NOW
+        assert slots[0].recommendation == Recommendations.EVSmartCharging.value
+        assert slots[0].primary_battery_hold is True
+
     # ------------------------------------------------------------------
     # Within-category transitions after hold time expires
     # ------------------------------------------------------------------
