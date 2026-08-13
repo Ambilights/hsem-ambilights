@@ -93,20 +93,6 @@ def _write_milp_results_to_slots(
         out_slots[i].ev_charger_calculated_power = 0.0
         out_slots[i].ev_second_charger_calculated_power = 0.0
 
-    # Write MILP-derived charge/discharge actions
-    # Pre-compute which slots have EV charging — when both battery and
-    # EV charge in the same slot, the battery must use BatteriesChargeGrid
-    # (not BatteriesChargeSolar) because the EV will consume the solar
-    # surplus, leaving nothing for the battery.
-    ev_charging_slots: set[int] = set()
-    if active_evs:
-        for ev_idx in range(len(active_evs)):
-            ev_off = ev_var_offsets[ev_idx]
-            ev_c_sol = result_x[ev_off : ev_off + m]
-            for lp_t in range(m):
-                if float(ev_c_sol[lp_t]) >= _min_action_kwh:
-                    ev_charging_slots.add(lp_t)
-
     # Pre-compute per-slot total EV AC load from the LP solution.
     # Needed for deriving grid import/export from the energy balance
     # equation when mutex resolution alters ec/ed (issue #659):
@@ -193,13 +179,36 @@ def _write_milp_results_to_slots(
                 ec_kwh = 0.0
                 ed_kwh = 0.0
 
-        if ec_kwh > _min_action_kwh:
-            # Use BatteriesChargeSolar when PV surplus is available,
-            # BatteriesChargeGrid otherwise.  When EV is also charging
-            # in this slot, always use BatteriesChargeGrid — the EV
-            # will consume the solar surplus, so the battery must draw
-            # from grid to actually receive the energy the MILP allocated.
-            if pv_avail[lp_t] > _min_action_kwh and lp_t not in ev_charging_slots:
+        # Store the same rounded energy that diagnostics, simulation, and the
+        # applier consume.  Do not create an action for sub-display solver
+        # residue that rounds to zero.
+        resolved_charge = round(max(ec_kwh, 0.0), 3)
+        resolved_discharge = round(max(ed_kwh, 0.0), 3)
+
+        if resolved_charge > 0.0:
+            # Primary charge is battery-side DC energy; PV surplus and EV load
+            # are AC-side.  Subtract co-optimised EV demand (fixed EV demand is
+            # already included in pv_avail), then require the remaining PV to
+            # cover the complete rounded battery allocation after losses.
+            # Raw EV AC is deliberately conservative if a later minimum-power
+            # guard suppresses a tiny EV allocation: it may choose grid mode,
+            # but can never falsely claim a grid-funded charge is solar.
+            available_primary_pv_ac_kwh = max(
+                float(pv_avail[lp_t])
+                - ev_ac_load_by_slot.get(lp_t, 0.0)
+                - max(float(curt_sol_full[lp_t]), 0.0),
+                0.0,
+            )
+            required_primary_charge_ac_kwh = resolved_charge / charge_eff
+            # Stay strictly below half the 0.001 kWh grid-flow display unit.
+            # A Solar label must therefore also report zero grid import.
+            source_tolerance_ac_kwh = 0.000499
+            solar_covers_charge = (
+                required_primary_charge_ac_kwh
+                <= available_primary_pv_ac_kwh + source_tolerance_ac_kwh
+            )
+
+            if solar_covers_charge:
                 out_slots[
                     slot_i
                 ].recommendation = Recommendations.BatteriesChargeSolar.value
@@ -209,14 +218,17 @@ def _write_milp_results_to_slots(
                 # constraints already prevent ec[t] > 0 here, but this
                 # guard protects against any edge case.
                 is_session_slot = _has_session_demand and lp_t in session_slots_set
-                if is_session_slot and pv_avail[lp_t] > _min_action_kwh:
-                    out_slots[
-                        slot_i
-                    ].recommendation = Recommendations.BatteriesChargeSolar.value
-                elif not is_session_slot:
+                if not is_session_slot:
                     out_slots[
                         slot_i
                     ].recommendation = Recommendations.BatteriesChargeGrid.value
+                else:
+                    # A validated incumbent should never reach this branch:
+                    # the session constraint caps primary charging at residual
+                    # PV.  Fail closed if solver tolerance or a future model
+                    # change nevertheless returns a grid-funded session charge.
+                    resolved_charge = 0.0
+                    ec_kwh = 0.0
         elif ed_kwh > _min_action_kwh:
             # If the LP is exporting (ge > 0) in this slot, use
             # ForceBatteriesDischarge to signal that the battery should
@@ -231,8 +243,6 @@ def _write_milp_results_to_slots(
                 ].recommendation = Recommendations.BatteriesDischargeMode.value
 
         # Write resolved charge/discharge kWh fields consistently.
-        resolved_charge = round(max(ec_kwh, 0.0), 3)
-        resolved_discharge = round(max(ed_kwh, 0.0), 3)
         out_slots[slot_i].batteries_charged_kwh = resolved_charge
         out_slots[slot_i].batteries_discharged_kwh = resolved_discharge
 
