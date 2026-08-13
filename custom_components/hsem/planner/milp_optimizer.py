@@ -34,6 +34,11 @@ _SOLVER_TIME_LIMIT_S = 2.0
 # to avoid writing tiny floating-point artefacts into recommendations.
 _MIN_ACTION_KWH = 1e-4
 
+# Select the zero-valued export-mode binary when both binary values are
+# feasible. This is far below any material energy cost but makes diagnostics
+# deterministic and prevents reserve rows activating without battery export.
+_EXPORT_MODE_TIEBREAK_COST = 1e-6
+
 
 def solve_milp(
     slots: list[PlannedSlot],
@@ -56,6 +61,7 @@ def solve_milp(
     phase_power_imbalance_w: PhasePowers | None = None,
     max_grid_export_power_kw: float | None = None,
     battery_export_min_price: float = 0.0,
+    excess_export_discharge_buffer_pct: float = 0.0,
     secondary_storage: SecondaryStorageConfig | None = None,
 ) -> tuple[list[PlannedSlot], dict] | None:
     """Solve the horizon and return independent result slots plus diagnostics.
@@ -180,6 +186,11 @@ def solve_milp(
             Per-slot hard floor below which intentional battery-to-grid
             discharge is forbidden (issue #752). `0.0` disables it.
             Caps `ed[t]` to `base_load[t]/discharge_eff` on blocked slots.
+        excess_export_discharge_buffer_pct:
+            Percentage of usable primary-battery capacity that an intentional
+            battery-to-grid export must leave at the next forecast solar-refill
+            checkpoint. The reserve is conditional and does not restrict
+            ordinary house self-consumption. `0.0` disables it.
 
     Returns:
         A tuple ``(slots, diagnostics)`` where:
@@ -209,6 +220,7 @@ def solve_milp(
         "max_chg=%.3f  max_dis=%s  cycle_cost=%.6f  "
         "chg_eff=%.2f  dis_eff=%.2f  discount=%.4f  repl_price=%s  "
         "no_export=%s  min_export_price=%.4f  battery_export_min_price=%.4f  "
+        "export_buffer=%.2f%%  "
         "fuse=%s  phase_aware=%s  secondary=%s",
         len(slots),
         current_kwh,
@@ -227,6 +239,7 @@ def solve_milp(
         no_export,
         min_export_price,
         battery_export_min_price,
+        excess_export_discharge_buffer_pct,
         (
             f"{main_fuse_amps:.1f}A/{main_fuse_phases}ph"
             if main_fuse_amps is not None
@@ -524,6 +537,25 @@ def solve_milp(
     charge_loss = 1.0 - charge_eff
     discharge_loss = 1.0 - discharge_eff
 
+    # A user-configured excess-export buffer is a conditional reserve, not a
+    # global minimum SoC. Binary variables distinguish intentional battery
+    # export from ordinary self-consumption; constraints are added below.
+    export_reserve_pct = min(max(excess_export_discharge_buffer_pct, 0.0), 100.0)
+    export_reserve_kwh = usable_kwh * export_reserve_pct / 100.0
+    export_reserve_active = bool(
+        not no_export and export_reserve_kwh > 1e-9 and max_dis > 1e-9
+    )
+    export_mode_off: int | None = None
+    export_reserve_checkpoints = None
+    if export_reserve_active:
+        from custom_components.hsem.planner.milp._export_reserve import (
+            _next_solar_refill_checkpoints,
+        )
+
+        export_mode_off = n_vars
+        n_vars += m
+        export_reserve_checkpoints = _next_solar_refill_checkpoints(pv_avail)
+
     base_n_vars = n_vars
     secondary_layout = None
     if secondary_active:
@@ -572,6 +604,9 @@ def solve_milp(
         usable_kwh=usable_kwh,
         max_charge_per_slot=max_charge_per_slot,
     )
+
+    if export_mode_off is not None:
+        c_obj[export_mode_off : export_mode_off + m] = _EXPORT_MODE_TIEBREAK_COST
 
     if secondary_active:
         from custom_components.hsem.planner.milp._secondary_storage import (
@@ -630,6 +665,30 @@ def solve_milp(
         battery_export_blocked=battery_export_blocked,
     )
 
+    if export_mode_off is not None:
+        from custom_components.hsem.planner.milp._export_reserve import (
+            _add_battery_export_reserve_constraints,
+        )
+
+        assert export_reserve_checkpoints is not None
+        constraints = _add_battery_export_reserve_constraints(
+            constraints,
+            n_vars=base_n_vars,
+            m=m,
+            ec_off=ec_off,
+            ed_off=ed_off,
+            export_mode_off=export_mode_off,
+            current_kwh=current_kwh,
+            usable_kwh=usable_kwh,
+            discharge_eff=discharge_eff,
+            max_discharge_kwh=max_dis,
+            # base_load is already net of forecast PV, so daytime discharge
+            # that would displace solar also activates the export reserve.
+            residual_house_load=base_load,
+            checkpoints=export_reserve_checkpoints,
+            reserve_kwh=export_reserve_kwh,
+        )
+
     integrality = None
     if secondary_active:
         from custom_components.hsem.planner.milp._secondary_storage import (
@@ -651,6 +710,11 @@ def solve_milp(
             primary_max_discharge_kwh=max_dis,
         )
         integrality = _secondary_integrality(n_vars, m, secondary_layout)
+
+    if export_mode_off is not None:
+        if integrality is None:
+            integrality = np.zeros(n_vars, dtype=int)
+        integrality[export_mode_off : export_mode_off + m] = 1
 
     from custom_components.hsem.planner.milp._phase_fuse import (
         _add_phase_fuse_constraints,
@@ -696,10 +760,12 @@ def solve_milp(
     # Solve using HiGHS
     # ------------------------------------------------------------------
     solver_options: dict[str, float | bool] = {
-        "time_limit": 5.0 if secondary_active else _SOLVER_TIME_LIMIT_S,
+        "time_limit": (
+            5.0 if secondary_active or export_reserve_active else _SOLVER_TIME_LIMIT_S
+        ),
         "disp": False,
     }
-    if secondary_active:
+    if secondary_active or export_reserve_active:
         solver_options["mip_rel_gap"] = 0.005
     try:
         result = linprog(
@@ -820,6 +886,30 @@ def solve_milp(
     )
 
     diagnostics["phase_fuse_active"] = phase_fuse_active
+
+    diagnostics["battery_export_reserve_active"] = export_reserve_active
+    diagnostics["battery_export_reserve_kwh"] = round(export_reserve_kwh, 6)
+    if export_mode_off is not None:
+        assert export_reserve_checkpoints is not None
+        export_mode_sol = result.x[export_mode_off : export_mode_off + m]
+        export_slots = [t for t, value in enumerate(export_mode_sol) if value > 0.5]
+        soc_after = current_kwh + np.cumsum(ec_sol - ed_sol)
+        checkpoint_soc = [
+            float(soc_after[int(export_reserve_checkpoints[t])]) for t in export_slots
+        ]
+        min_checkpoint_soc = min(checkpoint_soc) if checkpoint_soc else None
+        diagnostics["battery_export_reserve_slots"] = len(export_slots)
+        diagnostics["battery_export_reserve_min_checkpoint_soc_kwh"] = (
+            round(min_checkpoint_soc, 6) if min_checkpoint_soc is not None else None
+        )
+        log_planner(
+            "debug",
+            "[milp] battery_export_reserve  buffer=%.3f  export_slots=%d  "
+            "min_checkpoint_soc=%s",
+            export_reserve_kwh,
+            len(export_slots),
+            (f"{min_checkpoint_soc:.3f}" if min_checkpoint_soc is not None else "n/a"),
+        )
     if phase_fuse_active:
         from custom_components.hsem.planner.milp._phase_fuse import (
             _phase_imports_from_solution_kwh,

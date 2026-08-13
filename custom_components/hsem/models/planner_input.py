@@ -233,10 +233,10 @@ class PlannerInput:
 
     # --- time discount for selector score ---
     #: Per-hour exponential discount factor applied to the selector score
-    #: (not to total_cost).  A value of 1.0 disables the discount entirely.
-    #: Default 0.995 means a saving 48 hours from now is worth ~79% of a
-    #: saving right now in the selector's eyes.
-    time_discount_rate: float = 0.995
+    #: (not to total_cost). Published day-ahead prices are known values, so
+    #: the runtime default is 1.0 (no discount). Values below 1.0 remain
+    #: supported for explicit simulations and tests.
+    time_discount_rate: float = 1.0
 
     # --- EV planned load integration — primary EV (optional, disabled by default) ---
     #: When True, the primary EV planned load feature is active.

@@ -73,6 +73,12 @@ in the same layer must not change it.
 **Excess export** (only when enabled):
 
 1. Export price > threshold AND battery above required capacity → `force_batteries_discharge`
+2. In the MILP, any primary-battery discharge beyond house load activates an
+   export-mode binary. The battery SoC at the end of the following demand
+   window (immediately before the next forecast PV-surplus slot, or horizon
+   end) must then retain `hsem_batteries_excess_export_discharge_buffer`.
+   The reserve is conditional: normal self-consumption may use it, and a
+   planned cheap grid-charge before the checkpoint may restore it.
 
 **Seasonal fill** (remaining `None` slots):
 
@@ -701,6 +707,29 @@ bounds** on the discharge variable `ed[t]` (implemented as variable bounds in
    requiring `export_price >= max(export_min_price,
    recommended_threshold, battery_export_min_price)` for any slot it
    would otherwise label `ForceBatteriesDischarge`.
+
+4. **Conditional excess-export reserve** — when excess export is enabled and
+   `excess_export_discharge_buffer_pct > 0`, each slot receives a binary
+   `z_export[t]`. Discharge above the AC house load forces that binary on:
+
+   ```text
+   discharge_eff * ed[t] - M_export * z_export[t] <= base_load[t]
+   ```
+
+   Let `checkpoint[t]` be the final demand slot before the next forecast
+   PV-surplus slot, or the horizon end when no later surplus exists. When the
+   binary is on, primary SoC at that checkpoint must retain the configured
+   percentage of usable capacity:
+
+   ```text
+   SoC[checkpoint[t]] >= buffer_kwh - usable_kwh * (1 - z_export[t])
+   buffer_kwh = usable_kwh * buffer_pct / 100
+   ```
+
+   This protects forecast demand plus an error buffer without creating a hard
+   minimum SoC for ordinary self-consumption. Because the condition checks the
+   solved SoC trajectory at the checkpoint, future grid or PV charging may
+   legitimately restore the buffer before it is measured.
 
 When any apply, the tighter cap wins.  When the battery cannot export on
 a slot (`no_export` or a blocked-by-floor slot), the MILP labels
