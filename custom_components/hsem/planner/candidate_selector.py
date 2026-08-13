@@ -217,13 +217,13 @@ def select_best_candidate(  # NOSONAR
     if months_winter is None:
         months_winter = []
     for candidate in candidates:
-        # The MILP only writes recommendations for slots where the LP
-        # allocates charge or discharge (ec_kwh > 0 or ed_kwh > 0).
-        # apply_optimization_strategy only fills slots that are still None,
-        # so it will never overwrite the LP's decisions — it just provides
-        # sensible defaults for idle slots where the LP took no action.
-        # concentrate_discharge_on_expensive_slots only acts on
-        # DISCHARGE_RECS, so it also cannot damage the MILP's results.
+        if candidate.name == CANDIDATE_MILP:
+            # The writer returns a complete, validated allocation. Seasonal
+            # fill and discharge concentration would mutate its solved flows.
+            continue
+
+        # Heuristic candidates do not carry a solver-owned energy balance, so
+        # complete their recommendations and simulate the resulting flows.
         # Apply seasonal optimization strategy BEFORE concentration.
         # The seasonal fill marks unassigned summer slots as
         # BatteriesDischargeMode; concentrate_discharge then clears the

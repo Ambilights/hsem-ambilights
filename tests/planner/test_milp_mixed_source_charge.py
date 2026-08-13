@@ -74,6 +74,43 @@ def _write_charge(
     return result[0]
 
 
+def _write_discharge(
+    *,
+    discharge_kwh: float,
+    house_load_kwh: float,
+    raw_export_kwh: float = 0.0,
+) -> PlannedSlot:
+    """Return one MILP slot after writing a discharge allocation."""
+    slot = PlannedSlot(
+        start=_NOW,
+        end=_NOW + timedelta(minutes=15),
+        price=SlotPrice(import_price=1.731, export_price=0.725),
+    )
+    return _write_milp_results_to_slots(
+        slots=[slot],
+        future_idx=[0],
+        now=_NOW,
+        ec_sol=np.array([0.0]),
+        ed_sol=np.array([discharge_kwh]),
+        result_x=np.array([raw_export_kwh]),
+        m=1,
+        ge_off=0,
+        active_evs=[],
+        ev_var_offsets=[],
+        pv_avail=np.array([0.0]),
+        base_load=np.array([house_load_kwh]),
+        charge_eff=0.97,
+        discharge_eff=0.97,
+        p_exp=np.array([0.725]),
+        min_export_price=0.0,
+        _has_session_demand=False,
+        session_slots_set=set(),
+        current_kwh=10.0,
+        usable_kwh=28.5,
+        curt_sol_full=np.array([0.0]),
+    )[0]
+
+
 def test_mixed_solar_and_grid_charge_uses_grid_recommendation() -> None:
     """A small PV surplus must not hide a materially grid-funded charge."""
     slot = _write_charge(charge_kwh=2.45, solar_surplus_kwh=0.255)
@@ -138,7 +175,8 @@ def test_grid_funded_session_charge_fails_closed() -> None:
         session_slot=True,
     )
 
-    assert slot.recommendation is None
+    assert slot.recommendation == Recommendations.BatteriesWaitMode.value
+    assert slot.primary_battery_hold is True
     assert slot.batteries_charged_kwh == 0.0
     assert slot.grid_import_kwh == 0.0
 
@@ -170,6 +208,41 @@ def test_sub_millikwh_solver_residue_does_not_create_charge_action() -> None:
     """Energy that rounds to zero must not emit an executable recommendation."""
     slot = _write_charge(charge_kwh=0.0004, solar_surplus_kwh=0.0)
 
-    assert slot.recommendation is None
+    assert slot.recommendation == Recommendations.BatteriesWaitMode.value
+    assert slot.primary_battery_hold is True
     assert slot.batteries_charged_kwh == 0.0
     assert slot.grid_import_kwh == 0.0
+
+
+def test_idle_pv_export_is_completed_as_label_only_battery_hold() -> None:
+    """The writer labels an idle export without consuming its solved PV flow."""
+    slot = _write_charge(charge_kwh=0.0, solar_surplus_kwh=1.0)
+
+    assert slot.recommendation == Recommendations.BatteriesWaitMode.value
+    assert slot.primary_battery_hold is True
+    assert slot.batteries_charged_kwh == 0.0
+    assert slot.batteries_discharged_kwh == 0.0
+    assert slot.grid_import_kwh == 0.0
+    assert slot.grid_export_kwh == 1.0
+
+
+def test_sub_millikwh_discharge_residue_becomes_battery_hold() -> None:
+    """Rounded-zero discharge must not enable real hardware discharge."""
+    slot = _write_discharge(discharge_kwh=0.0004, house_load_kwh=0.5)
+
+    assert slot.recommendation == Recommendations.BatteriesWaitMode.value
+    assert slot.primary_battery_hold is True
+    assert slot.batteries_discharged_kwh == 0.0
+    assert slot.grid_import_kwh == 0.5
+
+
+def test_discharge_mode_uses_final_export_not_raw_solver_residue() -> None:
+    """A raw export residue cannot turn house-serving discharge into export mode."""
+    slot = _write_discharge(
+        discharge_kwh=0.25,
+        house_load_kwh=0.5,
+        raw_export_kwh=0.0004,
+    )
+
+    assert slot.recommendation == Recommendations.BatteriesDischargeMode.value
+    assert slot.grid_export_kwh == 0.0

@@ -87,6 +87,7 @@ def _write_milp_results_to_slots(
         out_slots[i].batteries_discharged_kwh = 0.0
         out_slots[i].grid_import_kwh = 0.0
         out_slots[i].grid_export_kwh = 0.0
+        out_slots[i].primary_battery_hold = False
         out_slots[i].ev_planned_load_kwh = 0.0
         out_slots[i].ev_accounted_load_kwh = 0.0
         out_slots[i].ev_total_planned_load_kwh = 0.0
@@ -128,8 +129,6 @@ def _write_milp_results_to_slots(
     for lp_t, slot_i in enumerate(future_idx):
         ec_kwh = float(ec_sol[lp_t])
         ed_kwh = float(ed_sol[lp_t])
-        ge_kwh = float(result_x[ge_off + lp_t])  # raw LP export (for recommendation)
-
         if ec_kwh > _min_action_kwh and ed_kwh > _min_action_kwh:
             # Degenerate LP vertex (simultaneous charge+discharge).
             # The LP is indifferent among cost-equivalent ec/ed
@@ -229,19 +228,6 @@ def _write_milp_results_to_slots(
                     # change nevertheless returns a grid-funded session charge.
                     resolved_charge = 0.0
                     ec_kwh = 0.0
-        elif ed_kwh > _min_action_kwh:
-            # If the LP is exporting (ge > 0) in this slot, use
-            # ForceBatteriesDischarge to signal that the battery should
-            # cover house load AND export excess to grid.
-            if ge_kwh > _min_action_kwh and p_exp[lp_t] >= min_export_price:
-                out_slots[
-                    slot_i
-                ].recommendation = Recommendations.ForceBatteriesDischarge.value
-            else:
-                out_slots[
-                    slot_i
-                ].recommendation = Recommendations.BatteriesDischargeMode.value
-
         # Write resolved charge/discharge kWh fields consistently.
         out_slots[slot_i].batteries_charged_kwh = resolved_charge
         out_slots[slot_i].batteries_discharged_kwh = resolved_discharge
@@ -271,6 +257,36 @@ def _write_milp_results_to_slots(
         else:
             out_slots[slot_i].grid_import_kwh = 0.0
             out_slots[slot_i].grid_export_kwh = round(-net_flow, 3)
+
+        if resolved_discharge > 0.0:
+            # Classify from the final rounded export field, not raw LP ge.
+            # This keeps the executable mode tied to the same authoritative
+            # energy balance that is exposed and scored downstream.
+            if (
+                out_slots[slot_i].grid_export_kwh > 0.0
+                and p_exp[lp_t] >= min_export_price
+            ):
+                out_slots[
+                    slot_i
+                ].recommendation = Recommendations.ForceBatteriesDischarge.value
+            else:
+                out_slots[
+                    slot_i
+                ].recommendation = Recommendations.BatteriesDischargeMode.value
+
+        # Complete a genuinely idle solved slot without changing its energy
+        # allocation. The generic seasonal-fill pass is not label-only and
+        # must never run after a validated MILP solve: it could consume PV that
+        # this energy balance already assigned to export. The explicit hold
+        # intent survives later EV display relabelling and tells the hardware
+        # applier to execute the solved zero-charge/zero-discharge decision.
+        if (
+            out_slots[slot_i].recommendation is None
+            and resolved_charge <= 1e-9
+            and resolved_discharge <= 1e-9
+        ):
+            out_slots[slot_i].recommendation = Recommendations.BatteriesWaitMode.value
+            out_slots[slot_i].primary_battery_hold = True
 
         # Advance resolved SoC for headroom-based degenerate-vertex
         # resolution in subsequent slots (issue #662).

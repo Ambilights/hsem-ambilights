@@ -130,6 +130,9 @@ the `[disch] seasonal_fill` prefix.
 **Seasonal-fill invariants:**
 
 - Existing non-`None` recommendations are never changed.
+- Seasonal fill and discharge concentration apply only to heuristic
+  candidates. A validated MILP candidate is already a complete energy
+  allocation and must not be changed by either heuristic after the solve.
 - The future forced-export reserve rule above remains higher priority than
   forecast headroom.
 - PV forecast after the next forced battery-discharge slot is not counted as
@@ -593,8 +596,15 @@ these fields in a **single merged write-out pass** (issue #659) that:
    combination.
 
 All four energy-flow fields are consistent with each other and with the
-recommendation label for every slot.  The resolved values are the source
-of truth; the SoC simulation must never silently overwrite them.
+recommendation label for every slot. The resolved values are the source
+of truth; candidate selection, seasonal fill, discharge concentration, and
+SoC simulation must never silently overwrite them. An idle MILP slot is
+completed with a label-only ``batteries_wait_mode`` recommendation and an
+explicit primary-battery hold intent; its charge, discharge, import, and
+export fields remain byte-for-byte unchanged. The runtime applier executes
+that hold in Time-of-Use mode with a 0 W discharge cap and preserves incidental
+PV export, even when the configured fallback wait behaviour permits
+self-consumption or an EV display relabel is active.
 
 For non-MILP candidates (`milp_prepopulated=False`, the default),
 the simulation continues to derive discharge and grid flows greedily

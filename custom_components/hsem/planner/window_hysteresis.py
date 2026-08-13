@@ -78,6 +78,13 @@ def apply_window_hysteresis(
     new_rec = current_slot.recommendation
     new_start = current_slot.start
 
+    # A validated MILP idle allocation is an explicit zero-energy control
+    # decision, not merely a display label. Holding an older charge/discharge
+    # string here would make hardware execute energy absent from the solved
+    # and scored flow fields. Let this transition through immediately.
+    if current_slot.primary_battery_hold:
+        return new_rec, new_start
+
     # No previous state — first run, no hysteresis to apply
     if previous_current_recommendation is None or previous_current_slot_start is None:
         return new_rec, new_start

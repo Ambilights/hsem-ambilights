@@ -111,6 +111,7 @@ Each entry in the `hourly_recommendations` list is a dictionary with these keys:
 | `estimated_battery_soc_pct` | float | Simulated absolute SoC at slot end (0–100 %) |
 | `grid_import_kwh` | float | Energy imported from grid (kWh) |
 | `grid_export_kwh` | float | Energy exported to grid (kWh) |
+| `primary_battery_hold` | bool | Explicit MILP zero-charge/zero-discharge intent; the Huawei battery is held in TOU with a 0 W discharge cap while incidental PV export is preserved |
 | `is_ev_surplus_only_slot` | bool | Slot restricted to EV surplus-only charging |
 | `secondary_storage_load_kwh` | float | Dedicated PowMr load energy (kWh) |
 | `secondary_storage_charged_kwh` | float | Battery-side PowMr charge energy (kWh) |

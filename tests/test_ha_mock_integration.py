@@ -2168,6 +2168,23 @@ class TestApplyPlannerOutputEvLoad:
         assert abs(rec_10.grid_import_kwh - 0.1) < 1e-9
         assert abs(rec_10.grid_export_kwh - 0.0) < 1e-9
 
+    def test_primary_battery_hold_is_copied_to_hourly_recommendation(self):
+        """Optimiser hold intent must cross the real coordinator boundary."""
+        coord = self._make_coord_with_recs()
+        output = self._make_output_from_recs(coord._hourly_recommendations, {})
+        slot_10 = next(slot for slot in output.slots if slot.start.hour == 10)
+        slot_10.primary_battery_hold = True
+
+        coord._apply_planner_output(output)
+
+        rec_10 = next(r for r in coord._hourly_recommendations if r.start.hour == 10)
+        assert rec_10.primary_battery_hold is True
+        assert all(
+            not rec.primary_battery_hold
+            for rec in coord._hourly_recommendations
+            if rec.start.hour != 10
+        )
+
     def test_all_24_recs_matched_with_utc_normalisation(self):
         """After UTC-normalisation all 24 hourly recs must match planner slots."""
         coord = self._make_coord_with_recs()

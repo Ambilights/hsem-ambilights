@@ -468,6 +468,7 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
             getattr(cfg, "read_only", None),
             getattr(getattr(live, "degraded_mode", None), "value", None),
             getattr(rec, "recommendation", data.state),
+            getattr(rec, "primary_battery_hold", False),
             getattr(rec, "secondary_storage_mode", None),
             getattr(rec, "secondary_storage_charge_current_a", None),
         )

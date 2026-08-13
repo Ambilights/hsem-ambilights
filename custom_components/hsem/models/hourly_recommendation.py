@@ -55,6 +55,9 @@ class HourlyRecommendation:
             plotting in an Apex chart time-series.
         grid_import_kwh: Energy imported from the grid during this slot (kWh).
         grid_export_kwh: Energy exported to the grid during this slot (kWh).
+        primary_battery_hold: Whether the optimiser explicitly requires the
+            primary battery to hold during this slot. This survives display
+            relabelling such as ``EVSmartCharging``.
     """
 
     start: datetime
@@ -89,3 +92,4 @@ class HourlyRecommendation:
     secondary_storage_estimated_soc_pct: float = 0.0
     secondary_storage_charge_current_a: float = 0.0
     secondary_storage_mode: str | None = None
+    primary_battery_hold: bool = False

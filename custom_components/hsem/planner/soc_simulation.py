@@ -198,21 +198,34 @@ def simulate_soc(
         ev_load = ev_injected + ev_accounted  # total AC EV draw → grid/PV only
         house_load = slot.avg_house_consumption_kwh - ev_accounted  # pure house load
 
-        # --- Enforce charge ceiling on pre-scheduled charge ---
+        # --- Enforce charge ceiling on heuristic pre-scheduled charge ---
         # The charge scheduler may have set batteries_charged without knowing
-        # the current SoC at this point in the simulation.  Reduce if the
+        # the current SoC at this point in the simulation. Reduce if the
         # battery would exceed max_capacity_kwh or the per-slot power limit.
+        #
+        # A pre-populated MILP slot is different: its charge, discharge, and
+        # grid-flow fields are one authoritative solved allocation. Clamping
+        # only its charge here would invalidate that energy balance and the
+        # solution that was validated before selection.
         headroom = max(max_capacity_kwh - cap, 0.0)
-        scheduled_charge = min(
-            slot.batteries_charged_kwh, headroom, max_charge_per_slot
-        )
+        if milp_prepopulated:
+            scheduled_charge = slot.batteries_charged_kwh
+        else:
+            scheduled_charge = min(
+                slot.batteries_charged_kwh, headroom, max_charge_per_slot
+            )
         scheduled_charge = max(scheduled_charge, 0.0)
-        slot.batteries_charged_kwh = round(scheduled_charge, 3)
+        if not milp_prepopulated:
+            slot.batteries_charged_kwh = round(scheduled_charge, 3)
 
         # If the scheduled charge was clamped to zero because the battery
         # is already full (no headroom), clear the charge recommendation
         # so the label doesn't claim "charge" when nothing is charged.
-        if scheduled_charge <= 1e-9 and slot.recommendation in _CHARGE_RECS:
+        if (
+            not milp_prepopulated
+            and scheduled_charge <= 1e-9
+            and slot.recommendation in _CHARGE_RECS
+        ):
             if headroom <= 1e-9:
                 slot.recommendation = Recommendations.BatteriesWaitMode.value
                 slot.batteries_charged_kwh = 0.0
@@ -389,9 +402,14 @@ def simulate_soc(
         # clear it to wait_mode.  Schedule discharge windows
         # (BatteriesDischargeMode) stay as-is — they represent the
         # user's configured windows, not a forced action.
-        if discharge <= 1e-9 and slot.recommendation in (
-            Recommendations.ForceBatteriesDischarge.value,
-            Recommendations.ForceExport.value,
+        if (
+            not milp_prepopulated
+            and discharge <= 1e-9
+            and slot.recommendation
+            in (
+                Recommendations.ForceBatteriesDischarge.value,
+                Recommendations.ForceExport.value,
+            )
         ):
             log_planner(
                 "debug",

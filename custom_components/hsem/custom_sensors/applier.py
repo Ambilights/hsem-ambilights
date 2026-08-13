@@ -409,6 +409,12 @@ def _desired_battery_discharge_cap_w(
             "EV V2H override",
         )
 
+    if rec.primary_battery_hold:
+        # The MILP explicitly allocated no primary-battery discharge. This
+        # intent must also survive an EV display relabel: the live-EV branch
+        # below otherwise derives a non-zero cap from historical house load.
+        return 0, "planned battery hold"
+
     if live.any_ev_charging:
         slot_hours = slot_duration_hours(rec.start, rec.end)
         historical_w = (
@@ -451,18 +457,17 @@ def _desired_battery_discharge_cap_w(
         )
         return cap_w, "EV active" if planned else "EV active (unplanned)"
 
-    if (
-        recommendation == Recommendations.BatteriesWaitMode.value
-        and cfg.batteries_wait_mode_behavior == "self_consumption_with_reserve"
-    ):
-        slot_hours = slot_duration_hours(rec.start, rec.end)
-        cap_w = _wait_mode_self_consumption_cap_w(
-            battery_capacity_kwh=live.battery_current_capacity_kwh,
-            required_capacity_kwh=current_required_battery_kwh,
-            slot_hours=slot_hours,
-            max_discharge_power_w=max_discharge_power_w,
-        )
-        return cap_w, "wait-mode self-consumption reserve"
+    if recommendation == Recommendations.BatteriesWaitMode.value:
+        if cfg.batteries_wait_mode_behavior == "self_consumption_with_reserve":
+            slot_hours = slot_duration_hours(rec.start, rec.end)
+            cap_w = _wait_mode_self_consumption_cap_w(
+                battery_capacity_kwh=live.battery_current_capacity_kwh,
+                required_capacity_kwh=current_required_battery_kwh,
+                slot_hours=slot_hours,
+                max_discharge_power_w=max_discharge_power_w,
+            )
+            return cap_w, "wait-mode self-consumption reserve"
+        return 0, "strict wait mode"
 
     return max_discharge_power_w, "normal hardware maximum"
 
@@ -754,7 +759,10 @@ async def async_apply_battery_settings(
             # Strict wait keeps the battery idle in TOU mode.  Self-consumption
             # with reserve switches to MaximizeSelfConsumption so the house can
             # use surplus battery energy above the planner's required reserve.
-            if cfg.batteries_wait_mode_behavior == "self_consumption_with_reserve":
+            if (
+                cfg.batteries_wait_mode_behavior == "self_consumption_with_reserve"
+                and not rec.primary_battery_hold
+            ):
                 surplus = (
                     live.battery_current_capacity_kwh - current_required_battery_kwh
                 )
@@ -774,6 +782,7 @@ async def async_apply_battery_settings(
     wait_mode_self_consumption = (
         recommendation == Recommendations.BatteriesWaitMode.value
         and cfg.batteries_wait_mode_behavior == "self_consumption_with_reserve"
+        and not rec.primary_battery_hold
         and working_mode == WorkingModes.MaximizeSelfConsumption.value
         and not ev_active
     )
@@ -826,6 +835,10 @@ async def async_apply_battery_settings(
     # the surplus above the reserve can be used for household self-consumption.
     # Both export recommendations map to FullyFedToGrid. The power cap
     # distinguishes PV-only export from planned battery export.
+    ev_smart_holds_primary = (
+        recommendation == Recommendations.EVSmartCharging.value
+        and rec.primary_battery_hold
+    )
     desired_excess = (
         "charge"
         if wait_mode_self_consumption
@@ -837,6 +850,7 @@ async def async_apply_battery_settings(
                 Recommendations.ForceExport.value,
                 Recommendations.ForceBatteriesDischarge.value,
             )
+            or ev_smart_holds_primary
             else "charge"
         )
     )
