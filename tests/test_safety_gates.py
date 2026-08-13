@@ -592,17 +592,17 @@ class TestFullyFedBatteryExportControl:
         assert summary.overall_status == ApplyStatus.SKIPPED
 
     @pytest.mark.asyncio
-    async def test_coarse_capacity_sample_is_latched_until_new_information(self):
-        """Time-only wakes do not write; a new capacity sample does."""
+    async def test_coarse_capacity_change_does_not_collapse_latched_cap(self):
+        """A one-percent Huawei SoC step is not precise pacing information."""
         sensor = _make_sensor()
         cfg = self._cfg()
         live = self._live()
         live.huawei_batteries_working_mode = "fully_fed_to_grid"
-        live.battery_current_capacity_kwh = 20.0
+        live.battery_current_capacity_kwh = 18.9
         rec = _make_planned_rec(
             "force_batteries_discharge",
-            discharged_kwh=2.5,
-            end_capacity_kwh=17.8,
+            discharged_kwh=0.458,
+            end_capacity_kwh=18.442,
         )
         state = FullyFedDischargeCapState()
 
@@ -617,62 +617,79 @@ class TestFullyFedBatteryExportControl:
                 live,
                 rec,
                 20.0,
-                now=rec.start + timedelta(seconds=30),
+                now=rec.end - timedelta(hours=0.139),
                 fully_fed_discharge_state=state,
             )
             assert verifier.await_count == 1
             first_call = verifier.await_args
             assert first_call is not None
             first_cap_w = int(first_call.kwargs["desired"])
-            assert first_cap_w < 10000
+            assert first_cap_w == 1832
 
             verifier.reset_mock()
             live.huawei_batteries_max_discharge_power_w = float(first_cap_w)
+            live.battery_current_capacity_kwh = 18.6
             await async_apply_battery_settings(
                 sensor,
                 cfg,
                 live,
                 rec,
                 20.0,
-                now=rec.start + timedelta(minutes=1, seconds=30),
+                now=rec.end - timedelta(hours=0.131),
+                fully_fed_discharge_state=state,
+            )
+            verifier.assert_not_awaited()
+            assert state.commanded_cap_w == 1832
+
+            # Reaching the rounded endpoint after latching must not turn the
+            # same coarse SoC artifact into a complete 0 W collapse.
+            live.battery_current_capacity_kwh = rec.estimated_battery_capacity_kwh
+            await async_apply_battery_settings(
+                sensor,
+                cfg,
+                live,
+                rec,
+                20.0,
+                now=rec.end - timedelta(minutes=5),
                 fully_fed_discharge_state=state,
             )
             verifier.assert_not_awaited()
 
-            live.battery_current_capacity_kwh = 19.7
+            # If another actor lowers the entity, normal reconciliation must
+            # restore the plan-derived cap without changing the latch.
+            live.huawei_batteries_max_discharge_power_w = 1206.0
             await async_apply_battery_settings(
                 sensor,
                 cfg,
                 live,
                 rec,
                 20.0,
-                now=rec.start + timedelta(minutes=2),
+                now=rec.end - timedelta(minutes=4),
                 fully_fed_discharge_state=state,
             )
 
         assert verifier.await_count == 1
-        second_call = verifier.await_args
-        assert second_call is not None
-        second_cap_w = int(second_call.kwargs["desired"])
-        assert second_cap_w < first_cap_w
+        restored = verifier.await_args
+        assert restored is not None
+        assert restored.kwargs["desired"] == 1832
 
     @pytest.mark.asyncio
-    async def test_changed_plan_recomputes_with_same_capacity_sample(self):
-        """A changed selected endpoint invalidates the capacity latch."""
+    async def test_changed_plan_recomputes_stable_cap(self):
+        """A changed selected discharge allocation invalidates the latch."""
         sensor = _make_sensor()
         cfg = self._cfg()
         live = self._live()
         live.huawei_batteries_working_mode = "fully_fed_to_grid"
-        live.battery_current_capacity_kwh = 20.0
+        live.battery_current_capacity_kwh = 18.9
         original = _make_planned_rec(
             "force_batteries_discharge",
-            discharged_kwh=2.5,
-            end_capacity_kwh=17.8,
+            discharged_kwh=0.458,
+            end_capacity_kwh=18.442,
         )
         changed = _make_planned_rec(
             "force_batteries_discharge",
-            discharged_kwh=2.5,
-            end_capacity_kwh=18.2,
+            discharged_kwh=0.478,
+            end_capacity_kwh=18.122,
         )
         state = FullyFedDischargeCapState()
 
@@ -709,11 +726,76 @@ class TestFullyFedBatteryExportControl:
         assert verifier.await_count == 1
         changed_call = verifier.await_args
         assert changed_call is not None
-        assert int(changed_call.kwargs["desired"]) < first_cap_w
+        assert first_cap_w == 1832
+        assert changed_call.kwargs["desired"] == 1912
 
     @pytest.mark.asyncio
-    async def test_finished_slot_forces_zero_despite_latched_sample(self):
-        """Slot completion is an immediate safety stop, even without new SoC."""
+    async def test_hardware_limit_change_does_not_rearm_endpoint_guard(self):
+        """Changing only the hardware limit must not trust coarse SoC again."""
+        sensor = _make_sensor()
+        cfg = self._cfg()
+        live = self._live()
+        live.huawei_batteries_working_mode = "fully_fed_to_grid"
+        live.battery_current_capacity_kwh = 18.9
+        rec = _make_planned_rec(
+            "force_batteries_discharge",
+            discharged_kwh=1.0,
+            end_capacity_kwh=18.442,
+        )
+        state = FullyFedDischargeCapState()
+
+        with patch(
+            "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+            new_callable=AsyncMock,
+            side_effect=_ok_apply_result,
+        ) as verifier:
+            await async_apply_battery_settings(
+                sensor,
+                cfg,
+                live,
+                rec,
+                20.0,
+                now=rec.start,
+                fully_fed_discharge_state=state,
+            )
+            assert verifier.await_args is not None
+            assert verifier.await_args.kwargs["desired"] == 4000
+
+            verifier.reset_mock()
+            live.battery_current_capacity_kwh = rec.estimated_battery_capacity_kwh
+            live.huawei_batteries_max_discharge_power_w = 4000.0
+            live.huawei_batteries_rated_capacity_wh = 5000.0
+            await async_apply_battery_settings(
+                sensor,
+                cfg,
+                live,
+                rec,
+                20.0,
+                now=rec.start + timedelta(minutes=1),
+                fully_fed_discharge_state=state,
+            )
+            assert verifier.await_args is not None
+            assert verifier.await_args.kwargs["desired"] == 2500
+
+            verifier.reset_mock()
+            live.huawei_batteries_max_discharge_power_w = 2500.0
+            live.huawei_batteries_rated_capacity_wh = 30000.0
+            await async_apply_battery_settings(
+                sensor,
+                cfg,
+                live,
+                rec,
+                20.0,
+                now=rec.start + timedelta(minutes=2),
+                fully_fed_discharge_state=state,
+            )
+
+        assert verifier.await_args is not None
+        assert verifier.await_args.kwargs["desired"] == 4000
+
+    @pytest.mark.asyncio
+    async def test_finished_slot_forces_zero_despite_latched_plan(self):
+        """Slot completion is an immediate safety stop for a cached plan."""
         sensor = _make_sensor()
         cfg = self._cfg()
         live = self._live()
@@ -759,6 +841,60 @@ class TestFullyFedBatteryExportControl:
         assert finished_call.kwargs["desired"] == 0
 
     @pytest.mark.asyncio
+    async def test_next_slot_replaces_prior_latched_cap(self):
+        """A boundary callback applies the next slot instead of reusing the old cap."""
+        sensor = _make_sensor()
+        cfg = self._cfg()
+        live = self._live()
+        live.huawei_batteries_working_mode = "fully_fed_to_grid"
+        first = _make_planned_rec(
+            "force_batteries_discharge",
+            discharged_kwh=0.458,
+            end_capacity_kwh=18.442,
+        )
+        second = _make_planned_rec(
+            "force_batteries_discharge",
+            discharged_kwh=0.478,
+            end_capacity_kwh=18.122,
+        )
+        second.start = first.end
+        second.end = first.end + timedelta(minutes=15)
+        state = FullyFedDischargeCapState()
+
+        with patch(
+            "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+            new_callable=AsyncMock,
+            side_effect=_ok_apply_result,
+        ) as verifier:
+            await async_apply_battery_settings(
+                sensor,
+                cfg,
+                live,
+                first,
+                20.0,
+                now=first.start,
+                fully_fed_discharge_state=state,
+            )
+            assert verifier.await_args is not None
+            assert verifier.await_args.kwargs["desired"] == 1832
+
+            verifier.reset_mock()
+            live.huawei_batteries_max_discharge_power_w = 1832.0
+            await async_apply_battery_settings(
+                sensor,
+                cfg,
+                live,
+                second,
+                20.0,
+                now=second.start,
+                fully_fed_discharge_state=state,
+            )
+
+        assert verifier.await_args is not None
+        assert verifier.await_args.kwargs["desired"] == 1912
+        assert state.slot_start == second.start
+
+    @pytest.mark.asyncio
     async def test_read_only_clears_latched_export_state(self):
         """Re-enabling writes cannot reuse a pre-read-only time sample."""
         sensor = _make_sensor()
@@ -772,7 +908,6 @@ class TestFullyFedBatteryExportControl:
             planned_discharge_kwh=rec.batteries_discharged_kwh,
             planned_end_capacity_kwh=rec.estimated_battery_capacity_kwh,
             max_discharge_power_w=10000,
-            battery_capacity_sample_kwh=20.0,
             commanded_cap_w=1800,
         )
 
@@ -791,7 +926,6 @@ class TestFullyFedBatteryExportControl:
 
         verifier.assert_not_awaited()
         assert state.commanded_cap_w is None
-        assert state.battery_capacity_sample_kwh is None
 
     @pytest.mark.asyncio
     async def test_pv_only_force_export_uses_zero_battery_cap(self):
@@ -815,7 +949,7 @@ class TestFullyFedBatteryExportControl:
         ]
 
     @pytest.mark.asyncio
-    async def test_live_plan_target_stops_battery_but_keeps_pv_export(self):
+    async def test_new_plan_at_endpoint_stops_battery_but_keeps_pv_export(self):
         sensor = _make_sensor()
         cfg = self._cfg()
         live = self._live()
@@ -1044,7 +1178,6 @@ class TestWorkingModeSensorTopLevelGate:
         from custom_components.hsem.utils.inverter_verify import CycleApplySummary
 
         state = FullyFedDischargeCapState(
-            battery_capacity_sample_kwh=20.0,
             commanded_cap_w=1800,
         )
         with (
@@ -1072,7 +1205,6 @@ class TestWorkingModeSensorTopLevelGate:
         mock_inv.assert_awaited_once()
         mock_bat.assert_not_awaited()
         assert state.commanded_cap_w is None
-        assert state.battery_capacity_sample_kwh is None
 
     @pytest.mark.asyncio
     async def test_degraded_mode_calls_inverter_applier(self):

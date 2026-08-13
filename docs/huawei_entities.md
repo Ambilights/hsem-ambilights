@@ -43,21 +43,24 @@
 
 On this installation, Huawei's Fully Fed to Grid mode gives PV priority and lets the battery fill
 only the inverter's remaining AC headroom. HSEM combines that mode with
-`number.batteries_maximum_discharging_power`: `force_batteries_discharge` reconciles the energy
-remaining above the selected slot's planned end capacity over the time remaining in the slot. The
-command never exceeds either the original planned power or the Huawei hardware maximum. Because
-Huawei reports usable capacity in coarse SoC steps, HSEM holds that command across time-only
-coordinator wakes and recomputes it only when the selected plan or reported capacity sample changes.
-Reaching the planned endpoint or the slot end still commands 0 W immediately. PV-only
+`number.batteries_maximum_discharging_power`: `force_batteries_discharge` divides the planned
+battery energy by the full slot duration and holds that power cap for the selected plan. The command
+never exceeds either the original planned power or the Huawei hardware maximum. Huawei's integer
+SoC samples are too coarse for sub-slot energy pacing (one percent is about 0.3 kWh on a 30 kWh
+battery), so SoC changes do not taper a latched cap. A newly accepted stale plan that is already at
+its endpoint is blocked, and the first callback at or after slot completion commands 0 W. PV-only
 `force_export` uses a 0 W battery cap.
 
-The selected slot's end capacity is authoritative for executing planned export. The separate
-`required_capacity_kwh` value is calculated before candidate selection and is not a constraint on
-the winning MILP plan, so applying it as a second hardware floor could contradict that winner.
+The selected slot's planned discharge energy is authoritative for executing export. Its end capacity
+is used only to reject a newly accepted stale plan. The separate `required_capacity_kwh` value is
+calculated before candidate selection and is not a constraint on the winning MILP plan, so applying
+it as a second hardware floor could contradict that winner.
+Accurate within-slot tapering would require integrating a primary-battery power or energy meter;
+integer SoC is deliberately not used as a substitute.
 
 `number.batteries_end_of_discharge_soc` exposes only 0–20% here. It remains the inverter's static
-hardware floor; higher planned stop targets are enforced by the live cap/reconciliation loop rather
-than by writing this entity.
+hardware floor. The plan-derived cap bounds discharge energy, while the inverter's configured
+end-of-discharge SoC remains the absolute hardware backstop.
 
 ---
 
