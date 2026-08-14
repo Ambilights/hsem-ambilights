@@ -287,6 +287,7 @@ class TestCoordinatorListenerCleanup:
         coord._hourly_timer_unsub = None
         coord._interval_timer_unsub = None
         coord._force_discharge_monitor_unsub = None
+        coord._secondary_storage_update_debounce_task = None
 
         return coord
 
@@ -339,3 +340,60 @@ class TestCoordinatorListenerCleanup:
 
         # Must not raise
         await coord.async_teardown()
+
+    @pytest.mark.asyncio
+    async def test_teardown_cancels_secondary_storage_debounce(self):
+        """A pending material-change debounce cannot outlive the coordinator."""
+        coord = self._make_coordinator()
+        task = MagicMock()
+        task.done.return_value = False
+        coord._secondary_storage_update_debounce_task = task
+
+        await coord.async_teardown()
+
+        task.cancel.assert_called_once()
+        assert coord._secondary_storage_update_debounce_task is None
+
+
+class TestSecondaryStorageListenerRouting:
+    """PowMr listeners use material filtering and omit raw net power."""
+
+    @pytest.mark.asyncio
+    async def test_secondary_inputs_use_filtered_callback(self) -> None:
+        from custom_components.hsem.custom_sensors.state_collector import (
+            _register_listeners,
+        )
+        from custom_components.hsem.models.live_state import LiveState
+        from custom_components.hsem.models.sensor_config import SensorConfig
+
+        cfg = SensorConfig()
+        secondary = cfg.secondary_storage
+        secondary.enabled = True
+        secondary.control_enabled = True
+        secondary.soc_entity = "sensor.powmr_soc"
+        secondary.load_power_entity = "sensor.powmr_load_avg"
+        secondary.battery_net_power_entity = "sensor.powmr_battery_net_power"
+        secondary.output_source_priority_entity = "select.powmr_output"
+        secondary.charger_source_priority_entity = "select.powmr_charger"
+        secondary.max_charge_current_entity = "number.powmr_current"
+        sensor = MagicMock()
+        tracked: set[str] = set()
+
+        with patch(
+            "custom_components.hsem.custom_sensors.state_collector"
+            ".async_track_state_change_event",
+            return_value=MagicMock(),
+        ) as register:
+            await _register_listeners(sensor, cfg, LiveState(), tracked)
+
+        registered = {call.args[1][0]: call.args[2] for call in register.call_args_list}
+        assert "sensor.powmr_battery_net_power" not in registered
+        assert registered["sensor.powmr_soc"] == (
+            sensor._async_handle_secondary_storage_change
+        )
+        assert registered["sensor.powmr_load_avg"] == (
+            sensor._async_handle_secondary_storage_change
+        )
+        assert registered["select.powmr_output"] == (
+            sensor._async_handle_secondary_storage_change
+        )

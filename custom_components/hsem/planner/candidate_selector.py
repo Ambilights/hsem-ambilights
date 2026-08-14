@@ -530,7 +530,7 @@ def select_best_candidate(  # NOSONAR
             RejectedPlan(
                 name=candidate.name,
                 reason=reason,
-                estimated_cost=getattr(cost, "score", 0.0),
+                estimated_cost=getattr(cost, "total_cost", 0.0),
                 import_cost=getattr(cost, "import_cost", 0.0),
                 export_revenue=getattr(cost, "export_revenue", 0.0),
                 conversion_loss=getattr(cost, "conversion_loss_cost", 0.0),

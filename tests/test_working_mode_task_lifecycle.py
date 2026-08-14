@@ -26,6 +26,7 @@ from custom_components.hsem.custom_sensors.working_mode_sensor import (
     HSEMWorkingModeSensor,
 )
 from custom_components.hsem.utils.degraded_mode import DegradedMode
+from custom_components.hsem.utils.inverter_verify import CycleApplySummary
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -448,6 +449,157 @@ class TestSingleTaskInFlight:
         await task
 
         assert applied == [first_data, latest_data]
+
+    @pytest.mark.asyncio
+    async def test_completed_apply_republishes_diagnostics_without_write_loop(
+        self,
+    ) -> None:
+        """A completed summary refreshes all listeners exactly once.
+
+        The diagnostics-only listener notification includes the working-mode
+        sensor itself.  That callback must publish state but must not queue a
+        second hardware apply.
+        """
+        sensor = _make_sensor()
+        data = _make_data()
+        summary = CycleApplySummary()
+        apply_count = 0
+        applier_status_refresh = MagicMock()
+        degraded_mode_refresh = MagicMock()
+        plan_explanation_refresh = MagicMock()
+
+        async def _apply(snapshot: CoordinatorData | None) -> None:
+            nonlocal apply_count
+            assert snapshot is data
+            assert snapshot is not None
+            apply_count += 1
+            snapshot.apply_summary = summary
+
+        def _publish(published: CycleApplySummary) -> None:
+            assert sensor.coordinator.data is data
+            sensor.coordinator.data.apply_summary = published
+            sensor.coordinator.async_update_listeners()
+
+        object.__setattr__(sensor, "_async_apply_hardware_writes", _apply)
+        publish_summary = MagicMock(side_effect=_publish)
+        object.__setattr__(
+            sensor.coordinator,
+            "async_publish_apply_summary",
+            publish_summary,
+        )
+
+        def _refresh_subscribers() -> None:
+            sensor._handle_coordinator_update()
+            applier_status_refresh()
+            degraded_mode_refresh()
+            plan_explanation_refresh()
+
+        update_listeners = MagicMock(side_effect=_refresh_subscribers)
+        object.__setattr__(
+            sensor.coordinator,
+            "async_update_listeners",
+            update_listeners,
+        )
+        sensor.coordinator.data = data
+        sensor._handle_coordinator_update()
+        task = sensor._update_task
+        assert task is not None
+        await task
+
+        assert apply_count == 1
+        assert data.apply_summary is summary
+        publish_summary.assert_called_once_with(summary)
+        update_listeners.assert_called_once_with()
+        applier_status_refresh.assert_called_once_with()
+        degraded_mode_refresh.assert_called_once_with()
+        plan_explanation_refresh.assert_called_once_with()
+        assert sensor._pending_update_data is None
+
+    @pytest.mark.asyncio
+    async def test_unload_during_apply_does_not_publish_diagnostics(self) -> None:
+        """An unloading entity must not notify HA after its apply returns."""
+        sensor = _make_sensor()
+        data = _make_data()
+
+        async def _apply(snapshot: CoordinatorData | None) -> None:
+            assert snapshot is data
+            assert snapshot is not None
+            snapshot.apply_summary = CycleApplySummary()
+            sensor._unloading = True
+
+        object.__setattr__(sensor, "_async_apply_hardware_writes", _apply)
+        publish_summary = MagicMock()
+        object.__setattr__(
+            sensor.coordinator,
+            "async_publish_apply_summary",
+            publish_summary,
+        )
+        sensor.coordinator.data = data
+        sensor._pending_update_data = data
+
+        await sensor._async_on_coordinator_update()
+
+        publish_summary.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stale_intent_does_not_publish_apply_summary(self) -> None:
+        """A completed obsolete command cannot overwrite current diagnostics."""
+        sensor = _make_sensor()
+        old_data = _make_data("batteries_wait_mode")
+        new_data = _make_data("batteries_charge_grid")
+
+        async def _apply(snapshot: CoordinatorData | None) -> None:
+            assert snapshot is old_data
+            assert snapshot is not None
+            snapshot.apply_summary = CycleApplySummary()
+            sensor.coordinator.data = new_data
+
+        object.__setattr__(sensor, "_async_apply_hardware_writes", _apply)
+        publish_summary = MagicMock()
+        object.__setattr__(
+            sensor.coordinator,
+            "async_publish_apply_summary",
+            publish_summary,
+        )
+        sensor.coordinator.data = old_data
+        sensor._pending_update_data = old_data
+
+        await sensor._async_on_coordinator_update()
+
+        publish_summary.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_apply_does_not_publish_apply_summary(self) -> None:
+        """Cancellation during a hardware apply cannot publish a partial result."""
+        sensor = _make_sensor()
+        data = _make_data()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _apply(snapshot: CoordinatorData | None) -> None:
+            assert snapshot is data
+            assert snapshot is not None
+            snapshot.apply_summary = CycleApplySummary()
+            started.set()
+            await release.wait()
+
+        object.__setattr__(sensor, "_async_apply_hardware_writes", _apply)
+        publish_summary = MagicMock()
+        object.__setattr__(
+            sensor.coordinator,
+            "async_publish_apply_summary",
+            publish_summary,
+        )
+        sensor.coordinator.data = data
+        sensor._pending_update_data = data
+        task = asyncio.create_task(sensor._async_on_coordinator_update())
+        await started.wait()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        publish_summary.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_state_is_published_before_hardware_apply(self) -> None:

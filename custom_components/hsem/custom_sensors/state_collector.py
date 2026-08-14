@@ -810,16 +810,28 @@ async def _register_listeners(
         state.force_working_mode,
     ]
 
+    for entity_id in candidates:
+        if entity_id and entity_id not in tracked_entities:
+            _LOGGER.debug(f"Starting to track state changes for {entity_id}")
+            unsub = async_track_state_change_event(
+                sensor.hass, [entity_id], sensor._async_handle_update
+            )
+            new_unsubs.append(unsub)
+            tracked_entities.add(entity_id)
+
+    # PowMr telemetry updates every few seconds. Register only planner/control
+    # inputs and route them through the coordinator's material-change debounce;
+    # battery net power is diagnostic/applier feedback, not a planner trigger.
+    secondary_candidates: list[str | None] = []
     if cfg.secondary_storage.enabled:
-        candidates.extend(
+        secondary_candidates.extend(
             [
                 cfg.secondary_storage.soc_entity,
                 cfg.secondary_storage.load_power_entity,
-                cfg.secondary_storage.battery_net_power_entity,
             ]
         )
         if cfg.secondary_storage.control_enabled:
-            candidates.extend(
+            secondary_candidates.extend(
                 [
                     cfg.secondary_storage.output_source_priority_entity,
                     cfg.secondary_storage.charger_source_priority_entity,
@@ -827,11 +839,13 @@ async def _register_listeners(
                 ]
             )
 
-    for entity_id in candidates:
+    for entity_id in secondary_candidates:
         if entity_id and entity_id not in tracked_entities:
-            _LOGGER.debug(f"Starting to track state changes for {entity_id}")
+            _LOGGER.debug(f"Starting material-change tracking for {entity_id}")
             unsub = async_track_state_change_event(
-                sensor.hass, [entity_id], sensor._async_handle_update
+                sensor.hass,
+                [entity_id],
+                sensor._async_handle_secondary_storage_change,
             )
             new_unsubs.append(unsub)
             tracked_entities.add(entity_id)

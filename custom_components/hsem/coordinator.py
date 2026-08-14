@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, override
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import Event, HomeAssistant
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import (
     async_track_time_change,
@@ -116,6 +116,7 @@ from custom_components.hsem.utils.prediction_tracker import (
 from custom_components.hsem.utils.recommendations import Recommendations
 from custom_components.hsem.utils.solar_corrector import SolarForecastCorrector
 from custom_components.hsem.utils.units import (
+    is_material_planned_energy_kwh,
     slot_duration_hours,
     usable_kwh_from_rated,
 )
@@ -130,10 +131,18 @@ if TYPE_CHECKING:
 # only rebuilds once after the user stops clicking.
 OPTIONS_UPDATE_DEBOUNCE_SECONDS = 0.25
 
-# Lightweight live-demand monitor for an active forced-discharge slot.  It is
-# deliberately separate from the normal coordinator interval: only two HA
-# states are read on each tick, and the expensive collection/planner pipeline
-# runs only after a material excess has persisted for the debounce period.
+# Secondary-storage state entities can update every few seconds.  Their
+# listener callback filters noisy telemetry against the last accepted plan,
+# then coalesces genuinely material changes into one coordinator cycle.
+SECONDARY_STORAGE_UPDATE_DEBOUNCE_SECONDS = 1.0
+SECONDARY_STORAGE_SOC_REPLAN_DELTA_PCT = 1.0
+SECONDARY_STORAGE_LOAD_REPLAN_DELTA_W = 25.0
+
+# Lightweight live-demand monitor for active forced export and materially
+# partial normal discharge. It is deliberately separate from the normal
+# coordinator interval: only two HA states are read on each tick, and the
+# expensive collection/planner pipeline runs only after a material excess has
+# persisted for the debounce period.
 FORCE_DISCHARGE_MONITOR_INTERVAL_SECONDS = 10
 FORCE_DISCHARGE_EXCESS_DEBOUNCE_SECONDS = 30
 FORCE_DISCHARGE_EXCESS_MIN_W = 150.0
@@ -151,7 +160,7 @@ def _force_discharge_live_metrics(
     house_power_w: float,
     solar_power_w: float,
 ) -> tuple[float, float, float, float] | None:
-    """Return planned delivery, live residual, threshold, and excess in watts.
+    """Return planned supply, live residual, threshold, and excess in watts.
 
     ``batteries_discharged_kwh`` is battery-side energy.  The live comparison
     is AC-side house demand after PV, so the planned delivery is multiplied by
@@ -168,13 +177,20 @@ def _force_discharge_live_metrics(
         / duration_h
         * 1000.0
     )
+    planned_grid_import_w = 0.0
+    if slot.recommendation == Recommendations.BatteriesDischargeMode.value:
+        grid_import_w = max(float(slot.grid_import_kwh), 0.0) / duration_h * 1000.0
+        if is_material_planned_energy_kwh(slot.grid_import_kwh):
+            planned_grid_import_w = grid_import_w
+
+    planned_demand_w = planned_ac_w + planned_grid_import_w
     live_residual_w = max(house_power_w - solar_power_w, 0.0)
     threshold_w = max(
         FORCE_DISCHARGE_EXCESS_MIN_W,
-        FORCE_DISCHARGE_EXCESS_RELATIVE * planned_ac_w,
+        FORCE_DISCHARGE_EXCESS_RELATIVE * planned_demand_w,
     )
-    excess_w = live_residual_w - planned_ac_w
-    return planned_ac_w, live_residual_w, threshold_w, excess_w
+    excess_w = live_residual_w - planned_demand_w
+    return planned_demand_w, live_residual_w, threshold_w, excess_w
 
 
 def _corrective_output_rejection_reason(
@@ -472,6 +488,10 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._batteries_schedules_remaining_capacity_needed: float = 0.0
         self._current_required_battery: float = 0.0
         self._next_update: str | None = None
+        # Most recent completed hardware apply.  Hardware writes finish after
+        # the coordinator snapshot is first published, so retain their result
+        # independently and copy it into every later snapshot.
+        self._last_apply_summary: CycleApplySummary | None = None
 
         # Entity resolution cache (persisted across cycles).
         self._force_working_mode_entity: str | None = None
@@ -543,8 +563,8 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._last_plan_secondary_output_priority: str | None = None
 
         # A 10-second lightweight monitor can request one corrective replan in
-        # an active force-discharge slot when live residual house demand stays
-        # materially above the slot's planned AC battery delivery for 30 s.
+        # active forced-export or materially partial normal-discharge slots
+        # when live residual demand stays above solved supply for 30 s.
         # The completed-slot marker is written only after the corrected
         # coordinator snapshot is published, so a busy coordinator or failed
         # update cannot consume the slot's one permitted attempt.
@@ -613,6 +633,23 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         # Debounce task for option changes.  Rapid toggles restart this timer
         # so the planner only runs once after the user stops clicking.
         self._options_update_debounce_task: asyncio.Task | None = None
+        self._secondary_storage_update_debounce_task: asyncio.Task | None = None
+
+    @callback
+    def async_publish_apply_summary(self, summary: CycleApplySummary) -> None:
+        """Persist a completed hardware apply and refresh diagnostic entities.
+
+        The hardware worker runs after the normal coordinator notification.
+        Updating the current snapshot alone would therefore leave other
+        coordinator-backed sensors stale until the next cycle.  Notify the
+        listeners immediately; the working-mode entity suppresses hardware
+        re-queueing while this diagnostics-only notification is in progress.
+        """
+        self._last_apply_summary = summary
+        if self.data is None:
+            return
+        self.data.apply_summary = summary
+        self.async_update_listeners()
 
     # ------------------------------------------------------------------
     # HA lifecycle
@@ -709,6 +746,10 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         if debounce_task is not None and not debounce_task.done():
             debounce_task.cancel()
             self._options_update_debounce_task = None
+        secondary_task = getattr(self, "_secondary_storage_update_debounce_task", None)
+        if secondary_task is not None and not secondary_task.done():
+            secondary_task.cancel()
+            self._secondary_storage_update_debounce_task = None
 
     async def async_options_updated(self) -> None:
         """Schedule a debounced pipeline re-run after an options change.
@@ -735,6 +776,80 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             name="hsem_options_update_debounce",
             eager_start=False,
         )
+
+    async def _async_handle_secondary_storage_change(self, event: Event) -> None:
+        """Coalesce material secondary-storage state changes into one update.
+
+        Raw PowMr telemetry is deliberately handled outside the generic state
+        listener path: SoC and the smoothed dedicated load only matter after
+        crossing their existing replan thresholds, while hardware control
+        entity changes remain promptly reactive. Battery net power is not a
+        planner input and is therefore not registered by the state collector.
+        """
+        cfg = self._cfg.secondary_storage
+        if not cfg.enabled:
+            return
+
+        entity_id = event.data.get("entity_id")
+        new_state = event.data.get("new_state")
+        if not entity_id or new_state is None:
+            return
+
+        material = False
+        if entity_id == cfg.soc_entity:
+            try:
+                value = float(new_state.state)
+            except TypeError, ValueError:
+                return
+            baseline = self._last_plan_secondary_soc_pct
+            material = baseline is None or abs(value - baseline) >= (
+                SECONDARY_STORAGE_SOC_REPLAN_DELTA_PCT
+            )
+        elif entity_id == cfg.load_power_entity:
+            try:
+                value = float(new_state.state)
+            except TypeError, ValueError:
+                return
+            baseline = self._last_plan_secondary_load_power_w
+            material = baseline is None or abs(value - baseline) >= (
+                SECONDARY_STORAGE_LOAD_REPLAN_DELTA_W
+            )
+        elif entity_id in {
+            cfg.output_source_priority_entity,
+            cfg.charger_source_priority_entity,
+            cfg.max_charge_current_entity,
+        }:
+            old_state = event.data.get("old_state")
+            material = old_state is None or old_state.state != new_state.state
+
+        if not material:
+            return
+
+        task = self._secondary_storage_update_debounce_task
+        if task is not None and not task.done():
+            return
+        self._secondary_storage_update_debounce_task = self.hass.async_create_task(
+            self._async_secondary_storage_update_debounced(),
+            name="hsem_secondary_storage_update_debounce",
+            eager_start=False,
+        )
+
+    async def _async_secondary_storage_update_debounced(self) -> None:
+        """Run one full cycle after coalescing secondary-storage events."""
+        try:
+            await asyncio.sleep(SECONDARY_STORAGE_UPDATE_DEBOUNCE_SECONDS)
+            # Unlike generic high-rate triggers, a material secondary control
+            # event must not be dropped merely because another cycle currently
+            # owns the coordinator lock. Wait for that cycle, then process the
+            # event exactly once. Teardown cancellation interrupts both sleep
+            # and lock acquisition safely.
+            async with self._update_lock:
+                await self._async_run_update_cycle()
+        except asyncio.CancelledError:
+            return
+        finally:
+            if self._secondary_storage_update_debounce_task is asyncio.current_task():
+                self._secondary_storage_update_debounce_task = None
 
     async def _async_options_update_debounced(self) -> None:
         """Wait for the debounce window, then schedule the planner run."""
@@ -810,6 +925,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         corrective_rejection_reason = ""
         corrective_candidate_winner = ""
         corrective_candidate_solver = "not_run"
+        plan_state_should_persist = False
 
         try:
             # 1. Reload config from the config entry.
@@ -877,14 +993,6 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
             # Update the weekday/weekend consumption profile (issue #612).
             house_w = live.house_consumption_power_w
-            if house_w is not None and house_w > 0:
-                weekday_profile.update(
-                    dow=now.weekday(),
-                    slot=now.hour,
-                    value_kwh=house_w / 1000.0,
-                )
-
-            # Update the weekday/weekend consumption profile (issue #612).
             if house_w is not None and house_w > 0:
                 weekday_profile.update(
                     dow=now.weekday(),
@@ -1264,6 +1372,10 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                     else:
                         planner_output = candidate_planner_output
                         self._last_planner_output = planner_output
+                        plan_state_should_persist = True
+
+                    if corrective_live_replan and corrective_output_accepted:
+                        plan_state_should_persist = True
 
                     # Record the time this plan was created so the slot-boundary
                     # check in _should_replan uses the actual plan time.
@@ -1316,9 +1428,6 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                         if self._last_plan_slot_start
                         else "(unknown)",
                     )
-
-                # Persist current state so the next cycle can detect changes.
-                self._persist_plan_state(live)
 
                 # -----------------------------------------------------------------------
                 # Window-level hysteresis — prevent rapid recommendation toggles
@@ -1545,6 +1654,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             state=state,
             last_updated=last_updated,
             next_update=self._next_update,
+            apply_summary=getattr(self, "_last_apply_summary", None),
             plan_explanation=self._plan_explanation,
             data_quality=self._data_quality,
             ev_charging_plan=self._ev_charging_plan,
@@ -1575,6 +1685,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
         # Notify all subscriber entities atomically.
         self.async_set_updated_data(data)
+        self._persist_plan_state_if_accepted(live, plan_state_should_persist)
         if corrective_live_replan and corrective_request_slot is not None:
             # Commit the corrected plan and consume the once-per-slot request
             # only after the complete coordinator update was successfully
@@ -1668,27 +1779,36 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         )
 
     def _active_force_discharge_slot(self, now: datetime) -> PlannedSlot | None:
-        """Return the active planned forced-discharge slot, if any."""
+        """Return an active slot needing live-demand correction, if any.
+
+        Besides forced battery export, a materially partial normal-discharge
+        allocation is monitored because its safe MSC cap intentionally follows
+        the solved energy split. Rounding-level grid import is ignored.
+        """
         output = self._last_planner_output
         if output is None or now.tzinfo is None:
             return None
-        return next(
-            (
-                slot
-                for slot in output.slots
-                if slot.recommendation == Recommendations.ForceBatteriesDischarge.value
-                and slot.batteries_discharged_kwh > 1e-9
+        for slot in output.slots:
+            if not (
+                slot.batteries_discharged_kwh > 1e-9
                 and as_tz(slot.start, now.tzinfo) <= now < as_tz(slot.end, now.tzinfo)
-            ),
-            None,
-        )
+            ):
+                continue
+            if slot.recommendation == Recommendations.ForceBatteriesDischarge.value:
+                return slot
+            if (
+                slot.recommendation == Recommendations.BatteriesDischargeMode.value
+                and is_material_planned_energy_kwh(slot.grid_import_kwh)
+            ):
+                return slot
+        return None
 
     def _clear_force_discharge_excess_window(self, reason: str | None = None) -> None:
         """Clear only the in-progress 30-second excess-demand debounce."""
         if reason is not None and self._force_discharge_excess_since is not None:
             async_log(
                 "debug",
-                "[replan] Forced-discharge live-demand debounce cleared: %s.",
+                "[replan] Live-demand debounce cleared: %s.",
                 reason,
             )
         self._force_discharge_excess_since = None
@@ -1761,7 +1881,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         if metrics is None:
             self._clear_force_discharge_excess_window()
             return
-        planned_ac_w, live_residual_w, threshold_w, excess_w = metrics
+        planned_supply_w, live_residual_w, threshold_w, excess_w = metrics
 
         if excess_w <= threshold_w:
             self._clear_force_discharge_excess_window(
@@ -1774,11 +1894,11 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             self._force_discharge_excess_since = now
             async_log(
                 "debug",
-                "[replan] Forced-discharge live demand exceeds plan: "
-                "slot=%s planned_ac=%.0fW live_residual=%.0fW excess=%.0fW "
+                "[replan] Live demand exceeds active discharge plan: "
+                "slot=%s planned_supply=%.0fW live_residual=%.0fW excess=%.0fW "
                 "threshold=%.0fW; starting 30 s debounce.",
                 slot_start.isoformat(),
-                planned_ac_w,
+                planned_supply_w,
                 live_residual_w,
                 excess_w,
                 threshold_w,
@@ -1796,11 +1916,11 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._force_discharge_live_replan_pending_slot = slot_start
         async_log(
             "debug",
-            "[replan] Sustained forced-discharge live demand exceeded plan for "
-            "30 s: slot=%s planned_ac=%.0fW live_residual=%.0fW; requesting "
+            "[replan] Sustained live demand exceeded active discharge plan for "
+            "30 s: slot=%s planned_supply=%.0fW live_residual=%.0fW; requesting "
             "one corrective replan.",
             slot_start.isoformat(),
-            planned_ac_w,
+            planned_supply_w,
             live_residual_w,
         )
         if not self._update_lock.locked():
@@ -1832,7 +1952,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         if self._force_discharge_live_replan_pending_slot is not None:
             async_log(
                 "debug",
-                "[replan] Sustained live demand exceeded forced-discharge plan — "
+                "[replan] Sustained live demand exceeded active discharge plan — "
                 "re-planning.",
             )
             return True
@@ -1992,7 +2112,8 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             if (
                 self._last_plan_secondary_soc_pct is not None
                 and secondary.soc_pct is not None
-                and abs(secondary.soc_pct - self._last_plan_secondary_soc_pct) >= 1.0
+                and abs(secondary.soc_pct - self._last_plan_secondary_soc_pct)
+                >= SECONDARY_STORAGE_SOC_REPLAN_DELTA_PCT
             ):
                 async_log(
                     "debug",
@@ -2005,7 +2126,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 self._last_plan_secondary_load_power_w is not None
                 and secondary.load_power_w is not None
                 and abs(secondary.load_power_w - self._last_plan_secondary_load_power_w)
-                >= 25.0
+                >= SECONDARY_STORAGE_LOAD_REPLAN_DELTA_W
             ):
                 async_log(
                     "debug",
@@ -2085,6 +2206,13 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._last_plan_secondary_output_priority = (
             live.secondary_storage.output_source_priority
         )
+
+    def _persist_plan_state_if_accepted(
+        self, live: LiveState, plan_state_should_persist: bool
+    ) -> None:
+        """Advance material-change baselines only for a published new plan."""
+        if plan_state_should_persist:
+            self._persist_plan_state(live)
 
     def _freeze_ev_charger_power_for_current_slot(
         self, output: PlannerOutput, now: datetime

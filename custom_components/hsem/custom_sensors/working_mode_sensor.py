@@ -114,6 +114,10 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         self._write_failure_backoff = WriteFailureBackoff()
         self._fully_fed_discharge_state = FullyFedDischargeCapState()
         self._last_write_block_signature: tuple[str, tuple[str, ...]] | None = None
+        # True only during the synchronous listener refresh that publishes a
+        # completed apply summary.  It prevents that diagnostics-only refresh
+        # from scheduling the same hardware work again.
+        self._publishing_apply_summary = False
 
     # ------------------------------------------------------------------
     # HA entity properties
@@ -400,6 +404,8 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         if data is not None:
             self._resolve_current_state(data)
         self.async_write_ha_state()
+        if self._publishing_apply_summary:
+            return
         if data is not None:
             self._queue_hardware_update(data)
 
@@ -484,10 +490,20 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
 
                 await self._async_apply_hardware_writes(data)
 
+                if self._unloading:
+                    return
+
                 current = self.coordinator.data
-                if current is not None and self._hardware_intent(current) == intent:
-                    current.apply_summary = data.apply_summary
-                self.async_write_ha_state()
+                if (
+                    current is not None
+                    and data.apply_summary is not None
+                    and self._hardware_intent(current) == intent
+                ):
+                    self._publishing_apply_summary = True
+                    try:
+                        self.coordinator.async_publish_apply_summary(data.apply_summary)
+                    finally:
+                        self._publishing_apply_summary = False
         except asyncio.CancelledError:
             raise
         except Exception:

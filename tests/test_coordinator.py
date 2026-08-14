@@ -31,7 +31,7 @@ import asyncio
 import inspect
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -47,6 +47,7 @@ from custom_components.hsem.models.live_state import LiveState
 from custom_components.hsem.models.plan_explanation import PlanExplanation
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.planner_output import PlannerOutput
+from custom_components.hsem.utils.inverter_verify import CycleApplySummary
 from custom_components.hsem.utils.recommendations import Recommendations
 
 # ---------------------------------------------------------------------------
@@ -80,7 +81,9 @@ def _make_bare_coordinator() -> HSEMDataUpdateCoordinator:
     coord._cfg = cfg
     coord._options_update_task = None
     coord._options_update_debounce_task = None
+    coord._secondary_storage_update_debounce_task = None
     coord._last_planner_output = None
+    coord._last_apply_summary = None
     coord._live = None
     coord._force_discharge_excess_since = None
     coord._force_discharge_excess_slot_start = None
@@ -118,6 +121,194 @@ class TestCoordinatorData:
         data = CoordinatorData()
         assert data.batteries_schedules_remaining_capacity_needed == pytest.approx(0.0)
         assert data.current_required_battery == pytest.approx(0.0)
+
+
+class TestLightweightSecondaryStorageEvents:
+    """Noisy PowMr states must not wake the full coordinator blindly."""
+
+    @staticmethod
+    def _configure(coordinator: HSEMDataUpdateCoordinator) -> MagicMock:
+        secondary = coordinator._cfg.secondary_storage
+        secondary.enabled = True
+        secondary.soc_entity = "sensor.powmr_soc"
+        secondary.load_power_entity = "sensor.powmr_load_avg"
+        secondary.output_source_priority_entity = "select.powmr_output"
+        secondary.charger_source_priority_entity = "select.powmr_charger"
+        secondary.max_charge_current_entity = "number.powmr_current"
+        coordinator._last_plan_secondary_soc_pct = 75.0
+        coordinator._last_plan_secondary_load_power_w = 190.0
+        hass = MagicMock()
+        coordinator.hass = hass
+        return hass
+
+    @pytest.mark.asyncio
+    async def test_subthreshold_soc_and_load_events_do_not_schedule_update(
+        self,
+    ) -> None:
+        coordinator = _make_bare_coordinator()
+        hass = self._configure(coordinator)
+
+        await coordinator._async_handle_secondary_storage_change(
+            cast(
+                Any,
+                SimpleNamespace(
+                    data={
+                        "entity_id": "sensor.powmr_soc",
+                        "new_state": SimpleNamespace(state="75.9"),
+                    }
+                ),
+            )
+        )
+        await coordinator._async_handle_secondary_storage_change(
+            cast(
+                Any,
+                SimpleNamespace(
+                    data={
+                        "entity_id": "sensor.powmr_load_avg",
+                        "new_state": SimpleNamespace(state="214.9"),
+                    }
+                ),
+            )
+        )
+
+        hass.async_create_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_material_events_are_coalesced(self) -> None:
+        coordinator = _make_bare_coordinator()
+        hass = self._configure(coordinator)
+        pending_task = MagicMock()
+        pending_task.done.return_value = False
+        hass.async_create_task.return_value = pending_task
+
+        await coordinator._async_handle_secondary_storage_change(
+            cast(
+                Any,
+                SimpleNamespace(
+                    data={
+                        "entity_id": "sensor.powmr_soc",
+                        "new_state": SimpleNamespace(state="76.0"),
+                    }
+                ),
+            )
+        )
+        await coordinator._async_handle_secondary_storage_change(
+            cast(
+                Any,
+                SimpleNamespace(
+                    data={
+                        "entity_id": "select.powmr_output",
+                        "old_state": SimpleNamespace(state="utility"),
+                        "new_state": SimpleNamespace(state="sbu"),
+                    }
+                ),
+            )
+        )
+
+        hass.async_create_task.assert_called_once()
+        coroutine = hass.async_create_task.call_args.args[0]
+        coroutine.close()
+
+    @pytest.mark.asyncio
+    async def test_material_event_waits_for_busy_coordinator_lock(self) -> None:
+        """A one-off priority event survives overlap with an active cycle."""
+        coordinator = _make_bare_coordinator()
+        await coordinator._update_lock.acquire()
+        try:
+            with (
+                patch(
+                    "custom_components.hsem.coordinator."
+                    "SECONDARY_STORAGE_UPDATE_DEBOUNCE_SECONDS",
+                    0.0,
+                ),
+                patch.object(
+                    coordinator, "_async_run_update_cycle", new_callable=AsyncMock
+                ) as run_cycle,
+            ):
+                task = asyncio.create_task(
+                    coordinator._async_secondary_storage_update_debounced()
+                )
+                coordinator._secondary_storage_update_debounce_task = task
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                run_cycle.assert_not_awaited()
+
+                coordinator._update_lock.release()
+                await task
+
+                run_cycle.assert_awaited_once()
+                assert coordinator._secondary_storage_update_debounce_task is None
+        finally:
+            if coordinator._update_lock.locked():
+                coordinator._update_lock.release()
+
+    def test_weekday_profile_is_updated_only_once_per_cycle(self) -> None:
+        source = inspect.getsource(HSEMDataUpdateCoordinator._async_run_update_cycle)
+        assert source.count("weekday_profile.update(") == 1
+
+    def test_reused_or_rejected_plan_does_not_advance_secondary_baseline(self) -> None:
+        """Small changes accumulate relative to the plan actually in force."""
+        coordinator = _make_bare_coordinator()
+        coordinator._last_plan_secondary_soc_pct = 75.0
+        coordinator._last_plan_secondary_load_power_w = 190.0
+        coordinator._last_plan_secondary_output_priority = "utility"
+        live = LiveState()
+        live.secondary_storage.soc_pct = 75.8
+        live.secondary_storage.load_power_w = 210.0
+        live.secondary_storage.output_source_priority = "sbu"
+
+        coordinator._persist_plan_state_if_accepted(live, False)
+
+        assert coordinator._last_plan_secondary_soc_pct == pytest.approx(75.0)
+        assert coordinator._last_plan_secondary_load_power_w == pytest.approx(190.0)
+        assert coordinator._last_plan_secondary_output_priority == "utility"
+
+        coordinator._persist_plan_state_if_accepted(live, True)
+        assert coordinator._last_plan_secondary_soc_pct == pytest.approx(75.8)
+        assert coordinator._last_plan_secondary_load_power_w == pytest.approx(210.0)
+        assert coordinator._last_plan_secondary_output_priority == "sbu"
+
+
+class TestApplySummaryPublication:
+    """Verify completed hardware results are republished to diagnostics."""
+
+    def test_publish_updates_snapshot_and_notifies_listeners(self) -> None:
+        """A completed apply must be visible to every coordinator-backed entity."""
+        coord = _make_bare_coordinator()
+        coord.data = CoordinatorData()
+        applier_status_refresh = MagicMock(name="applier_status_refresh")
+        degraded_mode_refresh = MagicMock(name="degraded_mode_refresh")
+        plan_explanation_refresh = MagicMock(name="plan_explanation_refresh")
+        coord._listeners = {
+            1: (applier_status_refresh, None),
+            2: (degraded_mode_refresh, None),
+            3: (plan_explanation_refresh, None),
+        }
+        summary = CycleApplySummary()
+
+        coord.async_publish_apply_summary(summary)
+
+        assert coord._last_apply_summary is summary
+        assert coord.data.apply_summary is summary
+        applier_status_refresh.assert_called_once_with()
+        degraded_mode_refresh.assert_called_once_with()
+        plan_explanation_refresh.assert_called_once_with()
+
+    def test_publish_before_snapshot_only_persists_summary(self) -> None:
+        """A late worker completion remains safe if teardown cleared the snapshot."""
+        coord = _make_bare_coordinator()
+        summary = CycleApplySummary()
+
+        with patch.object(coord, "async_update_listeners") as update_listeners:
+            coord.async_publish_apply_summary(summary)
+
+        assert coord._last_apply_summary is summary
+        update_listeners.assert_not_called()
+
+    def test_new_snapshots_retain_last_completed_summary(self) -> None:
+        """Normal refreshes must not revert diagnostics to pending."""
+        source = inspect.getsource(HSEMDataUpdateCoordinator._async_run_update_cycle)
+        assert 'apply_summary=getattr(self, "_last_apply_summary", None)' in source
 
 
 # ---------------------------------------------------------------------------
@@ -439,8 +630,8 @@ class TestForceDischargeLiveDemandMonitor:
         )
 
         assert metrics is not None
-        planned_ac_w, live_residual_w, threshold_w, excess_w = metrics
-        assert planned_ac_w == pytest.approx(980.0)
+        planned_supply_w, live_residual_w, threshold_w, excess_w = metrics
+        assert planned_supply_w == pytest.approx(980.0)
         assert live_residual_w == pytest.approx(2100.0)
         assert threshold_w == pytest.approx(150.0)
         assert excess_w == pytest.approx(1120.0)
@@ -459,8 +650,8 @@ class TestForceDischargeLiveDemandMonitor:
         )
 
         assert metrics is not None
-        planned_ac_w, live_residual_w, threshold_w, excess_w = metrics
-        assert planned_ac_w == pytest.approx(1403.36)
+        planned_supply_w, live_residual_w, threshold_w, excess_w = metrics
+        assert planned_supply_w == pytest.approx(1403.36)
         assert live_residual_w == pytest.approx(1590.0)
         assert threshold_w == pytest.approx(150.0)
         assert excess_w == pytest.approx(186.64)
@@ -478,6 +669,46 @@ class TestForceDischargeLiveDemandMonitor:
         assert metrics is not None
         assert metrics[2] == pytest.approx(150.0)
         assert metrics[3] == pytest.approx(150.0)
+
+    def test_material_partial_msc_compares_live_load_with_battery_plus_grid(
+        self,
+    ) -> None:
+        """A partial BDM slot monitors drift above its solved total supply."""
+        start = datetime(2026, 8, 13, 20, 0, tzinfo=UTC)
+        slot = _force_discharge_slot(start)
+        slot.recommendation = Recommendations.BatteriesDischargeMode.value
+        slot.grid_import_kwh = 0.10
+
+        metrics = _force_discharge_live_metrics(
+            slot,
+            discharge_efficiency_pct=98.0,
+            house_power_w=1800.0,
+            solar_power_w=100.0,
+        )
+
+        assert metrics is not None
+        planned_supply_w, live_residual_w, threshold_w, excess_w = metrics
+        assert planned_supply_w == pytest.approx(1380.0)
+        assert live_residual_w == pytest.approx(1700.0)
+        assert threshold_w == pytest.approx(150.0)
+        assert excess_w == pytest.approx(320.0)
+
+    def test_material_partial_msc_is_monitored_but_rounding_import_is_not(
+        self,
+    ) -> None:
+        """Only a real solved grid share extends the live-demand monitor."""
+        coordinator = _make_bare_coordinator()
+        coordinator._cfg.batteries_discharge_efficiency = 98.0
+        start = datetime(2026, 8, 13, 20, 0, tzinfo=UTC)
+        slot = _force_discharge_slot(start)
+        slot.recommendation = Recommendations.BatteriesDischargeMode.value
+        slot.grid_import_kwh = 0.10
+        coordinator._last_planner_output = SimpleNamespace(slots=[slot])  # type: ignore[assignment]
+
+        assert coordinator._active_force_discharge_slot(start) is slot
+
+        slot.grid_import_kwh = 0.001
+        assert coordinator._active_force_discharge_slot(start) is None
 
     @pytest.mark.asyncio
     async def test_triggers_after_30_seconds_and_only_once_per_slot(self) -> None:

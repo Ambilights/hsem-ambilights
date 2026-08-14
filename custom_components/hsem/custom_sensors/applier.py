@@ -73,7 +73,11 @@ from custom_components.hsem.utils.misc import (
     get_max_discharge_power,
 )
 from custom_components.hsem.utils.recommendations import Recommendations
-from custom_components.hsem.utils.units import hours_ahead, slot_duration_hours
+from custom_components.hsem.utils.units import (
+    hours_ahead,
+    is_material_planned_energy_kwh,
+    slot_duration_hours,
+)
 from custom_components.hsem.utils.workingmodes import WorkingModes
 
 
@@ -415,19 +419,20 @@ def _desired_battery_discharge_cap_w(
         and planned_grid_import_kwh > 1e-9
     ):
         # MSC normally follows live house demand up to the Huawei hardware
-        # maximum. When the selected plan deliberately retains grid import,
-        # however, unrestricted MSC could consume battery energy that the MILP
-        # reserved for a later slot. Reuse the stable full-slot energy cap so
-        # the physical inverter cannot exceed the solved partial-discharge
-        # allocation. A label-only runtime discharge override with no planned
-        # energy, and zero-import MSC, keep the normal hardware maximum below.
+        # maximum. When the selected plan deliberately retains more than the
+        # 0.001-kWh publication residue as grid import, unrestricted MSC could
+        # consume battery energy the MILP reserved for a later slot. Reuse the
+        # stable full-slot cap for that intentional partial allocation. A
+        # label-only runtime override, zero import, and rounding-only import
+        # keep the normal hardware maximum below.
         slot_hours = slot_duration_hours(rec.start, rec.end)
-        partial_self_consumption_cap_w = _fully_fed_discharge_cap_w(
-            planned_discharge_kwh=planned_discharge_kwh,
-            slot_hours=slot_hours,
-            remaining_slot_hours=hours_ahead(now, rec.end),
-            max_discharge_power_w=max_discharge_power_w,
-        )
+        if is_material_planned_energy_kwh(planned_grid_import_kwh):
+            partial_self_consumption_cap_w = _fully_fed_discharge_cap_w(
+                planned_discharge_kwh=planned_discharge_kwh,
+                slot_hours=slot_hours,
+                remaining_slot_hours=hours_ahead(now, rec.end),
+                max_discharge_power_w=max_discharge_power_w,
+            )
 
     if live.any_ev_charging:
         slot_hours = slot_duration_hours(rec.start, rec.end)

@@ -377,6 +377,7 @@ def solve_milp(
     if battery_export_min_price > 1e-9:
         battery_export_blocked = p_exp < battery_export_min_price
 
+    min_export_blocked = np.zeros(len(future_idx), dtype=bool)
     # Clamp export prices below min_export_price to 0.
     # The applier physically sets the inverter to GRID_EXPORT_LIMIT_WATT
     # for these slots, blocking export entirely.  The LP must not optimise
@@ -389,6 +390,7 @@ def solve_milp(
     # (cost 0) over export (cost > 0).
     if min_export_price > 1e-9:
         blocked = p_exp < min_export_price
+        min_export_blocked = blocked
         n_blocked = int(np.sum(blocked))
         if n_blocked > 0:
             log_planner(
@@ -400,6 +402,11 @@ def solve_milp(
                 float(np.max(p_exp[blocked])),
             )
         p_exp = np.where(blocked, 0.0, p_exp)
+
+    # Both export floors are physical execution guards. Apply their union to
+    # the primary discharge cap and to the later Huawei/PowMr coupling rows so
+    # the solved energy balance cannot rely on an export the applier blocks.
+    primary_export_blocked = np.logical_or(battery_export_blocked, min_export_blocked)
 
     # Clamp export price to never exceed import price for the same slot.
     # Without this, slots where p_exp[t] > p_imp[t] create an unbounded LP
@@ -740,7 +747,7 @@ def solve_milp(
         _has_session_demand,
         max_grid_export_per_slot_kwh=max_grid_export_per_slot_kwh,
         export_limit_active=export_limit_active,
-        battery_export_blocked=battery_export_blocked,
+        battery_export_blocked=primary_export_blocked,
     )
 
     if export_mode_off is not None:
@@ -767,6 +774,21 @@ def solve_milp(
             reserve_kwh=export_reserve_kwh,
         )
 
+    primary_site_discharge_limited = np.logical_or(
+        np.logical_or(
+            primary_export_blocked,
+            np.full(m, no_export, dtype=bool),
+        ),
+        np.logical_and(not active_evs, ev_accounted > 1e-9),
+    )
+    primary_site_discharge_cap_kwh = base_load.copy()
+    if not active_evs:
+        primary_site_discharge_cap_kwh = np.where(
+            ev_accounted > 1e-9,
+            np.maximum(base_load - ev_accounted, 0.0),
+            primary_site_discharge_cap_kwh,
+        )
+
     integrality = None
     if secondary_active:
         from custom_components.hsem.planner.milp._secondary_storage import (
@@ -786,6 +808,9 @@ def solve_milp(
             future_idx=future_idx,
             primary_discharge_off=ed_off,
             primary_max_discharge_kwh=max_dis,
+            primary_discharge_efficiency_fraction=discharge_eff,
+            primary_site_discharge_limited=primary_site_discharge_limited,
+            primary_site_discharge_cap_kwh=primary_site_discharge_cap_kwh,
         )
         integrality = _secondary_integrality(n_vars, m, secondary_layout)
 
@@ -1176,7 +1201,21 @@ def solve_milp(
             config=secondary_storage,
             future_idx=future_idx,
             minimum_action_kwh=_MIN_ACTION_KWH,
+            battery_export_min_price=max(
+                min_export_price,
+                battery_export_min_price,
+            ),
+            primary_site_discharge_limited=primary_site_discharge_limited,
         )
+        if secondary_diagnostics is None:
+            _sync_attempt_diagnostics(
+                attempt,
+                attempt_diagnostics,
+                solver_status="postwrite_invariant_failed",
+                result_available=False,
+                fallback_reason="secondary_postwrite_invariant_failed",
+            )
+            return None
         diagnostics.update(secondary_diagnostics)
         secondary_result = build_secondary_result_summary(
             out_slots,

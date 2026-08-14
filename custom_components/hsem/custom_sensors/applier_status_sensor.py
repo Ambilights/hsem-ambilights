@@ -23,8 +23,8 @@ The sensor is a *diagnostic* entity (``entity_category = EntityCategory.DIAGNOST
 so it appears in the *Diagnostic* section of the device page.
 
 This sensor subscribes to :class:`~custom_components.hsem.coordinator.HSEMDataUpdateCoordinator`
-and updates automatically after every coordinator cycle, including after the
-working-mode sensor mutates :attr:`CoordinatorData.apply_summary`.
+and updates after normal coordinator cycles and immediately when the
+working-mode hardware worker publishes a completed apply summary.
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ class HSEMApplierStatusSensor(
     """Diagnostic sensor exposing the last hardware-write cycle outcome.
 
     State reflects the worst-case :class:`~utils.inverter_verify.ApplyStatus`
-    across all writes in the most recent coordinator cycle.
+    across all writes in the most recent completed hardware apply.
 
     Attributes
     ----------
