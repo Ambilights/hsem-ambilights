@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
+import pytest
 
 from custom_components.hsem.models.ev_config import EVConfig
 from custom_components.hsem.models.planned_slot import PlannedSlot
@@ -193,15 +194,26 @@ def test_curtailed_pv_cannot_fund_a_solar_charge_label() -> None:
     assert slot.grid_import_kwh > 0.0
 
 
-def test_solar_label_never_rounds_to_nonzero_grid_import() -> None:
-    """A displayed 0.001 kWh grid shortfall must select grid-charge mode."""
+def test_one_wh_charge_shortfall_is_nonmaterial_solar_residue() -> None:
+    """A published 0.001 kWh source shortfall must keep solar/MSC mode."""
     slot = _write_charge(
         charge_kwh=0.248,
         solar_surplus_kwh=0.255,
     )
 
+    assert slot.recommendation == Recommendations.BatteriesChargeSolar.value
+    assert slot.grid_import_kwh == pytest.approx(0.001)
+
+
+def test_two_wh_charge_shortfall_uses_grid_mode() -> None:
+    """A source shortfall above publication residue must select grid/TOU mode."""
+    slot = _write_charge(
+        charge_kwh=0.249,
+        solar_surplus_kwh=0.255,
+    )
+
     assert slot.recommendation == Recommendations.BatteriesChargeGrid.value
-    assert slot.grid_import_kwh == 0.001
+    assert slot.grid_import_kwh == pytest.approx(0.002)
 
 
 def test_sub_millikwh_solver_residue_does_not_create_charge_action() -> None:
@@ -246,3 +258,25 @@ def test_discharge_mode_uses_final_export_not_raw_solver_residue() -> None:
 
     assert slot.recommendation == Recommendations.BatteriesDischargeMode.value
     assert slot.grid_export_kwh == 0.0
+
+
+def test_one_wh_primary_export_is_nonmaterial_residue() -> None:
+    """A published 0.001 kWh export must keep normal self-consumption mode."""
+    slot = _write_discharge(
+        discharge_kwh=0.400,
+        house_load_kwh=0.387,
+    )
+
+    assert slot.grid_export_kwh == pytest.approx(0.001)
+    assert slot.recommendation == Recommendations.BatteriesDischargeMode.value
+
+
+def test_two_wh_primary_export_uses_forced_discharge_mode() -> None:
+    """A published export above residue must use executable forced-export mode."""
+    slot = _write_discharge(
+        discharge_kwh=0.400,
+        house_load_kwh=0.386,
+    )
+
+    assert slot.grid_export_kwh == pytest.approx(0.002)
+    assert slot.recommendation == Recommendations.ForceBatteriesDischarge.value

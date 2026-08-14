@@ -287,7 +287,15 @@ class TestCoordinatorListenerCleanup:
         coord._hourly_timer_unsub = None
         coord._interval_timer_unsub = None
         coord._force_discharge_monitor_unsub = None
+        coord._slot_boundary_timer_unsub = None
+        coord._slot_boundary_interval_minutes = None
+        coord._window_hysteresis_timer_unsub = None
+        coord._window_hysteresis_expiry = None
+        coord._window_hysteresis_expiry_replan_pending = False
+        coord._tearing_down = False
         coord._secondary_storage_update_debounce_task = None
+        coord._price_source_update_debounce_task = None
+        coord._price_source_update_pending = False
 
         return coord
 
@@ -314,11 +322,15 @@ class TestCoordinatorListenerCleanup:
         timer_unsub = MagicMock()
         interval_unsub = MagicMock()
         monitor_unsub = MagicMock()
+        boundary_unsub = MagicMock()
+        hysteresis_unsub = MagicMock()
         listener_unsub = MagicMock()
 
         coord._hourly_timer_unsub = timer_unsub
         coord._interval_timer_unsub = interval_unsub
         coord._force_discharge_monitor_unsub = monitor_unsub
+        coord._slot_boundary_timer_unsub = boundary_unsub
+        coord._window_hysteresis_timer_unsub = hysteresis_unsub
         coord._listener_unsubs = [listener_unsub]
 
         await coord.async_teardown()
@@ -326,10 +338,14 @@ class TestCoordinatorListenerCleanup:
         timer_unsub.assert_called_once()
         interval_unsub.assert_called_once()
         monitor_unsub.assert_called_once()
+        boundary_unsub.assert_called_once()
+        hysteresis_unsub.assert_called_once()
         listener_unsub.assert_called_once()
         assert coord._hourly_timer_unsub is None
         assert coord._interval_timer_unsub is None
         assert coord._force_discharge_monitor_unsub is None
+        assert coord._slot_boundary_timer_unsub is None
+        assert coord._window_hysteresis_timer_unsub is None
         assert coord._listener_unsubs == []
 
     @pytest.mark.asyncio
@@ -353,6 +369,59 @@ class TestCoordinatorListenerCleanup:
 
         task.cancel.assert_called_once()
         assert coord._secondary_storage_update_debounce_task is None
+
+    @pytest.mark.asyncio
+    async def test_teardown_cancels_price_source_debounce(self) -> None:
+        """A pending price publication refresh cannot outlive teardown."""
+        coord = self._make_coordinator()
+        task = MagicMock()
+        task.done.return_value = False
+        coord._price_source_update_debounce_task = task
+
+        await coord.async_teardown()
+
+        task.cancel.assert_called_once()
+        assert coord._price_source_update_debounce_task is None
+
+
+class TestPriceSourceListenerRouting:
+    """Price and PV forecast sources wake the durable refresh path."""
+
+    @pytest.mark.asyncio
+    async def test_all_distinct_price_sources_use_price_callback(self) -> None:
+        from custom_components.hsem.custom_sensors.state_collector import (
+            _register_listeners,
+        )
+        from custom_components.hsem.models.live_state import LiveState
+        from custom_components.hsem.models.sensor_config import SensorConfig
+
+        cfg = SensorConfig()
+        cfg.import_electricity_price_sensor = "sensor.import"
+        cfg.export_electricity_price_sensor = "sensor.export"
+        cfg.import_electricity_price_forecast_sensor = "sensor.import_forecast"
+        cfg.export_electricity_price_forecast_sensor = "sensor.export_forecast"
+        cfg.solcast_pv_forecast_forecast_today = "sensor.pv_today"
+        cfg.solcast_pv_forecast_forecast_tomorrow = "sensor.pv_tomorrow"
+        sensor = MagicMock()
+        tracked: set[str] = set()
+
+        with patch(
+            "custom_components.hsem.custom_sensors.state_collector"
+            ".async_track_state_change_event",
+            return_value=MagicMock(),
+        ) as register:
+            await _register_listeners(sensor, cfg, LiveState(), tracked)
+
+        registered = {call.args[1][0]: call.args[2] for call in register.call_args_list}
+        for entity_id in {
+            "sensor.import",
+            "sensor.export",
+            "sensor.import_forecast",
+            "sensor.export_forecast",
+            "sensor.pv_today",
+            "sensor.pv_tomorrow",
+        }:
+            assert registered[entity_id] == sensor._async_handle_price_source_change
 
 
 class TestSecondaryStorageListenerRouting:
@@ -397,3 +466,39 @@ class TestSecondaryStorageListenerRouting:
         assert registered["select.powmr_output"] == (
             sensor._async_handle_secondary_storage_change
         )
+
+    @pytest.mark.asyncio
+    async def test_control_entities_are_not_registered_when_control_disabled(
+        self,
+    ) -> None:
+        from custom_components.hsem.custom_sensors.state_collector import (
+            _register_listeners,
+        )
+        from custom_components.hsem.models.live_state import LiveState
+        from custom_components.hsem.models.sensor_config import SensorConfig
+
+        cfg = SensorConfig()
+        secondary = cfg.secondary_storage
+        secondary.enabled = True
+        secondary.control_enabled = False
+        secondary.soc_entity = "sensor.powmr_soc"
+        secondary.load_power_entity = "sensor.powmr_load_avg"
+        secondary.output_source_priority_entity = "select.powmr_output"
+        secondary.charger_source_priority_entity = "select.powmr_charger"
+        secondary.max_charge_current_entity = "number.powmr_current"
+        sensor = MagicMock()
+        tracked: set[str] = set()
+
+        with patch(
+            "custom_components.hsem.custom_sensors.state_collector"
+            ".async_track_state_change_event",
+            return_value=MagicMock(),
+        ) as register:
+            await _register_listeners(sensor, cfg, LiveState(), tracked)
+
+        registered = {call.args[1][0] for call in register.call_args_list}
+        assert "sensor.powmr_soc" in registered
+        assert "sensor.powmr_load_avg" in registered
+        assert "select.powmr_output" not in registered
+        assert "select.powmr_charger" not in registered
+        assert "number.powmr_current" not in registered

@@ -49,6 +49,8 @@ class DataQuality:
     today_pv_missing_hours: list[int] = field(default_factory=list)
     horizon_has_tomorrow: bool = False
     horizon_days: int = 1
+    price_actionable_until: str | None = None
+    price_actionable_slots: int = 0
 
     @property
     def is_complete(self) -> bool:
@@ -82,6 +84,8 @@ class DataQuality:
             "is_complete": self.is_complete,
             "horizon_has_tomorrow": self.horizon_has_tomorrow,
             "horizon_days": self.horizon_days,
+            "price_actionable_until": self.price_actionable_until,
+            "price_actionable_slots": self.price_actionable_slots,
             "tomorrow_price_missing_hours": sorted(self.tomorrow_price_missing_hours),
             "tomorrow_pv_missing_hours": sorted(self.tomorrow_pv_missing_hours),
             "day2_price_missing_hours": sorted(self.day2_price_missing_hours),

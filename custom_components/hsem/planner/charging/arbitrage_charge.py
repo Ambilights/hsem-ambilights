@@ -9,7 +9,7 @@ from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.planner.charging._charge_helpers import (
     _already_planned_charge_kwh,
 )
-from custom_components.hsem.utils.datetime_utils import as_tz
+from custom_components.hsem.utils.datetime_utils import utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.recommendations import Recommendations
 
@@ -137,7 +137,9 @@ def apply_arbitrage_grid_charge(
     # arbitrage can avoid.
     expensive_slots: list[tuple[PlannedSlot, float]] = []
     for s in slots:
-        if as_tz(s.end, now.tzinfo) <= now:
+        if utc_key(s.end) <= utc_key(now):
+            continue
+        if not s.price_actionable:
             continue
         if s.recommendation is not None:
             continue
@@ -157,9 +159,11 @@ def apply_arbitrage_grid_charge(
         (
             s
             for s in slots
-            if as_tz(s.end, now.tzinfo) > now and s.recommendation is None
+            if utc_key(s.end) > utc_key(now)
+            and s.price_actionable
+            and s.recommendation is None
         ),
-        key=lambda x: (x.price.import_price, x.start),
+        key=lambda x: (x.price.import_price, utc_key(x.start)),
     )
     if not candidates:
         log_planner("debug", "arbitrage: no unassigned future slots")
@@ -178,7 +182,6 @@ def apply_arbitrage_grid_charge(
         if charged_total >= remaining_capacity - 1e-9:
             break
 
-        cand_start_local = as_tz(cand.start, now.tzinfo)
         cand_price = cand.price.import_price
 
         # Per-kWh conversion-loss cost approximated against this candidate's
@@ -195,11 +198,10 @@ def apply_arbitrage_grid_charge(
             (
                 es
                 for es, _ in expensive_slots
-                if as_tz(es.start, now.tzinfo)
-                >= cand_start_local + (cand.end - cand.start)
+                if utc_key(es.start) >= utc_key(cand.end)
                 and remaining_demand.get(id(es), 0.0) > 1e-9
             ),
-            key=lambda x: (-x.price.import_price, x.start),
+            key=lambda x: (-x.price.import_price, utc_key(x.start)),
         )
 
         slot_room = min(max_charge_per_interval, remaining_capacity - charged_total)

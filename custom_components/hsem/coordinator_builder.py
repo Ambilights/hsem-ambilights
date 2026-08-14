@@ -16,7 +16,7 @@ directly.
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, timedelta
 
 from custom_components.hsem.models.battery_schedule_input import BatteryScheduleInput
 from custom_components.hsem.models.hourly_consumption_average import (
@@ -31,6 +31,7 @@ from custom_components.hsem.models.secondary_storage_config import (
 )
 from custom_components.hsem.models.sensor_config import SensorConfig
 from custom_components.hsem.models.solcast_slot import SolcastSlot
+from custom_components.hsem.models.time_series import slot_key_for_datetime
 from custom_components.hsem.utils.capacity_learner import CapacityLearner
 from custom_components.hsem.utils.charge_rate_learner import CHARGE_RATE_LEARNER
 from custom_components.hsem.utils.conversion import convert_to_float, convert_to_int
@@ -159,6 +160,20 @@ def _build_secondary_storage_config(
     )
 
 
+def _normalize_live_house_for_secondary(
+    house_power_w: float,
+    secondary_site_delta_w: float,
+) -> float:
+    """Map the live site-bus reading to the configured history topology.
+
+    ``secondary_site_delta_w`` is the canonical signed contribution of the
+    live PowMr branch: dedicated load visibility plus any active AC charging.
+    Removing it leaves the stable exogenous base expected by the MILP, which
+    then adds its newly selected PowMr action exactly once.
+    """
+    return max(house_power_w - secondary_site_delta_w, 0.0)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -194,9 +209,10 @@ def build_planner_input(
     """
     now = hsem_now()
 
-    # Dedup key is (day_offset, hour) so that tomorrow's slots are kept
-    # separately from today's even when they share the same wall-clock hour.
-    seen_day_hours: set[tuple[int, int]] = set()
+    # Consumption history is hour-granular, so deduplicate it by local day and
+    # hour. Prices and Solcast retain elapsed slot identity below: two physical
+    # occurrences of an autumn repeated hour must not collapse into one.
+    seen_consumption_day_hours: set[tuple[int, int]] = set()
     consumption_averages: list[HourlyConsumptionAverage] = []
     price_points: list[PricePoint] = []
     solcast_slots: list[SolcastSlot] = []
@@ -233,7 +249,13 @@ def build_planner_input(
     )
 
     # Midnight of the planning day — used to compute per-slot day_offset.
-    planning_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    planning_midnight = now.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+        fold=0,
+    )
 
     for rec in hourly_recommendations:
         h = rec.start.hour
@@ -241,15 +263,17 @@ def build_planner_input(
         # planning midnight and this slot's date.  This preserves the
         # distinction between today's hour-3 and tomorrow's hour-3 for
         # multi-day planning horizons (e.g. 48 h or 72 h).
-        day_offset = (rec.start.date() - planning_midnight.date()).days
-
-        # Prices are per-slot: 15-min price data must survive to the planner
-        # as distinct quarter-hourly points (issue #720).  Consumption
-        # averages and Solcast PV are genuinely hour-granular and stay
-        # deduplicated below.
-        slot_in_day = (rec.start.hour * 60 + rec.start.minute) // int(
-            cfg.recommendation_interval_minutes
+        rec_key = slot_key_for_datetime(
+            rec.start,
+            planning_midnight,
+            int(cfg.recommendation_interval_minutes),
         )
+        day_offset = rec_key.day_offset
+
+        # Prices and the already-matched Solcast forecast retain physical-slot
+        # identity so DST folds and 15-minute values survive into the planner.
+        # Only historical consumption averages remain hour-deduplicated below.
+        slot_in_day = rec_key.slot_in_day
         # Multiply by price_share to reverse the per-slot divide applied during
         # population; the planner receives the original currency/kWh rate.
         price_points.append(
@@ -259,13 +283,33 @@ def build_planner_input(
                 export_price=round(rec.export_price * price_share, 5),
                 day_offset=day_offset,
                 slot_in_day=slot_in_day,
+                import_price_available=rec.import_price_available,
+                export_price_available=rec.export_price_available,
+            )
+        )
+
+        # Preserve the same elapsed ordinal for PV. The coordinator has
+        # already matched raw Solcast windows to exact physical slots; folding
+        # them back to (day, hour) here would make the second autumn 02:00 hour
+        # reuse the first hour's forecast. ``pv_estimate`` remains an
+        # hourly-equivalent value and is scaled back by ``populate_solcast``.
+        solcast_slots.append(
+            SolcastSlot(
+                hour=h,
+                pv_estimate=round(
+                    rec.solcast_pv_estimate_kwh * slots_per_hour,
+                    3,
+                ),
+                day_offset=day_offset,
+                slot_in_day=slot_in_day,
+                pv_estimate_available=rec.solcast_pv_estimate_available,
             )
         )
 
         day_hour_key = (day_offset, h)
-        if day_hour_key in seen_day_hours:
+        if day_hour_key in seen_consumption_day_hours:
             continue
-        seen_day_hours.add(day_hour_key)
+        seen_consumption_day_hours.add(day_hour_key)
 
         consumption_averages.append(
             HourlyConsumptionAverage(
@@ -274,13 +318,6 @@ def build_planner_input(
                 avg_3d=round(rec.avg_house_consumption_3d_kwh * slots_per_hour, 3),
                 avg_7d=round(rec.avg_house_consumption_7d_kwh * slots_per_hour, 3),
                 avg_14d=round(rec.avg_house_consumption_14d_kwh * slots_per_hour, 3),
-                day_offset=day_offset,
-            )
-        )
-        solcast_slots.append(
-            SolcastSlot(
-                hour=h,
-                pv_estimate=round(rec.solcast_pv_estimate_kwh * slots_per_hour, 3),
                 day_offset=day_offset,
             )
         )
@@ -301,24 +338,26 @@ def build_planner_input(
     _w14d = convert_to_int(cfg.house_consumption_energy_weight_14d)
 
     secondary_storage = _build_secondary_storage_config(cfg, live)
+    secondary_delta_w = 0.0
+    if secondary_storage.valid:
+        secondary_delta_w = secondary_site_power_delta_w(
+            battery_net_power_w=live.secondary_storage.battery_net_power_w,
+            load_power_w=live.secondary_storage.load_power_w,
+            charge_efficiency_pct=secondary_storage.charge_efficiency_pct,
+            base_load_includes_dedicated_load=(
+                secondary_storage.base_load_includes_dedicated_load
+            ),
+            output_source_priority=(live.secondary_storage.output_source_priority),
+            charger_source_priority=(live.secondary_storage.charger_source_priority),
+        )
+    live_house_w = _normalize_live_house_for_secondary(
+        convert_to_float(live.house_consumption_power_w) or 0.0,
+        secondary_delta_w,
+    )
     grid_phase_power_imbalance_w: tuple[float, float, float] | None = None
     live_phase_power_w = live.grid_phase_power_w
     if cfg.phase_aware_charging_enabled and phase_powers_valid(live_phase_power_w):
         measured_phase_power_w = live_phase_power_w
-        secondary_delta_w = 0.0
-        if secondary_storage.valid:
-            secondary_delta_w = secondary_site_power_delta_w(
-                battery_net_power_w=live.secondary_storage.battery_net_power_w,
-                load_power_w=live.secondary_storage.load_power_w,
-                charge_efficiency_pct=secondary_storage.charge_efficiency_pct,
-                base_load_includes_dedicated_load=(
-                    secondary_storage.base_load_includes_dedicated_load
-                ),
-                output_source_priority=(live.secondary_storage.output_source_priority),
-                charger_source_priority=(
-                    live.secondary_storage.charger_source_priority
-                ),
-            )
         grid_phase_power_imbalance_w = phase_imbalance_w(
             measured_phase_power_w,
             secondary_site_delta_w=secondary_delta_w,
@@ -329,6 +368,7 @@ def build_planner_input(
 
     return PlannerInput(
         now_iso=now.isoformat(),
+        timezone_name=getattr(now.tzinfo, "key", None),
         interval_minutes=cfg.recommendation_interval_minutes,
         interval_length_hours=cfg.recommendation_interval_length,
         battery_soc_pct=convert_to_float(live.huawei_batteries_soc_pct) or 50.0,
@@ -403,8 +443,7 @@ def build_planner_input(
         house_power_includes_ev=bool(cfg.house_power_includes_ev_charger_power),
         live_solar_production_w=live_solar_w,
         live_solar_production_available=live_solar_available,
-        live_house_consumption_w=convert_to_float(live.house_consumption_power_w)
-        or 0.0,
+        live_house_consumption_w=live_house_w,
         is_read_only=bool(cfg.read_only),
         # EV planned load
         ev_planned_load_enabled=bool(cfg.ev_planned_load_enabled),
@@ -524,13 +563,24 @@ def generate_recommendation_intervals(
         fields initialised to ``0.0``.
     """
     now = hsem_now()
-    start_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_time = now.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+        fold=0,
+    )
+    start_time_utc = start_time.astimezone(UTC)
     steps = int((total_hours * 60) / interval_minutes)
 
     intervals = []
     for i in range(steps):
-        t_start = start_time + timedelta(minutes=i * interval_minutes)
-        t_end = t_start + timedelta(minutes=interval_minutes)
+        t_start = (start_time_utc + timedelta(minutes=i * interval_minutes)).astimezone(
+            now.tzinfo
+        )
+        t_end = (
+            start_time_utc + timedelta(minutes=(i + 1) * interval_minutes)
+        ).astimezone(now.tzinfo)
         intervals.append(
             HourlyRecommendation(
                 avg_house_consumption_kwh=0.0,

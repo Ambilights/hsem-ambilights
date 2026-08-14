@@ -218,6 +218,45 @@ class TestDailyPlanVsActualTracker:
         assert tracker.plan.grid_import_kwh == pytest.approx(3.0)
         assert tracker.plan.grid_import_cost == pytest.approx(2.5)  # 0.5 + 2.0
 
+    def test_unavailable_prices_keep_energy_but_not_fabricated_money(self) -> None:
+        """Meter baselines advance while unpublished intervals stay unpriced."""
+        tracker = DailyPlanVsActualTracker()
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=100.0,
+            grid_export_energy_kwh=50.0,
+        )
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=105.0,
+            grid_export_energy_kwh=52.0,
+            import_price=0.0,
+            export_price=0.0,
+            import_price_available=False,
+            export_price_available=False,
+        )
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=106.0,
+            grid_export_energy_kwh=53.0,
+            import_price=3.0,
+            export_price=2.0,
+        )
+        tracker.accumulate_plan(
+            grid_import_kwh=4.0,
+            grid_export_kwh=2.0,
+            import_price=999.0,
+            export_price=999.0,
+            import_price_available=False,
+            export_price_available=False,
+        )
+
+        assert tracker.actual.grid_import_kwh == pytest.approx(6.0)
+        assert tracker.actual.grid_export_kwh == pytest.approx(3.0)
+        assert tracker.actual.grid_import_cost == pytest.approx(3.0)
+        assert tracker.actual.grid_export_rev == pytest.approx(2.0)
+        assert tracker.plan.grid_import_kwh == pytest.approx(4.0)
+        assert tracker.plan.grid_export_kwh == pytest.approx(2.0)
+        assert tracker.plan.grid_import_cost == 0.0
+        assert tracker.plan.grid_export_rev == 0.0
+
     def test_accumulate_actual_soc_tracking(self) -> None:
         """Battery cycle tracking uses SoC delta converted to kWh."""
         tracker = DailyPlanVsActualTracker()

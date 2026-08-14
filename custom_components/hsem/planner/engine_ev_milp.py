@@ -13,9 +13,10 @@ from custom_components.hsem.models.planner_input import PlannerInput
 from custom_components.hsem.planner.candidate_selector import (
     ev_future_charge_value_per_kwh,
 )
-from custom_components.hsem.utils.datetime_utils import as_tz
+from custom_components.hsem.utils.datetime_utils import utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import clamp_efficiency
+from custom_components.hsem.utils.units import slot_duration_hours
 
 
 def _build_ev_configs_for_milp(
@@ -37,10 +38,14 @@ def _build_ev_configs_for_milp(
         )
         if user_deadline is None:
             return horizon_cap
-        return min(user_deadline, horizon_cap)
+        return (
+            user_deadline
+            if utc_key(user_deadline) < utc_key(horizon_cap)
+            else horizon_cap
+        )
 
     configs: list[EVConfig] = []
-    future_slots = [i for i, s in enumerate(slots) if as_tz(s.end, now.tzinfo) > now]
+    future_slots = [i for i, s in enumerate(slots) if utc_key(s.end) > utc_key(now)]
     if not future_slots:
         return None
 
@@ -185,7 +190,7 @@ def _build_ev_configs_for_milp(
             eff_deadline = _effective_deadline_dt(deadline)
             for lp_t, slot_i in enumerate(future_slots):
                 s = slots[slot_i]
-                if as_tz(s.end, now.tzinfo) <= eff_deadline:
+                if utc_key(s.end) <= utc_key(eff_deadline):
                     deadline_slot = lp_t
                 else:
                     break
@@ -200,7 +205,8 @@ def _build_ev_configs_for_milp(
             charge_past_target = False
 
         eff = clamp_efficiency(eff_pct)
-        slot_hours = inp.interval_minutes / 60.0
+        first_future = slots[future_slots[0]]
+        slot_hours = slot_duration_hours(first_future.start, first_future.end)
         max_dc = pwr * slot_hours * eff  # DC-side kWh per slot
 
         future_value_per_kwh: float | None = None

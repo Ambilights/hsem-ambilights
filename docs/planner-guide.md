@@ -507,15 +507,15 @@ output with live sensor readings that were unknown at planning time.
 
 | Priority | Condition | Result |
 |---|---|---|
-| 1 (highest) | Live import price < 0 | → `force_export` |
+| 1 (highest) | Current slot actionable and available live import price < 0 | → `force_export` |
 | 2 | Current recommendation = `batteries_charge_grid` | Kept — grid charge never overridden |
 | 3 | Any EV (primary or second) is actively charging right now | → `ev_smart_charging` |
 | 4 | Battery energy > remaining discharge-schedule need, unless `primary_battery_hold` is set | → `batteries_discharge_mode` |
 | — | None of the above | Planner recommendation kept unchanged |
 
-> **Note:** Priorities 1 and 3 interact. A negative import price always wins — even
-> when an EV is charging. However, a grid-charge slot (priority 2) is never overridden
-> by an actively charging EV (priority 3).
+> **Note:** Priorities 1 and 3 interact. A published, actionable negative
+> import price always wins — even when an EV is charging. However, a grid-charge
+> slot (priority 2) is never overridden by an actively charging EV (priority 3).
 > Display relabelling and window hysteresis preserve an explicit
 > `primary_battery_hold`; neither may introduce battery energy absent from the
 > solved MILP allocation.
@@ -525,7 +525,7 @@ output with live sensor readings that were unknown at planning time.
 ##### Summary: full priority stack (highest → lowest)
 
 ```
-1. import_price < 0               → force_export           [runtime resolver]
+1. actionable available import_price < 0 → force_export    [runtime resolver]
 2. batteries_charge_grid active   → batteries_charge_grid  [runtime resolver guard]
 3. EV actively charging (live)    → ev_smart_charging      [runtime resolver]
 4. Battery above schedule need    → batteries_discharge_mode [runtime resolver]
@@ -998,8 +998,8 @@ unsafe or the system is in a degraded state.
 
 | Mode | Hardware writes | Trigger |
 |---|---|---|
-| `Normal` | Allowed | All inputs present and valid |
-| `Degraded` | Allowed (with warnings) | Non-critical data missing (e.g. tomorrow's prices) |
+| `Normal` | Allowed | All required live control/telemetry inputs present |
+| `Degraded` | Allowed (with warnings) | A non-critical live entity is missing |
 | `Error` | **Blocked** | Critical data missing (battery SoC, house load, working mode) |
 | `ReadOnly` | **Blocked** | `is_read_only = True` in config or `PlannerInput` |
 | `DryRun` | **Blocked** | Dry-run mode active |
@@ -1012,9 +1012,11 @@ Critical keywords in `missing_inputs` block hardware writes:
 - `house_consumption` — house load sensor unavailable
 - `working_mode` — inverter working-mode select unavailable
 
-Non-critical labels (e.g. `tomorrow_price_missing_hours:…`) trigger `Degraded`
-mode. The plan is computed and applied, but the coordinator logs a warning and
-surfaces the gap in `data_quality`.
+Forecast price/PV gaps are not live missing-entity labels and do not by
+themselves change degraded mode. They are surfaced in `data_quality` and by
+per-slot availability. Missing prices close the contiguous actionable prefix;
+automatic storage is held beyond it rather than optimized against placeholder
+zeros.
 
 ### Safety gate behaviour
 
@@ -1043,7 +1045,7 @@ The `DataQuality` object on `PlannerOutput` reports completeness of the planning
 | `day2_price_missing_hours` | `list[int]` | Hours with no price data for day +2 (72-h horizon only) |
 | `day2_pv_missing_hours` | `list[int]` | Hours with no PV forecast for day +2 |
 | `horizon_has_tomorrow` | `bool` | `True` when horizon extends beyond 24 h |
-| `horizon_days` | `int` | Number of calendar days covered (1, 2, or 3) |
+| `horizon_days` | `int` | Distinct local calendar dates covered; normally 1/2/3 for 24/48/72 h, or one extra across spring-forward |
 | `is_complete` | `bool` | `True` when no missing data was detected |
 
 ### Home Assistant attribute serialisation
@@ -1477,17 +1479,21 @@ immediately.  The ML mode (ridge regression with day-of-week, seasonality,
 and outdoor temperature) addresses several of these limitations.  See
 `docs/consumption-prediction.md`.
 
-### Prices are assumed known for the full horizon
+### Price authority may cover only a prefix of the horizon
 
-The planner treats all `price_points` as equally reliable. In practice:
+In practice:
 
 - Today's prices are firm (EDS publishes by ~13:00).
 - Tomorrow's prices arrive around 13:00 CET and are typically available before the evening planning run.
 - Day +2 prices (72-hour horizon) may be unavailable or estimated.
 
-Missing price data is surfaced in `data_quality` and triggers `Degraded` mode,
-but the planner proceeds using `0.0` as a fallback — which means it cannot
-meaningfully optimise slots where prices are absent.
+Missing price data is surfaced in `data_quality`. The numeric display fallback
+remains `0.0`, but availability distinguishes it from a genuinely published
+zero or negative price. The planner optimizes only the contiguous published
+prefix and enforces a price-neutral primary Hold plus secondary Utility beyond
+the first gap. Price and Solcast PV publication/withdrawal events wake a
+debounced refresh; an event that arrives during that refresh guarantees one
+coalesced follow-up cycle.
 
 ### No intra-day re-planning of past slots
 

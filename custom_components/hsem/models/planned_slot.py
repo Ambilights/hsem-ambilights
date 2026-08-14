@@ -29,6 +29,12 @@ class PlannedSlot:
         price:
             Import and export prices for this slot as a :class:`SlotPrice`.
             Both values are in local currency/kWh and may be negative.
+        import_price_available / export_price_available:
+            ``True`` only when the corresponding numeric price was supplied
+            by the source. Zero and negative prices remain available.
+        price_actionable:
+            ``True`` only inside the contiguous future prefix for which both
+            price channels are published.
         solcast_pv_estimate_kwh:
             Forecast PV production in kWh for this slot.
         avg_house_consumption_kwh:
@@ -119,6 +125,9 @@ class PlannedSlot:
     start: datetime
     end: datetime
     price: SlotPrice = field(default_factory=lambda: SlotPrice(0.0, 0.0))
+    import_price_available: bool = True
+    export_price_available: bool = True
+    price_actionable: bool = True
     solcast_pv_estimate_kwh: float = 0.0
     avg_house_consumption_kwh: float = 0.0
     avg_house_consumption_1d_kwh: float = 0.0

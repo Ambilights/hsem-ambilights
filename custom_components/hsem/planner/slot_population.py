@@ -13,21 +13,6 @@ import math
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from custom_components.hsem.const import (
-    BASELINE_7D_SHARE,
-    BASELINE_14D_SHARE,
-    CAP7_DOWN,
-    CAP7_UP,
-    CAP14_DOWN,
-    CAP14_UP,
-    CHANGE3_LIMIT_DOWN_FACTOR,
-    CHANGE3_LIMIT_UP_FACTOR,
-    CHANGE_LIMIT_DOWN_FACTOR,
-    CHANGE_LIMIT_UP_FACTOR,
-    IQR_OUTLIER_MULTIPLIER,
-    RELIABILITY_EPS,
-    RELIABILITY_SCALE_STRENGTH,
-)
 from custom_components.hsem.models.hourly_consumption_average import (
     HourlyConsumptionAverage,
 )
@@ -36,13 +21,32 @@ from custom_components.hsem.models.planner_input import PlannerInput
 from custom_components.hsem.models.price_point import PricePoint
 from custom_components.hsem.models.solcast_slot import SolcastSlot
 from custom_components.hsem.models.time_series import TimeSeriesIndex
-from custom_components.hsem.utils.datetime_utils import as_tz
+from custom_components.hsem.planner import consumption_weighting as _weighting
+from custom_components.hsem.utils.datetime_utils import as_tz, slot_contains, utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.prices import SlotPrice
 from custom_components.hsem.utils.recommendations import Recommendations
 
 if TYPE_CHECKING:
     from custom_components.hsem.utils.solar_corrector import SolarForecastCorrector
+
+# Backward-compatible re-exports for existing integrations and tests.
+BASELINE_7D_SHARE = _weighting.BASELINE_7D_SHARE
+BASELINE_14D_SHARE = _weighting.BASELINE_14D_SHARE
+CAP7_DOWN = _weighting.CAP7_DOWN
+CAP7_UP = _weighting.CAP7_UP
+CAP14_DOWN = _weighting.CAP14_DOWN
+CAP14_UP = _weighting.CAP14_UP
+CHANGE3_LIMIT_DOWN_FACTOR = _weighting.CHANGE3_LIMIT_DOWN_FACTOR
+CHANGE3_LIMIT_UP_FACTOR = _weighting.CHANGE3_LIMIT_UP_FACTOR
+CHANGE_LIMIT_DOWN_FACTOR = _weighting.CHANGE_LIMIT_DOWN_FACTOR
+CHANGE_LIMIT_UP_FACTOR = _weighting.CHANGE_LIMIT_UP_FACTOR
+IQR_OUTLIER_MULTIPLIER = _weighting.IQR_OUTLIER_MULTIPLIER
+WINDOW_PEER_CLAMP_FACTOR = _weighting.WINDOW_PEER_CLAMP_FACTOR
+WINDOW_PEER_CLAMP_FLOOR_KWH = _weighting.WINDOW_PEER_CLAMP_FLOOR_KWH
+clamp_window_to_peer_median = _weighting.clamp_window_to_peer_median
+detect_outliers_iqr = _weighting.detect_outliers_iqr
+weighted_avg_consumption = _weighting.weighted_avg_consumption
 
 # ---------------------------------------------------------------------------
 # Slot generation
@@ -112,6 +116,11 @@ def index_by_hour(items: list, hour_attr: str = "hour") -> dict[int, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _price_channel_available(value: float, advertised: bool) -> bool:
+    """Return whether a source advertised a finite economic price."""
+    return bool(advertised and math.isfinite(value))
+
+
 def populate_prices(
     slots: list[PlannedSlot],
     price_points: list[PricePoint],
@@ -121,8 +130,9 @@ def populate_prices(
 
     When a :class:`TimeSeriesIndex` is provided the prices are aligned via
     the shared slot index so that all series use the same time axis.  Missing
-    hours (``NaN`` sentinel) default to 0 to preserve backward-compatible
-    behaviour.
+    Numeric values still default to 0 for downstream compatibility, but
+    explicit availability flags distinguish an unpublished value from a
+    genuine zero or negative price.
 
     Args:
         slots: Mutable list of planned slots to update.
@@ -143,29 +153,52 @@ def populate_prices(
         # their own slots instead of being fanned out from one hourly value.
         if any(pp.slot_in_day is not None for pp in price_points):
             imp_by_slot = {
-                (pp.day_offset, pp.slot_in_day): pp.import_price
-                for pp in price_points
-                if pp.slot_in_day is not None
-            }
-            exp_by_slot = {
-                (pp.day_offset, pp.slot_in_day): pp.export_price
+                (pp.day_offset, pp.slot_in_day): pp
                 for pp in price_points
                 if pp.slot_in_day is not None
             }
             # Hourly fallback for slots the source does not cover (e.g. a
-            # 60-min price source feeding 15-min slots).
+            # 60-min price source feeding 15-min slots).  Sub-hourly points
+            # must never become an implicit fallback for adjacent quarters.
             imp_by_hour = {
-                (pp.day_offset, pp.hour): pp.import_price for pp in price_points
-            }
-            exp_by_hour = {
-                (pp.day_offset, pp.hour): pp.export_price for pp in price_points
+                (pp.day_offset, pp.hour): pp
+                for pp in price_points
+                if pp.slot_in_day is None
             }
             for slot, meta in zip(slots, tsi.slots):
                 key = (meta.key.day_offset, meta.key.slot_in_day)
                 hour_key = (meta.key.day_offset, meta.hour)
-                imp = imp_by_slot.get(key, imp_by_hour.get(hour_key, 0.0))
-                exp = exp_by_slot.get(key, exp_by_hour.get(hour_key, 0.0))
-                slot.price = SlotPrice(import_price=imp, export_price=exp)
+                point = imp_by_slot.get(key, imp_by_hour.get(hour_key))
+                imp_available = bool(
+                    point
+                    and _price_channel_available(
+                        point.import_price, point.import_price_available
+                    )
+                )
+                exp_available = bool(
+                    point
+                    and _price_channel_available(
+                        point.export_price, point.export_price_available
+                    )
+                )
+                slot.price = SlotPrice(
+                    import_price=(
+                        point.import_price
+                        if point is not None and imp_available
+                        else 0.0
+                    ),
+                    export_price=(
+                        point.export_price
+                        if point is not None and exp_available
+                        else 0.0
+                    ),
+                )
+                slot.import_price_available = imp_available
+                slot.export_price_available = exp_available
+                slot.price_actionable = imp_available and exp_available
+                if not slot.price_actionable:
+                    tsi.missing_slots.add(meta.key)
+                    tsi.missing_price_slots.add(meta.key)
             return
 
         # Use (day_offset, hour) keys when any entry carries a non-zero
@@ -174,31 +207,55 @@ def populate_prices(
         exp_prices: dict[int, float] | dict[tuple[int, int], float]
         if any(pp.day_offset != 0 for pp in price_points):
             imp_prices = {
-                (pp.day_offset, pp.hour): pp.import_price for pp in price_points
+                (pp.day_offset, pp.hour): pp.import_price
+                for pp in price_points
+                if _price_channel_available(pp.import_price, pp.import_price_available)
             }
             exp_prices = {
-                (pp.day_offset, pp.hour): pp.export_price for pp in price_points
+                (pp.day_offset, pp.hour): pp.export_price
+                for pp in price_points
+                if _price_channel_available(pp.export_price, pp.export_price_available)
             }
         else:
-            imp_prices = {pp.hour: pp.import_price for pp in price_points}
-            exp_prices = {pp.hour: pp.export_price for pp in price_points}
+            imp_prices = {
+                pp.hour: pp.import_price
+                for pp in price_points
+                if _price_channel_available(pp.import_price, pp.import_price_available)
+            }
+            exp_prices = {
+                pp.hour: pp.export_price
+                for pp in price_points
+                if _price_channel_available(pp.export_price, pp.export_price_available)
+            }
         aligned_imp, aligned_exp = tsi.align_hourly_prices(imp_prices, exp_prices)
         for slot, imp, exp in zip(slots, aligned_imp, aligned_exp):
-            # Missing hours (NaN sentinel) fall back to 0.0 — preserve
-            # backward-compatible behaviour for downstream consumers.
+            slot.import_price_available = math.isfinite(imp)
+            slot.export_price_available = math.isfinite(exp)
+            slot.price_actionable = (
+                slot.import_price_available and slot.export_price_available
+            )
             slot.price = SlotPrice(
-                import_price=0.0 if math.isnan(imp) else imp,
-                export_price=0.0 if math.isnan(exp) else exp,
+                import_price=imp if slot.import_price_available else 0.0,
+                export_price=exp if slot.export_price_available else 0.0,
             )
         return
 
     price_by_hour = index_by_hour(price_points)
     for slot in slots:
         pt = price_by_hour.get(slot.start.hour)
-        if pt is not None:
-            slot.price = SlotPrice(
-                import_price=pt.import_price, export_price=pt.export_price
-            )
+        imp_available = bool(
+            pt and _price_channel_available(pt.import_price, pt.import_price_available)
+        )
+        exp_available = bool(
+            pt and _price_channel_available(pt.export_price, pt.export_price_available)
+        )
+        slot.price = SlotPrice(
+            import_price=pt.import_price if pt is not None and imp_available else 0.0,
+            export_price=pt.export_price if pt is not None and exp_available else 0.0,
+        )
+        slot.import_price_available = imp_available
+        slot.export_price_available = exp_available
+        slot.price_actionable = imp_available and exp_available
 
 
 def populate_solcast(
@@ -239,18 +296,66 @@ def populate_solcast(
         tsi is not None,
     )
     if tsi is not None:
+        # Slot-addressed forecasts preserve physical identity across an autumn
+        # DST fold. Keep support for explicitly hour-granular callers as a
+        # fallback, but never fan one slot-addressed point into its neighbours.
+        if any(sc.slot_in_day is not None for sc in solcast_slots):
+            pv_by_slot = {
+                (sc.day_offset, sc.slot_in_day): sc
+                for sc in solcast_slots
+                if sc.slot_in_day is not None
+            }
+            point_by_hour = {
+                (sc.day_offset, sc.hour): sc
+                for sc in solcast_slots
+                if sc.slot_in_day is None
+            }
+            for i, (slot, meta) in enumerate(zip(slots, tsi.slots)):
+                point = pv_by_slot.get(
+                    (meta.key.day_offset, meta.key.slot_in_day),
+                    point_by_hour.get((meta.key.day_offset, meta.hour)),
+                )
+                if (
+                    point is None
+                    or not point.pv_estimate_available
+                    or not math.isfinite(point.pv_estimate)
+                ):
+                    tsi.missing_slots.add(meta.key)
+                    tsi.missing_pv_slots.add(meta.key)
+                    raw_estimate = 0.0
+                else:
+                    raw_estimate = point.pv_estimate * meta.slot_fraction
+                if corrector is not None and raw_estimate > 0:
+                    slot.solcast_pv_estimate_kwh = round(
+                        corrector.get_corrected_pv(
+                            slot.start.hour,
+                            raw_estimate,
+                            slots_ahead=i,
+                        ),
+                        3,
+                    )
+                else:
+                    slot.solcast_pv_estimate_kwh = round(raw_estimate, 3)
+            return
+
         # Use (day_offset, hour) keys when any entry carries a non-zero
         # day_offset so that tomorrow's PV forecast is not shadowed by today's.
         pv_by_hour: dict[int, float] | dict[tuple[int, int], float]
         if any(sc.day_offset != 0 for sc in solcast_slots):
             pv_by_hour = {
-                (sc.day_offset, sc.hour): sc.pv_estimate for sc in solcast_slots
+                (sc.day_offset, sc.hour): sc.pv_estimate
+                for sc in solcast_slots
+                if sc.pv_estimate_available and math.isfinite(sc.pv_estimate)
             }
         else:
-            pv_by_hour = {sc.hour: sc.pv_estimate for sc in solcast_slots}
+            pv_by_hour = {
+                sc.hour: sc.pv_estimate
+                for sc in solcast_slots
+                if sc.pv_estimate_available and math.isfinite(sc.pv_estimate)
+            }
         aligned = tsi.align_hourly_pv(pv_by_hour)
         for i, (slot, val) in enumerate(zip(slots, aligned)):
-            raw_estimate = 0.0 if math.isnan(val) else val
+            raw_estimate = val if math.isfinite(val) else 0.0
             if corrector is not None and raw_estimate > 0:
                 slot.solcast_pv_estimate_kwh = round(
                     corrector.get_corrected_pv(
@@ -267,7 +372,13 @@ def populate_solcast(
 
     for i, slot in enumerate(slots):
         sc = solcast_by_hour.get(slot.start.hour)
-        raw_estimate = round(sc.pv_estimate / scale, 3) if sc else 0.0
+        raw_estimate = (
+            round(sc.pv_estimate / scale, 3)
+            if sc is not None
+            and sc.pv_estimate_available
+            and math.isfinite(sc.pv_estimate)
+            else 0.0
+        )
         if corrector is not None and raw_estimate > 0:
             slot.solcast_pv_estimate_kwh = round(
                 corrector.get_corrected_pv(
@@ -435,6 +546,9 @@ def populate_estimated_cost(
         export_min_price,
     )
     for slot in slots:
+        if not slot.price_actionable:
+            slot.estimated_cost_currency = 0.0
+            continue
         net = slot.estimated_net_consumption_kwh
         if net >= 0:
             slot.estimated_cost_currency = round(net * slot.price.import_price, 4)
@@ -457,7 +571,7 @@ def mark_time_passed(slots: list[PlannedSlot], now: datetime) -> None:
     """
     past_count = 0
     for slot in slots:
-        if as_tz(slot.end, now.tzinfo) < now:
+        if utc_key(slot.end) < utc_key(now):
             slot.recommendation = Recommendations.TimePassed.value
             past_count += 1
     log_planner(
@@ -494,16 +608,15 @@ def populate_battery_capacity(
 
     for slot in slots:
         slot_start = as_tz(slot.start, now.tzinfo)
-        slot_end = as_tz(slot.end, now.tzinfo)
 
-        if slot_start <= now < slot_end:
+        if slot_contains(slot.start, slot.end, now):
             cap = max(
                 current_capacity
                 - slot.estimated_net_consumption_kwh
                 + slot.batteries_charged_kwh,
                 0.0,
             )
-        elif slot_start >= now:
+        elif utc_key(slot_start) >= utc_key(now):
             cap = max(
                 previous_capacity
                 - slot.estimated_net_consumption_kwh
@@ -560,229 +673,3 @@ def usable_capacity(
         result[1],
     )
     return result
-
-
-# ---------------------------------------------------------------------------
-# Consumption weighting (pure arithmetic, no I/O)
-# ---------------------------------------------------------------------------
-
-
-# A single window may pull the blend at most this far above/below the
-# median of the other three windows (issue #592).  Prevents one stale or
-# polluted window (e.g. a 14d average still holding pre-fix EV-charging
-# nights) from dominating when the other three windows agree.
-WINDOW_PEER_CLAMP_FACTOR: float = 3.0
-# Absolute floor for the peer band so a near-zero house baseline (night
-# slots) still allows the clamp to bite — a pure ratio band is degenerate
-# when the peers sit at ~0.03 kWh.
-WINDOW_PEER_CLAMP_FLOOR_KWH: float = 0.15
-
-
-def clamp_window_to_peer_median(
-    values: list[float],
-    *,
-    factor: float = WINDOW_PEER_CLAMP_FACTOR,
-    floor: float = WINDOW_PEER_CLAMP_FLOOR_KWH,
-) -> list[float]:
-    """Clamp each window into a sanity band around the median of its peers.
-
-    For each value, the allowed band is ``[0, max(median_others × factor,
-    floor)]`` — an absolute *floor* keeps the band meaningful when the
-    peers are near zero (e.g. night slots at ~0.03 kWh).
-
-    Only the upward side is clamped: a window reading *below* its peers is
-    never inflated — a genuine drop in consumption must flow through
-    immediately, while a stale/polluted window can only ever overstate.
-    This catches the classic pollution pattern — three windows agreeing
-    low, one stale window 10–100× higher — without punishing legitimate
-    gradual trends (where all four windows move together).
-
-    Args:
-        values: The 4 window values (1d, 3d, 7d, 14d), kWh/hour.
-        factor: Ratio band half-width.  Default 3.0.
-        floor: Absolute minimum band width (kWh/hour).  Default 0.15.
-
-    Returns:
-        New list with each value clamped into its peer band.
-    """
-    n = len(values)
-    if n < 2:
-        return list(values)
-    out: list[float] = []
-    for i, v in enumerate(values):
-        others = [values[j] for j in range(n) if j != i]
-        srt = sorted(others)
-        m = len(srt)
-        median = srt[m // 2] if m % 2 == 1 else (srt[m // 2 - 1] + srt[m // 2]) / 2.0
-        hi = max(median * factor, floor)
-        out.append(min(v, hi))
-    return out
-
-
-def detect_outliers_iqr(
-    values: list[float],
-    multiplier: float = IQR_OUTLIER_MULTIPLIER,
-) -> list[bool]:
-    """Return a boolean mask flagging outlier values via median-ratio detection.
-
-    With only 4 data points (1d, 3d, 7d, 14d), the classic IQR Tukey fence
-    produces wide bounds that rarely flag anything.  Instead we use a
-    median-ratio approach: a value is an outlier when its ratio to the
-    median of all 4 values exceeds ``multiplier`` (for upward outliers) or
-    falls below ``1/multiplier`` (for downward outliers).
-
-    This detects both upward spikes (e.g. 10.0 vs 1.0) and downward anomalies
-    (e.g. 0.188 vs 0.708) while allowing gradual trends (e.g. 2.0, 1.9, 1.8, 1.0).
-
-    When all values are identical (median = 0), no value is flagged.
-
-    Args:
-        values: List of 4 float values (typically 4: 1d, 3d, 7d, 14d).
-        multiplier: Ratio threshold.  Defaults to
-            :data:`IQR_OUTLIER_MULTIPLIER` (1.5).
-
-    Returns:
-        List of booleans the same length as *values*, where ``True`` means
-        the corresponding value is an outlier.
-    """
-    n = len(values)
-    if n < 4:
-        return [False] * n
-
-    sorted_vals = sorted(values)
-    # Median of 4 values = average of the two middle values
-    median = (sorted_vals[1] + sorted_vals[2]) / 2.0
-
-    if abs(median) < 1e-12:
-        return [False] * n  # all near-zero — no outliers
-
-    upper_ratio = multiplier
-    lower_ratio = 1.0 / multiplier
-
-    return [v / median > upper_ratio or v / median < lower_ratio for v in values]
-
-
-def weighted_avg_consumption(
-    value_1d: float,
-    value_3d: float,
-    value_7d: float,
-    value_14d: float,
-    w1: int,
-    w3: int,
-    w7: int,
-    w14: int,
-) -> tuple[float, list[bool]]:
-    """Apply IQR-based outlier-aware dynamic reweighting and return the weighted average.
-
-    Replaces the old ratio-based spike detection (issue #301).  Outliers are
-    detected via the IQR (Tukey fence) method across the 4 consumption windows.
-    When a window is flagged as an outlier, its weight is redistributed to the
-    non-outlier windows proportionally.  Outliers are tracked and returned
-    so callers can log or display them.
-
-    The mild capping between 7d/14d and the baseline capping for 1d/3d are
-    retained as a safety net.  The reliability scaling is also retained.
-
-    Args:
-        value_1d..value_14d: Raw consumption values for each window (kWh/hour).
-        w1..w14: Configured integer weights (percent, should sum to 100).
-
-    Returns:
-        ``(weighted_average, outlier_mask)`` where *weighted_average* is the
-        final weighted average in kWh/hour and *outlier_mask* is a list of 4
-        booleans ``[is_1d_outlier, is_3d_outlier, is_7d_outlier, is_14d_outlier]``.
-    """
-    log_planner(
-        "debug",
-        "[pop] weighted_avg_consumption  vals=%.3f/%.3f/%.3f/%.3f  weights=%d/%d/%d/%d",
-        value_1d,
-        value_3d,
-        value_7d,
-        value_14d,
-        w1,
-        w3,
-        w7,
-        w14,
-    )
-    w_total_config = w1 + w3 + w7 + w14
-    if w_total_config == 0:
-        return 0.0, [False, False, False, False]
-
-    # IQR outlier detection on the RAW values (before capping) so that
-    # extreme spikes are detected even when capping would hide them.
-    raw = [value_1d, value_3d, value_7d, value_14d]
-    outlier_mask = detect_outliers_iqr(raw)
-
-    # Peer-median clamp (issue #592): no single window may exceed
-    # max(3× peer median, 0.15 kWh).  This catches the stale-14d pollution
-    # pattern (three windows agreeing low after a behavioural change, one
-    # long window still holding pre-change nights) that the IQR mask
-    # misses — with 4 points the median lands between the clusters and
-    # flags BOTH ends, zeroing the clean recent windows too.
-    value_1d, value_3d, value_7d, value_14d = clamp_window_to_peer_median(raw)
-
-    # Mild capping between 7d and 14d
-    value_7d_eff = max(CAP7_DOWN * value_14d, min(value_7d, CAP7_UP * value_14d))
-    value_14d_eff = max(
-        CAP14_DOWN * value_7d_eff, min(value_14d, CAP14_UP * value_7d_eff)
-    )
-
-    # Baseline capping for 1d/3d
-    baseline = BASELINE_7D_SHARE * value_7d_eff + BASELINE_14D_SHARE * value_14d_eff
-    value_1d_eff = max(
-        baseline * CHANGE_LIMIT_DOWN_FACTOR,
-        min(value_1d, baseline * CHANGE_LIMIT_UP_FACTOR),
-    )
-    value_3d_eff = max(
-        baseline * CHANGE3_LIMIT_DOWN_FACTOR,
-        min(value_3d, baseline * CHANGE3_LIMIT_UP_FACTOR),
-    )
-
-    # Redistribute weight from outlier windows to non-outlier windows.
-    weights = [float(w1), float(w3), float(w7), float(w14)]
-    non_outlier_weight = sum(
-        w for w, is_out in zip(weights, outlier_mask) if not is_out
-    )
-
-    if non_outlier_weight > 1e-9 and any(outlier_mask):
-        scale = w_total_config / non_outlier_weight
-        w1_eff = weights[0] * scale if not outlier_mask[0] else 0.0
-        w3_eff = weights[1] * scale if not outlier_mask[1] else 0.0
-        w7_eff = weights[2] * scale if not outlier_mask[2] else 0.0
-        w14_eff = weights[3] * scale if not outlier_mask[3] else 0.0
-    else:
-        w1_eff, w3_eff, w7_eff, w14_eff = weights
-
-    # Reliability scaling
-    def _rel(diff: float) -> float:
-        raw = 1.0 / (RELIABILITY_EPS + abs(diff))
-        return 1.0 + (raw - 1.0) * RELIABILITY_SCALE_STRENGTH
-
-    w1_eff *= _rel(value_1d_eff - value_7d_eff)
-    w3_eff *= _rel(value_3d_eff - value_7d_eff)
-    w7_eff *= _rel(value_7d_eff - value_14d_eff)
-    w14_eff *= _rel(value_14d_eff - value_7d_eff)
-
-    w_sum_eff = w1_eff + w3_eff + w7_eff + w14_eff
-    if w_sum_eff > 0:
-        scale_back = w_total_config / w_sum_eff
-        w1_eff *= scale_back
-        w3_eff *= scale_back
-        w7_eff *= scale_back
-        w14_eff *= scale_back
-    else:
-        w1_eff, w3_eff, w7_eff, w14_eff = (
-            float(w1),
-            float(w3),
-            float(w7),
-            float(w14),
-        )
-
-    result = round(
-        value_1d_eff * (w1_eff / 100)
-        + value_3d_eff * (w3_eff / 100)
-        + value_7d_eff * (w7_eff / 100)
-        + value_14d_eff * (w14_eff / 100),
-        3,
-    )
-    return result, outlier_mask

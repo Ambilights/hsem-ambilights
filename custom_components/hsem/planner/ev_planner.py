@@ -26,10 +26,17 @@ from typing import Any
 
 from homeassistant.const import STATE_UNAVAILABLE
 
-from custom_components.hsem.utils.datetime_utils import utc_key
+from custom_components.hsem.planner.ev_plan_rebuild import (  # noqa: F401 -- public compatibility re-export
+    rebuild_ev_plan_from_slots,
+)
+from custom_components.hsem.utils.datetime_utils import slot_contains, utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import clamp_efficiency
-from custom_components.hsem.utils.units import ev_dc_to_ac_kwh
+from custom_components.hsem.utils.units import (
+    ev_dc_to_ac_kwh,
+    hours_ahead,
+    slot_duration_hours,
+)
 
 # ---------------------------------------------------------------------------
 # Public data structures
@@ -216,7 +223,7 @@ def compute_ev_energy_needed(
 
 def slot_duration_minutes(start: datetime, end: datetime) -> float:
     """Return slot duration in minutes (float, ≥ 0)."""
-    return max((end - start).total_seconds() / 60.0, 0.0)
+    return max(slot_duration_hours(start, end) * 60.0, 0.0)
 
 
 def max_charge_energy_for_slot(
@@ -245,7 +252,7 @@ def max_charge_energy_for_slot(
 
 def remaining_minutes_in_slot(now: datetime, slot_end: datetime) -> float:
     """Return minutes remaining in the current slot (clamped to ≥ 0)."""
-    return max((slot_end - now).total_seconds() / 60.0, 0.0)
+    return hours_ahead(now, slot_end) * 60.0
 
 
 def _max_planning_horizon_end(now: datetime) -> datetime:
@@ -313,7 +320,9 @@ def _effective_deadline(
     horizon_cap = _max_planning_horizon_end(now)
     if user_deadline is None:
         return horizon_cap
-    return min(user_deadline, horizon_cap)
+    return (
+        user_deadline if utc_key(user_deadline) < utc_key(horizon_cap) else horizon_cap
+    )
 
 
 def build_ev_charging_plan(
@@ -322,6 +331,7 @@ def build_ev_charging_plan(
     slots_end: list[datetime],
     slot_net_surplus_kwh: list[float],
     slot_import_price: list[float],
+    slot_price_actionable: list[bool] | None = None,
 ) -> EVChargingPlan:
     """Build an EV charging plan and return per-slot planned loads.
 
@@ -426,22 +436,29 @@ def build_ev_charging_plan(
     effective_deadline = _effective_deadline(now_tz, inp.deadline)
     # We surface a diagnostic in ``plan.data_quality`` only when the cap
     # actually changed the deadline — otherwise the field is noise.
-    deadline_clamped = inp.deadline is not None and effective_deadline < inp.deadline
+    deadline_clamped = inp.deadline is not None and utc_key(
+        effective_deadline
+    ) < utc_key(inp.deadline)
 
     candidate_indices: list[int] = []
     for i, (s_start, s_end) in enumerate(zip(slots_start, slots_end)):
         # Skip past slots
-        if s_end <= now_tz:
+        if utc_key(s_end) <= utc_key(now_tz):
             continue
         # Skip slots starting at or beyond the effective deadline.
         # ``effective_deadline`` is always non-None by construction.
-        if s_start >= effective_deadline:
+        if utc_key(s_start) >= utc_key(effective_deadline):
             break
+        if slot_price_actionable is not None and not slot_price_actionable[i]:
+            continue
         candidate_indices.append(i)
 
     if not candidate_indices:
         plan.state = "waiting"
-        plan.data_quality = {"warning": "No candidate slots before deadline"}
+        plan.data_quality = {
+            "warning": "No candidate slots before deadline",
+            "unmet_target_kwh": round(energy_needed, 3),
+        }
         if deadline_clamped:
             plan.data_quality["effective_deadline"] = effective_deadline.isoformat()
             plan.data_quality["deadline_clamped"] = True
@@ -479,7 +496,7 @@ def build_ev_charging_plan(
         s_end = slots_end[i]
 
         # Scale current slot by remaining minutes
-        is_current = s_start <= now_tz < s_end
+        is_current = slot_contains(s_start, s_end, now_tz)
         if is_current:
             avail_min = remaining_minutes_in_slot(now_tz, s_end)
         else:
@@ -487,13 +504,11 @@ def build_ev_charging_plan(
 
         # Clamp to the effective deadline (one-midnight-crossing horizon
         # cap, possibly tightened further by the user-configured deadline).
-        if s_end > effective_deadline:
+        if utc_key(s_end) > utc_key(effective_deadline):
+            available_from = s_start if utc_key(s_start) >= utc_key(now_tz) else now_tz
             avail_min = min(
                 avail_min,
-                max(
-                    (effective_deadline - max(s_start, now_tz)).total_seconds() / 60.0,
-                    0.0,
-                ),
+                slot_duration_minutes(available_from, effective_deadline),
             )
 
         max_charge = max_charge_energy_for_slot(
@@ -585,7 +600,7 @@ def build_ev_charging_plan(
 
     # Identify current slot load
     for s in selected:
-        if s.start <= now_tz < s.end:
+        if slot_contains(s.start, s.end, now_tz):
             plan.current_slot_planned_load_kwh = s.estimated_charged_kwh
             break
 
@@ -619,6 +634,13 @@ def build_ev_charging_plan(
         # obvious why the EV planner didn't reach further into the horizon.
         plan.data_quality["effective_deadline"] = effective_deadline.isoformat()
         plan.data_quality["deadline_clamped"] = False
+    if remaining_energy > 1e-9:
+        plan.data_quality["unmet_target_kwh"] = round(remaining_energy, 3)
+        if slot_price_actionable is not None:
+            plan.data_quality["warning"] = (
+                "EV target cannot be fully scheduled before the deadline using "
+                "published-price slots"
+            )
 
     return plan
 
@@ -662,134 +684,3 @@ def apply_ev_planned_load_to_slots(
             # than the kWh arriving in the EV battery.  The += operator ensures
             # multiple EVs sharing the same slot are summed, not overwritten.
             slot_ev_planned_load_kwh[idx] += ev_slot.ac_load_kwh
-
-
-def rebuild_ev_plan_from_slots(
-    original_plan: EVChargingPlan,
-    slots: list,
-    now: datetime,
-    charger_efficiency_pct: float = 100.0,
-    *,
-    is_second: bool = False,
-) -> EVChargingPlan:
-    """Rebuild an EVChargingPlan from MILP-decided per-EV slot fields.
-
-    When the MILP wins, its per-slot EV decisions (written to
-    ``PlannedSlot.ev_charger_calculated_power`` or
-    ``PlannedSlot.ev_second_charger_calculated_power``) replace the
-    EV planner's original charging plan.  This function scans the winning
-    slots and produces an updated :class:`EVChargingPlan` that the sensor
-    can display, so the user sees what the system *actually* plans to do
-    rather than the EV planner's pre-MILP estimate.
-
-    The original plan provides metadata (SoC, target, capacity, etc.) that
-    the MILP does not recompute.
-
-    .. important::
-
-       This function reads **per-EV** power fields, not the combined
-       ``ev_planned_load_kwh`` / ``ev_accounted_load_kwh`` totals.
-       The combined fields sum across both EVs and cannot distinguish
-       which EV contributed how much load (issue #646/#655).
-
-    Args:
-        original_plan: The EV planner's original plan (for metadata).
-        slots: The winning slot list with MILP-populated EV fields.
-        now: Current time (timezone-aware), used to detect the current slot.
-        charger_efficiency_pct: Charger efficiency (0–100 %) for converting
-            AC load back to DC-side delivered energy.
-        is_second: When ``True``, read from
-            ``ev_second_charger_calculated_power`` instead of
-            ``ev_charger_calculated_power``.  Must match the EV identity
-            the caller is rebuilding for.
-
-    Returns:
-        A new :class:`EVChargingPlan` with ``charging_slots`` derived from
-        the MILP's per-EV slot decisions.
-    """
-    from custom_components.hsem.utils.datetime_utils import as_tz
-    from custom_components.hsem.utils.units import slot_duration_hours
-
-    eff = clamp_efficiency(charger_efficiency_pct)
-    charging_slots: list[EVChargingSlot] = []
-    planned_load_by_slot: dict[str, float] = {}
-    current_slot_planned_load_kwh: float = 0.0
-    total_charged_kwh: float = 0.0
-
-    # Read from the per-EV charger power field, not the combined
-    # ev_planned_load_kwh / ev_accounted_load_kwh totals (issue #646/#655).
-    power_field = (
-        "ev_second_charger_calculated_power"
-        if is_second
-        else "ev_charger_calculated_power"
-    )
-    for s in slots:
-        power_w = getattr(s, power_field, 0.0)
-        if power_w < 1e-9:
-            continue
-        # Convert AC power (W) back to AC load (kWh) using the slot duration.
-        slot_hours = slot_duration_hours(s.start, s.end)
-        ac_load = power_w * slot_hours / 1000.0
-
-        # Convert AC load back to DC-side delivered energy for display.
-        dc_kwh = ac_load * eff
-        total_charged_kwh += dc_kwh
-
-        # Solar/import split: the MILP decides EV charging alongside PV, so
-        # any PV surplus in this slot is consumed by the EV first (before
-        # the battery).  Attribute as much of the AC load as possible to
-        # the slot's PV surplus; the remainder is grid import.  Use the
-        # house-netted surplus (PV minus house consumption) so the split
-        # matches the energy balance used elsewhere.
-        pv_kwh = max(getattr(s, "solcast_pv_estimate_kwh", 0.0), 0.0)
-        house_kwh = max(getattr(s, "avg_house_consumption_kwh", 0.0), 0.0)
-        surplus_kwh = max(pv_kwh - house_kwh, 0.0)
-        solar_used_ac = min(ac_load, surplus_kwh)
-        solar_used_dc = solar_used_ac * eff
-        import_needed = max(dc_kwh - solar_used_dc, 0.0)
-
-        ev_slot = EVChargingSlot(
-            start=s.start,
-            end=s.end,
-            estimated_charged_kwh=round(dc_kwh, 3),
-            ac_load_kwh=round(ac_load, 3),
-            solar_surplus_kwh=round(solar_used_dc, 3),
-            import_needed_kwh=round(import_needed, 3),
-            import_price=getattr(getattr(s, "price", None), "import_price", 0.0),
-            estimated_cost=round(
-                ac_load * getattr(getattr(s, "price", None), "import_price", 0.0), 4
-            ),
-        )
-        charging_slots.append(ev_slot)
-        planned_load_by_slot[s.start.isoformat()] = dc_kwh
-
-        # Detect current slot
-        s_start_tz = as_tz(s.start, now.tzinfo)
-        s_end_tz = as_tz(s.end, now.tzinfo)
-        if s_start_tz <= now < s_end_tz:
-            current_slot_planned_load_kwh = dc_kwh
-
-    # Determine state
-    if charging_slots:
-        state = "charging" if current_slot_planned_load_kwh > 1e-9 else "waiting"
-    elif original_plan.state == "fully_charged":
-        state = "fully_charged"
-    else:
-        state = original_plan.state
-
-    return EVChargingPlan(
-        state=state,
-        ev_connected=original_plan.ev_connected,
-        base_load_includes_ev=original_plan.base_load_includes_ev,
-        current_soc_pct=original_plan.current_soc_pct,
-        target_soc_pct=original_plan.target_soc_pct,
-        battery_capacity_kwh=original_plan.battery_capacity_kwh,
-        charger_power_kw=original_plan.charger_power_kw,
-        charger_min_power_w=original_plan.charger_min_power_w,
-        total_kwh_needed=round(total_charged_kwh, 3),
-        deadline=original_plan.deadline,
-        charging_slots=charging_slots,
-        planned_load_by_slot=planned_load_by_slot,
-        current_slot_planned_load_kwh=round(current_slot_planned_load_kwh, 3),
-        data_quality=original_plan.data_quality,
-    )

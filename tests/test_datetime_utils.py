@@ -55,6 +55,7 @@ def _make_bare_coordinator():
     coord.logger = logging.getLogger("test")
     # Issue #738: per-slot EV charger power freeze state.
     coord._current_slot_start = None
+    coord._current_slot_price_actionable = None
     coord._current_slot_ev_power_w = 0.0
     coord._current_slot_ev_second_power_w = 0.0
     return coord
@@ -107,6 +108,9 @@ def _make_hourly_recommendation(
         "import_price": 0.20,
         "recommendation": None,
         "solcast_pv_estimate_kwh": 0.5,
+        "import_price_available": True,
+        "export_price_available": True,
+        "price_actionable": True,
     }
     defaults.update(kwargs)
     return HourlyRecommendation(start=start, end=end, **defaults)  # type: ignore[arg-type]  # test helper: dict values are typed at runtime
@@ -196,6 +200,25 @@ class TestSlotKeyTimezoneEquivalence:
         assert key_utc == key_local, (
             f"15-min slot: UTC key={key_utc!r}, local key={key_local!r}"
         )
+
+    def test_autumn_repeated_hour_folds_have_distinct_keys(self) -> None:
+        from custom_components.hsem.utils.datetime_utils import slot_key
+
+        first = datetime(2026, 10, 25, 2, 15, tzinfo=_FIXED_LOCAL_TZ, fold=0)
+        second = datetime(2026, 10, 25, 2, 15, tzinfo=_FIXED_LOCAL_TZ, fold=1)
+
+        assert slot_key(first, 15) != slot_key(second, 15)
+
+    def test_slot_contains_distinguishes_autumn_repeated_hour(self) -> None:
+        from custom_components.hsem.utils.datetime_utils import slot_contains
+
+        start = datetime(2026, 10, 25, 0, 0, tzinfo=UTC).astimezone(_FIXED_LOCAL_TZ)
+        end = datetime(2026, 10, 25, 0, 15, tzinfo=UTC).astimezone(_FIXED_LOCAL_TZ)
+        first_fold = datetime(2026, 10, 25, 2, 5, tzinfo=_FIXED_LOCAL_TZ, fold=0)
+        second_fold = datetime(2026, 10, 25, 2, 5, tzinfo=_FIXED_LOCAL_TZ, fold=1)
+
+        assert slot_contains(start, end, first_fold) is True
+        assert slot_contains(start, end, second_fold) is False
 
 
 # ===========================================================================
@@ -733,6 +756,7 @@ class TestResolverDoesNotEraseEVFields:
 
         defaults = {
             "import_electricity_price": "0.25",
+            "import_electricity_price_available": True,
             "ev": MagicMock(is_charging=False),
             "ev_second": MagicMock(is_charging=False),
             "battery_current_capacity_kwh": 5.0,
@@ -898,7 +922,13 @@ class TestEvChargerPowerSlotFreeze:
     """Per-EV charger power must remain stable across replans inside one slot."""
 
     def _make_output(
-        self, start: datetime, end: datetime, primary: float, second: float
+        self,
+        start: datetime,
+        end: datetime,
+        primary: float,
+        second: float,
+        *,
+        price_actionable: bool = True,
     ) -> PlannerOutput:
         """Build a PlannerOutput with a single slot carrying the given power fields."""
         slot = _make_planned_slot(
@@ -906,6 +936,7 @@ class TestEvChargerPowerSlotFreeze:
             end,
             ev_charger_calculated_power=primary,
             ev_second_charger_calculated_power=second,
+            price_actionable=price_actionable,
         )
         return PlannerOutput(slots=[slot])
 
@@ -998,3 +1029,77 @@ class TestEvChargerPowerSlotFreeze:
         assert output.slots[0].ev_charger_calculated_power == pytest.approx(
             9999.0, abs=1e-9
         )
+
+    def test_price_withdrawal_resets_optional_ev_power_in_same_slot(self) -> None:
+        """The freeze cannot restore watts selected under withdrawn authority."""
+        start = datetime(2026, 5, 14, 10, 0, tzinfo=_FIXED_LOCAL_TZ)
+        end = start + timedelta(hours=1)
+        coord = _make_bare_coordinator()
+        coord._freeze_ev_charger_power_for_current_slot(
+            self._make_output(start, end, 7000.0, 0.0),
+            start + timedelta(minutes=3),
+        )
+        withdrawn = self._make_output(
+            start,
+            end,
+            0.0,
+            0.0,
+            price_actionable=False,
+        )
+
+        coord._freeze_ev_charger_power_for_current_slot(
+            withdrawn, start + timedelta(minutes=8)
+        )
+
+        assert withdrawn.slots[0].ev_charger_calculated_power == 0.0
+        assert coord._current_slot_ev_power_w == 0.0
+        assert coord._current_slot_price_actionable is False
+
+    def test_price_withdrawal_preserves_fresh_fixed_session_power(self) -> None:
+        """Mandatory live-session load is captured from the nonactionable plan."""
+        start = datetime(2026, 5, 14, 10, 0, tzinfo=_FIXED_LOCAL_TZ)
+        end = start + timedelta(hours=1)
+        coord = _make_bare_coordinator()
+        coord._freeze_ev_charger_power_for_current_slot(
+            self._make_output(start, end, 7000.0, 0.0),
+            start + timedelta(minutes=3),
+        )
+        fixed_session = self._make_output(
+            start,
+            end,
+            3000.0,
+            0.0,
+            price_actionable=False,
+        )
+
+        coord._freeze_ev_charger_power_for_current_slot(
+            fixed_session, start + timedelta(minutes=8)
+        )
+
+        assert fixed_session.slots[0].ev_charger_calculated_power == 3000.0
+        assert coord._current_slot_ev_power_w == 3000.0
+
+    def test_same_slot_price_recovery_captures_new_permitted_power(self) -> None:
+        """Restored authority creates a new freeze baseline without a boundary."""
+        start = datetime(2026, 5, 14, 10, 0, tzinfo=_FIXED_LOCAL_TZ)
+        end = start + timedelta(hours=1)
+        coord = _make_bare_coordinator()
+        coord._freeze_ev_charger_power_for_current_slot(
+            self._make_output(
+                start,
+                end,
+                0.0,
+                0.0,
+                price_actionable=False,
+            ),
+            start + timedelta(minutes=3),
+        )
+        recovered = self._make_output(start, end, 5500.0, 0.0)
+
+        coord._freeze_ev_charger_power_for_current_slot(
+            recovered, start + timedelta(minutes=8)
+        )
+
+        assert recovered.slots[0].ev_charger_calculated_power == 5500.0
+        assert coord._current_slot_ev_power_w == 5500.0
+        assert coord._current_slot_price_actionable is True

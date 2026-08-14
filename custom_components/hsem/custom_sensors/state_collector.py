@@ -15,11 +15,13 @@ so that downstream population functions never need additional
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable
-from datetime import datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
 from typing import Any
 
+from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_track_state_change_event
 
@@ -455,17 +457,21 @@ async def async_collect_live_state(
     )
 
     # --- Electricity prices ---
-    state.import_electricity_price = (
-        convert_to_float(
-            _read(cfg.import_electricity_price_sensor, "float", 3, label="import_price")
-        )
-        or 0.0
+    (
+        state.import_electricity_price,
+        state.import_electricity_price_available,
+    ) = _read_optional_price_channel(
+        _read,
+        cfg.import_electricity_price_sensor,
+        "import_price",
     )
-    state.export_electricity_price = (
-        convert_to_float(
-            _read(cfg.export_electricity_price_sensor, "float", 3, label="export_price")
-        )
-        or 0.0
+    (
+        state.export_electricity_price,
+        state.export_electricity_price_available,
+    ) = _read_optional_price_channel(
+        _read,
+        cfg.export_electricity_price_sensor,
+        "export_price",
     )
 
     # --- TOU periods (special: need State object, not just string) ---
@@ -555,6 +561,18 @@ async def async_collect_live_state(
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+
+def _read_optional_price_channel(
+    read: Callable[..., Any],
+    entity_id: str | None,
+    label: str,
+) -> tuple[float, bool]:
+    """Read a live price without turning an outage into planner-blocking input."""
+    value = convert_to_float(read(entity_id, "float", 3, label=label, required=False))
+    if value is None or not math.isfinite(value):
+        return 0.0, False
+    return value, True
 
 
 def _compute_battery_capacities(state: LiveState) -> None:
@@ -774,7 +792,7 @@ def _resolve_ev_deadline_from_params(
     deadline_naive = datetime.combine(today, time(hour, minute))
     deadline = deadline_naive.replace(tzinfo=now_local.tzinfo)
 
-    if deadline <= now_local:
+    if deadline.astimezone(UTC) <= now_local.astimezone(UTC):
         deadline = deadline + timedelta(days=1)
 
     return deadline
@@ -819,9 +837,33 @@ async def _register_listeners(
             new_unsubs.append(unsub)
             tracked_entities.add(entity_id)
 
-    # PowMr telemetry updates every few seconds. Register only planner/control
-    # inputs and route them through the coordinator's material-change debounce;
-    # battery net power is diagnostic/applier feedback, not a planner trigger.
+    # Price/PV publication, withdrawal, and recovery are safety-relevant
+    # planner events. Attribute-only changes (for example tomorrow_valid) also
+    # emit a state-change event, so route every forecast source through a short
+    # durable debounce rather than waiting for an unrelated periodic refresh.
+    forecast_candidates = [
+        cfg.import_electricity_price_sensor,
+        cfg.export_electricity_price_sensor,
+        cfg.import_electricity_price_forecast_sensor,
+        cfg.export_electricity_price_forecast_sensor,
+        cfg.solcast_pv_forecast_forecast_today,
+        cfg.solcast_pv_forecast_forecast_tomorrow,
+    ]
+    for entity_id in forecast_candidates:
+        if entity_id and entity_id not in tracked_entities:
+            _LOGGER.debug(f"Starting forecast-source tracking for {entity_id}")
+            unsub = async_track_state_change_event(
+                sensor.hass,
+                [entity_id],
+                sensor._async_handle_price_source_change,
+            )
+            new_unsubs.append(unsub)
+            tracked_entities.add(entity_id)
+
+    # PowMr telemetry updates every few seconds. Register only material
+    # replan/control inputs. Battery net power is sampled by each accepted plan
+    # for current-slot topology normalization, but deliberately does not wake
+    # the expensive planner on every inverter telemetry update.
     secondary_candidates: list[str | None] = []
     if cfg.secondary_storage.enabled:
         secondary_candidates.extend(
@@ -948,7 +990,10 @@ async def async_collect_all_states(
         if entity_id is None or not isinstance(entity_id, str):
             continue
         state_obj = sensor.hass.states.get(entity_id)
-        if state_obj:
+        if state_obj and not (
+            isinstance(state_obj.state, str)
+            and state_obj.state.strip().lower() in {STATE_UNKNOWN, STATE_UNAVAILABLE}
+        ):
             # Only store attributes — the raw state value is not needed here
             # (the populator reads from attributes).
             sensor_attributes[entity_id] = dict(state_obj.attributes)

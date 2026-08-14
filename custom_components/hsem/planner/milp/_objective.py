@@ -14,6 +14,7 @@ from custom_components.hsem.planner.cost_helpers import (
     compute_charge_premium,
     deferred_export_price_by_slot,
 )
+from custom_components.hsem.utils.datetime_utils import utc_key
 from custom_components.hsem.utils.units import hours_ahead
 
 if TYPE_CHECKING:
@@ -87,7 +88,8 @@ def _build_objective(
         if use_discount:
             # Compute hours from now for this slot's midpoint
             slot = slots[future_idx[t]]
-            slot_mid = slot.start + (slot.end - slot.start) / 2
+            start_utc = utc_key(slot.start)
+            slot_mid = start_utc + (utc_key(slot.end) - start_utc) / 2
             ha = hours_ahead(now, slot_mid)
             discount = time_discount_rate**ha
 
@@ -170,6 +172,7 @@ def _build_objective(
         if (
             replacement_price_per_kwh is not None
             and abs(replacement_price_per_kwh) > 1e-9
+            and slots[future_idx[t]].price_actionable
         ):
             terminal_premium = max(0.0, replacement_price_per_kwh - p_imp_obj[t])
             # Cap the CHARGE credit only: the terminal premium for
@@ -271,7 +274,8 @@ def _build_objective(
                 discount = 1.0
                 if use_discount:
                     slot = slots[future_idx[t]]
-                    slot_mid = slot.start + (slot.end - slot.start) / 2
+                    start_utc = utc_key(slot.start)
+                    slot_mid = start_utc + (utc_key(slot.end) - start_utc) / 2
                     ha = hours_ahead(now, slot_mid)
                     discount = time_discount_rate**ha
                 # Negative coefficient = reduces objective = benefit.
@@ -286,7 +290,8 @@ def _build_objective(
             discount = 1.0
             if use_discount:
                 slot = slots[future_idx[t]]
-                slot_mid = slot.start + (slot.end - slot.start) / 2
+                start_utc = utc_key(slot.start)
+                slot_mid = start_utc + (utc_key(slot.end) - start_utc) / 2
                 ha = hours_ahead(now, slot_mid)
                 discount = time_discount_rate**ha
             c_obj[gi_pen_off + t] = p_fuse * discount

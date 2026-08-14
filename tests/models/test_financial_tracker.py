@@ -144,6 +144,23 @@ class TestFinancialTrackerAccumulation:
         # Export: (60-50)*1.2 + (65-60)*1.5 = 12 + 7.5 = 19.5
         assert tracker.export_income_total == pytest.approx(19.5)
 
+    def test_unavailable_price_advances_meter_baseline_without_money(self) -> None:
+        """Later publication cannot retroactively price an unknown interval."""
+        tracker = FinancialTracker()
+        tracker.accumulate(100.0, 50.0, import_price=1.0, export_price=1.0)
+        tracker.accumulate(
+            105.0,
+            55.0,
+            import_price=0.0,
+            export_price=0.0,
+            import_price_available=False,
+            export_price_available=False,
+        )
+        tracker.accumulate(106.0, 56.0, import_price=3.0, export_price=2.0)
+
+        assert tracker.import_cost_total == pytest.approx(3.0)
+        assert tracker.export_income_total == pytest.approx(2.0)
+
 
 class TestFinancialTrackerDayRollover:
     """Tests for day rollover logic."""

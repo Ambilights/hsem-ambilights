@@ -26,6 +26,8 @@ from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.planner_input import PlannerInput
 from custom_components.hsem.planner import run_planner
 from custom_components.hsem.planner.candidate_generator import (
+    CANDIDATE_BASELINE,
+    CANDIDATE_MILP,
     CANDIDATE_NO_ACTION,
     CANDIDATE_PASSIVE,
     CandidatePlan,
@@ -45,6 +47,9 @@ from custom_components.hsem.planner.candidates._mutations import (
 )
 from custom_components.hsem.planner.candidates._soc_plan import _apply_soc_plan
 from custom_components.hsem.planner.cost_function import CostWeights
+from custom_components.hsem.planner.engine_core import (
+    _publish_selected_candidate_warnings,
+)
 from custom_components.hsem.planner.slot_population import (
     build_slots,
     build_time_series_index,
@@ -838,7 +843,45 @@ class TestSelectBestCandidate:
 
 
 # ===========================================================================
-# 6. Full planner integration — candidates on PlannerOutput
+# 6. Candidate-owned warning publication
+# ===========================================================================
+
+
+class TestCandidateWarningOwnership:
+    """Scheduling warnings must describe only the selected candidate."""
+
+    def test_discarded_baseline_warnings_are_not_published(self) -> None:
+        """A MILP winner must not inherit a heuristic force-export warning."""
+        warnings = ["global input warning"]
+        baseline_warnings = ["ForceBatteriesDischarge at discarded slot"]
+
+        _publish_selected_candidate_warnings(
+            warnings,
+            baseline_warnings,
+            CANDIDATE_MILP,
+        )
+
+        assert warnings == ["global input warning"]
+
+    def test_selected_baseline_warnings_are_published(self) -> None:
+        """Warnings owned by a selected baseline remain visible."""
+        warnings = ["global input warning"]
+        baseline_warnings = ["ForceBatteriesDischarge at selected slot"]
+
+        _publish_selected_candidate_warnings(
+            warnings,
+            baseline_warnings,
+            CANDIDATE_BASELINE,
+        )
+
+        assert warnings == [
+            "global input warning",
+            "ForceBatteriesDischarge at selected slot",
+        ]
+
+
+# ===========================================================================
+# 7. Full planner integration — candidates on PlannerOutput
 # ===========================================================================
 
 

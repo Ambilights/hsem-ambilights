@@ -13,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -53,6 +54,20 @@ def _make_record_args(
         "action": action,
         "slot_start": _slot_start(hour, minute),
     }
+
+
+def test_repeated_hour_folds_are_not_deduplicated() -> None:
+    copenhagen = ZoneInfo("Europe/Copenhagen")
+    tracker = PredictionTracker(_warmup_slots=0)
+    first = _make_record_args(hour=0)
+    second = _make_record_args(hour=0)
+    first["slot_start"] = datetime(2026, 10, 25, 2, 0, tzinfo=copenhagen, fold=0)
+    second["slot_start"] = datetime(2026, 10, 25, 2, 0, tzinfo=copenhagen, fold=1)
+
+    tracker.add_record(**first)
+    tracker.add_record(**second)
+
+    assert len(tracker.records) == 2
 
 
 # ---------------------------------------------------------------------------

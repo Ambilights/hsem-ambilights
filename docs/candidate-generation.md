@@ -132,14 +132,8 @@ When active:
 
 ### Window-level hysteresis (issue #315)
 
-Prevents rapid recommendation toggling by enforcing a minimum hold time.
-
-- **Charge-type**: `batteries_charge_grid`, `batteries_charge_solar`, `ev_smart_charging`
-- **Discharge-type**: `batteries_discharge_mode`, `force_batteries_discharge`, `force_export`
-- **Neutral**: `batteries_wait_mode`, `time_passed`, `missing_input_entities`, `None`
-
-All actionable recommendation changes are held within the hold window,
-including within-category flips (e.g. `ev_smart_charging` ↔
-`batteries_charge_solar`).  Only transitions to/from neutral pass through.
+Suppresses only command-equivalent `batteries_charge_solar` ↔ unrestricted
+`batteries_discharge_mode` label changes. Transitions that change Huawei mode,
+EV control, or a flow-derived partial-discharge cap pass through immediately.
 The hold time is configured by `planner_window_hysteresis_minutes`
 (default: 10).

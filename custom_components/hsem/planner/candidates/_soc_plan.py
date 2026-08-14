@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from custom_components.hsem.models.planned_slot import PlannedSlot
-from custom_components.hsem.utils.datetime_utils import as_tz
+from custom_components.hsem.utils.datetime_utils import as_tz, utc_key
 from custom_components.hsem.utils.misc import (
     calculate_recommended_threshold,
     clamp_efficiency,
@@ -71,10 +71,12 @@ def _apply_soc_plan(
         usable_kwh: Maximum usable battery capacity (kWh).
     """
 
-    future = [s for s in slots if as_tz(s.end, now.tzinfo) > now]
+    future = [s for s in slots if utc_key(s.end) > utc_key(now)]
 
     # Step 1: Identify discharge windows and calculate total energy needed
-    discharge_slots = [s for s in future if s.recommendation in _DISCHARGE_RECS]
+    discharge_slots = [
+        s for s in future if s.price_actionable and s.recommendation in _DISCHARGE_RECS
+    ]
     if not discharge_slots:
         # No discharge windows — nothing to plan for.  Keep solar charging
         # but clear all grid charging.
@@ -136,7 +138,10 @@ def _apply_soc_plan(
 
     # Step 2: Clear all existing charge/discharge recommendations
     for slot in slots:
-        if slot.recommendation in _CHARGE_RECS | _DISCHARGE_RECS:
+        if (
+            slot.price_actionable
+            and slot.recommendation in _CHARGE_RECS | _DISCHARGE_RECS
+        ):
             slot.recommendation = None
             slot.batteries_charged_kwh = 0.0
 
@@ -179,11 +184,12 @@ def _apply_soc_plan(
         (
             s
             for s in future
-            if s.recommendation is None
+            if s.price_actionable
+            and s.recommendation is None
             and s.estimated_net_consumption_kwh is not None
             and s.estimated_net_consumption_kwh < 0.0
         ),
-        key=lambda x: (x.estimated_net_consumption_kwh, x.start),
+        key=lambda x: (x.estimated_net_consumption_kwh, utc_key(x.start)),
     ):
         if charged >= charge_target:
             break
@@ -200,7 +206,9 @@ def _apply_soc_plan(
     if not discharge_slots:
         return None  # No discharge slots after filtering — nothing to plan for
 
-    first_discharge_start = min(as_tz(s.start, now.tzinfo) for s in discharge_slots)
+    first_discharge_start = min(
+        (as_tz(s.start, now.tzinfo) for s in discharge_slots), key=utc_key
+    )
 
     # Average discharge price — what we'd save by discharging instead of importing
     avg_discharge_price = (
@@ -214,9 +222,10 @@ def _apply_soc_plan(
             s
             for s in future
             if s.recommendation is None
-            and as_tz(s.end, now.tzinfo) <= first_discharge_start
+            and s.price_actionable
+            and utc_key(s.end) <= utc_key(first_discharge_start)
         ),
-        key=lambda x: (x.price.import_price, -x.start.timestamp()),
+        key=lambda x: (x.price.import_price, -utc_key(x.start).timestamp()),
     )
 
     # Only charge when the price spread covers the depreciation + cycle cost.

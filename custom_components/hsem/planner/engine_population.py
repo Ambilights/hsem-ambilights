@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from custom_components.hsem.models.data_quality import DataQuality
 from custom_components.hsem.models.planner_input import PlannerInput
@@ -12,15 +13,17 @@ from custom_components.hsem.planner.slot_population import (
     populate_prices,
     populate_solcast,
 )
-from custom_components.hsem.utils.datetime_utils import as_tz
+from custom_components.hsem.utils.datetime_utils import as_tz, slot_contains, utc_key
 from custom_components.hsem.utils.logger import log_planner
 
 
-def _parse_now(now_iso: str) -> datetime:
+def _parse_now(now_iso: str, timezone_name: str | None = None) -> datetime:
     """Parse a timezone-aware ISO-8601 string."""
     dt = datetime.fromisoformat(now_iso)
     if dt.tzinfo is None:
         raise ValueError(f"now_iso must be timezone-aware, got: {now_iso!r}")
+    if timezone_name is not None:
+        dt = dt.astimezone(ZoneInfo(timezone_name))
     return dt
 
 
@@ -28,6 +31,7 @@ def _populate_slots(
     slots: list,
     inp: PlannerInput,
     tsi: TimeSeriesIndex,
+    now: datetime,
     warnings: list[str],
     missing_inputs: list[str],
 ) -> tuple[DataQuality, list[str], list[str]]:
@@ -87,6 +91,37 @@ def _populate_slots(
         horizon_has_tomorrow=horizon_has_tomorrow,
         horizon_days=horizon_days,
     )
+    # Price-driven control is safe only over the contiguous future prefix in
+    # which both import and export prices are explicitly published. Keep the
+    # full display horizon, but close the actionable prefix permanently after
+    # its first gap so a later isolated point cannot bridge unpublished data.
+    prefix_open = True
+    actionable_slots = 0
+    actionable_until: datetime | None = None
+    restricted_slots = 0
+    for slot in slots:
+        if utc_key(slot.end) <= utc_key(now):
+            slot.price_actionable = False
+            continue
+        if prefix_open and slot.import_price_available and slot.export_price_available:
+            slot.price_actionable = True
+            actionable_slots += 1
+            actionable_until = as_tz(slot.end, now.tzinfo)
+        else:
+            prefix_open = False
+            slot.price_actionable = False
+            restricted_slots += 1
+    dq.price_actionable_slots = actionable_slots
+    dq.price_actionable_until = (
+        actionable_until.isoformat() if actionable_until is not None else None
+    )
+    if restricted_slots:
+        warnings.append(
+            "Price-actionable horizon ends at "
+            f"{dq.price_actionable_until or now}; {restricted_slots} later slot(s) "
+            "use price-neutral battery hold (no primary charge/discharge) until "
+            "prices are published."
+        )
     for tm_label, tm_list in [
         ("tomorrow_price_missing_hours", dq.tomorrow_price_missing_hours),
         ("tomorrow_pv_missing_hours", dq.tomorrow_pv_missing_hours),
@@ -162,9 +197,7 @@ def _inject_live_data_into_current_slot(
     slot_hours = inp.interval_minutes / 60.0
 
     for slot in slots:
-        s_start = as_tz(slot.start, now.tzinfo)
-        s_end = as_tz(slot.end, now.tzinfo)
-        if s_start <= now < s_end:
+        if slot_contains(slot.start, slot.end, now):
             # Convert live Watts to projected full-slot kWh.
             if inp.live_solar_production_available:
                 live_pv_kwh = (

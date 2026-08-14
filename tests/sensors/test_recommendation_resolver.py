@@ -45,6 +45,9 @@ def _make_rec(recommendation: str | None = None) -> HourlyRecommendation:
         recommendation=recommendation,
         solcast_pv_estimate_kwh=0.0,
         start=now,
+        import_price_available=True,
+        export_price_available=True,
+        price_actionable=True,
     )
 
 
@@ -55,9 +58,11 @@ def _make_live(
     battery_kwh: float = 5.0,
     ev_power_w: float | None = None,
     ev2_power_w: float | None = None,
+    import_price_available: bool = True,
 ) -> LiveState:
     live = LiveState()
     live.import_electricity_price = import_price
+    live.import_electricity_price_available = import_price_available
     live.ev = EVLiveState(is_charging=ev_charging, power_w=ev_power_w)
     live.ev_second = EVLiveState(is_charging=ev2_charging, power_w=ev2_power_w)
     live.battery_current_capacity_kwh = battery_kwh
@@ -83,6 +88,24 @@ class TestNegativeImportPrice:
     def test_positive_price_does_not_force_export(self):
         rec = _make_rec(recommendation=Recommendations.BatteriesWaitMode.value)
         resolve_current_recommendation(rec, _make_live(import_price=0.5), 0.0)
+        assert rec.recommendation == Recommendations.BatteriesWaitMode.value
+
+    def test_unavailable_negative_live_price_does_not_force_export(self):
+        """A stale numeric value has no authority after its source disappears."""
+        rec = _make_rec(recommendation=Recommendations.BatteriesWaitMode.value)
+        live = _make_live(import_price=-0.01, import_price_available=False)
+
+        resolve_current_recommendation(rec, live, 0.0)
+
+        assert rec.recommendation == Recommendations.BatteriesWaitMode.value
+
+    def test_nonactionable_slot_does_not_force_export(self):
+        """A live negative price cannot revive price control in an unknown slot."""
+        rec = _make_rec(recommendation=Recommendations.BatteriesWaitMode.value)
+        rec.price_actionable = False
+
+        resolve_current_recommendation(rec, _make_live(import_price=-0.01), 0.0)
+
         assert rec.recommendation == Recommendations.BatteriesWaitMode.value
 
 
@@ -158,6 +181,18 @@ class TestEVSmartCharging:
         live = _make_live(ev2_charging=True)
         resolve_current_recommendation(rec, live, 0.0)
         assert rec.recommendation == Recommendations.EVSmartCharging.value
+
+    def test_ev_relabel_preserves_primary_battery_hold(self) -> None:
+        """An active allocated EV may relabel, but cannot erase strict Hold."""
+        rec = _make_rec(recommendation=Recommendations.BatteriesWaitMode.value)
+        rec.ev_charger_calculated_power = 7500.0
+        rec.primary_battery_hold = True
+        live = _make_live(import_price=0.5, ev_charging=True)
+
+        resolve_current_recommendation(rec, live, 0.0)
+
+        assert rec.recommendation == Recommendations.EVSmartCharging.value
+        assert rec.primary_battery_hold is True
 
 
 # ---------------------------------------------------------------------------

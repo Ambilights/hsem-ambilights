@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from custom_components.hsem.utils.datetime_utils import utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.units import slot_duration_hours
 
@@ -140,7 +141,7 @@ class DynamicDischargeFloor:
             return configured_min_soc_pct, diag
 
         # Filter to future slots only, ordered chronologically.
-        future = [s for s in slots if s.end > now]
+        future = [s for s in slots if utc_key(s.end) > utc_key(now)]
         if not future:
             log_planner(
                 "debug",

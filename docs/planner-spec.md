@@ -42,6 +42,27 @@ Power values in kW must be converted to energy using:
 energy_kwh = power_kw * duration_hours
 ```
 
+### Slot timeline and DST identity
+
+The horizon is a physical timeline. It starts at local midnight, advances in
+UTC by the configured interval, and converts each boundary back to the Home
+Assistant IANA timezone. A 24-hour horizon always contains 96 fifteen-minute
+slots: on a spring transition it skips the nonexistent local hour, while on an
+autumn transition it contains both folds of the repeated hour.
+
+Slot identity is `(day_offset, slot_in_day)`, where `slot_in_day` is elapsed
+physical time since that local calendar day's midnight. It is not derived from
+the wall-clock hour. Consequently a complete 15-minute civil day has 92, 96,
+or 100 ordinals on spring-transition, ordinary, and autumn-transition days.
+Prices, PV forecasts, recommendations, and planner slots must preserve that
+identity; timestamps carrying `+02:00` and `+01:00` in the repeated hour are
+different slots.
+
+All aware datetime containment, ordering, duration, `hours_ahead`, and
+current/past/future decisions use UTC instants. `PlannerInput` carries both
+`now_iso` and `timezone_name`; the planner rehydrates the IANA timezone before
+building future slots because a fixed numeric offset cannot encode a DST rule.
+
 ## Recommendation priority rules
 
 ### Three-layer model
@@ -364,6 +385,13 @@ only when the final export price clears both the economic and user-configured
 battery-export floors; otherwise it remains self-consumption discharge. EV,
 session, and explicit battery-hold intents are not rewritten by this pass.
 
+Flow-based recommendation reconciliation follows the shared three-decimal
+publication contract. Final grid import or export of exactly 0.001 kWh or less
+is numerical/publication residue: it keeps solar charge or normal
+self-consumption respectively. Only a flow greater than 0.001 kWh enables
+forced grid-charge or forced battery-export hardware modes. This boundary is
+identical for the primary MILP write-out and the post-SBU adjustment.
+
 For no-export slots and slots below either export-price floor, the primary
 discharge cap is coupled to the SBU binary before solving. When the house
 forecast includes the dedicated load, Huawei AC discharge plus the included
@@ -555,6 +583,12 @@ can still include unmeasured EV load when no EV power sensor is configured)
 would destroy that fallback and let polluted history inflate the hardware
 discharge cap.
 
+The configured 1d/3d/7d/14d weights remain authoritative after outlier
+redistribution and the existing safety caps. Agreement between overlapping
+windows is not a reliability multiplier: with less than 14 days of history,
+the 7d and 14d sensors can contain the same source days, so equality is not
+independent corroboration and must not inflate their combined effective share.
+
 ## SoC simulation
 
 SoC must be simulated forward through the full horizon.
@@ -616,6 +650,12 @@ these fields in a **single merged write-out pass** (issue #659) that:
    the raw arrays assume the original (potentially now-invalid) ec/ed
    combination.
 
+Recommendation source/mode classification uses those final published flows.
+A charge-source shortfall or final export of exactly 0.001 kWh or less is
+rounding residue and cannot enable Time-of-Use grid charge or Fully Fed battery
+export; a value greater than 0.001 kWh is material and must select the matching
+executable mode.
+
 All four energy-flow fields are consistent with each other and with the
 recommendation label for every slot. The resolved values are the source
 of truth; candidate selection, seasonal fill, discharge concentration, and
@@ -653,6 +693,15 @@ live state is unavailable/degraded, and while an EV is charging if the house
 meter includes EV power. This monitor never changes the v13 latched hardware
 cap directly.
 
+The live house-power sensor and the solved Huawei-plus-grid supply are compared
+on the same site-bus boundary. Before current-slot injection, the coordinator
+removes the measured current PowMr site delta — including Utility/SBU load
+routing and any live AC charging draw — to recover the exogenous base load on
+the configured history topology. The MILP can then apply its prospective
+Utility/SBU/charge delta exactly once. The monitor therefore must not add PowMr
+discharge or load again. This prevents double-counting secondary supply or live
+charger power and preserves detection of genuinely under-modelled house load.
+
 The corrective planner run receives current live house/PV inputs and bypasses
 both candidate hysteresis and current-window hysteresis for that one run; stale
 plan preference must not restore the recommendation that caused the correction.
@@ -677,7 +726,9 @@ pending for the next 10-second monitor tick. Read-only and degraded-mode
 hardware-write gates remain unchanged.
 
 Secondary-storage state listeners do not route every PowMr sample through the
-full coordinator. Raw battery net power is not a planning trigger. Secondary
+full coordinator. Raw battery net power is sampled by accepted planner runs for
+the current-slot topology correction, but is not itself a high-rate planning
+trigger. Secondary
 SoC and the smoothed dedicated-load input use lightweight event callbacks and
 request one coalesced update only after changing by at least 1 percentage point
 or 25 W respectively; output/charger priority and charge-current control state
@@ -689,6 +740,11 @@ on a later material state event. If the coordinator is already running when a
 debounce expires, the material event waits for the current cycle's lock and is
 processed once instead of being dropped. All listener and debounce handles are
 cancelled during coordinator teardown.
+
+Control-entity callbacks are ignored whenever secondary hardware control is
+disabled, including stale listeners registered before an options change. SoC
+and dedicated-load telemetry continue to drive planning while secondary
+optimisation remains enabled.
 
 For non-MILP candidates (`milp_prepopulated=False`, the default),
 the simulation continues to derive discharge and grid flows greedily
@@ -1717,6 +1773,13 @@ The selected plan must be the lowest-cost valid candidate within the implemented
 
 The final returned plan must be the same plan that was selected.
 
+Planner warnings have the same ownership rule. Global input-quality and solver
+diagnostics remain visible for every run, but recommendation-specific warnings
+created while building a candidate are surfaced only if that candidate wins. A
+heuristic `ForceBatteriesDischarge` decision discarded in favour of MILP or
+passive output must therefore remain debug-only and cannot appear as a warning
+about the selected schedule.
+
 This invariant must always hold:
 
 ```text
@@ -1760,51 +1823,48 @@ Hysteresis is enabled by default with a 5 % percentage threshold; setting
 ### Window-level hysteresis (anti-flapping, issue #315)
 
 In addition to plan-level hysteresis, HSEM applies **window-level hysteresis**
-on the **current time slot** to prevent rapid charge↔discharge toggles near
-schedule-window boundaries.  This is a separate, independent mechanism that
-operates on the slot recommendation level rather than the plan level.
+on the **current time slot** to suppress display-label flapping only when the
+two labels produce the same hardware command.
 
-When the planner produces a new recommendation for the current slot that
-belongs to a different *category* than the previous recommendation, and the
-new category has been in effect for less than the configured hold time,
-the previous recommendation is kept.
-
-Two categories are defined:
-
-- **Charge-type**: ``batteries_charge_grid``, ``batteries_charge_solar``,
-  ``ev_smart_charging``
-- **Discharge-type**: ``batteries_discharge_mode``,
-  ``force_batteries_discharge``, ``force_export``
-- **Neutral**: ``batteries_wait_mode``, ``time_passed``,
-  ``missing_input_entities``, ``None``
-
-All actionable recommendation changes are held within the hold window,
-including within-category flips such as ``batteries_charge_solar`` ↔
-``ev_smart_charging``.  Only transitions to/from neutral pass through
-immediately.
+Only ``batteries_charge_solar`` ↔ unrestricted
+``batteries_discharge_mode`` is held: both execute maximise-self-consumption
+with the normal discharge cap. Grid charge, EV control, Fully Fed modes,
+neutral states, non-actionable prices, and explicit MILP holds pass through
+immediately. A BDM slot with material battery discharge and grid import is a
+partial allocation with a plan-derived cap, so it also bypasses hysteresis.
 
 The hold time is configured by ``planner_window_hysteresis_minutes``
-(default: 10).  When set to a positive integer, any recommendation
-change on the current slot is suppressed unless the previous
-recommendation has been active for at least this many minutes.
+(default: 10).  When set to a positive integer, only a command-equivalent MSC
+alias change on the current slot is suppressed until the previous label has
+been active for at least this many minutes.
 
-The previous recommendation and its slot start time are persisted across
-planner runs by the coordinator so the elapsed time is measured from the
-moment the previous category was established — not from the planner cycle
-time.
+The previous recommendation and its activation timestamp are persisted across
+planner runs so elapsed time is measured from the moment the mode was accepted.
+Every accepted in-slot switch starts a fresh full hold period. Elapsed and
+expiry arithmetic uses the UTC timeline, so the repeated autumn DST hour cannot
+extend a hold by an extra hour.
 
 Window-level hysteresis is applied **after** the planner engine completes but
 **before** the current slot recommendation is resolved.  The held
 recommendation is written back into the planner output slots so it propagates
 to the ``hourly_recommendations`` list and ultimately to hardware writes.
 
+When a transition is held, the coordinator schedules a one-shot callback at
+the exact hold expiry and forces a fresh planner run. The expiry does not depend
+on a drifting periodic poll, and it waits for an in-progress coordinator cycle
+instead of being dropped. Independently, a one-shot callback at every exact
+recommendation-slot boundary guarantees that the new slot is planned and
+applied on time. Boundary discovery advances on the UTC timeline while testing
+local wall-clock alignment, so DST folds never schedule a callback in the past.
+Both callbacks are cancelled during teardown; a degraded or
+failed expiry cycle leaves the forced-replan request pending until recovery.
+
 ### Invariants for window-level hysteresis tests
 
 - First run (no previous state) always accepts the new recommendation.
-- Any actionable recommendation change within the hold time keeps the
-  previous recommendation (including within-category flips such as
-  ``ev_smart_charging`` ↔ ``batteries_charge_solar``).
-- Transitions to/from neutral are never held.
+- Only command-equivalent ``batteries_charge_solar`` ↔ unrestricted
+  ``batteries_discharge_mode`` changes may keep the previous label.
+- Every hardware-semantic transition and partial BDM allocation is immediate.
 - Changes after the hold time expires switch to the new recommendation.
 - Neutral recommendations never trigger hold behaviour.
 - Feature disabled (hold minutes = 0) always allows the switch.
@@ -1840,6 +1900,21 @@ The applier must not write to hardware when:
 - error mode is active
 - required data is missing
 - config entry is unloading
+
+Hardware writes are serialized by one worker. Routine coordinator notifications
+with the same effective command intent are coalesced while verification is in
+flight. The fingerprint contains the quantized inverter export target, phase-
+limited Huawei charge command, ordered PowMr write plan and safety guards,
+battery/EV cap inputs, entity targets, slot flow, reserve, and mode. A material
+safe change never cancels a multi-write transaction. The worker completes the
+active sequence, discards snapshots collected against partially changed
+hardware, and requests a coordinator refresh. It drains another snapshot only
+when a successful listener generation was published after that refresh;
+otherwise it stops without retrying stale work, and a later external update
+recovers normally. Read-only, Error-mode, and unload gates may still cancel
+immediately. Numeric inputs are compared in command-relevant integer units, so
+sub-Wh or sub-command floating-point noise cannot restart a write or prevent a
+matching apply summary from being published.
 
 ### EV discharge cap semantics (issue #592)
 
@@ -1975,16 +2050,61 @@ day2_price_missing_hours:HH,HH,...
 day2_pv_missing_hours:HH,HH,...
 ```
 
-These labels are **non-critical** — they do not match battery or house-load
-keywords — so they trigger `DegradedMode.Degraded` (hardware writes allowed)
-rather than `Error` (writes blocked).
+These labels are data-quality diagnostics, not live missing-entity labels, and
+do not by themselves change degraded mode. Price incompleteness is handled by
+the explicit authority boundary below, while missing critical battery/house
+telemetry continues to block writes through `DegradedMode.Error`.
 
-Missing slots default to `0.0` in the planner.  The planner **must never**
-silently treat absent data as real zero without surfacing a diagnostic.
+Numeric missing-price fields remain `0.0` for display/backward compatibility,
+but availability is explicit at every boundary (`HourlyRecommendation`,
+`PricePoint`, and `PlannedSlot`). A published `0.0` or negative price is valid
+and actionable; an unpublished or non-finite (`NaN`/infinite) value is not.
+
+The engine retains the full display horizon and derives a **contiguous
+price-actionable future prefix**. The prefix closes at the first slot where
+either import or export price is unavailable and cannot reopen later in the
+horizon. `DataQuality.price_actionable_slots` and
+`DataQuality.price_actionable_until` surface the boundary.
+
+Beyond that boundary:
+
+- Huawei primary storage is held: charge and discharge are both zero. Grid
+  import and PV export/curtailment remain physical site-flow outputs, not
+  price-driven storage actions.
+- PowMr charge and SBU modes are forbidden (Utility only).
+- Optional EV arbitrage/deadline allocation is forbidden. A fixed live EV
+  session remains a mandatory physical load, and unmet target energy is
+  surfaced rather than priced as free.
+- Primary and secondary terminal/replacement valuation and deferred-export
+  look-ahead use only actionable prices.
+
+Heuristic fallback candidates enforce the same price-neutral hold contract, so a
+solver timeout cannot reintroduce actions selected from placeholder zeros.
+Window hysteresis cannot restore an older price-driven label onto a
+non-actionable current slot. Auto-Full requires both an actionable current slot
+and an available live import price. If the live export price is unavailable,
+the applier retains the last verified inverter export limit instead of treating
+the display placeholder zero as authority for a curtailment write.
+
+For the current slot, populated forecast-channel authority is intersected with
+the live price entities: stale attributes cannot remain actionable after the
+HA entity becomes unavailable, and live data cannot promote a missing forecast
+channel. In automatic mode, a current outage immediately publishes
+`batteries_wait_mode` with `primary_battery_hold=True`, zero primary storage
+flows, and secondary Utility/zero current, even if another missing input skips
+the planner. An explicit user force mode remains higher authority. Primary and
+dedicated forecast price entity changes, plus both Solcast PV sources, are
+debounced and replayed if another event arrives while a refresh is running. The
+accepted forecast-authority signature includes each future slot's finite PV
+value and availability, so PV publication, withdrawal, or correction cannot
+silently reuse a plan built from stale solar data.
 
 ### DataQuality fields for multi-day horizons
 
-`DataQuality.horizon_days` reflects the number of calendar days covered.
+`DataQuality.horizon_days` counts the distinct local calendar dates touched by
+the physical-time horizon. Ordinary midnight-anchored 24/48/72-hour horizons
+cover 1/2/3 dates; across a spring-forward transition the same duration can
+touch one extra local date.
 `DataQuality.day2_price_missing_hours` and `DataQuality.day2_pv_missing_hours`
 carry the day+2 gap lists for 72-hour horizon runs.
 
@@ -2016,7 +2136,9 @@ discharge slots on the same day.
 - Day+1 PV estimates are ≤ day+0 estimates for the same hour when both have
   the same raw input (confidence decay applied).
 - Day+2 PV estimates are ≤ day+1 estimates for the same raw input.
-- `DataQuality.horizon_days` equals 1 / 2 / 3 for 24 h / 48 h / 72 h.
+- On ordinary dates, `DataQuality.horizon_days` equals 1 / 2 / 3 for 24 h /
+  48 h / 72 h. A spring-forward physical horizon can touch one extra local
+  date and therefore report 2 / 3 / 4 instead.
 - Missing day+2 price data surfaces in `day2_price_missing_hours`.
 - Missing day+2 PV data surfaces in `day2_pv_missing_hours`.
 - `DataQuality.is_complete` is ``False`` when any future-day data is missing.

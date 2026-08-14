@@ -15,6 +15,7 @@ import pytest
 from custom_components.hsem.custom_sensors.state_collector import (
     _compute_battery_capacities,
     _compute_net_consumption,
+    _read_optional_price_channel,
     build_battery_schedules,
     build_sensor_config,
 )
@@ -233,6 +234,39 @@ class TestComputeBatteryCapacities:
         live.huawei_batteries_soc_pct = 80.0
         _compute_battery_capacities(live)
         assert live.battery_usable_capacity_kwh == pytest.approx(0.0)
+
+
+class TestOptionalPriceChannel:
+    """Price outages close authority without entering missing-entity mode."""
+
+    @pytest.mark.parametrize("raw", [None, float("nan"), float("inf")])
+    def test_missing_or_nonfinite_is_unavailable_placeholder(
+        self, raw: float | None
+    ) -> None:
+        read = MagicMock(return_value=raw)
+
+        value, available = _read_optional_price_channel(
+            read, "sensor.import", "import_price"
+        )
+
+        assert value == 0.0
+        assert available is False
+        read.assert_called_once_with(
+            "sensor.import",
+            "float",
+            3,
+            label="import_price",
+            required=False,
+        )
+
+    @pytest.mark.parametrize("raw", [0.0, -0.25])
+    def test_genuine_zero_or_negative_remains_available(self, raw: float) -> None:
+        value, available = _read_optional_price_channel(
+            MagicMock(return_value=raw), "sensor.import", "import_price"
+        )
+
+        assert value == raw
+        assert available is True
 
 
 # ---------------------------------------------------------------------------

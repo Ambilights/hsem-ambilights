@@ -31,9 +31,8 @@ Design constraints
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from custom_components.hsem.const import SEASONAL_FILL_MODE_FORECAST
 from custom_components.hsem.models.rejected_plan import RejectedPlan
@@ -54,14 +53,22 @@ from custom_components.hsem.planner.discharge_scheduler import (
     apply_optimization_strategy,
     concentrate_discharge_on_expensive_slots,
 )
+from custom_components.hsem.planner.future_value import (
+    ev_future_charge_value_per_kwh,
+    replacement_price_from_next_discharge,
+)
 from custom_components.hsem.planner.secondary_storage import (
     apply_secondary_utility_bypass,
 )
 from custom_components.hsem.planner.soc_simulation import simulate_soc
-from custom_components.hsem.utils.datetime_utils import as_tz
+from custom_components.hsem.utils.datetime_utils import utc_key
 from custom_components.hsem.utils.logger import log_planner
-from custom_components.hsem.utils.recommendations import (
-    DISCHARGE_RECS as _DISCHARGE_RECS,
+from custom_components.hsem.utils.recommendations import Recommendations
+
+__all__ = (
+    "ev_future_charge_value_per_kwh",
+    "replacement_price_from_next_discharge",
+    "select_best_candidate",
 )
 
 # ---------------------------------------------------------------------------
@@ -253,6 +260,16 @@ def select_best_candidate(  # NOSONAR
             max_discharge_per_slot,
             discharge_efficiency_pct=discharge_efficiency_pct,
         )
+        # A heuristic fallback must obey the same unpublished-tail contract as
+        # the MILP. Unknown economics produce an explicit primary-battery hold;
+        # grid/PV flows remain visible but cannot charge or discharge storage.
+        for slot in candidate.slots:
+            if utc_key(slot.end) <= utc_key(now) or slot.price_actionable:
+                continue
+            slot.recommendation = Recommendations.BatteriesWaitMode.value
+            slot.primary_battery_hold = True
+            slot.batteries_charged_kwh = 0.0
+            slot.batteries_discharged_kwh = 0.0
 
     # --- Step 1 & 2: simulate and validate each candidate ---------------
     for candidate in candidates:
@@ -361,7 +378,9 @@ def select_best_candidate(  # NOSONAR
             # value it does.  When two candidates have identical term_soc it
             # means they converge to the same end-of-horizon SoC; this trail
             # makes that visible without needing a debugger.
-            _future_tail = [s for s in candidate.slots if s.end > now][-3:]
+            _future_tail = [
+                s for s in candidate.slots if utc_key(s.end) > utc_key(now)
+            ][-3:]
             if _future_tail:
                 trail = "  ".join(
                     f"{s.start.strftime('%d %H:%M')}→{s.end.strftime('%H:%M')} "
@@ -550,141 +569,3 @@ def select_best_candidate(  # NOSONAR
 def _find_by_name(candidates: list[CandidatePlan], name: str) -> CandidatePlan | None:
     """Return the first candidate with the given name, or ``None``."""
     return next((c for c in candidates if c.name == name), None)
-
-
-def replacement_price_from_next_discharge(
-    slots: list,
-    now: datetime,
-    top_n: int = 4,
-    interval_minutes: int = 15,
-) -> float | None:
-    """Derive the terminal-SoC replacement price from the next discharge window.
-
-    The energy stored at end-of-horizon is worth what it would cost to
-    re-purchase that energy from the grid during the **first** upcoming
-    discharge schedule window.  Within that window the battery discharges
-    in priority order from the most expensive slots, so we use the average
-    of the *top_n* most expensive import prices within that window.
-
-    In a 48h or 72h horizon the planner marks ``BatteriesDischargeMode``
-    across all days, but the replacement price must reflect only the
-    closest discharge window — not windows 2+ days away.  We identify the
-    first window by collecting all future discharge slots, sorting them by
-    start time, and taking the first contiguous block of slots belonging
-    to the same schedule occurrence.
-
-    Args:
-        slots:
-            Any candidate's populated slot list (must have
-            ``recommendation``, ``price.import_price``, ``start`` set).
-        now:
-            Timezone-aware current datetime.  Past slots are excluded.
-        top_n:
-            Number of most expensive discharge slots to average over.
-            Derived dynamically from ``ceil(usable_kwh / max_discharge_per_slot)``
-            in the engine so it reflects how many slots the battery can actually
-            serve.  Default 4 is a safe fallback (~1 hour at 15-min resolution).
-        interval_minutes:
-            Slot duration in minutes.  Used to derive the gap threshold for
-            detecting separate discharge window occurrences.
-            Default 15.
-
-    Returns:
-        Replacement price in currency/kWh, or ``None`` when no future
-        discharge slot exists.
-    """
-    # Collect all future discharge slots sorted by start time.
-    # Use _DISCHARGE_RECS so both BatteriesDischargeMode and
-    # ForceBatteriesDischarge are included (Bug I fix).
-    future_discharge = sorted(
-        [
-            slot
-            for slot in slots
-            if (
-                slot.recommendation in _DISCHARGE_RECS
-                and as_tz(slot.start, now.tzinfo) > now
-                and not math.isnan(slot.price.import_price)
-            )
-        ],
-        key=lambda s: as_tz(s.start, now.tzinfo),
-    )
-
-    if not future_discharge:
-        return None
-
-    # Find the first contiguous block of discharge slots.  A gap larger than
-    # interval_minutes + 5 min between consecutive discharge slots signals a
-    # new schedule occurrence (the gap between discharge windows).
-    # We take only the first block.
-    GAP_THRESHOLD = timedelta(minutes=interval_minutes + 5)
-    first_block: list = [future_discharge[0]]
-    tz = now.tzinfo
-    for slot in future_discharge[1:]:
-        prev_end = as_tz(first_block[-1].end, tz)
-        this_start = as_tz(slot.start, tz)
-        if this_start - prev_end <= GAP_THRESHOLD:
-            first_block.append(slot)
-        else:
-            break  # reached the next schedule occurrence
-
-    # Average the top_n most expensive import prices within the first block
-    first_block.sort(key=lambda s: s.price.import_price, reverse=True)
-    top = [s.price.import_price for s in first_block[:top_n]]
-    return sum(top) / len(top) if top else None
-
-
-def ev_future_charge_value_per_kwh(
-    slots: list,
-    now: datetime,
-    lookahead_hours: float = 24.0,
-    confidence_factor: float = 0.9,
-) -> float | None:
-    """Value of 1 kWh of EV charge-past-target, priced at avoided future import cost.
-
-    When an EV has already reached its user-configured target SoC but
-    ``allow_charge_past_target_soc`` is enabled, surplus PV diverted to the
-    EV competes against exporting that same surplus.  This function prices
-    the EV side of that comparison: the energy is worth roughly what it
-    would otherwise cost to import the same amount of energy later, when
-    the EV needs to top up again.
-
-    Mirrors :func:`replacement_price_from_next_discharge`, which applies the
-    same avoided-cost principle to the house battery's terminal SoC.  The EV
-    case uses a fixed lookahead window instead of the next discharge window,
-    because EV energy use depends on driving patterns rather than a known
-    schedule — a plain average of near-term import prices is a reasonable,
-    defensible proxy.
-
-    A ``confidence_factor`` below ``1.0`` discounts the estimate to reflect
-    that the EV's future need is less certain than the battery's scheduled
-    discharge (the EV may be unplugged, or may not need the extra energy at
-    all before its next charge cycle).
-
-    Args:
-        slots:
-            Any candidate's populated slot list (must have ``price.import_price``
-            and ``start`` set).
-        now:
-            Timezone-aware current datetime.  Past slots are excluded.
-        lookahead_hours:
-            Size of the averaging window in hours.  Default 24 h: always
-            available even on the minimum-configured planning horizon, and
-            long enough to smooth over daily price cycles.
-        confidence_factor:
-            Multiplier applied to the averaged price to discount for
-            uncertainty in the EV's future energy need.  Default 0.9.
-
-    Returns:
-        Value in currency/kWh, or ``None`` when no future price data is
-        available within the lookahead window.
-    """
-    tz = now.tzinfo
-    cutoff = now + timedelta(hours=lookahead_hours)
-    future_prices: list[float] = [
-        float(s.price.import_price)
-        for s in slots
-        if now < as_tz(s.start, tz) <= cutoff and not math.isnan(s.price.import_price)
-    ]
-    if not future_prices:
-        return None
-    return confidence_factor * (sum(future_prices) / len(future_prices))

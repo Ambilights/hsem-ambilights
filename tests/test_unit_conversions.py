@@ -7,6 +7,9 @@ handles edge cases (zero, negative, large values, division by zero).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
+
 import pytest
 
 from custom_components.hsem.utils.units import (
@@ -15,14 +18,18 @@ from custom_components.hsem.utils.units import (
     ev_ac_to_dc_kwh,
     ev_dc_to_ac_kwh,
     fuse_max_energy_per_slot_kwh,
+    hours_ahead,
     implied_price_per_kwh,
     is_material_planned_energy_kwh,
     kilowatt_to_watt,
     kilowatthours_to_watthours,
     power_to_energy_kwh,
+    slot_duration_hours,
     watt_to_kilowatt,
     watthours_to_kilowatthours,
 )
+
+_STOCKHOLM = ZoneInfo("Europe/Stockholm")
 
 # ---------------------------------------------------------------------------
 # Power conversions (W ↔ kW)
@@ -153,6 +160,32 @@ class TestPowerToEnergyKwh:
     def test_negative_power(self) -> None:
         """-3 kW × 1 h → -3 kWh (discharge / export)."""
         assert power_to_energy_kwh(power_kw=-3.0, duration_h=1.0) == pytest.approx(-3.0)
+
+
+class TestDstAwareDurations:
+    """Aware datetime durations must follow elapsed UTC time across DST."""
+
+    @pytest.mark.parametrize(
+        ("start_utc", "end_utc"),
+        [
+            (
+                datetime(2026, 3, 29, 0, 45, tzinfo=UTC),
+                datetime(2026, 3, 29, 1, 0, tzinfo=UTC),
+            ),
+            (
+                datetime(2026, 10, 25, 0, 45, tzinfo=UTC),
+                datetime(2026, 10, 25, 1, 0, tzinfo=UTC),
+            ),
+        ],
+    )
+    def test_transition_slot_is_fifteen_physical_minutes(
+        self, start_utc: datetime, end_utc: datetime
+    ) -> None:
+        start = start_utc.astimezone(_STOCKHOLM)
+        end = end_utc.astimezone(_STOCKHOLM)
+
+        assert slot_duration_hours(start, end) == pytest.approx(0.25)
+        assert hours_ahead(start, end) == pytest.approx(0.25)
 
 
 class TestEnergyToPowerKw:

@@ -10,7 +10,9 @@ from custom_components.hsem.planner.ev_planner import (
     apply_ev_planned_load_to_slots,
     build_ev_charging_plan,
 )
+from custom_components.hsem.utils.datetime_utils import slot_contains
 from custom_components.hsem.utils.logger import log_planner
+from custom_components.hsem.utils.units import hours_ahead
 
 
 def _compute_ev_charger_power(
@@ -66,8 +68,8 @@ def _compute_ev_charger_power(
         # Divide by remaining hours to get the correct target power.
         # For future slots the full slot width is used.
         slot_end = slots[idx].end
-        if slots[idx].start <= now < slot_end:
-            remaining_min = max((slot_end - now).total_seconds() / 60.0, 0.0167)
+        if slot_contains(slots[idx].start, slot_end, now):
+            remaining_min = max(hours_ahead(now, slot_end) * 60.0, 0.0167)
             slot_hours = remaining_min / 60.0
         else:
             slot_hours = full_hours
@@ -161,6 +163,7 @@ def _build_and_inject_for_ev(
         slots_end=slot_ends,
         slot_net_surplus_kwh=slot_net_surplus,
         slot_import_price=slot_prices,
+        slot_price_actionable=[slot.price_actionable for slot in slots],
     )
     raw = [0.0] * len(slots)
     apply_ev_planned_load_to_slots(

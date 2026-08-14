@@ -29,6 +29,7 @@ def _build_constraints(
     ev_var_offsets: list[int],
     ev_pen_offsets: list[int],
     active_evs: list[EVConfig],
+    price_actionable: np.ndarray,  # type: ignore[name-defined]
     pv_avail: np.ndarray,  # type: ignore[name-defined]
     base_load: np.ndarray,  # type: ignore[name-defined]
     ev_accounted: np.ndarray,  # type: ignore[name-defined]
@@ -195,7 +196,9 @@ def _build_constraints(
         cap_house_load = base_load[t] / discharge_eff
         if ev_discharge_guard_active and ev_accounted[t] > 1e-9:
             cap_house_load = max(base_load[t] - ev_accounted[t], 0.0) / discharge_eff
-        if (
+        if not bool(price_actionable[t]):
+            ed_ub_per_slot.append(0.0)
+        elif (
             no_export
             or bool(battery_export_blocked[t])
             or (ev_discharge_guard_active and ev_accounted[t] > 1e-9)
@@ -397,7 +400,10 @@ def _build_constraints(
     # ------------------------------------------------------------------
     unbounded: tuple[float, float | None] = (0.0, None)
     bounds: list[tuple[float, float | None]] = list(
-        [(0.0, max_charge_per_slot)] * m  # ec[t]
+        [
+            ((0.0, max_charge_per_slot) if bool(price_actionable[t]) else (0.0, 0.0))
+            for t in range(m)
+        ]  # ec[t]: no primary storage action beyond published price authority
         + [(0.0, float(ed_ub_per_slot[t])) for t in range(m)]  # ed[t]
         + [unbounded] * m  # gi[t] (unbounded above)
         + [
@@ -410,7 +416,9 @@ def _build_constraints(
         + [unbounded] * m  # m[t] (auxiliary, unbounded above, ≥ 0)
         + [unbounded] * m  # s_max_pen[t] (penalty, ≥ 0)
         + [unbounded] * m  # s_min_pen[t] (penalty, ≥ 0)
-        + [unbounded] * m  # curt[t] (curtailment, ≥ 0)
+        + [
+            (0.0, float(pv_avail[t])) for t in range(m)
+        ]  # curt[t] is discarded available PV, never fabricated grid energy
     )
     # --- EV bounds ---
     for ev_idx, ev in enumerate(active_evs):
@@ -421,6 +429,10 @@ def _build_constraints(
                 session_dc = ev.session_charge_kw * slot_hours * ev.charger_efficiency
                 session_dc = min(session_dc, ev.max_charge_per_slot)
                 bounds.append((session_dc, session_dc))
+            elif not bool(price_actionable[t]):
+                # Optional smart charging must not treat an unpublished price
+                # as free. A live session remains fixed by the branch above.
+                bounds.append((0.0, 0.0))
             else:
                 bounds.append((0.0, ev.max_charge_per_slot))
         # ev deadline penalty: [0, unbounded)

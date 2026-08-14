@@ -19,7 +19,7 @@ from custom_components.hsem.const import (
 )
 from custom_components.hsem.models.battery_schedule_input import BatteryScheduleInput
 from custom_components.hsem.models.planned_slot import PlannedSlot
-from custom_components.hsem.utils.datetime_utils import as_tz
+from custom_components.hsem.utils.datetime_utils import as_tz, utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import clamp_efficiency
 from custom_components.hsem.utils.recommendations import (
@@ -62,7 +62,7 @@ def apply_discharge_schedules(
         # Determine the last slot end in the planning horizon so we know how
         # many days to cover.  We apply the discharge window once per calendar
         # day that falls within [now, horizon_end].
-        future_slots = [s for s in slots if as_tz(s.end, now.tzinfo) > now]
+        future_slots = [s for s in slots if utc_key(s.end) > utc_key(now)]
         if not future_slots:
             continue
         horizon_end = as_tz(future_slots[-1].end, now.tzinfo)
@@ -75,7 +75,7 @@ def apply_discharge_schedules(
         occurrences: list[tuple[datetime, datetime, float, float]] = []
         sched_total_net = 0.0
 
-        while window_start_abs < horizon_end:
+        while utc_key(window_start_abs) < utc_key(horizon_end):
             if sched.end > sched.start:
                 window_end_abs = datetime.combine(
                     window_start_abs.date(), sched.end
@@ -89,9 +89,11 @@ def apply_discharge_schedules(
             for slot in slots:
                 slot_start = as_tz(slot.start, now.tzinfo)
                 slot_end = as_tz(slot.end, now.tzinfo)
-                if slot_end <= now:
+                if utc_key(slot_end) <= utc_key(now):
                     continue
-                if slot_start >= window_start_abs and slot_end <= window_end_abs:
+                if utc_key(slot_start) >= utc_key(window_start_abs) and utc_key(
+                    slot_end
+                ) <= utc_key(window_end_abs):
                     slot.recommendation = Recommendations.BatteriesDischargeMode.value
 
             # Capture per-occurrence capacity and avg price.
@@ -115,8 +117,9 @@ def apply_discharge_schedules(
                 s_end = as_tz(s.end, now.tzinfo)
                 if (
                     s.recommendation == Recommendations.BatteriesDischargeMode.value
-                    and s_start >= window_start_abs
-                    and s_end <= window_end_abs
+                    and s.price_actionable
+                    and utc_key(s_start) >= utc_key(window_start_abs)
+                    and utc_key(s_end) <= utc_key(window_end_abs)
                 ):
                     # Subtract extra EV load (injected, base_load_includes_ev=False)
                     # so the battery only targets house coverage.
@@ -181,8 +184,12 @@ def calculate_required_battery_until_solar(
         Required battery capacity in kWh (including safety buffer).
     """
     required = 0.0
-    for slot in sorted(slots, key=lambda s: s.start):
-        if as_tz(slot.start, now.tzinfo) < now:
+    for slot in sorted(slots, key=lambda s: utc_key(s.start)):
+        if utc_key(slot.start) < utc_key(now):
+            continue
+        if not slot.price_actionable:
+            # Unknown-price slots are an authoritative storage Hold. Their PV
+            # cannot promise a refill that changes earlier priced decisions.
             continue
         if slot.estimated_net_consumption_kwh < 0:
             break
@@ -288,7 +295,8 @@ def apply_excess_export(
         (
             s
             for s in slots
-            if as_tz(s.start, now.tzinfo) >= now
+            if utc_key(s.start) >= utc_key(now)
+            and s.price_actionable
             and s.recommendation
             in (
                 None,
@@ -386,7 +394,9 @@ def concentrate_discharge_on_expensive_slots(
     discharge_slots = [
         s
         for s in slots
-        if s.recommendation in _DISCHARGE_RECS and as_tz(s.end, now.tzinfo) > now
+        if s.recommendation in _DISCHARGE_RECS
+        and s.price_actionable
+        and utc_key(s.end) > utc_key(now)
     ]
     if not discharge_slots:
         return
@@ -503,6 +513,11 @@ def _forward_refill_forecast(
         forecast_usable_after[index] = running_forecast_usable
 
         slot = slots[index]
+        if not slot.price_actionable:
+            # The unknown-price tail is a primary-battery Hold.  Do not expose
+            # its PV or net surplus as refill headroom for an earlier priced
+            # slot; that promised charge is forbidden later in finalization.
+            continue
         if slot.recommendation == forced_discharge:
             running_refill_kwh = 0.0
             running_forecast_usable = False
@@ -591,7 +606,8 @@ def apply_optimization_strategy(
     # ForceExport when export > import AND export >= export_min_price (A3 fix)
     for rec in slots:
         if (
-            rec.price.export_price > rec.price.import_price
+            rec.price_actionable
+            and rec.price.export_price > rec.price.import_price
             and rec.price.export_price >= export_min_price
             and rec.recommendation is None
         ):
@@ -603,13 +619,20 @@ def apply_optimization_strategy(
     # Group unassigned future slots by calendar day.
     by_day: dict[date, list[PlannedSlot]] = defaultdict(list)
     for s in slots:
-        if s.recommendation is None and as_tz(s.start, now.tzinfo) >= now:
+        if s.recommendation is None and utc_key(s.start) >= utc_key(now):
             by_day[as_tz(s.start, now.tzinfo).date()].append(s)
 
     for day_slots in by_day.values():
         day_budget = usable_capacity
         day_charged = 0.0
-        for rec in sorted(day_slots, key=lambda x: x.price.export_price):
+        for rec in sorted(
+            day_slots,
+            key=lambda x: (
+                not x.price_actionable,
+                x.price.export_price if x.price_actionable else 0.0,
+                utc_key(x.start),
+            ),
+        ):
             if day_charged >= day_budget:
                 break
             # Only charge from solar when there is an actual PV surplus
@@ -636,7 +659,7 @@ def apply_optimization_strategy(
 
         has_future_forced_export = any(
             r.recommendation == Recommendations.ForceBatteriesDischarge.value
-            and r.start > rec.start
+            and utc_key(r.start) > utc_key(rec.start)
             for r in slots
         )
         if has_future_forced_export and current_capacity > required_capacity:

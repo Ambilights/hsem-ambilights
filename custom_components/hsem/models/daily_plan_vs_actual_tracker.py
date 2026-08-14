@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import tempfile
 from contextlib import suppress
@@ -114,6 +115,8 @@ class DailyPlanVsActualTracker:
         rated_capacity_kwh: float = 0.0,
         import_price: float = 0.0,
         export_price: float = 0.0,
+        import_price_available: bool = True,
+        export_price_available: bool = True,
     ) -> None:
         """Accumulate actual energy and cost values.
 
@@ -131,6 +134,8 @@ class DailyPlanVsActualTracker:
             rated_capacity_kwh: Rated battery capacity in kWh for cycle tracking.
             import_price: Current import price (currency/kWh).
             export_price: Current export price (currency/kWh).
+            import_price_available: Whether the import price is authoritative.
+            export_price_available: Whether the export price is authoritative.
         """
         # Grid import delta from cumulative meter (kWh).
         if grid_import_energy_kwh is not None:
@@ -138,7 +143,8 @@ class DailyPlanVsActualTracker:
                 delta = grid_import_energy_kwh - self._last_import_energy_kwh
                 if delta > 0:
                     self.actual.grid_import_kwh += delta
-                    self.actual.grid_import_cost += delta * import_price
+                    if import_price_available and math.isfinite(import_price):
+                        self.actual.grid_import_cost += delta * import_price
             self._last_import_energy_kwh = grid_import_energy_kwh
 
         # Grid export delta from cumulative meter (kWh).
@@ -147,7 +153,8 @@ class DailyPlanVsActualTracker:
                 delta = grid_export_energy_kwh - self._last_export_energy_kwh
                 if delta > 0:
                     self.actual.grid_export_kwh += delta
-                    self.actual.grid_export_rev += delta * export_price
+                    if export_price_available and math.isfinite(export_price):
+                        self.actual.grid_export_rev += delta * export_price
             self._last_export_energy_kwh = grid_export_energy_kwh
 
         # PV production delta from cumulative meter (kWh).
@@ -177,6 +184,8 @@ class DailyPlanVsActualTracker:
         pv_kwh: float = 0.0,
         import_price: float = 0.0,
         export_price: float = 0.0,
+        import_price_available: bool = True,
+        export_price_available: bool = True,
     ) -> None:
         """Accumulate planned energy values from a single time slot.
 
@@ -187,11 +196,15 @@ class DailyPlanVsActualTracker:
             pv_kwh: Planned PV production for the slot (kWh).
             import_price: Spot import price (currency/kWh).
             export_price: Spot export price (currency/kWh).
+            import_price_available: Whether the import price is authoritative.
+            export_price_available: Whether the export price is authoritative.
         """
         self.plan.grid_import_kwh += grid_import_kwh
-        self.plan.grid_import_cost += grid_import_kwh * import_price
+        if import_price_available and math.isfinite(import_price):
+            self.plan.grid_import_cost += grid_import_kwh * import_price
         self.plan.grid_export_kwh += grid_export_kwh
-        self.plan.grid_export_rev += grid_export_kwh * export_price
+        if export_price_available and math.isfinite(export_price):
+            self.plan.grid_export_rev += grid_export_kwh * export_price
         self.plan.battery_cycled_kwh += cycle_kwh
         self.plan.pv_produced_kwh += pv_kwh
 

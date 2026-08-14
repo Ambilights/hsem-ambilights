@@ -10,7 +10,7 @@ from __future__ import annotations
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 
 from custom_components.hsem.models.prediction_record import PredictionRecord
 
@@ -18,6 +18,11 @@ from custom_components.hsem.models.prediction_record import PredictionRecord
 _SEVEN_DAY_SLOTS = 672
 # 30 days × 4 slots/h × 24 h = 2880
 _THIRTY_DAY_SLOTS = 2880
+
+
+def _utc_key(value: datetime) -> datetime:
+    """Return a pure-Python UTC identity without importing HA utilities."""
+    return value.astimezone(UTC).replace(microsecond=0)
 
 
 def _action_label(recommendation: str | None) -> str:
@@ -109,7 +114,8 @@ class PredictionTracker:
             slot_start: Timezone-aware start of the slot (used for
                 deduplication).
         """
-        if slot_start in self._recorded_starts:
+        slot_start_key = _utc_key(slot_start)
+        if slot_start_key in self._recorded_starts:
             return
 
         self._slots_seen += 1
@@ -117,7 +123,7 @@ class PredictionTracker:
         if self._slots_seen <= self._warmup_slots:
             return
 
-        self._recorded_starts.add(slot_start)
+        self._recorded_starts.add(slot_start_key)
 
         record = PredictionRecord(
             slot_start=slot_start,
@@ -204,4 +210,4 @@ class PredictionTracker:
         """Remove the oldest records when the buffer exceeds the max size."""
         while len(self.records) > self.max_records:
             removed = self.records.pop(0)
-            self._recorded_starts.discard(removed.slot_start)
+            self._recorded_starts.discard(_utc_key(removed.slot_start))

@@ -27,6 +27,7 @@ safety-gate assertions from log-formatting changes.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -35,6 +36,9 @@ from custom_components.hsem.custom_sensors.applier import (
     FullyFedDischargeCapState,
     async_apply_battery_settings,
     async_apply_inverter_power_control,
+)
+from custom_components.hsem.custom_sensors.pv_curtailment_sensor import (
+    _is_derived_curtailment,
 )
 from custom_components.hsem.models.hourly_recommendation import HourlyRecommendation
 from custom_components.hsem.models.live_state import LiveState
@@ -87,6 +91,8 @@ def _make_rec(recommendation: str = "batteries_discharge_mode") -> HourlyRecomme
     object.__setattr__(rec, "recommendation", recommendation)
     object.__setattr__(rec, "batteries_discharged_kwh", 0.0)
     object.__setattr__(rec, "grid_import_kwh", 0.0)
+    object.__setattr__(rec, "price_actionable", True)
+    object.__setattr__(rec, "export_price_available", True)
     return rec
 
 
@@ -102,6 +108,7 @@ def _make_planned_rec(
         start=start,
         end=start + timedelta(minutes=15),
         avg_house_consumption_kwh=0.25,
+        historical_avg_house_consumption_kwh=0.25,
         avg_house_consumption_1d_kwh=0.25,
         avg_house_consumption_3d_kwh=0.25,
         avg_house_consumption_7d_kwh=0.25,
@@ -155,7 +162,9 @@ class TestInverterPowerControlSafetyGate:
                 "custom_components.hsem.custom_sensors.applier.async_set_grid_export_power_pct"
             ) as mock_write,
         ):
-            summary = await async_apply_inverter_power_control(sensor, cfg, live)
+            summary = await async_apply_inverter_power_control(
+                sensor, cfg, live, _make_rec()
+            )
 
         mock_write.assert_not_called()
         assert len(summary.results) == 0
@@ -173,7 +182,9 @@ class TestInverterPowerControlSafetyGate:
                 "custom_components.hsem.custom_sensors.applier.async_set_grid_export_power_pct"
             ) as mock_write,
         ):
-            summary = await async_apply_inverter_power_control(sensor, cfg, live)
+            summary = await async_apply_inverter_power_control(
+                sensor, cfg, live, _make_rec()
+            )
 
         mock_write.assert_not_called()
         assert len(summary.results) == 0
@@ -218,7 +229,9 @@ class TestInverterPowerControlSafetyGate:
                 status=ApplyStatus.OK,
                 attempts=1,
             )
-            _summary = await async_apply_inverter_power_control(sensor, cfg, live)
+            _summary = await async_apply_inverter_power_control(
+                sensor, cfg, live, _make_rec()
+            )
 
         # The write-and-verify function should have been reached (not blocked).
         mock_wv.assert_called_once()
@@ -258,14 +271,206 @@ class TestInverterPowerControlSafetyGate:
                 status=ApplyStatus.OK,
                 attempts=1,
             )
-            _summary = await async_apply_inverter_power_control(sensor, cfg, live)
+            _summary = await async_apply_inverter_power_control(
+                sensor, cfg, live, _make_rec()
+            )
 
         mock_wv.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_missing_export_price_keeps_last_verified_inverter_limit(self):
+        """A placeholder zero cannot curtail passive PV export."""
+        sensor = _make_sensor()
+        cfg = _make_cfg(read_only=False)
+        cfg.huawei_solar_device_id_inverter_1 = "device_abc"
+        cfg.export_electricity_min_price = 1.0
+        live = _make_live(degraded_mode=DegradedMode.Degraded)
+        live.export_electricity_price = 0.0
+        live.export_electricity_price_available = False
+
+        with patch(
+            "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+            new_callable=AsyncMock,
+        ) as verifier:
+            summary = await async_apply_inverter_power_control(
+                sensor, cfg, live, _make_rec()
+            )
+
+        verifier.assert_not_awaited()
+        assert summary.results == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("price_actionable", "export_price_available"),
+        [(False, True), (True, False)],
+    )
+    async def test_recommendation_without_export_authority_skips_inverter_write(
+        self, price_actionable: bool, export_price_available: bool
+    ) -> None:
+        """Live numeric price alone cannot authorize active-power curtailment."""
+        sensor = _make_sensor()
+        cfg = _make_cfg(read_only=False)
+        cfg.huawei_solar_device_id_inverter_1 = "device_abc"
+        cfg.huawei_solar_inverter_active_power_control = "sensor.inverter_control"
+        cfg.export_electricity_min_price = 1.0
+        live = _make_live(degraded_mode=DegradedMode.OK)
+        live.export_electricity_price = 0.0
+        live.export_electricity_price_available = True
+        rec = _make_rec()
+        rec.price_actionable = price_actionable
+        rec.export_price_available = export_price_available
+
+        with patch(
+            "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+            new_callable=AsyncMock,
+        ) as verifier:
+            summary = await async_apply_inverter_power_control(sensor, cfg, live, rec)
+
+        verifier.assert_not_awaited()
+        assert summary.results == []
+
+    @pytest.mark.asyncio
+    async def test_published_zero_price_still_applies_export_floor(self):
+        """A real zero price remains economically actionable."""
+        sensor = _make_sensor()
+        cfg = _make_cfg(read_only=False)
+        cfg.huawei_solar_device_id_inverter_1 = "device_abc"
+        cfg.huawei_solar_inverter_active_power_control = "sensor.inverter_control"
+        cfg.export_electricity_min_price = 1.0
+        live = _make_live(degraded_mode=DegradedMode.OK)
+        live.export_electricity_price = 0.0
+        live.export_electricity_price_available = True
+        live.huawei_inverter_active_power_control = "Unlimited"
+        sensor.hass.states.get.return_value = SimpleNamespace(state="Unlimited")
+
+        with patch(
+            "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+            new_callable=AsyncMock,
+            side_effect=_ok_apply_result,
+        ) as verifier:
+            await async_apply_inverter_power_control(sensor, cfg, live, _make_rec())
+
+        assert verifier.await_args is not None
+        assert verifier.await_args.kwargs["desired"] == ("watt", 100)
+
+    @pytest.mark.asyncio
+    async def test_real_verifier_distinguishes_full_export_from_100_watt(self):
+        """The verifier must not preflight-skip a percent-to-watt transition."""
+        from custom_components.hsem.utils.inverter_verify import (
+            async_write_and_verify as real_write_and_verify,
+        )
+
+        sensor = _make_sensor()
+        cfg = _make_cfg(read_only=False)
+        cfg.huawei_solar_device_id_inverter_1 = "device_abc"
+        cfg.huawei_solar_inverter_active_power_control = "sensor.inverter_control"
+        cfg.export_electricity_min_price = 1.0
+        live = _make_live(degraded_mode=DegradedMode.OK)
+        live.export_electricity_price = 0.0
+        live.export_electricity_price_available = True
+        live.huawei_inverter_active_power_control = "Unlimited"
+        control_state = SimpleNamespace(state="Unlimited")
+        sensor.hass.states.get.return_value = control_state
+
+        async def immediate_verify(**kwargs):
+            return await real_write_and_verify(**kwargs, settle_seconds=0.0)
+
+        async def set_watt_limit(*_args, **_kwargs):
+            control_state.state = "Limited to 100W"
+
+        with (
+            patch(
+                "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+                new=immediate_verify,
+            ),
+            patch(
+                "custom_components.hsem.custom_sensors.applier.async_set_grid_export_power_watt",
+                new=AsyncMock(side_effect=set_watt_limit),
+            ) as writer,
+        ):
+            summary = await async_apply_inverter_power_control(
+                sensor, cfg, live, _make_rec()
+            )
+
+        writer.assert_awaited_once_with(sensor, "device_abc", 100)
+        assert summary.overall_status is ApplyStatus.OK
+        assert summary.results[0].desired == ("watt", 100)
+        assert summary.results[0].actual == ("watt", 100)
+
+    @pytest.mark.asyncio
+    async def test_real_verifier_distinguishes_100_watt_from_full_export(self):
+        """The inverse watt-to-percent transition must also reach hardware."""
+        from custom_components.hsem.utils.inverter_verify import (
+            async_write_and_verify as real_write_and_verify,
+        )
+
+        sensor = _make_sensor()
+        cfg = _make_cfg(read_only=False)
+        cfg.huawei_solar_device_id_inverter_1 = "device_abc"
+        cfg.huawei_solar_inverter_active_power_control = "sensor.inverter_control"
+        cfg.export_electricity_min_price = 0.5
+        live = _make_live(degraded_mode=DegradedMode.OK)
+        live.export_electricity_price = 1.0
+        live.export_electricity_price_available = True
+        live.huawei_inverter_active_power_control = "Limited to 100W"
+        control_state = SimpleNamespace(state="Limited to 100W")
+        sensor.hass.states.get.return_value = control_state
+
+        async def immediate_verify(**kwargs):
+            return await real_write_and_verify(**kwargs, settle_seconds=0.0)
+
+        async def set_full_export(*_args, **_kwargs):
+            control_state.state = "Unlimited"
+
+        with (
+            patch(
+                "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+                new=immediate_verify,
+            ),
+            patch(
+                "custom_components.hsem.custom_sensors.applier.async_set_grid_export_power_pct",
+                new=AsyncMock(side_effect=set_full_export),
+            ) as writer,
+        ):
+            summary = await async_apply_inverter_power_control(
+                sensor, cfg, live, _make_rec()
+            )
+
+        writer.assert_awaited_once_with(sensor, "device_abc", 100)
+        assert summary.overall_status is ApplyStatus.OK
+        assert summary.results[0].desired == ("pct", 100)
+        assert summary.results[0].actual == ("pct", 100)
 
 
 # ---------------------------------------------------------------------------
 # async_apply_battery_settings — safety gate
 # ---------------------------------------------------------------------------
+
+
+class TestPVCurtailmentPriceAuthority:
+    """Derived display diagnostics require a published export price."""
+
+    @staticmethod
+    def _live(*, price: float, available: bool) -> LiveState:
+        live = LiveState()
+        live.solar_production_power_w = 2000.0
+        live.huawei_batteries_soc_pct = 99.0
+        live.export_electricity_price = price
+        live.export_electricity_price_available = available
+        live.huawei_inverter_active_power_control = None
+        return live
+
+    def test_placeholder_zero_does_not_report_derived_curtailment(self) -> None:
+        assert _is_derived_curtailment(self._live(price=0.0, available=False)) is False
+
+    @pytest.mark.parametrize("published_price", [0.0, -0.25])
+    def test_published_low_price_keeps_derived_detection(
+        self, published_price: float
+    ) -> None:
+        assert (
+            _is_derived_curtailment(self._live(price=published_price, available=True))
+            is True
+        )
 
 
 class TestBatterySettingsSafetyGate:
@@ -951,6 +1156,69 @@ class TestFullyFedBatteryExportControl:
         ]
 
     @pytest.mark.asyncio
+    async def test_ev_v2h_override_cannot_bypass_primary_hold(self) -> None:
+        """A relabelled unknown-price Hold remains TOU with a zero cap."""
+        sensor = _make_sensor()
+        cfg = self._cfg()
+        live = self._live()
+        live.ev.is_charging = True
+        live.ev.force_max_discharge_power = True
+        live.ev.max_discharge_power_w = 5000
+        live.huawei_batteries_working_mode = "maximise_self_consumption"
+        live.huawei_batteries_max_discharge_power_w = 5000.0
+        live.huawei_batteries_excess_pv_use_in_tou = "charge"
+        live.tou_periods.periods = ["00:00-00:01/1234567/+"]
+        rec = _make_planned_rec("ev_smart_charging", discharged_kwh=0.0)
+        rec.primary_battery_hold = True
+        rec.price_actionable = False
+        rec.import_price_available = False
+        rec.export_price_available = False
+
+        with patch(
+            "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+            new_callable=AsyncMock,
+            side_effect=_ok_apply_result,
+        ) as verifier:
+            await async_apply_battery_settings(
+                sensor, cfg, live, rec, 20.0, now=rec.start
+            )
+
+        assert [call.kwargs["desired"] for call in verifier.await_args_list] == [
+            0,
+            "fed_to_grid",
+            "time_of_use_luna2000",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_price_outage_hold_exits_fully_fed_with_zero_cap(self) -> None:
+        """A stale export mode is actively replaced by strict TOU Hold."""
+        sensor = _make_sensor()
+        cfg = self._cfg()
+        live = self._live()
+        live.huawei_batteries_working_mode = "fully_fed_to_grid"
+        live.huawei_batteries_max_discharge_power_w = 1800.0
+        live.huawei_batteries_excess_pv_use_in_tou = "charge"
+        live.tou_periods.periods = ["00:00-00:01/1234567/+"]
+        rec = _make_planned_rec("batteries_wait_mode", discharged_kwh=0.0)
+        rec.primary_battery_hold = True
+        rec.price_actionable = False
+
+        with patch(
+            "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+            new_callable=AsyncMock,
+            side_effect=_ok_apply_result,
+        ) as verifier:
+            await async_apply_battery_settings(
+                sensor, cfg, live, rec, 20.0, now=rec.start
+            )
+
+        assert [call.kwargs["desired"] for call in verifier.await_args_list] == [
+            0,
+            "fed_to_grid",
+            "time_of_use_luna2000",
+        ]
+
+    @pytest.mark.asyncio
     async def test_new_plan_at_endpoint_stops_battery_but_keeps_pv_export(self):
         sensor = _make_sensor()
         cfg = self._cfg()
@@ -1082,6 +1350,70 @@ class TestFullyFedBatteryExportControl:
         assert [call.kwargs["desired"] for call in verifier.await_args_list] == [
             "maximise_self_consumption",
         ]
+
+    @pytest.mark.asyncio
+    async def test_live_resolved_load_does_not_raise_ev_discharge_cap(self):
+        """EV protection uses stable history, not the live-resolved slot load."""
+        sensor = _make_sensor()
+        cfg = self._cfg()
+        live = self._live()
+        live.huawei_batteries_working_mode = "maximise_self_consumption"
+        live.huawei_batteries_max_discharge_power_w = 10000.0
+        live.huawei_batteries_excess_pv_use_in_tou = "charge"
+        live.ev.is_charging = True
+        live.ev.power_w = 7000.0
+        live.net_consumption_w = 5000.0
+        rec = _make_planned_rec(
+            "batteries_discharge_mode",
+            discharged_kwh=0.10,
+        )
+        rec.grid_export_kwh = 0.0
+        rec.grid_import_kwh = 0.0
+        rec.historical_avg_house_consumption_kwh = 0.10
+        rec.avg_house_consumption_kwh = 1.50
+
+        with patch(
+            "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+            new_callable=AsyncMock,
+            side_effect=_ok_apply_result,
+        ) as verifier:
+            await async_apply_battery_settings(
+                sensor, cfg, live, rec, 5.0, now=rec.start
+            )
+
+        assert [call.kwargs["desired"] for call in verifier.await_args_list] == [400]
+
+    @pytest.mark.asyncio
+    async def test_missing_historical_snapshot_falls_back_to_slot_average(self):
+        """Older/manual recommendations retain the conservative EV baseline."""
+        sensor = _make_sensor()
+        cfg = self._cfg()
+        live = self._live()
+        live.huawei_batteries_working_mode = "maximise_self_consumption"
+        live.huawei_batteries_max_discharge_power_w = 10000.0
+        live.huawei_batteries_excess_pv_use_in_tou = "charge"
+        live.ev.is_charging = True
+        live.ev.power_w = 7000.0
+        live.net_consumption_w = 5000.0
+        rec = _make_planned_rec(
+            "batteries_discharge_mode",
+            discharged_kwh=0.10,
+        )
+        rec.grid_export_kwh = 0.0
+        rec.grid_import_kwh = 0.0
+        rec.historical_avg_house_consumption_kwh = 0.0
+        rec.avg_house_consumption_kwh = 0.10
+
+        with patch(
+            "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+            new_callable=AsyncMock,
+            side_effect=_ok_apply_result,
+        ) as verifier:
+            await async_apply_battery_settings(
+                sensor, cfg, live, rec, 5.0, now=rec.start
+            )
+
+        assert [call.kwargs["desired"] for call in verifier.await_args_list] == [400]
 
     @pytest.mark.asyncio
     async def test_partial_msc_cap_also_bounds_unplanned_ev_session(self):

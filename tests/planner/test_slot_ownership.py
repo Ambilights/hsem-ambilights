@@ -196,6 +196,9 @@ def _make_hrec(
         recommendation=recommendation,
         solcast_pv_estimate_kwh=0.5,
         start=now,
+        import_price_available=True,
+        export_price_available=True,
+        price_actionable=True,
     )
 
 
@@ -208,6 +211,7 @@ def _make_live(
     """Build a minimal :class:`LiveState` for resolver tests."""
     live = LiveState()
     live.import_electricity_price = import_price
+    live.import_electricity_price_available = True
     live.ev = EVLiveState(is_charging=ev_charging)
     live.ev_second = EVLiveState(is_charging=ev2_charging)
     live.battery_current_capacity_kwh = battery_kwh

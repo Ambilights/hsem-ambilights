@@ -198,6 +198,9 @@ class TestRecommendationResolverNullSafety:
             grid_import_kwh=0.0,
             import_price=0.0,
             solcast_pv_estimate_kwh=0.0,
+            import_price_available=True,
+            export_price_available=True,
+            price_actionable=True,
         )
 
     def test_none_import_price_does_not_trigger_force_export(self) -> None:

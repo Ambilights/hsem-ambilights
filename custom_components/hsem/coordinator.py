@@ -31,9 +31,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, override
 
@@ -41,6 +42,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import (
+    async_track_point_in_utc_time,
     async_track_time_change,
     async_track_time_interval,
 )
@@ -84,11 +86,14 @@ from custom_components.hsem.models.state_snapshot import StateSnapshot
 from custom_components.hsem.planner import run_planner
 from custom_components.hsem.planner.charge_scheduler import apply_window_hysteresis
 from custom_components.hsem.planner.ev_planner import EVChargingPlan
+from custom_components.hsem.planner.secondary_storage import SECONDARY_MODE_UTILITY
 from custom_components.hsem.utils.capacity_learner import CapacityLearner
 from custom_components.hsem.utils.charge_rate_learner import CHARGE_RATE_LEARNER
 from custom_components.hsem.utils.datetime_utils import (
     as_tz,
     now as hsem_now,
+    slot_contains,
+    slot_key,
     utc_key,
     utc_now_iso,
 )
@@ -137,6 +142,7 @@ OPTIONS_UPDATE_DEBOUNCE_SECONDS = 0.25
 SECONDARY_STORAGE_UPDATE_DEBOUNCE_SECONDS = 1.0
 SECONDARY_STORAGE_SOC_REPLAN_DELTA_PCT = 1.0
 SECONDARY_STORAGE_LOAD_REPLAN_DELTA_W = 25.0
+PRICE_SOURCE_UPDATE_DEBOUNCE_SECONDS = 0.25
 
 # Lightweight live-demand monitor for active forced export and materially
 # partial normal discharge. It is deliberately separate from the normal
@@ -151,6 +157,163 @@ FORCE_DISCHARGE_REPLAN_MIN_REMAINING_SECONDS = 60
 CORRECTIVE_MILP_SOLVER_STATUSES = frozenset(
     {"optimal", "time_limit_feasible_incumbent"}
 )
+
+type _PriceChannelSignature = tuple[bool, float | None]
+type _PriceSlotSignature = tuple[
+    str,
+    _PriceChannelSignature,
+    _PriceChannelSignature,
+    _PriceChannelSignature,
+]
+type _PriceForecastSignature = tuple[
+    _PriceChannelSignature,
+    _PriceChannelSignature,
+    tuple[_PriceSlotSignature, ...],
+]
+
+
+def _canonical_price_channel(
+    value: float | None, available: bool
+) -> _PriceChannelSignature:
+    """Return a stable signature that distinguishes zero from unavailable."""
+    if not available or value is None:
+        return (False, None)
+    number = float(value)
+    if not math.isfinite(number):
+        return (False, None)
+    return (True, round(number, 5))
+
+
+def _price_forecast_signature(
+    recommendations: list[HourlyRecommendation],
+    live: LiveState,
+    now: datetime,
+) -> _PriceForecastSignature:
+    """Return the canonical live and future populated price/PV authority."""
+    now_utc = utc_key(now)
+    future_slots = sorted(
+        (rec for rec in recommendations if utc_key(rec.end) > now_utc),
+        key=lambda rec: utc_key(rec.start),
+    )
+    slots: tuple[_PriceSlotSignature, ...] = tuple(
+        (
+            utc_key(rec.start).isoformat(),
+            _canonical_price_channel(rec.import_price, rec.import_price_available),
+            _canonical_price_channel(rec.export_price, rec.export_price_available),
+            _canonical_price_channel(
+                rec.solcast_pv_estimate_kwh,
+                rec.solcast_pv_estimate_available,
+            ),
+        )
+        for rec in future_slots
+    )
+    return (
+        _canonical_price_channel(
+            live.import_electricity_price,
+            live.import_electricity_price_available,
+        ),
+        _canonical_price_channel(
+            live.export_electricity_price,
+            live.export_electricity_price_available,
+        ),
+        slots,
+    )
+
+
+def _apply_live_current_price_availability(
+    recommendations: list[HourlyRecommendation],
+    live: LiveState,
+    now: datetime,
+) -> None:
+    """Intersect current forecast authority with the live entity states.
+
+    Forecast attributes can remain present after Home Assistant marks the
+    underlying price entity unavailable.  They must not keep the current slot
+    actionable: retain each populated forecast value, but withdraw its
+    authority unless both the forecast channel and the live channel are
+    currently available and finite.  A live channel never promotes a missing
+    forecast channel.
+    """
+    current = next(
+        (rec for rec in recommendations if slot_contains(rec.start, rec.end, now)),
+        None,
+    )
+    if current is None:
+        return
+
+    current.import_price_available = bool(
+        current.import_price_available
+        and live.import_electricity_price_available
+        and math.isfinite(live.import_electricity_price)
+    )
+    current.export_price_available = bool(
+        current.export_price_available
+        and live.export_electricity_price_available
+        and math.isfinite(live.export_electricity_price)
+    )
+    current.price_actionable = bool(
+        current.import_price_available and current.export_price_available
+    )
+
+
+def _apply_current_price_outage_hold(
+    recommendations: list[HourlyRecommendation],
+    live: LiveState,
+    now: datetime,
+) -> HourlyRecommendation | None:
+    """Publish a strict current-slot storage hold during a price outage."""
+    if str(live.force_working_mode_state).strip().lower() != "auto":
+        return None
+    current = next(
+        (rec for rec in recommendations if slot_contains(rec.start, rec.end, now)),
+        None,
+    )
+    if current is None or current.price_actionable:
+        return None
+
+    current.recommendation = Recommendations.BatteriesWaitMode.value
+    current.primary_battery_hold = True
+    current.batteries_charged_kwh = 0.0
+    current.batteries_discharged_kwh = 0.0
+    current.secondary_storage_mode = SECONDARY_MODE_UTILITY
+    current.secondary_storage_charge_current_a = 0.0
+    current.secondary_storage_charged_kwh = 0.0
+    current.secondary_storage_discharged_kwh = 0.0
+    return current
+
+
+def _next_slot_boundary_utc(now: datetime, interval_minutes: int) -> datetime:
+    """Return the next future wall-clock-aligned boundary in UTC.
+
+    Iterating on the UTC timeline keeps the result strictly in the future at
+    both sides of a DST fold while still testing alignment in local wall time.
+    """
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    interval = max(int(interval_minutes), 1)
+    candidate = now.astimezone(UTC).replace(second=0, microsecond=0) + timedelta(
+        minutes=1
+    )
+    for _ in range(24 * 60 + 1):
+        local_candidate = candidate.astimezone(now.tzinfo)
+        elapsed_minutes = local_candidate.hour * 60 + local_candidate.minute
+        if elapsed_minutes % interval == 0:
+            return candidate
+        candidate += timedelta(minutes=1)
+    raise RuntimeError("unable to find the next recommendation boundary")
+
+
+def _auto_full_negative_price_allowed(
+    live: LiveState,
+    slot: HourlyRecommendation | None,
+) -> bool:
+    """Return whether a published current price authorizes Auto-Full EV."""
+    return bool(
+        slot is not None
+        and slot.price_actionable
+        and live.import_electricity_price_available
+        and live.import_electricity_price <= 0.0
+    )
 
 
 def _force_discharge_live_metrics(
@@ -226,8 +389,16 @@ def _select_corrective_planner_output(
     previous: PlannerOutput,
     candidate: PlannerOutput,
     slot_start: datetime,
+    *,
+    price_authority_changed: bool = False,
 ) -> tuple[PlannerOutput, bool, str]:
     """Keep the prior plan unless the corrective candidate is authoritative."""
+    if price_authority_changed:
+        # Retaining a previously validated plan would also retain its stale
+        # per-slot availability/actionability flags and could execute an old
+        # force-export decision after prices were withdrawn.  The fresh
+        # fallback is the only output derived from current price authority.
+        return candidate, True, ""
     rejection_reason = _corrective_output_rejection_reason(candidate, slot_start)
     accepted = not rejection_reason
     return (candidate if accepted else previous), accepted, rejection_reason
@@ -292,11 +463,7 @@ def _apply_force_charge_now(
         return
 
     now_slot = next(
-        (
-            r
-            for r in hourly_recommendations
-            if as_tz(r.start, now.tzinfo) <= now < as_tz(r.end, now.tzinfo)
-        ),
+        (r for r in hourly_recommendations if slot_contains(r.start, r.end, now)),
         None,
     )
     if now_slot is None:
@@ -476,6 +643,12 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._interval_timer_unsub: Callable[[], None] | None = None
         self._hourly_timer_unsub: Callable[[], None] | None = None
         self._force_discharge_monitor_unsub: Callable[[], None] | None = None
+        self._slot_boundary_timer_unsub: Callable[[], None] | None = None
+        self._slot_boundary_interval_minutes: int | None = None
+        self._window_hysteresis_timer_unsub: Callable[[], None] | None = None
+        self._window_hysteresis_expiry: datetime | None = None
+        self._window_hysteresis_expiry_replan_pending: bool = False
+        self._tearing_down: bool = False
         self._timer_interval: timedelta | None = None
 
         # Per-cycle mutable state (not exposed directly; packaged into CoordinatorData).
@@ -510,6 +683,8 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         # Most recent planner input/output retained for diagnostics dumps.
         self._last_planner_input: PlannerInput | None = None
         self._last_planner_output: PlannerOutput | None = None
+        self._price_source_update_debounce_task: asyncio.Task[None] | None = None
+        self._price_source_update_pending: bool = False
 
         # Previous planner winner name and score for hysteresis (issue #372).
         # Persisted across cycles so the planner can compare against the
@@ -537,6 +712,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         # until the next slot begins. Explicit overrides (force-charge-now,
         # auto-full-EV) are applied on top of the frozen value each cycle.
         self._current_slot_start: datetime | None = None
+        self._current_slot_price_actionable: bool | None = None
         self._current_slot_ev_power_w: float = 0.0
         self._current_slot_ev_second_power_w: float = 0.0
 
@@ -551,6 +727,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._last_plan_force_mode: str = "auto"
         self._last_plan_slot_start: datetime | None = None
         self._last_plan_import_price: float | None = None
+        self._last_plan_price_forecast_signature: _PriceForecastSignature | None = None
         # EV planned-load config that affects planner optimisation.
         self._last_plan_ev_target_soc: float | None = None
         self._last_plan_ev_smart_charging: bool | None = None
@@ -688,6 +865,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
         # Run an immediate first cycle so entities have data before first render.
         await self._async_handle_update(None)
+        self._schedule_next_slot_boundary(hsem_now())
 
         # Hourly tick — guarantees a refresh at the top of every hour.
         self._hourly_timer_unsub = async_track_time_change(
@@ -708,6 +886,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
         Called from :func:`~custom_components.hsem.__init__.async_unload_entry`.
         """
+        self._tearing_down = True
         # Cancel the base DataUpdateCoordinator's internal refresh timer
         # (set to 24 h as a fallback).  Without this the timer holds a
         # reference to the coordinator and prevents garbage collection.
@@ -723,6 +902,15 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         if self._force_discharge_monitor_unsub is not None:
             self._force_discharge_monitor_unsub()
             self._force_discharge_monitor_unsub = None
+        if self._slot_boundary_timer_unsub is not None:
+            self._slot_boundary_timer_unsub()
+            self._slot_boundary_timer_unsub = None
+        self._slot_boundary_interval_minutes = None
+        if self._window_hysteresis_timer_unsub is not None:
+            self._window_hysteresis_timer_unsub()
+            self._window_hysteresis_timer_unsub = None
+        self._window_hysteresis_expiry = None
+        self._window_hysteresis_expiry_replan_pending = False
         for unsub in self._listener_unsubs:
             unsub()
         self._listener_unsubs.clear()
@@ -750,6 +938,11 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         if secondary_task is not None and not secondary_task.done():
             secondary_task.cancel()
             self._secondary_storage_update_debounce_task = None
+        price_task = getattr(self, "_price_source_update_debounce_task", None)
+        if price_task is not None and not price_task.done():
+            price_task.cancel()
+            self._price_source_update_debounce_task = None
+        self._price_source_update_pending = False
 
     async def async_options_updated(self) -> None:
         """Schedule a debounced pipeline re-run after an options change.
@@ -819,6 +1012,11 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             cfg.charger_source_priority_entity,
             cfg.max_charge_current_entity,
         }:
+            # A control listener registered before an options change may still
+            # deliver events after hardware control is disabled. Ignore those
+            # stale subscriptions; telemetry SoC/load remain planner inputs.
+            if not cfg.control_enabled:
+                return
             old_state = event.data.get("old_state")
             material = old_state is None or old_state.state != new_state.state
 
@@ -850,6 +1048,38 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         finally:
             if self._secondary_storage_update_debounce_task is asyncio.current_task():
                 self._secondary_storage_update_debounce_task = None
+
+    async def _async_handle_price_source_change(self, _event: Event) -> None:
+        """Coalesce price state/attribute changes into one durable refresh."""
+        self._price_source_update_pending = True
+        task = self._price_source_update_debounce_task
+        if task is not None and not task.done():
+            return
+        self._price_source_update_debounce_task = self.hass.async_create_task(
+            self._async_price_source_update_debounced(),
+            name="hsem_price_source_update_debounce",
+            eager_start=False,
+        )
+
+    async def _async_price_source_update_debounced(self) -> None:
+        """Refresh after publication/withdrawal without dropping busy events."""
+        try:
+            while True:
+                await asyncio.sleep(PRICE_SOURCE_UPDATE_DEBOUNCE_SECONDS)
+                # Events already coalesced into the snapshot about to be read
+                # are consumed here. Any event arriving during collection,
+                # solve, or publication sets this flag again and guarantees a
+                # follow-up cycle with the newer source state.
+                self._price_source_update_pending = False
+                async with self._update_lock:
+                    await self._async_run_update_cycle()
+                if not self._price_source_update_pending:
+                    break
+        except asyncio.CancelledError:
+            return
+        finally:
+            if self._price_source_update_debounce_task is asyncio.current_task():
+                self._price_source_update_debounce_task = None
 
     async def _async_options_update_debounced(self) -> None:
         """Wait for the debounce window, then schedule the planner run."""
@@ -926,11 +1156,21 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         corrective_candidate_winner = ""
         corrective_candidate_solver = "not_run"
         plan_state_should_persist = False
+        price_forecast_signature: _PriceForecastSignature | None = None
+        price_authority_changed = False
+        # An exact hysteresis-expiry callback must survive degraded or failed
+        # cycles.  Consume it only after this cycle actually ran the planner
+        # and published the resulting snapshot successfully.
+        hysteresis_expiry_replan = getattr(
+            self, "_window_hysteresis_expiry_replan_pending", False
+        )
+        hysteresis_expiry_replan_completed = False
 
         try:
             # 1. Reload config from the config entry.
             self._cfg = build_sensor_config(self._config_entry)
             cfg = self._cfg
+            self._refresh_slot_boundary_schedule(now)
 
             # 2. Collect ALL HA entity states once into an immutable snapshot.
             #    This single call replaces the three-stage read pattern:
@@ -1023,7 +1263,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             # Also handle the case where the user manually cleared the override
             # before the expiry — clean up the stored expiry in that case too.
             if self._override_expiry is not None:
-                if now >= self._override_expiry:
+                if utc_key(now) >= utc_key(self._override_expiry):
                     async_log(
                         "debug",
                         "Timed override EXPIRED — clearing select entity to 'auto'.",
@@ -1160,6 +1400,29 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 self._snapshot,
                 cfg,
             )
+            _apply_live_current_price_availability(
+                self._hourly_recommendations,
+                live,
+                now,
+            )
+            price_outage_hold = _apply_current_price_outage_hold(
+                self._hourly_recommendations,
+                live,
+                now,
+            )
+            if price_outage_hold is not None:
+                # Publish fail-safe intent even when another missing input or
+                # pending consumption history prevents a planner run below.
+                self._hourly_recommendation = price_outage_hold
+                state = price_outage_hold.recommendation
+            price_forecast_signature = _price_forecast_signature(
+                self._hourly_recommendations,
+                live,
+                now,
+            )
+            price_authority_changed = price_forecast_signature != getattr(
+                self, "_last_plan_price_forecast_signature", None
+            )
 
             # -----------------------------------------------------------------------
             # Forecast-vs-actual accumulation (issue #373)
@@ -1262,8 +1525,8 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 corrective_live_replan = (
                     pending_force_slot is not None
                     and active_force_slot is not None
-                    and active_force_slot.start == pending_force_slot
-                    and (as_tz(active_force_slot.end, now.tzinfo) - now).total_seconds()
+                    and utc_key(active_force_slot.start) == utc_key(pending_force_slot)
+                    and (utc_key(active_force_slot.end) - utc_key(now)).total_seconds()
                     >= FORCE_DISCHARGE_REPLAN_MIN_REMAINING_SECONDS
                     and not live.missing_entities
                     and not (
@@ -1276,7 +1539,11 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 if pending_force_slot is not None and not corrective_live_replan:
                     self._force_discharge_live_replan_pending_slot = None
                     self._clear_force_discharge_excess_window()
-                should_replan = self._should_replan(live, now)
+                should_replan = self._should_replan(
+                    live,
+                    now,
+                    price_forecast_signature=price_forecast_signature,
+                )
 
                 if should_replan:
                     planner_input = build_planner_input(
@@ -1333,6 +1600,8 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                     candidate_planner_output = await self.hass.async_add_executor_job(
                         run_planner, planner_input
                     )
+                    if hysteresis_expiry_replan:
+                        hysteresis_expiry_replan_completed = True
                     if corrective_live_replan:
                         corrective_candidate_winner = (
                             candidate_planner_output.winner_name
@@ -1350,6 +1619,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                             self._last_planner_output,
                             candidate_planner_output,
                             corrective_request_slot,
+                            price_authority_changed=price_authority_changed,
                         )
                         if not corrective_output_accepted:
                             # A passive/no-action fallback is not an economic
@@ -1400,7 +1670,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                         has_planned = any(
                             s.ev_total_planned_load_kwh > 1e-9
                             for s in planner_output.slots
-                            if s.end > now
+                            if utc_key(s.end) > utc_key(now)
                         )
                         if not has_planned:
                             async_log(
@@ -1437,6 +1707,19 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 # the held recommendation propagates to hourly_recommendations.
                 window_hys_minutes = cfg.planner_window_hysteresis_minutes
                 if window_hys_minutes > 0:
+                    current_before_hysteresis = next(
+                        (
+                            s
+                            for s in planner_output.slots
+                            if slot_contains(s.start, s.end, now)
+                        ),
+                        None,
+                    )
+                    proposed_rec = (
+                        current_before_hysteresis.recommendation
+                        if current_before_hysteresis is not None
+                        else None
+                    )
                     held_rec, held_start = apply_window_hysteresis(
                         planner_output.slots,
                         now,
@@ -1454,11 +1737,23 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                     )
                     self._window_hys_previous_rec = held_rec
                     self._window_hys_previous_slot_start = held_start
+                    if held_rec != proposed_rec and held_start is not None:
+                        expiry = (
+                            as_tz(held_start, now.tzinfo).astimezone(UTC)
+                            + timedelta(minutes=window_hys_minutes)
+                        ).astimezone(now.tzinfo)
+                        self._schedule_window_hysteresis_expiry(expiry)
+                    elif should_replan:
+                        # A fresh authoritative result no longer needs a hold.
+                        # Reused, already-mutated plans must leave an existing
+                        # expiry callback intact.
+                        self._cancel_window_hysteresis_expiry()
                 else:
+                    self._cancel_window_hysteresis_expiry()
                     # Feature disabled — still persist the current recommendation
                     # so that re-enabling picks up the right state.
                     for s in planner_output.slots:
-                        if as_tz(s.start, now.tzinfo) <= now < as_tz(s.end, now.tzinfo):
+                        if slot_contains(s.start, s.end, now):
                             self._window_hys_previous_rec = s.recommendation
                             self._window_hys_previous_slot_start = s.start
                             break
@@ -1482,18 +1777,17 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                         self._config_entry, "hsem_ev_auto_full_negative_price"
                     )
                 )
-                if auto_full_enabled and live.import_electricity_price <= 0.0:
+                if auto_full_enabled:
                     now_slot = next(
                         (
                             r
                             for r in self._hourly_recommendations
-                            if as_tz(r.start, now.tzinfo)
-                            <= now
-                            < as_tz(r.end, now.tzinfo)
+                            if slot_contains(r.start, r.end, now)
                         ),
                         None,
                     )
-                    if now_slot is not None:
+                    if _auto_full_negative_price_allowed(live, now_slot):
+                        assert now_slot is not None
                         now_slot.recommendation = Recommendations.EVSmartCharging.value
                         pwr_kw = float(
                             get_config_value(
@@ -1530,7 +1824,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 )
 
                 # 9. Find the current time-slot recommendation.
-                self._hourly_recommendations.sort(key=lambda x: x.start)
+                self._hourly_recommendations.sort(key=lambda x: utc_key(x.start))
                 # now.tzinfo is guaranteed non-None because hsem_now() returns
                 # a timezone-aware datetime; assert so pyright narrows the type.
                 assert now.tzinfo is not None, (
@@ -1540,7 +1834,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                     (
                         r
                         for r in self._hourly_recommendations
-                        if as_tz(r.start, now.tzinfo) <= now < as_tz(r.end, now.tzinfo)
+                        if slot_contains(r.start, r.end, now)
                     ),
                     None,
                 )
@@ -1630,7 +1924,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             raise UpdateFailed(f"HSEM update cycle failed: {exc}") from exc
 
         # Final sort and timestamp.
-        self._hourly_recommendations.sort(key=lambda x: x.start)
+        self._hourly_recommendations.sort(key=lambda x: utc_key(x.start))
         last_updated = utc_now_iso()
 
         # Package OCPP charger state for sensor entities.
@@ -1685,7 +1979,13 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
         # Notify all subscriber entities atomically.
         self.async_set_updated_data(data)
-        self._persist_plan_state_if_accepted(live, plan_state_should_persist)
+        if hysteresis_expiry_replan_completed:
+            self._window_hysteresis_expiry_replan_pending = False
+        self._persist_plan_state_if_accepted(
+            live,
+            plan_state_should_persist,
+            price_forecast_signature=price_forecast_signature,
+        )
         if corrective_live_replan and corrective_request_slot is not None:
             # Commit the corrected plan and consume the once-per-slot request
             # only after the complete coordinator update was successfully
@@ -1741,6 +2041,76 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
     # Timer management
     # ------------------------------------------------------------------
 
+    def _schedule_next_slot_boundary(self, now: datetime) -> None:
+        """Schedule one exact callback at the next recommendation boundary."""
+        if getattr(self, "_tearing_down", False):
+            return
+        if self._slot_boundary_timer_unsub is not None:
+            self._slot_boundary_timer_unsub()
+        interval_minutes = self._cfg.recommendation_interval_minutes
+        boundary = _next_slot_boundary_utc(now, interval_minutes)
+        self._slot_boundary_interval_minutes = interval_minutes
+        self._slot_boundary_timer_unsub = async_track_point_in_utc_time(
+            self.hass, self._async_handle_slot_boundary, boundary
+        )
+
+    def _refresh_slot_boundary_schedule(self, now: datetime) -> None:
+        """Reschedule immediately when a live options update changes cadence."""
+        if getattr(self, "_slot_boundary_timer_unsub", None) is None:
+            return
+        interval_minutes = self._cfg.recommendation_interval_minutes
+        if getattr(self, "_slot_boundary_interval_minutes", None) != interval_minutes:
+            self._schedule_next_slot_boundary(now)
+
+    async def _async_handle_slot_boundary(self, now: datetime) -> None:
+        """Run one non-droppable cycle at a recommendation-slot boundary."""
+        self._slot_boundary_timer_unsub = None
+        if self._tearing_down:
+            return
+        try:
+            async with self._update_lock:
+                if self._tearing_down:
+                    return
+                await self._async_run_update_cycle()
+        finally:
+            if not self._tearing_down:
+                self._schedule_next_slot_boundary(hsem_now())
+
+    def _cancel_window_hysteresis_expiry(self) -> None:
+        """Cancel the pending exact hysteresis-expiry callback, if any."""
+        if self._window_hysteresis_timer_unsub is not None:
+            self._window_hysteresis_timer_unsub()
+        self._window_hysteresis_timer_unsub = None
+        self._window_hysteresis_expiry = None
+
+    def _schedule_window_hysteresis_expiry(self, expiry: datetime) -> None:
+        """Schedule one non-droppable planner run when a held action expires."""
+        expiry_utc = expiry.astimezone(UTC)
+        if (
+            self._window_hysteresis_timer_unsub is not None
+            and self._window_hysteresis_expiry == expiry_utc
+        ):
+            return
+        self._cancel_window_hysteresis_expiry()
+        if self._tearing_down:
+            return
+        self._window_hysteresis_expiry = expiry_utc
+        self._window_hysteresis_timer_unsub = async_track_point_in_utc_time(
+            self.hass, self._async_handle_window_hysteresis_expiry, expiry_utc
+        )
+
+    async def _async_handle_window_hysteresis_expiry(self, now: datetime) -> None:
+        """Force a fresh plan exactly when a held recommendation may change."""
+        self._window_hysteresis_timer_unsub = None
+        self._window_hysteresis_expiry = None
+        if self._tearing_down:
+            return
+        self._window_hysteresis_expiry_replan_pending = True
+        async with self._update_lock:
+            if self._tearing_down:
+                return
+            await self._async_run_update_cycle()
+
     async def _set_update_interval(self, override_minutes: int | None = None) -> None:
         """Register or re-register the periodic update timer.
 
@@ -1791,7 +2161,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         for slot in output.slots:
             if not (
                 slot.batteries_discharged_kwh > 1e-9
-                and as_tz(slot.start, now.tzinfo) <= now < as_tz(slot.end, now.tzinfo)
+                and slot_contains(slot.start, slot.end, now)
             ):
                 continue
             if slot.recommendation == Recommendations.ForceBatteriesDischarge.value:
@@ -1837,11 +2207,13 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             return
 
         slot_start = slot.start
-        if self._force_discharge_replanned_slot_start == slot_start:
+        if self._force_discharge_replanned_slot_start is not None and utc_key(
+            self._force_discharge_replanned_slot_start
+        ) == utc_key(slot_start):
             self._clear_force_discharge_excess_window()
             return
 
-        remaining_seconds = (as_tz(slot.end, now.tzinfo) - now).total_seconds()
+        remaining_seconds = (utc_key(slot.end) - utc_key(now)).total_seconds()
         if remaining_seconds < FORCE_DISCHARGE_REPLAN_MIN_REMAINING_SECONDS:
             self._force_discharge_live_replan_pending_slot = None
             self._clear_force_discharge_excess_window("less than 60 s remains")
@@ -1850,7 +2222,9 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         # A pending request remains pending until run_planner returns. If the
         # update lock was busy or a previous update failed, retry on this tick
         # without consuming the slot's one successful attempt.
-        if self._force_discharge_live_replan_pending_slot == slot_start:
+        if self._force_discharge_live_replan_pending_slot is not None and utc_key(
+            self._force_discharge_live_replan_pending_slot
+        ) == utc_key(slot_start):
             if not self._update_lock.locked():
                 await self._async_handle_update(None)
             return
@@ -1889,7 +2263,9 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             )
             return
 
-        if self._force_discharge_excess_slot_start != slot_start:
+        if self._force_discharge_excess_slot_start is None or utc_key(
+            self._force_discharge_excess_slot_start
+        ) != utc_key(slot_start):
             self._force_discharge_excess_slot_start = slot_start
             self._force_discharge_excess_since = now
             async_log(
@@ -1908,7 +2284,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         excess_since = self._force_discharge_excess_since
         if (
             excess_since is None
-            or (now - excess_since).total_seconds()
+            or (utc_key(now) - utc_key(excess_since)).total_seconds()
             < FORCE_DISCHARGE_EXCESS_DEBOUNCE_SECONDS
         ):
             return
@@ -1930,7 +2306,13 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
     # Planner bridge helpers
     # ------------------------------------------------------------------
 
-    def _should_replan(self, live: LiveState, now: datetime) -> bool:
+    def _should_replan(
+        self,
+        live: LiveState,
+        now: datetime,
+        *,
+        price_forecast_signature: _PriceForecastSignature | None = None,
+    ) -> bool:
         """Determine whether the planner should be re-run.
 
         Returns ``True`` when a material event occurred since the last plan:
@@ -1949,6 +2331,19 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         if self._last_planner_output is None:
             return True
 
+        if price_forecast_signature is not None and price_forecast_signature != getattr(
+            self, "_last_plan_price_forecast_signature", None
+        ):
+            async_log(
+                "debug",
+                "[replan] Published price/PV forecast authority changed — re-planning.",
+            )
+            return True
+
+        if getattr(self, "_window_hysteresis_expiry_replan_pending", False):
+            async_log("debug", "[replan] Window hysteresis expired — re-planning.")
+            return True
+
         if self._force_discharge_live_replan_pending_slot is not None:
             async_log(
                 "debug",
@@ -1960,18 +2355,8 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         # Slot boundary crossed — new slot needs a fresh plan.
         if self._last_plan_slot_start is not None:
             slot_minutes = self._cfg.recommendation_interval_minutes
-            # Compute the start of the recommendation slot containing *dt*.
-            # Slots are aligned to wall-clock time (00:00, 00:15, …).
-            total_minutes = now.hour * 60 + now.minute
-            now_slot_idx = total_minutes // slot_minutes
-            last_total = (
-                self._last_plan_slot_start.hour * 60 + self._last_plan_slot_start.minute
-            )
-            last_slot_idx = last_total // slot_minutes
-            # Also re-plan if the date changed (midnight crossing).
-            if (
-                now_slot_idx != last_slot_idx
-                or now.date() != self._last_plan_slot_start.date()
+            if slot_key(now, slot_minutes) != slot_key(
+                self._last_plan_slot_start, slot_minutes
             ):
                 async_log(
                     "debug",
@@ -2069,7 +2454,9 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
         if self._last_plan_ev_deadline is not None:
             cur_deadline = live.ev_planned_load_deadline
-            if cur_deadline != self._last_plan_ev_deadline:
+            if cur_deadline is None or utc_key(cur_deadline) != utc_key(
+                self._last_plan_ev_deadline
+            ):
                 async_log(
                     "debug",
                     "[replan] EV deadline changed — re-planning.",
@@ -2100,7 +2487,9 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
         if self._last_plan_ev2_deadline is not None:
             cur_deadline2 = live.ev_second_planned_load_deadline
-            if cur_deadline2 != self._last_plan_ev2_deadline:
+            if cur_deadline2 is None or utc_key(cur_deadline2) != utc_key(
+                self._last_plan_ev2_deadline
+            ):
                 async_log(
                     "debug",
                     "[replan] EV2 deadline changed — re-planning.",
@@ -2168,7 +2557,12 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         # Nothing material changed — stick to the plan.
         return False
 
-    def _persist_plan_state(self, live: LiveState) -> None:
+    def _persist_plan_state(
+        self,
+        live: LiveState,
+        *,
+        price_forecast_signature: _PriceForecastSignature | None = None,
+    ) -> None:
         """Record the current state after a successful plan run.
 
         Called after every planner run so ``_should_replan`` can compare
@@ -2206,13 +2600,22 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._last_plan_secondary_output_priority = (
             live.secondary_storage.output_source_priority
         )
+        if price_forecast_signature is not None:
+            self._last_plan_price_forecast_signature = price_forecast_signature
 
     def _persist_plan_state_if_accepted(
-        self, live: LiveState, plan_state_should_persist: bool
+        self,
+        live: LiveState,
+        plan_state_should_persist: bool,
+        *,
+        price_forecast_signature: _PriceForecastSignature | None = None,
     ) -> None:
         """Advance material-change baselines only for a published new plan."""
         if plan_state_should_persist:
-            self._persist_plan_state(live)
+            self._persist_plan_state(
+                live,
+                price_forecast_signature=price_forecast_signature,
+            )
 
     def _freeze_ev_charger_power_for_current_slot(
         self, output: PlannerOutput, now: datetime
@@ -2242,25 +2645,34 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
         for slot in output.slots:
             s_start = as_tz(slot.start, now.tzinfo)
-            s_end = as_tz(slot.end, now.tzinfo)
-            if not (s_start <= now < s_end):
+            if not slot_contains(slot.start, slot.end, now):
                 continue
 
-            if self._current_slot_start is None or utc_key(
+            price_actionable = bool(slot.price_actionable)
+            new_slot = self._current_slot_start is None or utc_key(
                 self._current_slot_start
-            ) != utc_key(s_start):
-                # New slot — capture the freshly planned power values as the
-                # frozen baseline for this slot.
+            ) != utc_key(s_start)
+            authority_changed = (
+                getattr(self, "_current_slot_price_actionable", None)
+                is not price_actionable
+            )
+            if new_slot or authority_changed:
+                # A new slot or same-slot price-authority transition captures
+                # fresh planner power. This prevents withdrawal from restoring
+                # an old optional-EV command while preserving fixed-session
+                # load that the nonactionable plan still publishes.
                 self._current_slot_start = s_start
+                self._current_slot_price_actionable = price_actionable
                 self._current_slot_ev_power_w = slot.ev_charger_calculated_power
                 self._current_slot_ev_second_power_w = (
                     slot.ev_second_charger_calculated_power
                 )
                 async_log(
                     "debug",
-                    "[freeze] New EV power baseline for slot %s: "
-                    "primary=%dW second=%dW",
+                    "[freeze] New EV power baseline for slot %s "
+                    "(price_actionable=%s): primary=%dW second=%dW",
                     s_start.isoformat(),
+                    price_actionable,
                     self._current_slot_ev_power_w,
                     self._current_slot_ev_second_power_w,
                 )
@@ -2316,6 +2728,10 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 unmatched.append(rec.start.isoformat())
                 continue
             rec.recommendation = slot.recommendation
+            # Publish the live-resolved current-slot load alongside the flows
+            # derived from it. Keep the raw 1d/3d/7d/14d diagnostics intact.
+            rec.historical_avg_house_consumption_kwh = rec.avg_house_consumption_kwh
+            rec.avg_house_consumption_kwh = slot.avg_house_consumption_kwh
             rec.batteries_charged_kwh = slot.batteries_charged_kwh
             rec.batteries_discharged_kwh = slot.batteries_discharged_kwh
             rec.estimated_net_consumption_kwh = slot.estimated_net_consumption_kwh
@@ -2348,6 +2764,9 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             rec.grid_import_kwh = slot.grid_import_kwh
             rec.grid_export_kwh = slot.grid_export_kwh
             rec.primary_battery_hold = slot.primary_battery_hold
+            rec.import_price_available = slot.import_price_available
+            rec.export_price_available = slot.export_price_available
+            rec.price_actionable = slot.price_actionable
             # Copy the planner's PV estimate so that solcast_pv_estimate,
             # estimated_net_consumption, and ev_planned_load_kwh are all
             # internally consistent in the final HourlyRecommendation output.
@@ -2406,7 +2825,9 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         """
         # Compute elapsed seconds since last accumulation.
         if self._last_accumulation_ts is not None:
-            elapsed = (now - self._last_accumulation_ts).total_seconds()
+            elapsed = (
+                utc_key(now) - utc_key(self._last_accumulation_ts)
+            ).total_seconds()
         else:
             elapsed = 0.0
 
@@ -2422,7 +2843,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         # Find the slot whose time range contains 'now'.
         current_slot = None
         for rec in self._hourly_recommendations:
-            if as_tz(rec.start, now.tzinfo) <= now < as_tz(rec.end, now.tzinfo):
+            if slot_contains(rec.start, rec.end, now):
                 current_slot = rec
                 break
 
@@ -2456,7 +2877,8 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         for frec in self._forecast_tracker.records:
             if not frec.finalised:
                 continue
-            if frec.start in self._solar_corrector_processed:
+            processed_key = utc_key(frec.start)
+            if processed_key in self._solar_corrector_processed:
                 continue
 
             self._solar_corrector.update_hour(
@@ -2465,7 +2887,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             self._solar_corrector.update_residual(
                 frec.forecast_pv_kwh, frec.actual_pv_kwh
             )
-            self._solar_corrector_processed.add(frec.start)
+            self._solar_corrector_processed.add(processed_key)
 
         # -------------------------------------------------------------------
         # Prediction accuracy scorecard (issue #601)
@@ -2479,7 +2901,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 # Find the matching planner slot for this forecast record.
                 planner_slot = None
                 for slot in self._last_planner_output.slots:
-                    if slot.start == frec.start:
+                    if utc_key(slot.start) == utc_key(frec.start):
                         planner_slot = slot
                         break
                 if planner_slot is None:
@@ -2569,6 +2991,8 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             rated_capacity_kwh=rated_cap_kwh,
             import_price=live.import_electricity_price,
             export_price=live.export_electricity_price,
+            import_price_available=live.import_electricity_price_available,
+            export_price_available=live.export_electricity_price_available,
         )
 
     # ------------------------------------------------------------------
@@ -2650,6 +3074,8 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             grid_export_energy_kwh=live.grid_export_energy_kwh,
             import_price=live.import_electricity_price,
             export_price=live.export_electricity_price,
+            import_price_available=live.import_electricity_price_available,
+            export_price_available=live.export_electricity_price_available,
         )
 
     async def _accumulate_savings(
@@ -2704,6 +3130,10 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         if (
             hourly_rec is not None
             and hourly_rec.recommendation in CHARGE_RECS
+            and hourly_rec.price_actionable
+            and hourly_rec.import_price_available
+            and live.import_electricity_price_available
+            and math.isfinite(import_price)
             and import_price < avg_import_price
             and avg_import_price > 0
         ):
@@ -2731,10 +3161,9 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         prices: list[float] = []
         for slot in output.slots:
             slot_date = slot.start.strftime("%Y-%m-%d")
-            if slot_date == today_str:
-                p = getattr(slot, "import_price", None)
-                if p is not None and p > 0:
-                    prices.append(float(p))
+            p = slot.price.import_price
+            if slot_date == today_str and slot.price_actionable and math.isfinite(p):
+                prices.append(float(p))
         if not prices:
             return 0.0
         return sum(prices) / len(prices)
@@ -2898,9 +3327,11 @@ def _accumulate_plan_for_slots(
         if (
             slot_start is not None
             and slot_end is not None
-            and slot_start <= now < slot_end
+            and slot_contains(slot_start, slot_end, now)
         ):
-            if last_accumulated is None or last_accumulated < slot_start:
+            if last_accumulated is None or utc_key(last_accumulated) < utc_key(
+                slot_start
+            ):
                 _add_slot_to_tracker(tracker, slot, fraction=1.0)
                 return slot_start  # Mark this slot as accumulated
             return last_accumulated  # Already accumulated this slot
@@ -2909,10 +3340,16 @@ def _accumulate_plan_for_slots(
         # accumulated yet.  Only active after the first cycle (when
         # last_accumulated is not None) to avoid inflating plan values
         # with stale zeroed fields from past slots on startup.
-        if last_accumulated is not None and slot_end is not None and slot_end <= now:
+        if (
+            last_accumulated is not None
+            and slot_end is not None
+            and utc_key(slot_end) <= utc_key(now)
+        ):
             # Use slot_start in the skip-check because last_accumulated
             # is now a slot-start marker (set by the current-slot branch).
-            if slot_start is not None and slot_start <= last_accumulated:
+            if slot_start is not None and utc_key(slot_start) <= utc_key(
+                last_accumulated
+            ):
                 continue
             _add_slot_to_tracker(tracker, slot, fraction=1.0)
 
@@ -2935,6 +3372,13 @@ def _add_slot_to_tracker(
     slot_price = getattr(slot, "price", None)
     import_price = slot_price.import_price if slot_price is not None else 0.0
     export_price = slot_price.export_price if slot_price is not None else 0.0
+    price_actionable = bool(getattr(slot, "price_actionable", True))
+    import_price_available = price_actionable and bool(
+        getattr(slot, "import_price_available", True)
+    )
+    export_price_available = price_actionable and bool(
+        getattr(slot, "export_price_available", True)
+    )
     cycle_kwh = abs(chg) + abs(dis)
     tracker.accumulate_plan(
         grid_import_kwh=gi,
@@ -2943,6 +3387,8 @@ def _add_slot_to_tracker(
         pv_kwh=pv,
         import_price=import_price,
         export_price=export_price,
+        import_price_available=import_price_available,
+        export_price_available=export_price_available,
     )
 
 
@@ -2951,7 +3397,7 @@ def _last_completed_slot_end(slots: list, now: datetime) -> datetime | None:
     last_end: datetime | None = None
     for slot in slots:
         slot_end = as_tz(slot.end, now.tzinfo) if hasattr(slot, "end") else None
-        if slot_end is not None and slot_end <= now:
-            if last_end is None or slot_end > last_end:
+        if slot_end is not None and utc_key(slot_end) <= utc_key(now):
+            if last_end is None or utc_key(slot_end) > utc_key(last_end):
                 last_end = slot_end
     return last_end

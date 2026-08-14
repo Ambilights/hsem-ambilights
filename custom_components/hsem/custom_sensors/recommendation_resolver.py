@@ -35,7 +35,7 @@ def resolve_current_recommendation(
     cannot know, for example, whether a car just plugged in.  This function
     applies the final layer of real-time overrides in priority order:
 
-    1. **Negative import price** → force export everything to earn money.
+    1. **Published negative import price** → force export available PV.
     2. **Grid charge active** → grid charging takes priority over EV smart charge.
     3. **EV actively charging** → switch to EV smart charging mode.
     4. **Battery above remaining schedule need** → switch to discharge mode,
@@ -54,9 +54,17 @@ def resolve_current_recommendation(
 
     original_recommendation = rec.recommendation
 
-    # 1. Negative import price → force export
+    # 1. A published, actionable negative import price → force export.
+    # The numeric live-state fallback remains 0.0 when its source is missing,
+    # and a cached/stale negative value must not restore price-driven control
+    # after the current planner slot has become non-actionable.
     import_price = convert_to_float(live.import_electricity_price)
-    if import_price is not None and import_price < 0:
+    if (
+        rec.price_actionable
+        and live.import_electricity_price_available
+        and import_price is not None
+        and import_price < 0
+    ):
         rec.recommendation = Recommendations.ForceExport.value
         HSEM_LOGGER.debug(
             "[resolver] negative import price (%.4f) → overriding %s to force_export",

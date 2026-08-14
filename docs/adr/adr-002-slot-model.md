@@ -31,6 +31,10 @@ The slot model must satisfy several conflicting requirements:
    (no Home Assistant imports). It must be fully serialisable for test assertions
    and debug logging.
 
+6. **Unambiguous DST identity** — A spring clock change must not manufacture a
+   nonexistent hour, and both occurrences of an autumn repeated hour must remain
+   separately addressable.
+
 ---
 
 ## Decision
@@ -43,6 +47,8 @@ We adopt an **explicit per-slot record** model. Every slot in the horizon is a
 - `start_time` / `end_time` — timezone-aware datetime range
 - `duration_hours` — cached float for power→energy conversion
 - `slot_index` — ordinal position in the horizon [0..n-1]
+- `SlotKey(day_offset, slot_in_day)` — local calendar-day offset plus the
+  elapsed-time ordinal since that day's local midnight
 
 ### Forecast data (immutable after population)
 
@@ -95,6 +101,20 @@ planner that schedules around it and the sensors that display it.
 #### 5. Energy units only
 All power limits are converted to per-slot energy caps at the planner boundary.
 The slot model never stores kW values — only kWh.
+
+#### 6. UTC timeline, local presentation
+The planning grid is anchored at local midnight, converted to UTC, advanced on
+the UTC timeline, and converted back to the configured IANA timezone for display.
+Slot containment, ordering, duration, and "current/past/future" decisions compare
+UTC instants. Direct subtraction or ordering of two datetimes that share a
+`ZoneInfo` object is not used across a DST fold.
+
+`slot_in_day` is therefore an elapsed-time ordinal rather than
+`hour * slots_per_hour + quarter`. At 15-minute resolution a complete spring,
+ordinary, or autumn civil day has 92, 96, or 100 ordinals. The repeated autumn
+hour occupies eight distinct ordinals (four for `fold=0`, then four for `fold=1`).
+Planner input carries the IANA timezone name alongside `now_iso`, because an ISO
+numeric offset alone cannot describe a future timezone transition.
 
 ---
 

@@ -32,7 +32,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from custom_components.hsem.models.planned_slot import PlannedSlot
-from custom_components.hsem.utils.datetime_utils import as_tz
+from custom_components.hsem.utils.datetime_utils import slot_contains, utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import clamp_efficiency
 from custom_components.hsem.utils.recommendations import (
@@ -150,25 +150,27 @@ def simulate_soc(
     )
 
     for slot in slots:
-        slot_start = as_tz(slot.start, now.tzinfo)
-        slot_end = as_tz(slot.end, now.tzinfo)
-
         # Past slots: zero out SoC display fields only.
         # Energy-flow fields (grid_import_kwh, grid_export_kwh,
         # batteries_discharged_kwh, batteries_charged_kwh) are NOT zeroed
         # here so that the daily plan-vs-actual tracker can still read the
         # plan values for completed slots.
-        if slot_end <= now:
+        if utc_key(slot.end) <= utc_key(now):
             slot.estimated_battery_capacity_kwh = 0.0
             slot.estimated_battery_soc_pct = 0.0
             continue
 
         # For the current in-progress slot use current_kwh as the starting
         # state; for all future slots chain from the previous slot's end.
-        if slot_start <= now < slot_end:
+        if slot_contains(slot.start, slot.end, now):
             cap = current_kwh
 
         pv = slot.solcast_pv_estimate_kwh  # kWh produced by PV this slot
+        primary_hold = not milp_prepopulated and slot.primary_battery_hold
+        if primary_hold:
+            slot.recommendation = Recommendations.BatteriesWaitMode.value
+            slot.batteries_charged_kwh = 0.0
+            slot.batteries_discharged_kwh = 0.0
 
         # ev_planned_load_kwh  — extra EV AC load NOT yet in avg_house_consumption
         #                        (base_load_includes_ev=False case)
@@ -279,7 +281,11 @@ def simulate_soc(
             wait_self_consumption = (
                 is_wait_mode and wait_mode_behavior == "self_consumption_with_reserve"
             )
-            if ev_load > 1e-9 or (is_wait_mode and not wait_self_consumption):
+            if (
+                primary_hold
+                or ev_load > 1e-9
+                or (is_wait_mode and not wait_self_consumption)
+            ):
                 # EV is charging or strict wait is active: everything from grid.
                 discharge = 0.0
                 house_grid_import = net_demand
@@ -354,10 +360,14 @@ def simulate_soc(
             # (beyond what the scheduler already planned):
             remaining_headroom = max(headroom - scheduled_charge, 0.0)
             remaining_power = max(max_charge_per_slot - scheduled_charge, 0.0)
-            max_additional_pv_input = min(
-                pv_remaining,
-                remaining_headroom / charge_eff,
-                remaining_power / charge_eff,
+            max_additional_pv_input = (
+                0.0
+                if primary_hold
+                else min(
+                    pv_remaining,
+                    remaining_headroom / charge_eff,
+                    remaining_power / charge_eff,
+                )
             )
             max_additional_pv_input = max(max_additional_pv_input, 0.0)
             additional_pv_charge = max_additional_pv_input * charge_eff

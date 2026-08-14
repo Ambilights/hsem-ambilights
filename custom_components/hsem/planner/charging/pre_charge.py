@@ -14,7 +14,7 @@ from datetime import datetime
 from custom_components.hsem.const import SOLAR_SURPLUS_CHARGE_THRESHOLD_KWH
 from custom_components.hsem.models.battery_schedule_input import BatteryScheduleInput
 from custom_components.hsem.models.planned_slot import PlannedSlot
-from custom_components.hsem.utils.datetime_utils import as_tz
+from custom_components.hsem.utils.datetime_utils import as_tz, utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.recommendations import Recommendations
 from custom_components.hsem.utils.time_windows import next_window_start_dt
@@ -151,8 +151,8 @@ def apply_charge_schedules(
             eligible = [
                 s
                 for s in slots
-                if as_tz(s.end, now.tzinfo) > now
-                and as_tz(s.end, now.tzinfo) <= window_start_abs
+                if utc_key(s.end) > utc_key(now)
+                and utc_key(s.end) <= utc_key(window_start_abs)
                 and s.recommendation is None
             ]
 
@@ -161,8 +161,12 @@ def apply_charge_schedules(
 
             # Priority 1: negative import price
             for s in sorted(
-                (e for e in eligible if e.price.import_price < 0.0),
-                key=lambda x: (x.price.import_price, x.start),
+                (
+                    e
+                    for e in eligible
+                    if e.price_actionable and e.price.import_price < 0.0
+                ),
+                key=lambda x: (x.price.import_price, utc_key(x.start)),
             ):
                 if charged >= occurrence_budget:
                     break
@@ -185,7 +189,10 @@ def apply_charge_schedules(
                     # NOTE: SOLAR_SURPLUS_CHARGE_THRESHOLD_KWH is negative, so this
                     # selects slots where net consumption is sufficiently negative
                     # (i.e., there is a meaningful solar surplus to charge from).
-                    key=lambda x: (x.estimated_net_consumption_kwh, x.start),
+                    key=lambda x: (
+                        x.estimated_net_consumption_kwh,
+                        utc_key(x.start),
+                    ),
                 ):
                     if charged >= occurrence_budget:
                         break
@@ -264,8 +271,8 @@ def _apply_grid_charge(
         The total energy (kWh) assigned to grid charging by this call.
     """
     grid_candidates = sorted(
-        (e for e in eligible if e.recommendation is None),
-        key=lambda x: (x.price.import_price, x.start),
+        (e for e in eligible if e.price_actionable and e.recommendation is None),
+        key=lambda x: (x.price.import_price, utc_key(x.start)),
     )
 
     # First pass: estimate average charge price

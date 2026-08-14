@@ -12,10 +12,11 @@ import numpy as np
 
 from custom_components.hsem.models.ev_config import EVConfig
 from custom_components.hsem.models.planned_slot import PlannedSlot
+from custom_components.hsem.utils.datetime_utils import slot_contains
 from custom_components.hsem.utils.units import (
     ev_dc_to_ac_kwh,
+    is_material_planned_energy_kwh,
     slot_duration_hours,
-    timedelta_to_hours,
 )
 
 
@@ -199,12 +200,19 @@ def _write_milp_results_to_slots(
                 0.0,
             )
             required_primary_charge_ac_kwh = resolved_charge / charge_eff
-            # Stay strictly below half the 0.001 kWh grid-flow display unit.
-            # A Solar label must therefore also report zero grid import.
-            source_tolerance_ac_kwh = 0.000499
-            solar_covers_charge = (
-                required_primary_charge_ac_kwh
-                <= available_primary_pv_ac_kwh + source_tolerance_ac_kwh
+            # Classify against the same three-decimal publication contract used
+            # by execution.  A shortfall that publishes as exactly 0.001 kWh is
+            # rounding residue and must not enable forced TOU grid charging;
+            # anything larger remains a real grid-funded charge.
+            published_source_shortfall_kwh = round(
+                max(
+                    required_primary_charge_ac_kwh - available_primary_pv_ac_kwh,
+                    0.0,
+                ),
+                3,
+            )
+            solar_covers_charge = not is_material_planned_energy_kwh(
+                published_source_shortfall_kwh
             )
 
             if solar_covers_charge:
@@ -263,7 +271,7 @@ def _write_milp_results_to_slots(
             # This keeps the executable mode tied to the same authoritative
             # energy balance that is exposed and scored downstream.
             if (
-                out_slots[slot_i].grid_export_kwh > 0.0
+                is_material_planned_energy_kwh(out_slots[slot_i].grid_export_kwh)
                 and p_exp[lp_t] >= min_export_price
             ):
                 out_slots[
@@ -337,9 +345,9 @@ def _write_milp_results_to_slots(
                 )
                 slot_start = out_slots[slot_i].start
                 slot_end = out_slots[slot_i].end
-                if slot_start <= now < slot_end:
+                if slot_contains(slot_start, slot_end, now):
                     remaining_hours = max(
-                        timedelta_to_hours(slot_end - now),
+                        slot_duration_hours(now, slot_end),
                         1.0 / 3600.0,  # 1 s minimum guard
                     )
                     ac_power_w = round(
@@ -395,7 +403,9 @@ def _write_milp_results_to_slots(
                 - s.solcast_pv_estimate_kwh
             )
             net = s.estimated_net_consumption_kwh
-            if net > 0:
+            if not s.price_actionable:
+                s.estimated_cost_currency = 0.0
+            elif net > 0:
                 s.estimated_cost_currency = round(net * s.price.import_price, 4)
             else:
                 s.estimated_cost_currency = round(net * s.price.export_price, 4)
