@@ -61,6 +61,7 @@ from custom_components.hsem.utils.huawei import (
     async_set_grid_export_power_watt,
     async_set_tou_periods,
     async_stop_forcible_discharge,
+    extract_tou_periods,
 )
 from custom_components.hsem.utils.inverter_verify import (
     ApplyResult,
@@ -792,6 +793,43 @@ async def async_apply_battery_settings(
             if charge_result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
                 return summary
 
+    elif (
+        recommendation != Recommendations.BatteriesChargeGrid.value
+        and _grid_charging_is_armed(live)
+    ):
+        # Leaving GridCharge.  The TOU schedule is the only actuator for this
+        # transition (working mode is TimeOfUse on both sides), so a failed TOU
+        # write would otherwise leave the full-day charge window armed and the
+        # battery charging from the grid — the 0 W discharge cap gates discharge
+        # only.  Disarm the charge power first, mirroring the "fail closed at
+        # 0 W" sequencing already used when leaving Fully Fed to Grid.
+        charge_entity = cfg.huawei_solar_batteries_grid_charge_maximum_power
+        if charge_entity is None:
+            # Nothing to disarm through; the TOU write below is then the only
+            # way to stop charging, so fall through rather than returning.
+            _LOGGER.warning(
+                "Leaving grid charge but grid charge maximum power entity is "
+                "not configured; cannot pre-disarm charging"
+            )
+        else:
+            _dis: str = charge_entity  # narrowed for closure
+            disarm_result = await async_write_and_verify(
+                entity_id=_dis,
+                desired=0.0,
+                writer=lambda: async_set_number_value(sensor, _dis, 0.0),
+                reader=lambda: _read_number_state(sensor, _dis),
+                backoff=get_write_failure_backoff(sensor),
+            )
+            summary.results.append(disarm_result)
+            _LOGGER.debug(
+                "Grid charge power pre-disarmed to 0 W before TOU change (%s)",
+                disarm_result.status.value,
+            )
+            # Deliberately no early return on failure: returning here would
+            # leave the full-day charge window active and charging.  Continuing
+            # to the TOU write is the remaining chance to stop it, and the
+            # failed result is already recorded for the applier status sensor.
+
     match recommendation:
         case Recommendations.ForceExport.value:
             working_mode = WorkingModes.FullyFedToGrid.value
@@ -938,8 +976,11 @@ async def async_apply_battery_settings(
         if excess_result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
             return summary
 
-    # TOU periods — no read-back verification (TOU period state is complex JSON;
-    # hash comparison is sufficient; single attempt only).
+    # TOU periods — verified against the entity's live ``Period N`` attributes
+    # (see :func:`_read_tou_periods`), retried up to twice.  The gate below uses
+    # the pre-write LiveState snapshot only to decide *whether* a write is
+    # needed; verification must re-read HA, because the snapshot by definition
+    # still holds the old schedule.
     if (
         working_mode == WorkingModes.TimeOfUse.value
         and tou_modes
@@ -953,19 +994,14 @@ async def async_apply_battery_settings(
                 "TOU entity or battery device ID not configured; skipping write.",
             )
             return summary
+        _te: str = tou_entity  # narrowed for closure
         result = await async_write_and_verify(
-            entity_id=tou_entity,
-            desired=generate_hash(str(tou_modes)),
+            entity_id=_te,
+            desired=list(tou_modes),
             writer=lambda: async_set_tou_periods(sensor, battery_device_id, tou_modes),
-            reader=lambda: generate_hash(
-                str(
-                    sensor.hass.states.get(tou_entity).state
-                    if tou_entity and sensor.hass.states.get(tou_entity) is not None
-                    else ""
-                )
-            ),
-            # TOU periods may take longer to propagate; skip equality check
-            # since we always write when the hash differs.
+            reader=lambda: _read_tou_periods(sensor, _te),
+            # The LiveState gate above already established a difference, so the
+            # first attempt must write rather than short-circuit on a stale read.
             skip_if_equal=False,
             max_retries=2,
             backoff=get_write_failure_backoff(sensor),
@@ -1124,6 +1160,50 @@ def _read_number_state(
         return float(state.state)
     except ValueError, TypeError:
         return None
+
+
+def _grid_charging_is_armed(live: LiveState) -> bool:
+    """Return ``True`` when the hardware is currently able to charge from grid.
+
+    Grid charging is armed only while the inverter sits in Time of Use with the
+    full-day charge window loaded.  Checking both avoids pointless 0 W writes on
+    every non-GridCharge cycle.
+
+    Args:
+        live: Current hardware snapshot.
+
+    Returns:
+        ``True`` when the live TOU schedule is the full-day charge window.
+    """
+    if live.huawei_batteries_working_mode != WorkingModes.TimeOfUse.value:
+        return False
+    return list(live.tou_periods.periods) == list(DEFAULT_HSEM_TOU_MODES_FORCE_CHARGE)
+
+
+def _read_tou_periods(
+    sensor: Any, entity_id: str | None
+) -> list[str] | None:  # NOSONAR -- HA internal type; circular import risk
+    """Read the live TOU schedule from HA and return it as a period list.
+
+    The schedule lives in the entity's ``Period 1``…``Period 10`` attributes.
+    The entity *state* is only the number of configured periods, so it can
+    never be used to verify a written schedule.  This reads HA directly rather
+    than :class:`LiveState`, whose snapshot is captured before the write and
+    would therefore never reflect it.
+
+    Args:
+        sensor: HSEM sensor instance with a ``hass`` attribute.
+        entity_id: HA entity ID to read.
+
+    Returns:
+        Current period strings, or ``None`` when the entity is unavailable.
+    """
+    if not entity_id:
+        return None
+    state = sensor.hass.states.get(entity_id)
+    if state is None or state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE, None):
+        return None
+    return extract_tou_periods(state.attributes)
 
 
 def _read_select_state(
