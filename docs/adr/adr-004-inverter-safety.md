@@ -61,9 +61,13 @@ Every update cycle, the system classifies overall health into one of three state
 
 **Non-critical entities** (any missing → `Degraded` mode, writes allowed):
 
-- Tomorrow's price/PV forecast gaps
 - EV charger states
-- Export price sensor
+
+Price/PV forecast gaps are represented by explicit per-slot availability and
+`DataQuality`, not live missing-entity labels. A current price outage enters the
+automatic price-neutral battery Hold path; future price gaps close the
+actionable horizon, while missing PV remains unavailable rather than becoming a
+fabricated zero forecast.
 
 **Rationale:** The battery SoC is the single most critical value for safe operation. Without it, the planner cannot know whether to charge or discharge, and the applier cannot verify that battery limits are respected. House load is equally critical because the planner must know whether the house is importing or exporting to decide battery action.
 
@@ -156,7 +160,9 @@ Applied **only to the current slot** immediately before hardware writes. Overrid
 
 ### B. Pessimistic: block all writes when any entity is missing
 
-*Rejected because:* This would make the system unusable during minor data gaps (e.g., missing tomorrow's prices). The `Degraded` mode allows safe continued operation.
+*Rejected because:* This would make the system unusable during minor optional
+telemetry gaps. Forecast-price gaps use a narrower safety policy: the published
+prefix remains usable and automatic storage holds beyond the authority boundary.
 
 ### C. Trust the planner — no write verification
 

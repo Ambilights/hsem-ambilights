@@ -8,6 +8,7 @@ from datetime import datetime
 
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.planner.cost_types import CostWeights
+from custom_components.hsem.utils.datetime_utils import utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import resolve_cycle_cost
 from custom_components.hsem.utils.units import usable_kwh_from_rated
@@ -231,10 +232,10 @@ def deferred_export_price_by_slot(
     best: float | None = None
     for i in range(n - 1, -1, -1):
         result[i] = best
-        if now is not None and slots[i].end <= now:
+        if now is not None and utc_key(slots[i].end) <= utc_key(now):
             continue
-        if surplus[i] > absorbable + 1e-9:
+        if slots[i].price_actionable and surplus[i] > absorbable + 1e-9:
             p = slots[i].price.export_price
-            if not math.isnan(p) and (best is None or p < best):
+            if math.isfinite(p) and (best is None or p < best):
                 best = p
     return result

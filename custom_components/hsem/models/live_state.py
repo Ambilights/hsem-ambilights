@@ -186,6 +186,8 @@ class LiveState:
     # Electricity prices
     import_electricity_price: float = 0.0
     export_electricity_price: float = 0.0
+    import_electricity_price_available: bool = True
+    export_electricity_price_available: bool = True
 
     # Derived battery capacities (set by state_collector after computing them)
     battery_usable_capacity_kwh: float = 0.0

@@ -32,6 +32,10 @@ class PlannerInput:
         now_iso:
             ISO-8601 timestamp of the planning moment (e.g.
             ``"2024-06-15T14:00:00+02:00"``).  Must be timezone-aware.
+        timezone_name:
+            Optional IANA timezone name (for example ``Europe/Stockholm``).
+            ISO-8601 preserves only the current numeric offset, so this name is
+            needed to reconstruct future DST transitions in the pure planner.
         interval_minutes:
             Planning slot width in minutes.  Typical values: 15 or 60.
         interval_length_hours:
@@ -120,6 +124,7 @@ class PlannerInput:
 
     # --- temporal context ---
     now_iso: str = "2024-06-15T00:00:00+02:00"
+    timezone_name: str | None = None
     interval_minutes: int = 60
     interval_length_hours: int = 24
 

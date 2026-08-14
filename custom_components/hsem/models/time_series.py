@@ -20,8 +20,9 @@ Key types
 ``SlotKey``
     A ``(day_offset, slot_in_day)`` named-tuple.  *day_offset* is the
     number of whole calendar days since the planning midnight; *slot_in_day*
-    is the 0-based slot index within that day.  This is unambiguous across
-    DST transitions because it does not rely on wall-clock hours.
+    is the 0-based elapsed-time ordinal within that local calendar day.  A
+    15-minute civil day therefore has 92, 96, or 100 ordinals across a
+    spring-forward, ordinary, or autumn-fallback day respectively.
 
 ``TimeSeriesIndex``
     The central alignment object.  Construct it once from the planning
@@ -45,9 +46,8 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
-from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
 # Public constants
@@ -73,13 +73,47 @@ class SlotKey(NamedTuple):
             Number of whole calendar days since the planning midnight (0 for
             today, 1 for tomorrow, etc.).
         slot_in_day:
-            0-based index of this slot within its calendar day.  For 15-min
-            slots there are 96 indices per day (0-95); for 60-min slots there
-            are 24 (0-23).
+            0-based elapsed-time ordinal of this slot within its local calendar
+            day.  For 15-minute slots an ordinary day uses 0-95, a spring
+            transition day 0-91, and an autumn transition day 0-99.
     """
 
     day_offset: int
     slot_in_day: int
+
+
+def slot_key_for_datetime(
+    value: datetime,
+    planning_midnight: datetime,
+    interval_minutes: int,
+) -> SlotKey:
+    """Return the DST-safe :class:`SlotKey` for *value*.
+
+    ``slot_in_day`` is an elapsed-time ordinal measured on the UTC timeline
+    from the local midnight that begins ``value``'s calendar day.  This keeps
+    both occurrences of an autumn repeated hour distinct and naturally skips
+    the nonexistent spring hour.
+    """
+    if value.tzinfo is None or planning_midnight.tzinfo is None:
+        raise ValueError("value and planning_midnight must be timezone-aware.")
+    if interval_minutes <= 0:
+        raise ValueError(f"interval_minutes must be positive; got {interval_minutes}.")
+
+    local = value.astimezone(planning_midnight.tzinfo)
+    day_start = local.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+        fold=0,
+    )
+    elapsed_minutes = int(
+        (local.astimezone(UTC) - day_start.astimezone(UTC)).total_seconds() // 60
+    )
+    return SlotKey(
+        day_offset=(local.date() - planning_midnight.date()).days,
+        slot_in_day=elapsed_minutes // interval_minutes,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -175,8 +209,9 @@ class TimeSeriesIndex:
 
         Slots start at midnight of *now*'s calendar day (wall-clock midnight
         in *now*'s timezone) and extend *horizon_hours* into the future.
-        Boundaries are computed with ``timedelta`` arithmetic so DST
-        transitions never cause gaps, duplicates, or incorrect slot counts.
+        Boundaries advance with ``timedelta`` arithmetic on the UTC timeline,
+        then project back to the local timezone, so DST transitions never
+        cause physical gaps, collapsed folds, or incorrect slot counts.
 
         Args:
             now:
@@ -204,19 +239,32 @@ class TimeSeriesIndex:
         if horizon_hours <= 0:
             raise ValueError(f"horizon_hours must be positive; got {horizon_hours}.")
 
-        # Midnight in the same timezone — use timedelta to stay in the same tz
-        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        # Generate the physical timeline in UTC, then project each boundary
+        # back into the planning timezone.  Adding timedeltas directly to a
+        # ZoneInfo local datetime performs wall-clock arithmetic and would
+        # manufacture the nonexistent spring hour while collapsing the two
+        # autumn occurrences.
+        midnight = now.replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+            fold=0,
+        )
+        midnight_utc = midnight.astimezone(UTC)
         slots_per_hour = 60 // interval_minutes
         total_slots = horizon_hours * slots_per_hour
         slot_fraction = interval_minutes / 60.0
 
         slots: list[SlotMeta] = []
         for i in range(total_slots):
-            start = midnight + timedelta(minutes=i * interval_minutes)
-            end = midnight + timedelta(minutes=(i + 1) * interval_minutes)
-            day_offset = i // (24 * slots_per_hour)
-            slot_in_day = i % (24 * slots_per_hour)
-            key = SlotKey(day_offset=day_offset, slot_in_day=slot_in_day)
+            start = (midnight_utc + timedelta(minutes=i * interval_minutes)).astimezone(
+                now.tzinfo
+            )
+            end = (
+                midnight_utc + timedelta(minutes=(i + 1) * interval_minutes)
+            ).astimezone(now.tzinfo)
+            key = slot_key_for_datetime(start, midnight, interval_minutes)
             slots.append(
                 SlotMeta(
                     key=key,
@@ -474,9 +522,9 @@ class TimeSeriesIndex:
             raise ValueError("dt must be timezone-aware.")
         for i, meta in enumerate(self.slots):
             # Compare via UTC to be DST-safe: convert both sides to UTC first.
-            start_utc = meta.start.astimezone(ZoneInfo("UTC"))
-            end_utc = meta.end.astimezone(ZoneInfo("UTC"))
-            dt_utc = dt.astimezone(ZoneInfo("UTC"))
+            start_utc = meta.start.astimezone(UTC)
+            end_utc = meta.end.astimezone(UTC)
+            dt_utc = dt.astimezone(UTC)
             if start_utc <= dt_utc < end_utc:
                 return i
         return None
@@ -578,10 +626,11 @@ class TimeSeriesIndex:
 
     @property
     def horizon_days(self) -> int:
-        """Return the number of distinct calendar days covered by this index.
+        """Return the number of distinct local calendar dates in this index.
 
-        A 24-hour index anchored at midnight returns 1; a 48-hour index
-        returns 2; a 72-hour index returns 3.
+        Ordinary midnight-anchored 24/48/72-hour physical horizons cover
+        1/2/3 local dates. Across a spring-forward transition, the same
+        physical horizon can touch one extra local date.
 
         Returns:
             Integer count of unique ``day_offset`` values in the slot list.

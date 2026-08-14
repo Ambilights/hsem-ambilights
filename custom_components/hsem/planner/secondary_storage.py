@@ -9,7 +9,7 @@ from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.secondary_storage_config import (
     SecondaryStorageConfig,
 )
-from custom_components.hsem.utils.datetime_utils import as_tz
+from custom_components.hsem.utils.datetime_utils import utc_key
 from custom_components.hsem.utils.misc import clamp_efficiency
 from custom_components.hsem.utils.units import slot_duration_hours
 
@@ -70,7 +70,7 @@ def apply_secondary_utility_bypass(
     populate_secondary_storage_load(slots, config)
     current_capacity = config.current_usable_kwh
     for slot in slots:
-        if as_tz(slot.end, now.tzinfo) <= now:
+        if utc_key(slot.end) <= utc_key(now):
             continue
 
         load_kwh = slot.secondary_storage_load_kwh
@@ -89,10 +89,14 @@ def apply_secondary_utility_bypass(
         net_grid = slot.grid_import_kwh - slot.grid_export_kwh + site_delta
         slot.grid_import_kwh = round(max(net_grid, 0.0), 3)
         slot.grid_export_kwh = round(max(-net_grid, 0.0), 3)
-        slot.estimated_cost_currency = round(
-            slot.grid_import_kwh * max(slot.price.import_price, 0.0)
-            - slot.grid_export_kwh * slot.price.export_price,
-            4,
+        slot.estimated_cost_currency = (
+            round(
+                slot.grid_import_kwh * max(slot.price.import_price, 0.0)
+                - slot.grid_export_kwh * slot.price.export_price,
+                4,
+            )
+            if slot.price_actionable
+            else 0.0
         )
 
 
@@ -110,17 +114,21 @@ def resolve_secondary_terminal_price(
     future = [
         slot
         for slot in slots
-        if as_tz(slot.end, now.tzinfo) > now and not math.isnan(slot.price.import_price)
+        if (
+            utc_key(slot.end) > utc_key(now)
+            and slot.price_actionable
+            and math.isfinite(slot.price.import_price)
+        )
     ]
     if not future:
         return None
 
-    horizon_end = max(as_tz(slot.end, now.tzinfo) for slot in future)
+    horizon_end = max(utc_key(slot.end) for slot in future)
     tail_start = horizon_end - timedelta(hours=24)
     tail_prices = [
         max(slot.price.import_price, 0.0)
         for slot in future
-        if as_tz(slot.start, now.tzinfo) >= tail_start
+        if utc_key(slot.start) >= tail_start
     ]
     if not tail_prices:
         return None

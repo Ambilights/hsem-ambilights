@@ -62,7 +62,7 @@ Design constraints
 - **Pure Python, no Home Assistant imports** — testable with plain pytest.
 - **Additive, independently-disableable terms** — any weight set to 0 disables
   that penalty without touching the others.
-- **Float-safe** — NaN prices are treated as 0.0 rather than propagating.
+- **Float-safe** — non-finite prices are treated as 0.0 rather than propagating.
 - **Immutable input** — slots are *never* mutated; the function is a pure
   read-only scan.
 - **Money / selector split** — ``total_cost`` never includes synthetic
@@ -93,7 +93,9 @@ from custom_components.hsem.planner.cost_types import (  # noqa: F401
     CostWeights,
     PlanCostBreakdown,
 )
+from custom_components.hsem.planner.plan_comparison import compare_plans
 from custom_components.hsem.planner.secondary_cost import SecondaryCostAccumulator
+from custom_components.hsem.utils.datetime_utils import utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import clamp_efficiency
 from custom_components.hsem.utils.recommendations import Recommendations
@@ -120,7 +122,7 @@ def score_plan(
     """Score a candidate plan and return a full cost breakdown.
 
     This is a **pure read-only function** — the slot list is never mutated.
-    NaN price values are treated as ``0.0`` to avoid silent propagation.
+    Non-finite price values are treated as ``0.0`` to avoid silent propagation.
 
     The grid limit can be passed either via ``weights.grid_limit_kw`` or via
     the keyword argument ``grid_limit_kw``; the keyword argument takes
@@ -299,7 +301,7 @@ def score_plan(
         # Fallback guard: recommendation == TimePassed (used when now is None,
         # e.g. in unit tests that call score_plan without a clock).
         if now is not None:
-            if slot.end <= now:
+            if utc_key(slot.end) <= utc_key(now):
                 continue
         elif slot.recommendation == _time_passed_value:
             continue
@@ -311,7 +313,8 @@ def score_plan(
             assert (
                 now is not None
             )  # guarded by use_discount = discount_rate < 1.0 and now is not None
-            slot_mid = slot.start + (slot.end - slot.start) / 2
+            start_utc = utc_key(slot.start)
+            slot_mid = start_utc + (utc_key(slot.end) - start_utc) / 2
             hours_ahead_val = hours_ahead(now, slot_mid)
             discount = discount_rate**hours_ahead_val
         else:
@@ -320,10 +323,18 @@ def score_plan(
         imp_price = slot.price.import_price
         exp_price = slot.price.export_price
 
-        # Treat NaN prices as zero to avoid propagation
-        if math.isnan(imp_price):
+        # Treat all non-finite values as zero.  Directly constructed planner
+        # inputs must fail closed just like source-populated inputs.
+        if not math.isfinite(imp_price):
             imp_price = 0.0
-        if math.isnan(exp_price):
+        if not math.isfinite(exp_price):
+            exp_price = 0.0
+
+        # A numeric value outside the contiguous published-price prefix is
+        # diagnostic data, not economic authority.  Neutralise every monetary
+        # use while leaving physical cycle/SoC/grid/override penalties intact.
+        if not slot.price_actionable:
+            imp_price = 0.0
             exp_price = 0.0
 
         # Sanitised (non-negative) import price — mirrors milp_optimizer.py's
@@ -514,6 +525,7 @@ def score_plan(
             initial_battery_kwh is not None
             and replacement_price_per_kwh is not None
             and abs(replacement_price_per_kwh) > 1e-9
+            and slot.price_actionable
         ):
             terminal_premium = max(0.0, replacement_price_per_kwh - imp_price_obj)
             # Cap the CHARGE credit only: the terminal premium for
@@ -526,7 +538,7 @@ def score_plan(
             _charge_premium = compute_charge_premium(
                 replacement_price_per_kwh=replacement_price_per_kwh,
                 imp_price_obj=imp_price_obj,
-                exp_price=slot.price.export_price,
+                exp_price=exp_price,
                 charge_eff=charge_eff,
                 deferred_export_price=(
                     _deferred_prices[slot_idx] if _deferred_prices else None
@@ -609,78 +621,3 @@ def score_plan(
     )
 
     return result
-
-
-def compare_plans(
-    plan_a: Sequence[PlannedSlot],
-    plan_b: Sequence[PlannedSlot],
-    weights: CostWeights | None = None,
-    *,
-    slot_duration_hours: float = 1.0,
-    now: datetime | None = None,
-    initial_battery_kwh: float | None = None,
-    replacement_price_per_kwh: float | None = None,
-) -> tuple[PlanCostBreakdown, PlanCostBreakdown, str]:
-    """Score two candidate plans and return which one wins.
-
-    The winner is the plan with the lower :attr:`PlanCostBreakdown.score`
-    (selector objective).  When the scores tie within ``1e-9``, the winner
-    is ``"tie"``.
-
-    Args:
-        plan_a: First candidate plan (list of slots).
-        plan_b: Second candidate plan (list of slots).
-        weights: Shared cost weights applied to both plans.
-        slot_duration_hours: Duration of each slot in hours.
-        now: Forwarded to :func:`score_plan`.
-        initial_battery_kwh: Forwarded to :func:`score_plan` to enable
-            terminal-SoC accounting.
-        replacement_price_per_kwh: Forwarded to :func:`score_plan` to enable
-            terminal-SoC accounting.
-
-    Returns:
-        A three-tuple ``(breakdown_a, breakdown_b, winner)`` where
-        ``winner`` is either ``"plan_a"`` or ``"plan_b"`` (the plan with
-        the lower selector score).  ``"tie"`` when both plans are
-        equivalent within floating-point tolerance.
-
-    Examples:
-        >>> bd_a, bd_b, winner = compare_plans(cheap_slots, expensive_slots)
-        >>> winner
-        'plan_a'
-    """
-    bd_a = score_plan(
-        plan_a,
-        weights,
-        slot_duration_hours=slot_duration_hours,
-        now=now,
-        initial_battery_kwh=initial_battery_kwh,
-        replacement_price_per_kwh=replacement_price_per_kwh,
-    )
-    bd_b = score_plan(
-        plan_b,
-        weights,
-        slot_duration_hours=slot_duration_hours,
-        now=now,
-        initial_battery_kwh=initial_battery_kwh,
-        replacement_price_per_kwh=replacement_price_per_kwh,
-    )
-
-    diff = bd_a.score - bd_b.score
-    if abs(diff) < 1e-9:
-        winner = "tie"
-    elif diff < 0:
-        winner = "plan_a"
-    else:
-        winner = "plan_b"
-
-    log_planner(
-        "debug",
-        "[cost] compare_plans  a_score=%.6f  b_score=%.6f  diff=%.6f  winner=%s",
-        bd_a.score,
-        bd_b.score,
-        diff,
-        winner,
-    )
-
-    return bd_a, bd_b, winner

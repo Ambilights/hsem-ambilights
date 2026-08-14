@@ -5,7 +5,7 @@ charge/discharge window, calculate the next occurrence of a window
 start, and determine if an interval ends before a window begins.
 """
 
-from datetime import datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
 
 
 def is_time_in_window(current: time, start: time, end: time) -> bool:
@@ -47,7 +47,7 @@ def next_window_start_dt(now: datetime, window_start: time) -> datetime:
         Timezone-aware datetime of the next occurrence of *window_start*.
     """
     candidate = datetime.combine(now.date(), window_start).replace(tzinfo=now.tzinfo)
-    if candidate <= now:
+    if candidate.astimezone(UTC) <= now.astimezone(UTC):
         candidate += timedelta(days=1)
     return candidate
 
@@ -72,4 +72,6 @@ def interval_ends_before_window_start(
     Returns:
         True if the interval ends before the window starts.
     """
-    return interval_end <= next_window_start_dt(now, window_start)
+    return interval_end.astimezone(UTC) <= next_window_start_dt(
+        now, window_start
+    ).astimezone(UTC)

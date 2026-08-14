@@ -6,6 +6,7 @@ rollups (today, last 7 days, last 30 days, this month, this year).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -168,6 +169,8 @@ class FinancialTracker:
         grid_export_energy_kwh: float | None = None,
         import_price: float = 0.0,
         export_price: float = 0.0,
+        import_price_available: bool = True,
+        export_price_available: bool = True,
     ) -> None:
         """Accumulate import cost and export income from live meter readings.
 
@@ -179,12 +182,18 @@ class FinancialTracker:
             grid_export_energy_kwh: Cumulative grid export meter reading (kWh).
             import_price: Current import spot price (currency/kWh).
             export_price: Current export spot price (currency/kWh).
+            import_price_available: Whether the import price is authoritative.
+            export_price_available: Whether the export price is authoritative.
         """
         # Grid import cost delta.
         if grid_import_energy_kwh is not None:
             if self._last_import_energy_kwh is not None:
                 delta = grid_import_energy_kwh - self._last_import_energy_kwh
-                if delta > 1e-9:
+                if (
+                    delta > 1e-9
+                    and import_price_available
+                    and math.isfinite(import_price)
+                ):
                     self.import_cost_total += delta * import_price
             self._last_import_energy_kwh = grid_import_energy_kwh
 
@@ -192,7 +201,11 @@ class FinancialTracker:
         if grid_export_energy_kwh is not None:
             if self._last_export_energy_kwh is not None:
                 delta = grid_export_energy_kwh - self._last_export_energy_kwh
-                if delta > 1e-9:
+                if (
+                    delta > 1e-9
+                    and export_price_available
+                    and math.isfinite(export_price)
+                ):
                     self.export_income_total += delta * export_price
             self._last_export_energy_kwh = grid_export_energy_kwh
 

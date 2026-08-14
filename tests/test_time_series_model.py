@@ -22,7 +22,7 @@ Timezone under test: ``Europe/Copenhagen``
 from __future__ import annotations
 
 import math
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -33,6 +33,7 @@ from custom_components.hsem.models.time_series import (
     SlotKey,
     SlotMeta,
     TimeSeriesIndex,
+    slot_key_for_datetime,
 )
 
 # ---------------------------------------------------------------------------
@@ -222,6 +223,24 @@ class TestDstTransitions:
 
     # ---- Spring forward: 2024-03-31, 02:00 → 03:00, UTC+1 → UTC+2 -----
 
+    @pytest.mark.parametrize(
+        ("value", "expected_ordinal"),
+        [
+            (_cph(2024, 3, 31, 23, 45), 91),
+            (_cph(2024, 6, 15, 23, 45), 95),
+            (_cph(2024, 10, 27, 23, 45), 99),
+        ],
+    )
+    def test_elapsed_ordinal_tracks_civil_day_length(
+        self, value: datetime, expected_ordinal: int
+    ) -> None:
+        midnight = value.replace(hour=0, minute=0, second=0, microsecond=0, fold=0)
+
+        assert slot_key_for_datetime(value, midnight, 15) == SlotKey(
+            day_offset=0,
+            slot_in_day=expected_ordinal,
+        )
+
     def test_spring_forward_96_slots_15min(self):
         now = _cph(2024, 3, 31, 0)
         tsi = TimeSeriesIndex.from_now(now, interval_minutes=15, horizon_hours=24)
@@ -235,7 +254,17 @@ class TestDstTransitions:
     def test_spring_forward_total_span_24h(self):
         now = _cph(2024, 3, 31, 0)
         tsi = TimeSeriesIndex.from_now(now, interval_minutes=15, horizon_hours=24)
-        assert tsi.slots[-1].end - tsi.slots[0].start == timedelta(hours=24)
+        assert tsi.slots[-1].end.astimezone(UTC) - tsi.slots[0].start.astimezone(
+            UTC
+        ) == timedelta(hours=24)
+
+    def test_spring_forward_skips_nonexistent_hour(self):
+        now = _cph(2024, 3, 31, 0)
+        tsi = TimeSeriesIndex.from_now(now, interval_minutes=15, horizon_hours=24)
+
+        assert not [
+            meta for meta in tsi if meta.start.date() == now.date() and meta.hour == 2
+        ]
 
     def test_spring_forward_all_slots_aware(self):
         now = _cph(2024, 3, 31, 0)
@@ -265,7 +294,30 @@ class TestDstTransitions:
     def test_autumn_fallback_total_span_24h(self):
         now = _cph(2024, 10, 27, 0)
         tsi = TimeSeriesIndex.from_now(now, interval_minutes=15, horizon_hours=24)
-        assert tsi.slots[-1].end - tsi.slots[0].start == timedelta(hours=24)
+        assert tsi.slots[-1].end.astimezone(UTC) - tsi.slots[0].start.astimezone(
+            UTC
+        ) == timedelta(hours=24)
+
+    def test_autumn_fallback_repeated_hour_has_unique_elapsed_ordinals(self):
+        now = _cph(2024, 10, 27, 0)
+        tsi = TimeSeriesIndex.from_now(now, interval_minutes=15, horizon_hours=24)
+
+        repeated = [
+            meta for meta in tsi if meta.start.date() == now.date() and meta.hour == 2
+        ]
+        assert len(repeated) == 8
+        assert [meta.start.fold for meta in repeated] == [0] * 4 + [1] * 4
+        assert [meta.key.slot_in_day for meta in repeated] == list(range(8, 16))
+        assert len({meta.key for meta in repeated}) == 8
+
+    def test_autumn_fallback_slot_index_distinguishes_both_folds(self):
+        now = _cph(2024, 10, 27, 0)
+        tsi = TimeSeriesIndex.from_now(now, interval_minutes=15, horizon_hours=24)
+
+        first = datetime(2024, 10, 27, 2, 30, tzinfo=_TZ, fold=0)
+        second = datetime(2024, 10, 27, 2, 30, tzinfo=_TZ, fold=1)
+        assert tsi.slot_index_for(first) == 10
+        assert tsi.slot_index_for(second) == 14
 
     def test_autumn_fallback_all_slots_aware(self):
         now = _cph(2024, 10, 27, 0)

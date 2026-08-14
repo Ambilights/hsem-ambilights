@@ -16,17 +16,18 @@ Fix (three parts)
 -----------------
 1. ``PricePoint`` gained an optional ``slot_in_day`` field (hour-granular
    callers unaffected).
-2. ``build_planner_input`` appends price points per slot (outside the
-   hourly dedup guard) and sets ``slot_in_day``; consumption averages and
-   Solcast PV stay hour-deduplicated.
+2. ``build_planner_input`` appends price and Solcast points per slot (outside
+   the hourly consumption dedup guard) and sets ``slot_in_day``.
 3. ``populate_prices`` keys by ``(day_offset, slot_in_day)`` when points
-   carry it, with an hourly fallback for uncovered slots.
+   carry it. Only explicitly hour-granular points fan out; a missing quarter
+   must not borrow an adjacent quarter price.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -35,6 +36,7 @@ from custom_components.hsem.models.price_point import PricePoint
 from custom_components.hsem.models.time_series import TimeSeriesIndex
 from custom_components.hsem.planner.slot_population import (
     populate_prices,
+    populate_solcast,
 )
 
 
@@ -105,10 +107,8 @@ class TestSlotInDayPricePoints:
         got = [slots[17 * 4 + q].price.import_price for q in range(4)]
         assert got == pytest.approx([0.179, 0.363, 0.476, 0.603])
 
-    def test_hourly_fallback_for_uncovered_slots(self) -> None:
-        """A point set that only covers slot :00 of each hour (e.g. a
-        60-min source) must still fan out to the remaining quarters via the
-        hourly fallback."""
+    def test_missing_quarter_is_not_filled_from_adjacent_point(self) -> None:
+        """A missing quarter stays unavailable instead of borrowing :00."""
         tsi = _tsi(self.now, hours=24)
         slots = _slots_from_tsi(tsi)
         points = [
@@ -123,9 +123,46 @@ class TestSlotInDayPricePoints:
         ]
         populate_prices(slots, points, tsi=tsi)
 
-        for i, slot in enumerate(slots):
-            hour = i // 4
-            assert slot.price.import_price == pytest.approx(0.10 + hour * 0.01)
+        for hour in range(24):
+            exact = slots[hour * 4]
+            assert exact.price.import_price == pytest.approx(0.10 + hour * 0.01)
+            assert exact.price_actionable is True
+            for quarter in range(1, 4):
+                missing = slots[hour * 4 + quarter]
+                assert missing.price.import_price == 0.0
+                assert missing.import_price_available is False
+                assert missing.export_price_available is False
+                assert missing.price_actionable is False
+
+    def test_explicit_unavailable_zero_is_missing_but_published_zero_is_actionable(
+        self,
+    ) -> None:
+        """Availability preserves the semantic difference between two zeros."""
+        tsi = _tsi(self.now, hours=24)
+        slots = _slots_from_tsi(tsi)
+        points = [
+            PricePoint(
+                hour=0,
+                import_price=0.0,
+                export_price=0.0,
+                day_offset=0,
+                slot_in_day=0,
+            ),
+            PricePoint(
+                hour=0,
+                import_price=0.0,
+                export_price=0.0,
+                day_offset=0,
+                slot_in_day=1,
+                import_price_available=False,
+                export_price_available=False,
+            ),
+        ]
+        populate_prices(slots, points, tsi=tsi)
+
+        assert slots[0].price_actionable is True
+        assert slots[1].price_actionable is False
+        assert tsi.slots[1].key in tsi.missing_price_slots
 
     def test_legacy_hourly_points_unchanged(self) -> None:
         """Points without slot_in_day use the existing hourly path."""
@@ -204,7 +241,7 @@ class TestBuildPlannerInputSlotInDay:
 
         assert len(inp.price_points) == 192
         assert len(inp.consumption_averages) == 48  # still hour-deduplicated
-        assert len(inp.solcast_slots) == 48
+        assert len(inp.solcast_slots) == 192
 
         # Distinct quarter-hourly prices must survive with distinct slot_in_day.
         slot_keys = {(pp.day_offset, pp.slot_in_day) for pp in inp.price_points}
@@ -214,3 +251,148 @@ class TestBuildPlannerInputSlotInDay:
         first_hour = [pp for pp in inp.price_points if pp.day_offset == 0][:4]
         prices = [pp.import_price for pp in first_hour]
         assert len(set(prices)) == 4
+
+    def test_fallback_hour_keeps_both_folds_and_timezone_name(self) -> None:
+        from custom_components.hsem.coordinator_builder import build_planner_input
+        from custom_components.hsem.models.hourly_recommendation import (
+            HourlyRecommendation,
+        )
+        from custom_components.hsem.models.live_state import LiveState
+        from custom_components.hsem.models.sensor_config import SensorConfig
+
+        stockholm = ZoneInfo("Europe/Stockholm")
+        midnight = datetime(2026, 10, 25, 0, 0, tzinfo=stockholm)
+        midnight_utc = midnight.astimezone(UTC)
+        cfg = SensorConfig()
+        cfg.recommendation_interval_minutes = 15
+        cfg.recommendation_interval_length = 5
+        cfg.electricity_price_update_interval = 15
+
+        recs = []
+        for i in range(20):
+            start = (midnight_utc + timedelta(minutes=15 * i)).astimezone(stockholm)
+            end = (midnight_utc + timedelta(minutes=15 * (i + 1))).astimezone(stockholm)
+            recs.append(
+                HourlyRecommendation(
+                    start=start,
+                    end=end,
+                    recommendation="idle",
+                    avg_house_consumption_kwh=0.1,
+                    avg_house_consumption_1d_kwh=0.1,
+                    avg_house_consumption_3d_kwh=0.1,
+                    avg_house_consumption_7d_kwh=0.1,
+                    avg_house_consumption_14d_kwh=0.1,
+                    batteries_charged_kwh=0.0,
+                    batteries_discharged_kwh=0.0,
+                    estimated_battery_capacity_kwh=0.0,
+                    estimated_battery_soc_pct=0.0,
+                    estimated_cost_currency=0.0,
+                    estimated_net_consumption_kwh=0.0,
+                    export_price=round(0.05 + i * 0.001, 5),
+                    grid_export_kwh=0.0,
+                    grid_import_kwh=0.0,
+                    import_price=round(0.10 + i * 0.001, 5),
+                    solcast_pv_estimate_kwh=round(0.20 + i * 0.01, 3),
+                    solcast_pv_estimate_available=True,
+                )
+            )
+
+        with patch(
+            "custom_components.hsem.coordinator_builder.hsem_now",
+            return_value=midnight,
+        ):
+            inp = build_planner_input(
+                cfg=cfg,
+                live=LiveState(),
+                hourly_recommendations=recs,
+                batteries_schedules=[],
+                previous_winner_name=None,
+                previous_winner_score=0.0,
+            )
+
+        assert inp.timezone_name == "Europe/Stockholm"
+        assert len(inp.price_points) == 20
+        assert [point.slot_in_day for point in inp.price_points] == list(range(20))
+        assert (
+            len({(point.day_offset, point.slot_in_day) for point in inp.price_points})
+            == 20
+        )
+        repeated_points = [point for point in inp.price_points if point.hour == 2]
+        assert len(repeated_points) == 8
+        assert [point.slot_in_day for point in repeated_points] == list(range(8, 16))
+        assert len({point.import_price for point in repeated_points}) == 8
+
+        repeated_solcast = [point for point in inp.solcast_slots if point.hour == 2]
+        assert len(repeated_solcast) == 8
+        assert [point.slot_in_day for point in repeated_solcast] == list(range(8, 16))
+
+        tsi = TimeSeriesIndex.from_now(midnight, interval_minutes=15, horizon_hours=5)
+        planned_slots = _slots_from_tsi(tsi)
+        populate_solcast(planned_slots, inp.solcast_slots, 15, tsi=tsi)
+        repeated_planned = [slot for slot in planned_slots if slot.start.hour == 2]
+        assert [slot.start.fold for slot in repeated_planned] == [0] * 4 + [1] * 4
+        assert [slot.solcast_pv_estimate_kwh for slot in repeated_planned] == [
+            rec.solcast_pv_estimate_kwh for rec in recs[8:16]
+        ]
+
+    def test_solcast_availability_survives_builder_and_population(self) -> None:
+        from custom_components.hsem.coordinator_builder import build_planner_input
+        from custom_components.hsem.models.hourly_recommendation import (
+            HourlyRecommendation,
+        )
+        from custom_components.hsem.models.live_state import LiveState
+        from custom_components.hsem.models.sensor_config import SensorConfig
+
+        base = datetime(2026, 8, 9, 0, 0, tzinfo=UTC)
+        cfg = SensorConfig()
+        cfg.recommendation_interval_minutes = 15
+        cfg.recommendation_interval_length = 2
+        cfg.electricity_price_update_interval = 15
+        recs = []
+        for i in range(8):
+            start = base + timedelta(minutes=15 * i)
+            recs.append(
+                HourlyRecommendation(
+                    start=start,
+                    end=start + timedelta(minutes=15),
+                    recommendation="idle",
+                    avg_house_consumption_kwh=0.1,
+                    avg_house_consumption_1d_kwh=0.1,
+                    avg_house_consumption_3d_kwh=0.1,
+                    avg_house_consumption_7d_kwh=0.1,
+                    avg_house_consumption_14d_kwh=0.1,
+                    batteries_charged_kwh=0.0,
+                    batteries_discharged_kwh=0.0,
+                    estimated_battery_capacity_kwh=0.0,
+                    estimated_battery_soc_pct=0.0,
+                    estimated_cost_currency=0.0,
+                    estimated_net_consumption_kwh=0.0,
+                    export_price=0.1,
+                    grid_export_kwh=0.0,
+                    grid_import_kwh=0.0,
+                    import_price=0.2,
+                    solcast_pv_estimate_kwh=0.0,
+                    solcast_pv_estimate_available=i < 4,
+                )
+            )
+
+        with patch(
+            "custom_components.hsem.coordinator_builder.hsem_now",
+            return_value=base,
+        ):
+            inp = build_planner_input(
+                cfg=cfg,
+                live=LiveState(),
+                hourly_recommendations=recs,
+                batteries_schedules=[],
+                previous_winner_name=None,
+                previous_winner_score=0.0,
+            )
+
+        tsi = TimeSeriesIndex.from_now(base, interval_minutes=15, horizon_hours=2)
+        planned_slots = _slots_from_tsi(tsi)
+        populate_solcast(planned_slots, inp.solcast_slots, 15, tsi=tsi)
+
+        assert [slot.solcast_pv_estimate_kwh for slot in planned_slots] == [0.0] * 8
+        assert tsi.missing_future_day_pv_hours(0) == {1}
+        assert {key.slot_in_day for key in tsi.missing_pv_slots} == {4, 5, 6, 7}

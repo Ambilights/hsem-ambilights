@@ -25,8 +25,8 @@ of three states:
 
 | Mode | Writes allowed | Meaning |
 |---|---|---|
-| `OK` | ✅ Yes | All required entities are present and readable |
-| `Degraded` | ✅ Yes (with warnings) | Non-critical data missing (e.g. tomorrow's prices) |
+| `OK` | ✅ Yes | All required control/telemetry entities are present and readable |
+| `Degraded` | ✅ Yes (with warnings) | A non-critical live control/telemetry entity is missing |
 | `Error` | ❌ Blocked | Critical data missing — hardware writes are **blocked** |
 
 ### Critical entities (trigger `Error` mode)
@@ -44,10 +44,20 @@ If any of these entity labels appear in the missing-entities list, writes are bl
 All other missing entities produce `Degraded` mode. The plan is computed and
 applied, but warnings are logged and surfaced in `data_quality`.
 
-Examples:
-- Tomorrow's price/PV forecast gaps
-- EV charger states
-- Export price sensor
+Examples include optional EV charger states. Price/PV forecast gaps are not
+added to the live missing-entity list: they are represented by explicit
+per-slot availability and `data_quality` instead.
+
+### Price-source outages
+
+An unavailable import/export price source does not skip the planner or enter
+`Error` mode. Missing numeric fields remain `0.0` for display compatibility,
+but are non-actionable. At the first unavailable slot the economic horizon
+closes and automatic primary storage is held (TOU, zero discharge cap, no
+charge/discharge); controlled secondary storage uses Utility. A current-slot
+outage publishes that Hold directly even if another input prevents a solve.
+Explicit user force mode remains higher authority. The inverter export-control
+path makes no new price-driven write and retains its last verified limit.
 
 ### Classification logic
 
@@ -129,7 +139,7 @@ planner output with live sensor readings:
 
 | Priority | Condition | Action |
 |---|---|---|
-| 1 (highest) | Live import price < 0 | → `force_export` (overrides everything) |
+| 1 (highest) | Current slot actionable and available live import price < 0 | → `force_export` (overrides lower priorities) |
 | 2 | Current recommendation = `batteries_charge_grid` | Kept (never overridden) |
 | 3 | Any EV actively charging | → `ev_smart_charging` |
 | 4 | Battery energy > remaining schedule need | → `batteries_discharge_mode` |
@@ -138,9 +148,11 @@ planner output with live sensor readings:
 ### Protection rules
 
 - `batteries_charge_grid` is **never** overridden by the runtime resolver
-- `force_export` (negative price) always beats EV charging
+- `force_export` from a published, actionable negative price always beats EV charging
 - The resolver reads live sensor data that was unavailable at planning time
   (actual inverter working mode, real-time EV charge state)
+- A `primary_battery_hold` survives an `ev_smart_charging` display relabel;
+  EV V2H force-max cannot turn an unknown-price Hold into discharge
 
 ---
 

@@ -29,7 +29,7 @@ Usage
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 PLANNED_ENERGY_ROUNDING_KWH = 0.001
 
@@ -122,6 +122,8 @@ def slot_duration_hours(slot_start: datetime, slot_end: datetime) -> float:
     Returns:
         Slot duration in hours (h).
     """
+    if slot_start.tzinfo is not None and slot_end.tzinfo is not None:
+        return timedelta_to_hours(slot_end.astimezone(UTC) - slot_start.astimezone(UTC))
     return timedelta_to_hours(slot_end - slot_start)
 
 
@@ -138,7 +140,11 @@ def hours_ahead(now: datetime, future_time: datetime) -> float:
     Returns:
         Non-negative hours ahead.
     """
-    return max(timedelta_to_hours(future_time - now), 0.0)
+    if now.tzinfo is not None and future_time.tzinfo is not None:
+        delta = future_time.astimezone(UTC) - now.astimezone(UTC)
+    else:
+        delta = future_time - now
+    return max(timedelta_to_hours(delta), 0.0)
 
 
 # ---------------------------------------------------------------------------

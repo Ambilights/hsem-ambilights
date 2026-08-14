@@ -14,9 +14,9 @@ Timezone under test: ``Europe/Copenhagen``
 
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pytest
 
@@ -53,6 +53,11 @@ def _cph_fold(year: int, month: int, day: int, hour: int, minute: int = 0) -> da
     return datetime(year, month, day, hour, minute, fold=1, tzinfo=_TZ_CPH)
 
 
+def _parse_cph(value: str) -> datetime:
+    """Parse an ISO instant and restore Copenhagen's transition rules."""
+    return _parse_now(value, _TZ_CPH.key)
+
+
 # ---------------------------------------------------------------------------
 # 1. _parse_now: accepts timezone-aware ISO strings with DST offsets
 # ---------------------------------------------------------------------------
@@ -84,6 +89,25 @@ class TestParseNowDst:
         dt = _parse_now("2024-10-27T02:30:00+01:00")
         assert dt.tzinfo is not None
         assert dt.utcoffset() == timedelta(hours=1)
+
+    @pytest.mark.parametrize(
+        ("now_iso", "expected_fold"),
+        [
+            ("2024-10-27T02:30:00+02:00", 0),
+            ("2024-10-27T02:30:00+01:00", 1),
+        ],
+    )
+    def test_timezone_name_rehydrates_both_folds(
+        self, now_iso: str, expected_fold: int
+    ) -> None:
+        dt = _parse_now(now_iso, _TZ_CPH.key)
+
+        assert dt.tzinfo is _TZ_CPH
+        assert dt.fold == expected_fold
+
+    def test_invalid_timezone_name_raises(self) -> None:
+        with pytest.raises(ZoneInfoNotFoundError):
+            _parse_now("2024-10-27T02:30:00+02:00", "Invalid/HSEM")
 
     def test_naive_string_raises(self):
         """A naive ISO-8601 string must raise ValueError."""
@@ -126,20 +150,20 @@ class TestBuildSlotsDst:
     def test_spring_forward_produces_24_slots(self):
         """Planning from midnight on spring-forward day → 24 one-hour slots."""
         # Midnight UTC+1 (before the spring-forward at 02:00)
-        now = _parse_now("2024-03-31T00:00:00+01:00")
+        now = _parse_now("2024-03-31T00:00:00+01:00", _TZ_CPH.key)
         slots = build_slots(self._make_input_stub(), now)
         assert len(slots) == 24, f"Expected 24 slots, got {len(slots)}"
 
     def test_autumn_fallback_produces_24_slots(self):
         """Planning from midnight on autumn-fallback day → 24 one-hour slots."""
         # Midnight UTC+2 (before the autumn fallback at 03:00 → 02:00)
-        now = _parse_now("2024-10-27T00:00:00+02:00")
+        now = _parse_now("2024-10-27T00:00:00+02:00", _TZ_CPH.key)
         slots = build_slots(self._make_input_stub(), now)
         assert len(slots) == 24, f"Expected 24 slots, got {len(slots)}"
 
     def test_spring_forward_all_slots_are_aware(self):
         """Every slot start/end must be timezone-aware on spring-forward day."""
-        now = _parse_now("2024-03-31T00:00:00+01:00")
+        now = _parse_now("2024-03-31T00:00:00+01:00", _TZ_CPH.key)
         slots = build_slots(self._make_input_stub(), now)
         for slot in slots:
             assert slot.start.tzinfo is not None, f"slot.start is naive: {slot.start}"
@@ -147,7 +171,7 @@ class TestBuildSlotsDst:
 
     def test_autumn_fallback_all_slots_are_aware(self):
         """Every slot start/end must be timezone-aware on autumn-fallback day."""
-        now = _parse_now("2024-10-27T00:00:00+02:00")
+        now = _parse_now("2024-10-27T00:00:00+02:00", _TZ_CPH.key)
         slots = build_slots(self._make_input_stub(), now)
         for slot in slots:
             assert slot.start.tzinfo is not None, f"slot.start is naive: {slot.start}"
@@ -155,7 +179,7 @@ class TestBuildSlotsDst:
 
     def test_spring_forward_slots_are_contiguous(self):
         """Slots must be gapless and non-overlapping on spring-forward day."""
-        now = _parse_now("2024-03-31T00:00:00+01:00")
+        now = _parse_now("2024-03-31T00:00:00+01:00", _TZ_CPH.key)
         slots = build_slots(self._make_input_stub(), now)
         for a, b in zip(slots, slots[1:]):
             assert a.end == b.start, (
@@ -164,7 +188,7 @@ class TestBuildSlotsDst:
 
     def test_autumn_fallback_slots_are_contiguous(self):
         """Slots must be gapless and non-overlapping on autumn-fallback day."""
-        now = _parse_now("2024-10-27T00:00:00+02:00")
+        now = _parse_now("2024-10-27T00:00:00+02:00", _TZ_CPH.key)
         slots = build_slots(self._make_input_stub(), now)
         for a, b in zip(slots, slots[1:]):
             assert a.end == b.start, (
@@ -173,16 +197,16 @@ class TestBuildSlotsDst:
 
     def test_spring_forward_slot_span_equals_24_hours(self):
         """Total duration of all slots on spring-forward day must be 24 hours."""
-        now = _parse_now("2024-03-31T00:00:00+01:00")
+        now = _parse_now("2024-03-31T00:00:00+01:00", _TZ_CPH.key)
         slots = build_slots(self._make_input_stub(), now)
-        total = slots[-1].end - slots[0].start
+        total = slots[-1].end.astimezone(UTC) - slots[0].start.astimezone(UTC)
         assert total == timedelta(hours=24)
 
     def test_autumn_fallback_slot_span_equals_24_hours(self):
         """Total duration of all slots on autumn-fallback day must be 24 hours."""
-        now = _parse_now("2024-10-27T00:00:00+02:00")
+        now = _parse_now("2024-10-27T00:00:00+02:00", _TZ_CPH.key)
         slots = build_slots(self._make_input_stub(), now)
-        total = slots[-1].end - slots[0].start
+        total = slots[-1].end.astimezone(UTC) - slots[0].start.astimezone(UTC)
         assert total == timedelta(hours=24)
 
 
@@ -197,9 +221,9 @@ class TestNextWindowStartDstForward:
     def test_window_before_gap_is_in_future(self):
         """A 01:00 window resolved from 00:30 on spring-forward day is in the future."""
         # It is currently 00:30 UTC+1 on spring-forward day
-        now = _parse_now("2024-03-31T00:30:00+01:00")
+        now = _parse_cph("2024-03-31T00:30:00+01:00")
         result = next_window_start_dt(now, time(1, 0))
-        assert result > now, f"Expected result > now, got {result!r} <= {now!r}"
+        assert result.astimezone(UTC) > now.astimezone(UTC)
 
     def test_window_in_dst_gap_resolves_to_next_day(self):
         """A window at 02:30 on spring-forward day (non-existent wall time) is skipped.
@@ -208,16 +232,16 @@ class TestNextWindowStartDstForward:
         the 02:30 target is in the past, so next_window_start_dt must return tomorrow.
         """
         # It is 03:30 UTC+2 (after the spring-forward)
-        now = _parse_now("2024-03-31T03:30:00+02:00")
+        now = _parse_cph("2024-03-31T03:30:00+02:00")
         result = next_window_start_dt(now, time(2, 30))
         # The result must be strictly in the future relative to now
-        assert result > now, f"Expected result > now, got {result!r} <= {now!r}"
+        assert result.astimezone(UTC) > now.astimezone(UTC)
 
     def test_window_after_gap_is_same_day(self):
         """A 04:00 window resolved from 00:30 on spring-forward day is later today."""
-        now = _parse_now("2024-03-31T00:30:00+01:00")
+        now = _parse_cph("2024-03-31T00:30:00+01:00")
         result = next_window_start_dt(now, time(4, 0))
-        assert result > now
+        assert result.astimezone(UTC) > now.astimezone(UTC)
         # Must be on the same calendar date (still 2024-03-31)
         assert result.date() == now.date()
 
@@ -227,32 +251,32 @@ class TestNextWindowStartDstFallback:
 
     def test_window_before_fold_is_in_future(self):
         """A 01:00 window resolved from 00:30 on autumn-fallback day is in the future."""
-        now = _parse_now("2024-10-27T00:30:00+02:00")
+        now = _parse_cph("2024-10-27T00:30:00+02:00")
         result = next_window_start_dt(now, time(1, 0))
-        assert result > now
+        assert result.astimezone(UTC) > now.astimezone(UTC)
 
     def test_window_in_folded_hour_resolved_after_now(self):
         """A window at 02:30 on autumn-fallback day is resolved correctly.
 
         When it is currently 01:00 UTC+2 (before the fold), 02:30 is in the future.
         """
-        now = _parse_now("2024-10-27T01:00:00+02:00")
+        now = _parse_cph("2024-10-27T01:00:00+02:00")
         result = next_window_start_dt(now, time(2, 30))
-        assert result > now
+        assert result.astimezone(UTC) > now.astimezone(UTC)
 
     def test_window_after_fold_is_future(self):
         """A 04:00 window resolved from 00:30 UTC+2 on autumn-fallback day is in future."""
-        now = _parse_now("2024-10-27T00:30:00+02:00")
+        now = _parse_cph("2024-10-27T00:30:00+02:00")
         result = next_window_start_dt(now, time(4, 0))
-        assert result > now
+        assert result.astimezone(UTC) > now.astimezone(UTC)
         assert result.date() == now.date()
 
     def test_window_already_passed_goes_to_next_day(self):
         """A 01:00 window resolved when it is already 02:00 (post-fold) advances by 1 day."""
         # After the fold at 03:00 → 02:00, it is now 02:30 UTC+1 (fold=1)
-        now = _parse_now("2024-10-27T02:30:00+01:00")
+        now = _parse_cph("2024-10-27T02:30:00+01:00")
         result = next_window_start_dt(now, time(1, 0))
-        assert result > now
+        assert result.astimezone(UTC) > now.astimezone(UTC)
         # Must have advanced to the next calendar day
         assert result.date() > now.date()
 
@@ -267,9 +291,9 @@ class TestIntervalEndsDst:
 
     def test_spring_forward_interval_before_gap(self):
         """An interval ending at 01:30 is before a 03:00 window on spring-forward day."""
-        now = _parse_now("2024-03-31T00:00:00+01:00")
+        now = _parse_cph("2024-03-31T00:00:00+01:00")
         # Interval ends at 01:30 UTC+1
-        interval_end = _parse_now("2024-03-31T01:30:00+01:00")
+        interval_end = _parse_cph("2024-03-31T01:30:00+01:00")
         # Window starts at 03:00 (wall clock — UTC+2 after the spring-forward)
         assert interval_ends_before_window_start(interval_end, time(3, 0), now)
 
@@ -281,15 +305,15 @@ class TestIntervalEndsDst:
         An interval ending at 04:00 *today* ends before 03:00 *tomorrow*, so
         the function correctly returns ``True``.
         """
-        now = _parse_now("2024-03-31T03:30:00+02:00")
-        interval_end = _parse_now("2024-03-31T04:00:00+02:00")
+        now = _parse_cph("2024-03-31T03:30:00+02:00")
+        interval_end = _parse_cph("2024-03-31T04:00:00+02:00")
         # 04:00 today < 03:00 tomorrow → interval ends before the (next-day) window
         assert interval_ends_before_window_start(interval_end, time(3, 0), now)
 
     def test_autumn_fallback_interval_before_fold(self):
         """An interval ending at 01:30 UTC+2 is before a 03:00 window on fallback day."""
-        now = _parse_now("2024-10-27T00:00:00+02:00")
-        interval_end = _parse_now("2024-10-27T01:30:00+02:00")
+        now = _parse_cph("2024-10-27T00:00:00+02:00")
+        interval_end = _parse_cph("2024-10-27T01:30:00+02:00")
         assert interval_ends_before_window_start(interval_end, time(3, 0), now)
 
     def test_autumn_fallback_interval_after_fold(self):
@@ -299,8 +323,8 @@ class TestIntervalEndsDst:
         already passed today (03:00 == now's day, rolled to next-day).  An
         interval ending at 04:00 today ends before 03:00 tomorrow.
         """
-        now = _parse_now("2024-10-27T03:30:00+01:00")
-        interval_end = _parse_now("2024-10-27T04:00:00+01:00")
+        now = _parse_cph("2024-10-27T03:30:00+01:00")
+        interval_end = _parse_cph("2024-10-27T04:00:00+01:00")
         # 04:00 today < 03:00 tomorrow → interval ends before the (next-day) window
         assert interval_ends_before_window_start(interval_end, time(3, 0), now)
 
@@ -347,6 +371,7 @@ class TestPlannerRunsDstDays:
         ]
         return PlannerInput(
             now_iso=now_iso,
+            timezone_name=_TZ_CPH.key,
             interval_minutes=60,
             interval_length_hours=24,
             battery_soc_pct=50.0,
@@ -394,6 +419,7 @@ class TestPlannerRunsDstDays:
         for slot in result.slots:
             assert slot.start.tzinfo is not None, f"slot.start is naive: {slot.start}"
             assert slot.end.tzinfo is not None, f"slot.end is naive: {slot.end}"
+        assert not [slot for slot in result.slots if slot.start.hour == 2]
 
     def test_autumn_fallback_all_output_slots_are_aware(self):
         """All output slots from an autumn-fallback run must have timezone-aware datetimes."""
@@ -403,3 +429,6 @@ class TestPlannerRunsDstDays:
         for slot in result.slots:
             assert slot.start.tzinfo is not None, f"slot.start is naive: {slot.start}"
             assert slot.end.tzinfo is not None, f"slot.end is naive: {slot.end}"
+        repeated = [slot for slot in result.slots if slot.start.hour == 2]
+        assert len(repeated) == 2
+        assert [slot.start.fold for slot in repeated] == [0, 1]

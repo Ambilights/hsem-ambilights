@@ -19,13 +19,26 @@ class TestComputeWeightedAverage:
     def test_equal_values_returns_same(self):
         """When all windows have the same value, the weighted average is very close to that value.
 
-        Reliability scaling slightly dampens weights when all windows agree (rel factors
-        approach 1 but not exactly), so the result may be fractionally below the input.
+        Equal inputs remain equal after applying the configured weights.
         """
         result, mask = _compute_weighted_average(1.0, 1.0, 1.0, 1.0, 50, 20, 15, 10)
         # Should be within 10% of the input value
         assert result == pytest.approx(1.0, rel=0.1)
         assert mask == [False, False, False, False]
+
+    def test_duplicate_thin_7d_14d_do_not_gain_false_reliability(self):
+        """Overlapping equal long windows retain their configured 45% share.
+
+        With thin history the 7d and 14d sensors can contain the same source
+        days. Their equality is not independent corroboration and must not
+        inflate their combined effective share to the former ~88--93%.
+        """
+        result, mask = _compute_weighted_average(1.4, 1.3, 1.0, 1.0, 25, 30, 30, 15)
+        assert mask == [False, False, False, False]
+        # The existing safety caps reduce 1d/3d to 1.20/1.15. Applying the
+        # configured 25/30/30/15 weights then gives exactly 1.095; the
+        # duplicated long windows keep their configured 45% combined share.
+        assert result == pytest.approx(1.095, abs=0.001)
 
     def test_all_zero_values_returns_zero(self):
         result, mask = _compute_weighted_average(0.0, 0.0, 0.0, 0.0, 50, 20, 15, 10)

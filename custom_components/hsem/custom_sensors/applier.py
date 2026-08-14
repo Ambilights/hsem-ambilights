@@ -31,9 +31,11 @@ to Home Assistant.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from typing import Any
 
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
@@ -391,6 +393,12 @@ def _desired_battery_discharge_cap_w(
     if recommendation == Recommendations.ForceExport.value:
         return 0, "PV-only fully-fed export"
 
+    if rec.primary_battery_hold:
+        # Price authority and the selected plan require the primary battery to
+        # remain idle.  Preserve explicit user force labels above, but do not
+        # let an EV/V2H runtime relabel turn a conservative hold into discharge.
+        return 0, "planned battery hold"
+
     if recommendation == Recommendations.EVSmartCharging.value and (
         live.ev.force_max_discharge_power or live.ev_second.force_max_discharge_power
     ):
@@ -403,12 +411,6 @@ def _desired_battery_discharge_cap_w(
             ),
             "EV V2H override",
         )
-
-    if rec.primary_battery_hold:
-        # The MILP explicitly allocated no primary-battery discharge. This
-        # intent must also survive an EV display relabel: the live-EV branch
-        # below otherwise derives a non-zero cap from historical house load.
-        return 0, "planned battery hold"
 
     planned_discharge_kwh = float(getattr(rec, "batteries_discharged_kwh", 0.0) or 0.0)
     planned_grid_import_kwh = float(getattr(rec, "grid_import_kwh", 0.0) or 0.0)
@@ -436,9 +438,14 @@ def _desired_battery_discharge_cap_w(
 
     if live.any_ev_charging:
         slot_hours = slot_duration_hours(rec.start, rec.end)
+        historical_kwh = float(
+            getattr(rec, "historical_avg_house_consumption_kwh", 0.0)
+            or rec.avg_house_consumption_kwh
+            or 0.0
+        )
         historical_w = (
-            int(rec.avg_house_consumption_kwh / slot_hours * 1000.0)
-            if slot_hours > 1e-9 and rec.avg_house_consumption_kwh > 1e-9
+            int(historical_kwh / slot_hours * 1000.0)
+            if slot_hours > 1e-9 and historical_kwh > 1e-9
             else 0
         )
         live_net_w = live.net_consumption_w
@@ -452,7 +459,7 @@ def _desired_battery_discharge_cap_w(
                 rec.avg_house_consumption_3d_kwh,
                 rec.avg_house_consumption_7d_kwh,
                 rec.avg_house_consumption_14d_kwh,
-                rec.avg_house_consumption_kwh,
+                historical_kwh,
             )
             if window_kwh > 1e-9 and slot_hours > 1e-9
         ]
@@ -524,10 +531,43 @@ def _should_force_export_for_ev(
     return False
 
 
+def desired_inverter_export_control(
+    cfg: SensorConfig,
+    live: LiveState,
+    rec: HourlyRecommendation | None,
+) -> tuple[str, int] | None:
+    """Return the quantized inverter export command, or ``None`` if unknown."""
+    if (
+        rec is None
+        or not rec.price_actionable
+        or not rec.export_price_available
+        or not live.export_electricity_price_available
+    ):
+        return None
+    export_price = live.export_electricity_price
+    min_price = cfg.export_electricity_min_price
+    if not isinstance(export_price, (int, float)) or not isinstance(
+        min_price, (int, float)
+    ):
+        return None
+    if not math.isfinite(float(export_price)) or not math.isfinite(float(min_price)):
+        return None
+
+    export_pct = 100 if export_price >= min_price else 0
+    if export_pct == 0 and _should_force_export_for_ev(live.ev, cfg.ev, live):
+        export_pct = 100
+    if export_pct == 0 and _should_force_export_for_ev(
+        live.ev_second, cfg.ev_second, live
+    ):
+        export_pct = 100
+    return ("pct", 100) if export_pct else ("watt", GRID_EXPORT_LIMIT_WATT)
+
+
 async def async_apply_inverter_power_control(
     sensor: Any,  # NOSONAR -- HA internal type; circular import risk
     cfg: SensorConfig,
     live: LiveState,
+    rec: HourlyRecommendation | None,
 ) -> CycleApplySummary:
     """Set the grid-export power percentage on all inverters.
 
@@ -550,6 +590,7 @@ async def async_apply_inverter_power_control(
         sensor: ``HSEMWorkingModeSensor`` instance for HA access and logging.
         cfg: Current sensor configuration.
         live: Live state snapshot (prices, EV states, inverter control state).
+        rec: Current resolved recommendation carrying populated price authority.
 
     Returns:
         :class:`CycleApplySummary` with one :class:`ApplyResult` per inverter
@@ -567,32 +608,26 @@ async def async_apply_inverter_power_control(
         )
         return summary
 
-    export_price = live.export_electricity_price
-    min_price = cfg.export_electricity_min_price
-
-    if not isinstance(export_price, (int, float)):
+    desired_control = desired_inverter_export_control(cfg, live, rec)
+    if desired_control is None:
+        _LOGGER.debug(
+            "async_apply_inverter_power_control: skipped — current export price "
+            "is not actionable"
+        )
         return summary
-    if not isinstance(min_price, (int, float)):
-        return summary
-
-    export_pct = 100 if export_price >= min_price else 0
-
-    # Allow export if EV is connected and needs charging
-    if export_pct == 0 and _should_force_export_for_ev(live.ev, cfg.ev, live):
-        export_pct = 100
-    if export_pct == 0 and _should_force_export_for_ev(
-        live.ev_second, cfg.ev_second, live
-    ):
-        export_pct = 100
+    control_kind, control_value = desired_control
+    export_pct = 100 if control_kind == "pct" else 0
 
     _LOGGER.debug(
         f"Determined export power percentage: {export_pct}% "
-        f"(export={export_price}, min={min_price}, "
+        f"(export={live.export_electricity_price}, "
+        f"min={cfg.export_electricity_min_price}, "
         f"ev1_connected={live.ev.is_connected}, ev2_connected={live.ev_second.is_connected})",
     )
 
-    current_pct = _parse_power_control_pct(live.huawei_inverter_active_power_control)
-    current_is_watt = _is_watt_limit(live.huawei_inverter_active_power_control)
+    current_control = _parse_power_control_command(
+        live.huawei_inverter_active_power_control
+    )
 
     for inv_id in [
         cfg.huawei_solar_device_id_inverter_1,
@@ -602,7 +637,7 @@ async def async_apply_inverter_power_control(
             continue
 
         inv_entity = cfg.huawei_solar_inverter_active_power_control
-        reader_fn = lambda inv=inv_entity: _parse_power_control_pct(
+        reader_fn = lambda inv=inv_entity: _parse_power_control_command(
             sensor.hass.states.get(inv).state
             if inv and sensor.hass.states.get(inv) is not None
             else None
@@ -610,33 +645,34 @@ async def async_apply_inverter_power_control(
 
         if export_pct == 0:
             # Block export → set a soft floor at GRID_EXPORT_LIMIT_WATT.
-            desired = GRID_EXPORT_LIMIT_WATT
-            if current_pct is not None and current_is_watt and current_pct == desired:
+            if current_control == desired_control:
                 continue  # already at the watt limit
 
             result = await async_write_and_verify(
                 entity_id=inv_entity or f"inverter:{inv_id}",
-                desired=desired,
-                writer=lambda _id=inv_id, _w=desired: async_set_grid_export_power_watt(  # type: ignore[misc]  # mypy cannot infer lambda types with default parameters
-                    sensor, _id, _w
+                desired=desired_control,
+                writer=partial(
+                    async_set_grid_export_power_watt,
+                    sensor,
+                    inv_id,
+                    control_value,
                 ),
                 reader=reader_fn,
                 backoff=get_write_failure_backoff(sensor),
             )
         else:
             # export_pct == 100 — Allow full export.
-            if (
-                current_pct is not None
-                and not current_is_watt
-                and current_pct == export_pct
-            ):
+            if current_control == desired_control:
                 continue  # already at unlimited / 100 %
 
             result = await async_write_and_verify(
                 entity_id=inv_entity or f"inverter:{inv_id}",
-                desired=export_pct,
-                writer=lambda _id=inv_id, _pct=export_pct: (  # type: ignore[misc]  # mypy cannot infer lambda types with default parameters
-                    async_set_grid_export_power_pct(sensor, _id, _pct)
+                desired=desired_control,
+                writer=partial(
+                    async_set_grid_export_power_pct,
+                    sensor,
+                    inv_id,
+                    control_value,
                 ),
                 reader=reader_fn,
                 backoff=get_write_failure_backoff(sensor),
@@ -765,7 +801,10 @@ async def async_apply_battery_settings(
             working_mode = WorkingModes.TimeOfUse.value
 
         case Recommendations.EVSmartCharging.value:
-            if (
+            if rec.primary_battery_hold:
+                tou_modes = DEFAULT_HSEM_EV_CHARGER_TOU_MODES
+                working_mode = WorkingModes.TimeOfUse.value
+            elif (
                 live.ev.force_max_discharge_power
                 or live.ev_second.force_max_discharge_power
             ):
@@ -1148,6 +1187,20 @@ def _parse_power_control_pct(state: str | None) -> int | None:
         except ValueError, TypeError:
             pass
     return None
+
+
+def _parse_power_control_command(state: str | None) -> tuple[str, int] | None:
+    """Parse both the unit and value of an inverter export-control state.
+
+    Huawei uses the numeric value ``100`` for two materially different
+    controls: unrestricted/100 percent output and a 100 watt export limit.
+    Keeping the unit in the read-back identity prevents the generic verifier
+    from treating a required unit transition as already satisfied.
+    """
+    value = _parse_power_control_pct(state)
+    if value is None:
+        return None
+    return ("watt" if _is_watt_limit(state) else "pct", value)
 
 
 def _is_watt_limit(state: str | None) -> bool:

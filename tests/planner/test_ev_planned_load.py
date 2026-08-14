@@ -21,6 +21,7 @@ import pytest
 from custom_components.hsem.models.hourly_consumption_average import (
     HourlyConsumptionAverage,
 )
+from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.planner_input import PlannerInput
 from custom_components.hsem.models.price_point import PricePoint
 from custom_components.hsem.models.solcast_slot import SolcastSlot
@@ -32,6 +33,7 @@ from custom_components.hsem.planner.ev_planner import (
     build_ev_charging_plan,
     compute_ev_energy_needed,
     max_charge_energy_for_slot,
+    rebuild_ev_plan_from_slots,
 )
 
 # ---------------------------------------------------------------------------
@@ -285,6 +287,47 @@ class TestBuildEvChargingPlanGuards:
             inp, starts, ends, self._surplus(), self._prices()
         )
         assert plan.state == "unavailable"
+
+    def test_unpublished_window_surfaces_numeric_unmet_target(self):
+        """An unknown-price horizon cannot erase EV energy still required."""
+        inp = self._make_inp(
+            current_soc_pct=70.0,
+            target_soc_pct=80.0,
+            battery_capacity_kwh=100.0,
+        )
+        starts, ends = self._slots()
+        plan = build_ev_charging_plan(
+            inp,
+            starts,
+            ends,
+            self._surplus(),
+            self._prices(),
+            slot_price_actionable=[False] * len(starts),
+        )
+
+        assert plan.state == "waiting"
+        assert plan.total_kwh_needed == pytest.approx(10.0)
+        assert plan.data_quality["unmet_target_kwh"] == pytest.approx(10.0)
+
+    def test_milp_fulfillment_clears_stale_unmet_warning(self):
+        """A successful MILP rebuild cannot retain a greedy-plan warning."""
+        start = _dt(6)
+        original = EVChargingPlan(
+            state="waiting",
+            ev_connected=True,
+            total_kwh_needed=1.0,
+            data_quality={
+                "warning": "No candidate slots before deadline",
+                "unmet_target_kwh": 1.0,
+            },
+        )
+        slot = PlannedSlot(start=start, end=start + timedelta(hours=1))
+        slot.ev_charger_calculated_power = 1000.0
+
+        rebuilt = rebuild_ev_plan_from_slots(original, [slot], start)
+
+        assert "unmet_target_kwh" not in rebuilt.data_quality
+        assert "warning" not in rebuilt.data_quality
 
 
 class TestBuildEvChargingPlanSlotSelection:

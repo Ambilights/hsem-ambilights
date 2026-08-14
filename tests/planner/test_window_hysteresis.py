@@ -1,15 +1,13 @@
 """Tests for window-level hysteresis (issue #315).
 
-Window-level hysteresis prevents rapid toggling between any non-neutral
-recommendations.  When the current slot's recommendation changes and the
-previous recommendation has been in effect for less than the configured
-hold time, the previous recommendation is kept.
+Window-level hysteresis prevents display-label flapping only when both labels
+map to the same executable maximise-self-consumption command. Hardware-mode,
+EV-command, and flow-derived cap changes pass through immediately.
 
 Acceptance criteria
 -------------------
-1. All actionable recommendation flips are held within the hold window,
-   including within-category flips (e.g. ev_smart_charging ↔
-   batteries_charge_solar, batteries_charge_grid ↔ batteries_charge_solar).
+1. Only unrestricted batteries_charge_solar ↔ batteries_discharge_mode
+   aliases are held within the hold window.
 2. Minimum hold time is configurable.
 3. Neutral recommendations (wait_mode, time_passed, None) do not trigger hold.
 4. Feature disabled (0 min) always allows the switch.
@@ -74,12 +72,11 @@ class TestWindowHysteresis:
         )
 
     # ------------------------------------------------------------------
-    # Within-category transitions (must be held)
+    # Command-changing transitions (must pass through)
     # ------------------------------------------------------------------
 
     def test_charge_to_charge_within_hold(self):
-        """Within-category change (grid-charge → solar-charge) must be held
-        within the hold window."""
+        """Grid-charge → solar-charge changes hardware and cannot be held."""
         slots = _make_slots(
             Recommendations.BatteriesChargeSolar.value,
         )
@@ -90,16 +87,11 @@ class TestWindowHysteresis:
             previous_current_recommendation=Recommendations.BatteriesChargeGrid.value,
             previous_current_slot_start=_NOW - timedelta(minutes=5),
         )
-        assert rec == Recommendations.BatteriesChargeGrid.value, (
-            "Within-category charge change must be held within hold window"
-        )
-        assert slots[0].recommendation == Recommendations.BatteriesChargeGrid.value, (
-            "Slot recommendation must reflect the held value"
-        )
+        assert rec == Recommendations.BatteriesChargeSolar.value
+        assert slots[0].recommendation == Recommendations.BatteriesChargeSolar.value
 
     def test_discharge_to_discharge_within_hold(self):
-        """Within-category change (discharge → force-discharge) must be held
-        within the hold window."""
+        """MSC → fully-fed discharge changes hardware and cannot be held."""
         slots = _make_slots(
             Recommendations.ForceBatteriesDischarge.value,
         )
@@ -110,17 +102,11 @@ class TestWindowHysteresis:
             previous_current_recommendation=Recommendations.BatteriesDischargeMode.value,
             previous_current_slot_start=_NOW - timedelta(minutes=5),
         )
-        assert rec == Recommendations.BatteriesDischargeMode.value, (
-            "Within-category discharge change must be held within hold window"
-        )
-        assert (
-            slots[0].recommendation == Recommendations.BatteriesDischargeMode.value
-        ), "Slot recommendation must reflect the held value"
+        assert rec == Recommendations.ForceBatteriesDischarge.value
+        assert slots[0].recommendation == Recommendations.ForceBatteriesDischarge.value
 
     def test_ev_smart_charging_to_solar_within_hold(self):
-        """Within-category change (ev_smart_charging → batteries_charge_solar)
-        must be held within the hold window — this is the primary oscillation
-        pattern observed in production (MILP re-solving)."""
+        """EV control → solar MSC changes commands and cannot be held."""
         slots = _make_slots(
             Recommendations.BatteriesChargeSolar.value,
         )
@@ -131,9 +117,73 @@ class TestWindowHysteresis:
             previous_current_recommendation=Recommendations.EVSmartCharging.value,
             previous_current_slot_start=_NOW - timedelta(minutes=2),
         )
-        assert rec == Recommendations.EVSmartCharging.value, (
-            "ev_smart_charging → batteries_charge_solar must be held within hold window"
+        assert rec == Recommendations.BatteriesChargeSolar.value
+
+    def test_solar_to_unrestricted_bdm_is_held(self):
+        """The two unrestricted MSC labels may be coalesced safely."""
+        slots = _make_slots(Recommendations.BatteriesDischargeMode.value)
+
+        rec, started_at = apply_window_hysteresis(
+            slots,
+            _NOW,
+            window_hysteresis_minutes=10,
+            previous_current_recommendation=Recommendations.BatteriesChargeSolar.value,
+            previous_current_slot_start=_NOW - timedelta(minutes=2),
         )
+
+        assert rec == Recommendations.BatteriesChargeSolar.value
+        assert started_at == _NOW - timedelta(minutes=2)
+        assert slots[0].recommendation == Recommendations.BatteriesChargeSolar.value
+
+    def test_unrestricted_bdm_to_solar_is_held(self):
+        """The safe MSC alias is symmetric."""
+        slots = _make_slots(Recommendations.BatteriesChargeSolar.value)
+
+        rec, _ = apply_window_hysteresis(
+            slots,
+            _NOW,
+            window_hysteresis_minutes=10,
+            previous_current_recommendation=Recommendations.BatteriesDischargeMode.value,
+            previous_current_slot_start=_NOW - timedelta(minutes=2),
+        )
+
+        assert rec == Recommendations.BatteriesDischargeMode.value
+
+    def test_partial_bdm_bypasses_alias_hold(self):
+        """A 0.002 kWh grid share makes the BDM cap command-significant."""
+        slots = _make_slots(Recommendations.BatteriesDischargeMode.value)
+        slots[0].batteries_discharged_kwh = 0.2
+        slots[0].grid_import_kwh = 0.002
+
+        rec, started_at = apply_window_hysteresis(
+            slots,
+            _NOW,
+            window_hysteresis_minutes=10,
+            previous_current_recommendation=Recommendations.BatteriesChargeSolar.value,
+            previous_current_slot_start=_NOW - timedelta(minutes=2),
+        )
+
+        assert rec == Recommendations.BatteriesDischargeMode.value
+        assert started_at == _NOW
+        assert slots[0].recommendation == Recommendations.BatteriesDischargeMode.value
+
+    def test_grid_import_rounding_residue_keeps_alias_hold(self):
+        """Exactly 0.001 kWh is publication residue, not a partial BDM cap."""
+        slots = _make_slots(Recommendations.BatteriesDischargeMode.value)
+        slots[0].batteries_discharged_kwh = 0.2
+        slots[0].grid_import_kwh = 0.001
+
+        rec, started_at = apply_window_hysteresis(
+            slots,
+            _NOW,
+            window_hysteresis_minutes=10,
+            previous_current_recommendation=Recommendations.BatteriesChargeSolar.value,
+            previous_current_slot_start=_NOW - timedelta(minutes=2),
+        )
+
+        assert rec == Recommendations.BatteriesChargeSolar.value
+        assert started_at == _NOW - timedelta(minutes=2)
+        assert slots[0].recommendation == Recommendations.BatteriesChargeSolar.value
 
     def test_optimizer_hold_bypasses_previous_actionable_label(self):
         """Label hysteresis must not add energy to a solved MILP hold slot."""
@@ -153,24 +203,47 @@ class TestWindowHysteresis:
         assert slots[0].recommendation == Recommendations.EVSmartCharging.value
         assert slots[0].primary_battery_hold is True
 
+    def test_unpublished_slot_never_restores_price_driven_action(self):
+        """Hysteresis cannot revive grid charge or forced battery export."""
+        for previous in (
+            Recommendations.BatteriesChargeGrid.value,
+            Recommendations.ForceBatteriesDischarge.value,
+        ):
+            slots = _make_slots(Recommendations.BatteriesDischargeMode.value)
+            slots[0].price_actionable = False
+
+            rec, start = apply_window_hysteresis(
+                slots,
+                _NOW,
+                window_hysteresis_minutes=30,
+                previous_current_recommendation=previous,
+                previous_current_slot_start=_NOW - timedelta(minutes=2),
+            )
+
+            assert rec == Recommendations.BatteriesDischargeMode.value
+            assert start == _NOW
+            assert (
+                slots[0].recommendation == Recommendations.BatteriesDischargeMode.value
+            )
+
     # ------------------------------------------------------------------
     # Within-category transitions after hold time expires
     # ------------------------------------------------------------------
 
-    def test_charge_to_charge_after_hold(self):
-        """Within-category change after hold time must be allowed."""
+    def test_alias_transition_after_hold(self):
+        """A command-equivalent alias change is released at hold expiry."""
         slots = _make_slots(
-            Recommendations.BatteriesChargeSolar.value,
+            Recommendations.BatteriesDischargeMode.value,
         )
         rec, _ = apply_window_hysteresis(
             slots,
             _NOW,
             window_hysteresis_minutes=5,
-            previous_current_recommendation=Recommendations.BatteriesChargeGrid.value,
+            previous_current_recommendation=Recommendations.BatteriesChargeSolar.value,
             previous_current_slot_start=_NOW - timedelta(minutes=10),
         )
-        assert rec == Recommendations.BatteriesChargeSolar.value, (
-            "Within-category charge change after hold time must be allowed"
+        assert rec == Recommendations.BatteriesDischargeMode.value, (
+            "MSC alias change after hold time must be allowed"
         )
 
     # ------------------------------------------------------------------
@@ -178,7 +251,7 @@ class TestWindowHysteresis:
     # ------------------------------------------------------------------
 
     def test_charge_to_discharge_within_hold(self):
-        """Charge→discharge within hold time must keep the previous recommendation."""
+        """Grid charge → BDM changes hardware and must pass through."""
         slots = _make_slots(
             Recommendations.BatteriesDischargeMode.value,
         )
@@ -189,16 +262,11 @@ class TestWindowHysteresis:
             previous_current_recommendation=Recommendations.BatteriesChargeGrid.value,
             previous_current_slot_start=_NOW - timedelta(minutes=5),
         )
-        assert rec == Recommendations.BatteriesChargeGrid.value, (
-            "Charge→discharge within hold time must be held"
-        )
-        # The slot's recommendation should also be updated
-        assert slots[0].recommendation == Recommendations.BatteriesChargeGrid.value, (
-            "Slot recommendation must reflect the held value"
-        )
+        assert rec == Recommendations.BatteriesDischargeMode.value
+        assert slots[0].recommendation == Recommendations.BatteriesDischargeMode.value
 
     def test_discharge_to_charge_within_hold(self):
-        """Discharge→charge within hold time must keep the previous recommendation."""
+        """BDM → grid charge changes hardware and must pass through."""
         slots = _make_slots(
             Recommendations.BatteriesChargeGrid.value,
         )
@@ -209,15 +277,11 @@ class TestWindowHysteresis:
             previous_current_recommendation=Recommendations.BatteriesDischargeMode.value,
             previous_current_slot_start=_NOW - timedelta(minutes=5),
         )
-        assert rec == Recommendations.BatteriesDischargeMode.value, (
-            "Discharge→charge within hold time must be held"
-        )
-        assert (
-            slots[0].recommendation == Recommendations.BatteriesDischargeMode.value
-        ), "Slot recommendation must reflect the held value"
+        assert rec == Recommendations.BatteriesChargeGrid.value
+        assert slots[0].recommendation == Recommendations.BatteriesChargeGrid.value
 
     def test_charge_to_force_export_within_hold(self):
-        """Charge→force-export within hold time must keep charge."""
+        """EV charge → force export changes hardware and must pass through."""
         slots = _make_slots(
             Recommendations.ForceExport.value,
         )
@@ -228,9 +292,7 @@ class TestWindowHysteresis:
             previous_current_recommendation=Recommendations.EVSmartCharging.value,
             previous_current_slot_start=_NOW - timedelta(minutes=2),
         )
-        assert rec == Recommendations.EVSmartCharging.value, (
-            "Charge→force-export within hold time must be held"
-        )
+        assert rec == Recommendations.ForceExport.value
 
     # ------------------------------------------------------------------
     # Cross-category transitions after hold time expires
@@ -351,7 +413,7 @@ class TestWindowHysteresis:
             slots,
             _NOW,
             window_hysteresis_minutes=10,
-            previous_current_recommendation=Recommendations.EVSmartCharging.value,
+            previous_current_recommendation=Recommendations.BatteriesChargeSolar.value,
             previous_current_slot_start=_NOW - timedelta(minutes=10),
         )
         assert rec == Recommendations.BatteriesDischargeMode.value, (
@@ -367,10 +429,10 @@ class TestWindowHysteresis:
             slots,
             _NOW,
             window_hysteresis_minutes=10,
-            previous_current_recommendation=Recommendations.EVSmartCharging.value,
+            previous_current_recommendation=Recommendations.BatteriesChargeSolar.value,
             previous_current_slot_start=_NOW - timedelta(minutes=9, seconds=59),
         )
-        assert rec == Recommendations.EVSmartCharging.value, (
+        assert rec == Recommendations.BatteriesChargeSolar.value, (
             "Transition just before hold time boundary must be held"
         )
 
@@ -379,20 +441,64 @@ class TestWindowHysteresis:
     # ------------------------------------------------------------------
 
     def test_returns_updated_start_time_on_switch(self):
-        """When a switch is allowed, the returned start time must be the new slot start."""
+        """An accepted switch starts a fresh hold period at transition time."""
         slots = _make_slots(
             Recommendations.BatteriesDischargeMode.value,
         )
+        switch_time = _NOW + timedelta(minutes=11)
         _, start = apply_window_hysteresis(
             slots,
-            _NOW,
+            switch_time,
             window_hysteresis_minutes=5,
-            previous_current_recommendation=Recommendations.BatteriesChargeGrid.value,
+            previous_current_recommendation=Recommendations.BatteriesChargeSolar.value,
             previous_current_slot_start=_NOW - timedelta(minutes=15),
         )
-        assert start == slots[0].start, (
-            "Returned start time must be from the current slot after a switch"
+        assert start == switch_time
+
+    def test_accepted_switch_gets_a_new_hold_before_flip_back(self):
+        """A late in-slot transition cannot immediately flap to its old label."""
+        switched_slots = _make_slots(Recommendations.BatteriesDischargeMode.value)
+        switch_time = _NOW + timedelta(minutes=11)
+        switched_rec, switched_at = apply_window_hysteresis(
+            switched_slots,
+            switch_time,
+            window_hysteresis_minutes=10,
+            previous_current_recommendation=Recommendations.BatteriesChargeSolar.value,
+            previous_current_slot_start=_NOW,
         )
+        assert switched_rec == Recommendations.BatteriesDischargeMode.value
+        assert switched_at == switch_time
+
+        flip_slots = _make_slots(Recommendations.BatteriesChargeSolar.value)
+        flip_rec, flip_started_at = apply_window_hysteresis(
+            flip_slots,
+            switch_time + timedelta(minutes=1),
+            window_hysteresis_minutes=10,
+            previous_current_recommendation=switched_rec,
+            previous_current_slot_start=switched_at,
+        )
+        assert flip_rec == Recommendations.BatteriesDischargeMode.value
+        assert flip_started_at == switch_time
+
+    def test_fallback_fold_uses_elapsed_real_time(self):
+        """The repeated autumn hour cannot extend a hold by another hour."""
+        stockholm = ZoneInfo("Europe/Stockholm")
+        activated = datetime(2026, 10, 25, 2, 55, tzinfo=stockholm, fold=0)
+        now = datetime(2026, 10, 25, 2, 5, tzinfo=stockholm, fold=1)
+        slots = _make_slots(Recommendations.BatteriesDischargeMode.value)
+        slots[0].start = datetime(2026, 10, 25, 2, 0, tzinfo=stockholm, fold=0)
+        slots[0].end = datetime(2026, 10, 25, 3, 0, tzinfo=stockholm)
+
+        rec, started_at = apply_window_hysteresis(
+            slots,
+            now,
+            window_hysteresis_minutes=10,
+            previous_current_recommendation=Recommendations.BatteriesChargeSolar.value,
+            previous_current_slot_start=activated,
+        )
+
+        assert rec == Recommendations.BatteriesDischargeMode.value
+        assert started_at == now
 
     def test_returns_previous_start_time_on_hold(self):
         """When held, the returned start time must be the previous slot start."""
@@ -404,7 +510,7 @@ class TestWindowHysteresis:
             slots,
             _NOW,
             window_hysteresis_minutes=10,
-            previous_current_recommendation=Recommendations.BatteriesChargeGrid.value,
+            previous_current_recommendation=Recommendations.BatteriesChargeSolar.value,
             previous_current_slot_start=prev_start,
         )
         assert start == prev_start, (

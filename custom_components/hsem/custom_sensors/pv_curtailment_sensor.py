@@ -19,6 +19,7 @@ The sensor state is either ``"curtailed"`` or ``"normal"``.
 
 from __future__ import annotations
 
+import math
 from typing import Any, override
 
 from homeassistant.components.sensor import SensorEntity
@@ -211,8 +212,16 @@ def _is_derived_curtailment(live: Any) -> bool:
     if soc is None or soc < _DERIVED_SOC_THRESHOLD:
         return False
 
+    # An unpublished numeric fallback (normally 0.0) is not authority to
+    # infer curtailment. Direct inverter-register detection above remains
+    # available regardless of price publication state.
+    if not live.export_electricity_price_available:
+        return False
+
     # Export must be price-blocked.
     export_price = live.export_electricity_price
+    if not isinstance(export_price, int | float) or not math.isfinite(export_price):
+        return False
     if export_price >= _DERIVED_EXPORT_PRICE_THRESHOLD:
         return False
 

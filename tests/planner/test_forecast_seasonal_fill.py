@@ -226,3 +226,24 @@ def test_refill_suffix_stops_before_next_forced_discharge() -> None:
     _apply(slots, now, current_kwh=1.0, required_kwh=2.0)
 
     assert slots[0].recommendation == _WAIT
+
+
+def test_unknown_tail_pv_cannot_justify_actionable_prefix_discharge() -> None:
+    """A Hold-only tail cannot promise refill energy to an earlier slot."""
+    now = datetime(2026, 1, 15, 8, 0, tzinfo=UTC)
+
+    def decisions(tail_pv_kwh: float) -> list[str | None]:
+        slots = [
+            _slot(now, net_kwh=0.4, pv_kwh=0.0),
+            _slot(
+                now + timedelta(minutes=15),
+                net_kwh=0.2 - tail_pv_kwh,
+                pv_kwh=tail_pv_kwh,
+            ),
+        ]
+        slots[1].price_actionable = False
+        _apply(slots, now, current_kwh=1.0, required_kwh=2.0)
+        return [slot.recommendation for slot in slots]
+
+    assert decisions(0.0)[0] == _WAIT
+    assert decisions(100.0)[0] == _WAIT

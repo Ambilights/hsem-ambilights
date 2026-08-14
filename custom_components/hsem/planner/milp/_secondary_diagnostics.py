@@ -50,17 +50,21 @@ class SecondaryResultSummary:
 
 def _sanitised_import_price(slot: PlannedSlot) -> float:
     """Return the non-negative import price used by the scorer."""
+    if not slot.price_actionable:
+        return 0.0
     price = slot.price.import_price
-    return 0.0 if math.isnan(price) else max(price, 0.0)
+    return 0.0 if not math.isfinite(price) else max(price, 0.0)
 
 
 def _sanitised_prices(slot: PlannedSlot) -> tuple[float, float]:
-    """Return the NaN-safe raw prices passed to secondary cost scoring."""
+    """Return authoritative finite prices passed to secondary cost scoring."""
+    if not slot.price_actionable:
+        return (0.0, 0.0)
     import_price = slot.price.import_price
     export_price = slot.price.export_price
     return (
-        0.0 if math.isnan(import_price) else import_price,
-        0.0 if math.isnan(export_price) else export_price,
+        import_price if math.isfinite(import_price) else 0.0,
+        export_price if math.isfinite(export_price) else 0.0,
     )
 
 
@@ -143,7 +147,9 @@ def _parked_reason(
     weights: CostWeights,
 ) -> str:
     """Return a conservative explanation for a solution with no cycling."""
-    future_slots = [slots[slot_i] for slot_i in future_idx]
+    future_slots = [
+        slots[slot_i] for slot_i in future_idx if slots[slot_i].price_actionable
+    ]
     if not future_slots:
         return "unknown"
 

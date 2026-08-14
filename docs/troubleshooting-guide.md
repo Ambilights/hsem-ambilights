@@ -141,9 +141,10 @@ stays full and the inverter physically blocks export.
 
 **2d. Negative prices trigger force-export**
 
-If the live import price is negative, the runtime recommendation resolver
-forces `force_export` mode regardless of planner output. This is correct
-behaviour — the battery should discharge to avoid paying to import.
+If the current slot has published prices and the available live import price
+is negative, the runtime recommendation resolver gives PV-only `force_export`
+priority over the planner output. An unavailable/stale price or a slot beyond
+the actionable published-price horizon cannot trigger this override.
 
 - **Check:** `sensor.hsem_working_mode` shows `force_export` during a
   slot with negative prices. This is normal — verify the spot price in EDS.
@@ -306,10 +307,9 @@ strategies.
 
 **5b. Window hysteresis preventing slot-level changes**
 
-`planner_window_hysteresis_minutes` prevents rapid recommendation toggling
-(e.g. ``ev_smart_charging`` ↔ ``batteries_charge_solar``) by enforcing a
-minimum hold time. When enabled, a slot's recommendation is locked once
-established.
+`planner_window_hysteresis_minutes` suppresses rapid label toggling between
+``batteries_charge_solar`` and unrestricted ``batteries_discharge_mode``.
+Hardware-mode, EV-command, and partial-discharge-cap changes remain immediate.
 
 - **Check:** HSEM → **Configure** → **Battery Economics & Hysteresis** step.
   _Window Hysteresis Hold Time_ value (0 = disabled).

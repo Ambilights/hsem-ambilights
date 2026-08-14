@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from custom_components.hsem.models.planned_slot import PlannedSlot
-from custom_components.hsem.utils.datetime_utils import as_tz
+from custom_components.hsem.utils.datetime_utils import utc_key
 from custom_components.hsem.utils.recommendations import (
     CHARGE_RECS as _CHARGE_RECS,
     DISCHARGE_RECS as _DISCHARGE_RECS,
@@ -60,7 +60,7 @@ def _apply_aggressive_strategy(
     """
     import math
 
-    future = [s for s in slots if as_tz(s.end, now.tzinfo) > now]
+    future = [s for s in slots if utc_key(s.end) > utc_key(now) and s.price_actionable]
 
     # -----------------------------------------------------------------------
     # Bug 2 fix: derive N dynamically from battery headroom.
@@ -101,7 +101,7 @@ def _apply_aggressive_strategy(
     )
     selected = price_sorted[:aggressive_charge_slots]
     # Phase 2: within selected, assign latest-first
-    for slot in sorted(selected, key=lambda s: s.start, reverse=True):
+    for slot in sorted(selected, key=lambda s: utc_key(s.start), reverse=True):
         if slot.recommendation in _CHARGE_RECS:
             continue
         slot.recommendation = Recommendations.BatteriesChargeGrid.value
@@ -110,7 +110,7 @@ def _apply_aggressive_strategy(
     # Apply force-discharge to most-expensive M slots.
     discharge_candidates = sorted(
         (s for s in future if s.recommendation not in _CHARGE_RECS),
-        key=lambda s: (-s.price.import_price, s.start),
+        key=lambda s: (-s.price.import_price, utc_key(s.start)),
     )
     discharged = 0
     for slot in discharge_candidates:
@@ -128,12 +128,12 @@ def _apply_aggressive_strategy(
     first_discharge_start = min(
         (s.start for s in future if s.recommendation in _DISCHARGE_RECS),
         default=None,
+        key=utc_key,
     )
     if first_discharge_start is not None:
-        for slot in slots:
-            if (
-                slot.recommendation in _CHARGE_RECS
-                and slot.start >= first_discharge_start
+        for slot in future:
+            if slot.recommendation in _CHARGE_RECS and utc_key(slot.start) >= utc_key(
+                first_discharge_start
             ):
                 slot.recommendation = None
                 slot.batteries_charged_kwh = 0.0

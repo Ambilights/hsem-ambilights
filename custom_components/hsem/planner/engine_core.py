@@ -12,12 +12,10 @@ from dataclasses import replace
 from datetime import datetime
 
 from custom_components.hsem.models.ev_config import EVConfig
-from custom_components.hsem.models.plan_explanation import PlanExplanation
 from custom_components.hsem.models.planner_input import PlannerInput
 from custom_components.hsem.models.planner_output import PlannerOutput
 from custom_components.hsem.planner.candidate_generator import (
     CANDIDATE_MILP,
-    CandidatePlan,
     generate_candidates,
 )
 from custom_components.hsem.planner.candidate_selector import (
@@ -57,7 +55,11 @@ from custom_components.hsem.planner.slot_population import (
     populate_net_consumption,
     usable_capacity,
 )
-from custom_components.hsem.utils.datetime_utils import as_tz
+from custom_components.hsem.planner.solver_diagnostics import (
+    populate_solver_explanation as _populate_solver_explanation,
+    publish_selected_candidate_warnings as _publish_selected_candidate_warnings,
+)
+from custom_components.hsem.utils.datetime_utils import slot_contains, utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import (
     calculate_recommended_threshold,
@@ -69,71 +71,6 @@ from custom_components.hsem.utils.units import (
     fuse_max_energy_per_slot_kwh,
     hours_ahead,
 )
-
-
-def _extract_solver_diagnostics(candidates: list[CandidatePlan]) -> dict:
-    """Return successful MILP diagnostics or the retained failed attempt."""
-    for candidate in candidates:
-        if candidate.name == CANDIDATE_MILP and candidate.diagnostics is not None:
-            return candidate.diagnostics
-    for candidate in candidates:
-        diagnostics = candidate.diagnostics
-        if diagnostics is None:
-            continue
-        attempt = diagnostics.get("milp_attempt")
-        if isinstance(attempt, dict):
-            return attempt
-    return {}
-
-
-def _diagnostic_number(diagnostics: dict, key: str, default: float) -> float:
-    """Read a finite numeric diagnostic, returning *default* otherwise."""
-    value = diagnostics.get(key)
-    if not isinstance(value, (int, float)):
-        return default
-    number = float(value)
-    return number if number == number and abs(number) != float("inf") else default
-
-
-def _populate_solver_explanation(
-    explanation: PlanExplanation,
-    candidates: list[CandidatePlan],
-    winner_name: str,
-    configured_timeout: float,
-) -> None:
-    """Expose MILP outcome without changing the candidate control-flow name."""
-    diagnostics = _extract_solver_diagnostics(candidates)
-    explanation.solver_status = str(diagnostics.get("solver_status", "not_run"))
-    explanation.solver_optimal = bool(diagnostics.get("solver_optimal", False))
-    explanation.solver_time_limit_seconds = _diagnostic_number(
-        diagnostics,
-        "solver_time_limit_seconds",
-        configured_timeout,
-    )
-    explanation.solver_elapsed_seconds = _diagnostic_number(
-        diagnostics,
-        "solver_elapsed_seconds",
-        0.0,
-    )
-    raw_gap = diagnostics.get("solver_mip_gap")
-    explanation.solver_mip_gap = (
-        float(raw_gap) if isinstance(raw_gap, (int, float)) else None
-    )
-    explanation.solver_message = str(diagnostics.get("solver_message", ""))
-    explanation.incumbent_used = bool(diagnostics.get("incumbent_used", False))
-    explanation.incumbent_validation = str(diagnostics.get("incumbent_validation", ""))
-    explanation.fallback_reason = str(diagnostics.get("fallback_reason", ""))
-
-    if winner_name != CANDIDATE_MILP and not explanation.fallback_reason:
-        explanation.fallback_reason = (
-            "milp_candidate_not_selected"
-            if explanation.solver_status in {"optimal", "time_limit_feasible_incumbent"}
-            else "milp_candidate_unavailable"
-        )
-    if explanation.fallback_reason:
-        explanation.constraints.append("milp_fallback")
-    elif explanation.incumbent_used:
-        explanation.constraints.append("milp_time_limit_incumbent")
 
 
 def _select_candidate(
@@ -205,7 +142,7 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
     """Execute the HSEM planner and return a :class:`PlannerOutput`."""
     warnings: list[str] = []
     missing_inputs: list[str] = []
-    now = _parse_now(inp.now_iso)
+    now = _parse_now(inp.now_iso, inp.timezone_name)
     log_planner(
         "debug",
         "==== HSEM PLANNER RUN START ==== now=%s interval=%dmin horizon=%dh",
@@ -259,7 +196,7 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
         return PlannerOutput(missing_inputs=missing_inputs, warnings=warnings)
     # Step 1 — populate time-series data
     data_quality, warnings, missing_inputs = _populate_slots(
-        slots, inp, tsi, warnings, missing_inputs
+        slots, inp, tsi, now, warnings, missing_inputs
     )
     log_planner(
         "debug",
@@ -407,7 +344,8 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
         rt,
         effective_cycle_cost,
     )
-    mcps, mdps, max_soc_kwh, rc, warnings = _schedule_slots(
+    baseline_warnings: list[str] = []
+    mcps, mdps, max_soc_kwh, rc, baseline_warnings = _schedule_slots(
         slots,
         inp,
         now,
@@ -415,7 +353,7 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
         usable_kwh,
         rt,
         effective_cycle_cost,
-        warnings,
+        baseline_warnings,
     )
     log_planner(
         "debug",
@@ -483,6 +421,11 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
         sdh,
         rc,
         ev_configs=ev_configs,
+    )
+    _publish_selected_candidate_warnings(
+        warnings,
+        baseline_warnings,
+        winner.name,
     )
     # Surface MILP penalty violations in warnings if the winner used penalties
     if (
@@ -619,10 +562,9 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
                 # Below this EV's own minimum — charger won't start.
                 # Reverse-engineer the energy contribution from the
                 # power field to subtract from combined slot totals.
-                s_end_tz = as_tz(s.end, now.tzinfo)
-                if as_tz(s.start, now.tzinfo) <= now < s_end_tz:
+                if slot_contains(s.start, s.end, now):
                     remaining_h = max(
-                        hours_ahead(now, s_end_tz),
+                        hours_ahead(now, s.end),
                         1.0 / 3600.0,
                     )
                     ev_energy = round((ev_w / 1000.0) * remaining_h, 3)
@@ -664,7 +606,9 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
                     - s.solcast_pv_estimate_kwh
                 )
                 net = s.estimated_net_consumption_kwh
-                if net > 0:
+                if not s.price_actionable:
+                    s.estimated_cost_currency = 0.0
+                elif net > 0:
                     s.estimated_cost_currency = round(net * s.price.import_price, 4)
                 else:
                     s.estimated_cost_currency = round(net * s.price.export_price, 4)
@@ -688,10 +632,10 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
             s.recommendation = Recommendations.EVSmartCharging.value
     cur_rec: str | None = None
     for s in slots:
-        if as_tz(s.start, now.tzinfo) <= now < as_tz(s.end, now.tzinfo):
+        if slot_contains(s.start, s.end, now):
             cur_rec = s.recommendation
             break
-    fut = [s for s in slots if as_tz(s.end, now.tzinfo) > now]
+    fut = [s for s in slots if utc_key(s.end) > utc_key(now)]
     bsoc_end = fut[-1].estimated_battery_soc_pct if fut else 0.0
     secondary_soc_end = (
         fut[-1].secondary_storage_estimated_soc_pct

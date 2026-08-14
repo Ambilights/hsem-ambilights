@@ -235,6 +235,7 @@ def make_bare_coordinator(
     coord._force_discharge_live_replan_pending_slot = None
     # Issue #738: per-slot EV charger power freeze state.
     coord._current_slot_start = None
+    coord._current_slot_price_actionable = None
     coord._current_slot_ev_power_w = 0.0
     coord._current_slot_ev_second_power_w = 0.0
 

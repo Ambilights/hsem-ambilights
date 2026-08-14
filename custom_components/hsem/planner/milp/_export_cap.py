@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.units import (
     export_max_energy_per_slot_kwh,
-    timedelta_to_hours,
+    slot_duration_hours,
 )
 
 if TYPE_CHECKING:
@@ -45,7 +45,7 @@ def _resolve_export_cap(
         return False, 0.0
 
     first_slot = slots[future_idx[0]]
-    slot_hours = timedelta_to_hours(first_slot.end - first_slot.start)
+    slot_hours = slot_duration_hours(first_slot.start, first_slot.end)
     max_kwh = export_max_energy_per_slot_kwh(max_grid_export_power_kw, slot_hours)
     log_planner(
         "debug",

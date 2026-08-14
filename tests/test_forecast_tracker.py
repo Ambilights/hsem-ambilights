@@ -12,7 +12,8 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -29,6 +30,25 @@ NEVER = datetime(2099, 1, 1, tzinfo=UTC)
 def _slot_start(hour: int, minute: int = 0) -> datetime:
     """Create a timezone-aware slot start time."""
     return datetime(2024, 6, 15, hour, minute, tzinfo=UTC)
+
+
+def test_repeated_hour_folds_create_distinct_forecast_records() -> None:
+    copenhagen = ZoneInfo("Europe/Copenhagen")
+    first = datetime(2026, 10, 25, 2, 0, tzinfo=copenhagen, fold=0)
+    second = datetime(2026, 10, 25, 2, 0, tzinfo=copenhagen, fold=1)
+    tracker = ForecastTracker()
+
+    first_record = tracker.get_or_create_record(
+        first,
+        (first.astimezone(UTC) + timedelta(minutes=15)).astimezone(copenhagen),
+    )
+    second_record = tracker.get_or_create_record(
+        second,
+        (second.astimezone(UTC) + timedelta(minutes=15)).astimezone(copenhagen),
+    )
+
+    assert first_record is not second_record
+    assert len(tracker.records) == 2
 
 
 # ---------------------------------------------------------------------------

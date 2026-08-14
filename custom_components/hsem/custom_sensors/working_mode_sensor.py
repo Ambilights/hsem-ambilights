@@ -16,6 +16,7 @@ coordinator.  This entity only reacts to coordinator pushes.
 from __future__ import annotations
 
 import asyncio
+from math import isfinite
 from typing import Any, override
 
 from homeassistant.components.sensor import SensorEntity
@@ -31,6 +32,7 @@ from custom_components.hsem.custom_sensors.applier import (
     FullyFedDischargeCapState,
     async_apply_battery_settings,
     async_apply_inverter_power_control,
+    desired_inverter_export_control,
 )
 from custom_components.hsem.custom_sensors.phase_charge_limiter import (
     build_phase_aware_charge_commands,
@@ -40,6 +42,7 @@ from custom_components.hsem.custom_sensors.recommendation_resolver import (
 )
 from custom_components.hsem.custom_sensors.secondary_storage_applier import (
     async_apply_secondary_storage,
+    build_secondary_write_plan,
 )
 from custom_components.hsem.entity import HSEMCoordinatorEntity, HSEMEntity
 from custom_components.hsem.utils.degraded_mode import hardware_writes_allowed
@@ -57,6 +60,21 @@ from custom_components.hsem.utils.sensornames.diagnostics import (
     get_working_mode_sensor_name,
     get_working_mode_sensor_unique_id,
 )
+
+
+def _intent_scaled_int(value: Any, scale: float) -> int | None:
+    """Return a stable integer identity for a finite numeric command input."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not isfinite(number):
+        return None
+    return round(number * scale)
+
+
+def _intent_energy_wh(value: Any) -> int | None:
+    """Quantize planner kWh fields to their published whole-Wh precision."""
+    return _intent_scaled_int(value, 1000.0)
 
 
 class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
@@ -110,6 +128,11 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         self._update_task: asyncio.Task | None = None
         self._pending_update_data: CoordinatorData | None = None
         self._active_hardware_intent: tuple[Any, ...] | None = None
+        # Number real coordinator listener generations locally, so a refresh
+        # can prove it produced a post-transaction snapshot.
+        self._coordinator_update_generation = 0
+        self._post_write_refresh_needed = False
+        self._refresh_in_progress = False
         self._unloading = False
         self._write_failure_backoff = WriteFailureBackoff()
         self._fully_fed_discharge_state = FullyFedDischargeCapState()
@@ -346,6 +369,7 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         """
         self._unloading = True
         self._pending_update_data = None
+        self._post_write_refresh_needed = False
         self._write_failure_backoff.clear()
         self._fully_fed_discharge_state.reset()
         self._cancel_update_task()
@@ -369,7 +393,7 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         recorded without breaking the task lifecycle.
 
         Cancelled tasks are ignored because cancellation is expected on unload
-        or when a materially different hardware intent supersedes a write.
+        or when a hard no-write safety gate supersedes an active write.
         """
         is_current_task = self._update_task is task
         if is_current_task:
@@ -407,6 +431,7 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         if self._publishing_apply_summary:
             return
         if data is not None:
+            self._coordinator_update_generation += 1
             self._queue_hardware_update(data)
 
     @staticmethod
@@ -438,21 +463,42 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         )
 
     def _queue_hardware_update(self, data: CoordinatorData) -> None:
-        """Keep the latest snapshot and start or redirect the write worker."""
+        """Keep the latest snapshot and safely redirect the write worker."""
         if self._unloading:
             return
 
         self._pending_update_data = data
         next_intent = self._hardware_intent(data)
         if self._update_task is not None and not self._update_task.done():
-            if (
-                self._active_hardware_intent is not None
+            if self._hard_no_write_gate(data) and not self._refresh_in_progress:
+                # Explicit safety gates may interrupt a transaction. Safe
+                # intent changes wait for a coherent post-write refresh.
+                self._post_write_refresh_needed = False
+                self._update_task.cancel()
+            elif (
+                not self._refresh_in_progress
+                and self._active_hardware_intent is not None
                 and next_intent != self._active_hardware_intent
             ):
-                self._update_task.cancel()
+                # The new snapshot was collected against potentially partial
+                # hardware state. Complete the active transaction and replace
+                # this snapshot with a fresh coordinator generation.
+                self._post_write_refresh_needed = True
             return
 
         self._start_update_task()
+
+    @staticmethod
+    def _hard_no_write_gate(data: CoordinatorData) -> bool:
+        """Return whether a snapshot deliberately forbids hardware writes."""
+        cfg = data.cfg
+        live = data.live
+        return (
+            cfg is None
+            or live is None
+            or cfg.read_only
+            or not hardware_writes_allowed(live.degraded_mode)
+        )
 
     def _start_update_task(self) -> None:
         """Create the sole hardware worker when pending data exists."""
@@ -470,13 +516,122 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         cfg = data.cfg
         live = data.live
         rec = data.hourly_recommendation
+        if cfg is None or live is None:
+            return (None, data.state)
+        phase_commands = (
+            build_phase_aware_charge_commands(cfg, live, rec)
+            if rec is not None
+            else None
+        )
+        effective_rec = (
+            phase_commands.recommendation if phase_commands is not None else rec
+        )
+        secondary_operations = (
+            build_secondary_write_plan(cfg, live, effective_rec)
+            if effective_rec is not None
+            and cfg.secondary_storage.enabled
+            and cfg.secondary_storage.control_enabled
+            else []
+        )
+        secondary_intent = tuple(
+            (
+                operation.kind,
+                operation.entity_id,
+                (
+                    _intent_scaled_int(operation.desired, 1000.0)
+                    if isinstance(operation.desired, (int, float))
+                    else operation.desired
+                ),
+            )
+            for operation in secondary_operations
+        )
+        phase_intent = (
+            (
+                _intent_scaled_int(phase_commands.primary_grid_charge_power_w, 0.01),
+                getattr(effective_rec, "secondary_storage_mode", None),
+                _intent_scaled_int(
+                    getattr(effective_rec, "secondary_storage_charge_current_a", None),
+                    1000.0,
+                ),
+            )
+            if phase_commands is not None
+            else None
+        )
+        recommendation = getattr(rec, "recommendation", data.state)
+        battery_capacity_intent = (
+            None
+            if recommendation == Recommendations.ForceBatteriesDischarge.value
+            else _intent_energy_wh(live.battery_current_capacity_kwh)
+        )
         return (
             getattr(cfg, "read_only", None),
             getattr(getattr(live, "degraded_mode", None), "value", None),
-            getattr(rec, "recommendation", data.state),
+            (
+                cfg.huawei_solar_device_id_inverter_1,
+                cfg.huawei_solar_device_id_inverter_2,
+                cfg.huawei_solar_inverter_active_power_control,
+            ),
+            desired_inverter_export_control(cfg, live, rec),
+            getattr(cfg, "batteries_wait_mode_behavior", None),
+            getattr(cfg, "phase_aware_charging_enabled", None),
+            _intent_scaled_int(getattr(cfg, "main_fuse_amps", None), 1000.0),
+            _intent_scaled_int(getattr(cfg, "main_fuse_phases", None), 1.0),
+            (
+                cfg.huawei_solar_device_id_batteries,
+                cfg.huawei_solar_batteries_working_mode,
+                cfg.huawei_solar_batteries_grid_charge_maximum_power,
+                cfg.huawei_solar_batteries_maximum_discharging_power,
+                cfg.huawei_solar_batteries_tou_charging_and_discharging_periods,
+                cfg.huawei_solar_batteries_excess_pv_energy_use_in_tou,
+                cfg.huawei_solar_batteries_forcible_charge,
+            ),
+            getattr(cfg.secondary_storage, "enabled", None),
+            getattr(cfg.secondary_storage, "control_enabled", None),
+            (
+                cfg.secondary_storage.output_source_priority_entity,
+                cfg.secondary_storage.charger_source_priority_entity,
+                cfg.secondary_storage.max_charge_current_entity,
+            ),
+            getattr(rec, "start", None),
+            getattr(rec, "end", None),
+            recommendation,
             getattr(rec, "primary_battery_hold", False),
+            _intent_energy_wh(getattr(rec, "batteries_charged_kwh", None)),
+            _intent_energy_wh(getattr(rec, "batteries_discharged_kwh", None)),
+            _intent_energy_wh(getattr(rec, "grid_import_kwh", None)),
+            _intent_energy_wh(getattr(rec, "grid_export_kwh", None)),
+            _intent_energy_wh(getattr(rec, "estimated_battery_capacity_kwh", None)),
+            _intent_energy_wh(getattr(rec, "avg_house_consumption_kwh", None)),
+            _intent_energy_wh(
+                getattr(rec, "historical_avg_house_consumption_kwh", None)
+            ),
+            _intent_energy_wh(getattr(rec, "avg_house_consumption_1d_kwh", None)),
+            _intent_energy_wh(getattr(rec, "avg_house_consumption_3d_kwh", None)),
+            _intent_energy_wh(getattr(rec, "avg_house_consumption_7d_kwh", None)),
+            _intent_energy_wh(getattr(rec, "avg_house_consumption_14d_kwh", None)),
             getattr(rec, "secondary_storage_mode", None),
-            getattr(rec, "secondary_storage_charge_current_a", None),
+            _intent_scaled_int(
+                getattr(rec, "secondary_storage_charge_current_a", None), 1000.0
+            ),
+            _intent_energy_wh(data.current_required_battery),
+            phase_intent,
+            secondary_intent,
+            (
+                live.any_ev_charging,
+                live.ev.force_max_discharge_power,
+                live.ev_second.force_max_discharge_power,
+                _intent_scaled_int(live.ev.max_discharge_power_w, 1.0),
+                _intent_scaled_int(live.ev_second.max_discharge_power_w, 1.0),
+                _intent_scaled_int(live.ev.power_w, 0.01),
+                _intent_scaled_int(live.ev_second.power_w, 0.01),
+                _intent_scaled_int(live.net_consumption_w, 0.01),
+            ),
+            battery_capacity_intent,
+            _intent_scaled_int(live.huawei_batteries_rated_capacity_wh, 1.0),
+            _intent_scaled_int(live.huawei_batteries_max_charge_power_w, 0.01),
+            _intent_scaled_int(live.huawei_batteries_charge_discharge_power_w, 0.01),
+            live.huawei_batteries_working_mode,
+            live.huawei_batteries_forcible_charge_state,
         )
 
     async def _async_on_coordinator_update(self) -> None:
@@ -504,10 +659,67 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
                         self.coordinator.async_publish_apply_summary(data.apply_summary)
                     finally:
                         self._publishing_apply_summary = False
+
+                if self._post_write_refresh_needed:
+                    if not await self._async_refresh_after_superseded_write():
+                        return
         except asyncio.CancelledError:
             raise
         except Exception:
+            if self._post_write_refresh_needed:
+                self._pending_update_data = None
+                self._post_write_refresh_needed = False
             _LOGGER.exception("Hardware-write task failed during coordinator update")
+
+    async def _async_refresh_after_superseded_write(self) -> bool:
+        """Replace a mid-write snapshot with one collected after completion.
+
+        Return ``True`` only when the refresh publishes a newer successful
+        listener generation. A failed or silent refresh drops the stale
+        snapshot and stops this worker; a later external update can recover.
+        """
+        generation_before_refresh = self._coordinator_update_generation
+        self._pending_update_data = None
+        self._post_write_refresh_needed = False
+        self._refresh_in_progress = True
+        try:
+            await self.coordinator.async_request_refresh()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._pending_update_data = None
+            _LOGGER.exception(
+                "Post-write coordinator refresh failed; stale hardware intent dropped"
+            )
+            return False
+        finally:
+            self._refresh_in_progress = False
+
+        if self._unloading:
+            self._pending_update_data = None
+            return False
+
+        generation_advanced = (
+            self._coordinator_update_generation > generation_before_refresh
+        )
+        fresh_data = self.coordinator.data
+        if (
+            not generation_advanced
+            or not self.coordinator.last_update_success
+            or fresh_data is None
+        ):
+            self._pending_update_data = None
+            _LOGGER.warning(
+                "Post-write coordinator refresh produced no successful new "
+                "generation; stale hardware intent dropped"
+            )
+            return False
+
+        # The refresh callback normally queued this object already. Assign it
+        # explicitly so the worker always drains the coordinator's newest
+        # coherent snapshot, never an intermediate listener snapshot.
+        self._pending_update_data = fresh_data
+        return True
 
     async def _async_apply_hardware_writes(self, data: CoordinatorData | None) -> None:
         """Perform inverter and battery hardware writes for the current slot.
@@ -566,7 +778,9 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
                 self._last_write_block_signature = block_signature
         else:
             self._last_write_block_signature = None
-            inv_summary = await async_apply_inverter_power_control(self, cfg, live)
+            inv_summary = await async_apply_inverter_power_control(
+                self, cfg, live, hourly_rec
+            )
             combined_summary.results.extend(inv_summary.results)
 
             phase_commands = (

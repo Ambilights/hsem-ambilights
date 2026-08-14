@@ -22,12 +22,20 @@ class HourlyRecommendation:
         recommendation: Working-mode recommendation string (or None).
         import_price: Spot import price (local currency/kWh).
         export_price: Spot export price (local currency/kWh).
+        import_price_available / export_price_available: Whether each numeric
+            price came from its configured source. A genuine zero is available.
+        price_actionable: Whether price-driven control is allowed in the slot.
         avg_house_consumption_kwh: Weighted spike-aware consumption estimate (kWh).
+        historical_avg_house_consumption_kwh: Weighted estimate before the
+            current slot is replaced with live power. Runtime EV protection
+            uses this stable history rather than the live-resolved value.
         avg_house_consumption_1d_kwh: 1-day window contribution (kWh).
         avg_house_consumption_3d_kwh: 3-day window contribution (kWh).
         avg_house_consumption_7d_kwh: 7-day window contribution (kWh).
         avg_house_consumption_14d_kwh: 14-day window contribution (kWh).
         solcast_pv_estimate_kwh: Forecast PV production (kWh).
+        solcast_pv_estimate_available: Whether the numeric PV estimate came
+            from a finite, matched forecast point. A published zero is available.
         estimated_net_consumption_kwh: avg_consumption + ev_planned_load_kwh - pv_estimate (kWh).
         ev_planned_load_kwh: Extra EV AC load added to net consumption (kWh, ≥ 0).
             Combined injected load from primary and second EV.  Zero when EV
@@ -79,6 +87,7 @@ class HourlyRecommendation:
     import_price: float
     recommendation: Any | None
     solcast_pv_estimate_kwh: float
+    historical_avg_house_consumption_kwh: float = 0.0
     ev_planned_load_kwh: float = 0.0
     ev_accounted_load_kwh: float = 0.0
     ev_total_planned_load_kwh: float = 0.0
@@ -93,3 +102,7 @@ class HourlyRecommendation:
     secondary_storage_charge_current_a: float = 0.0
     secondary_storage_mode: str | None = None
     primary_battery_hold: bool = False
+    import_price_available: bool = False
+    export_price_available: bool = False
+    price_actionable: bool = False
+    solcast_pv_estimate_available: bool = False

@@ -346,7 +346,7 @@
           "hsem_planner_hysteresis_enabled": "When enabled, the planner keeps the active candidate plan unless a new plan improves the score by more than the configured thresholds. Prevents oscillation between equally-scored strategies.",
           "hsem_planner_hysteresis_absolute": "Minimum absolute score improvement required to switch to a new plan. 0.00 disables the absolute threshold. The score uses the same currency as your electricity prices, so a value of 0.01 requires at least 1 cent/kWh-equivalent improvement before switching.",
           "hsem_planner_hysteresis_percentage": "Minimum percentage score improvement required to switch to a new plan. 0% disables the percentage threshold. Default 5% prevents flapping between nearly-identical plans.",
-          "hsem_planner_window_hysteresis_minutes": "Minimum time (minutes) a recommendation must be held before it can change. Prevents rapid toggling such as ev_smart_charging ↔ batteries_charge_solar. 0 disables the feature. Default 10."
+          "hsem_planner_window_hysteresis_minutes": "Minimum time (minutes) to coalesce equivalent batteries_charge_solar ↔ unrestricted batteries_discharge_mode labels. Hardware-mode and partial-discharge changes remain immediate. 0 disables the feature. Default 10."
         },
         "description": "Configure battery economics parameters and planner hysteresis (anti-flapping).",
         "title": "Battery Economics & Hysteresis"
@@ -906,7 +906,7 @@
           "hsem_planner_hysteresis_enabled": "When enabled, the planner keeps the active candidate plan unless a new plan improves the score by more than the configured thresholds. Prevents oscillation between equally-scored strategies.",
           "hsem_planner_hysteresis_absolute": "Minimum absolute score improvement required to switch to a new plan. 0.00 disables the absolute threshold. The score uses the same currency as your electricity prices, so a value of 0.01 requires at least 1 cent/kWh-equivalent improvement before switching.",
           "hsem_planner_hysteresis_percentage": "Minimum percentage score improvement required to switch to a new plan. 0% disables the percentage threshold. Default 5% prevents flapping between nearly-identical plans.",
-          "hsem_planner_window_hysteresis_minutes": "Minimum time (minutes) a recommendation must be held before it can change. Prevents rapid toggling such as ev_smart_charging ↔ batteries_charge_solar. 0 disables the feature. Default 10."
+          "hsem_planner_window_hysteresis_minutes": "Minimum time (minutes) to coalesce equivalent batteries_charge_solar ↔ unrestricted batteries_discharge_mode labels. Hardware-mode and partial-discharge changes remain immediate. 0 disables the feature. Default 10."
         },
         "description": "Configure battery economics parameters and planner hysteresis (anti-flapping).",
         "title": "Battery Economics & Hysteresis"

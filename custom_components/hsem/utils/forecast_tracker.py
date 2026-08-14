@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 import statistics
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -389,7 +389,7 @@ class ForecastTracker:
         """
         count = 0
         for rec in self._records:
-            if not rec.finalised and rec.end <= now:
+            if not rec.finalised and _utc_key(rec.end) <= _utc_key(now):
                 rec.finalise()
                 count += 1
         return count
@@ -465,7 +465,12 @@ class ForecastTracker:
 
 def _same_slot(a: datetime, b: datetime) -> bool:
     """Return ``True`` when *a* and *b* represent the same slot start."""
-    return a == b
+    return _utc_key(a) == _utc_key(b)
+
+
+def _utc_key(value: datetime) -> datetime:
+    """Return a pure-Python UTC identity without importing HA utilities."""
+    return value.astimezone(UTC).replace(microsecond=0)
 
 
 def compute_accumulated_energy(power_w: float, elapsed_seconds: float) -> float:

@@ -270,6 +270,32 @@ def test_sbu_relabels_zero_import_primary_charge_as_solar() -> None:
     assert slot.batteries_charged_kwh == original_charge
 
 
+def test_sbu_one_wh_import_residue_relabels_primary_charge_as_solar() -> None:
+    """Post-SBU 0.001 kWh import residue must not force grid/TOU mode."""
+    slot = _slots([1.0], house_load_kwh=0.100)[0]
+    slot.recommendation = Recommendations.BatteriesChargeGrid.value
+    slot.batteries_charged_kwh = 0.400
+    slot.grid_import_kwh = 0.101
+
+    _apply_sbu_to_primary_slot(slot, battery_export_min_price=0.50)
+
+    assert slot.grid_import_kwh == pytest.approx(0.001)
+    assert slot.recommendation == Recommendations.BatteriesChargeSolar.value
+
+
+def test_sbu_two_wh_import_keeps_primary_grid_charge() -> None:
+    """Post-SBU import above publication residue must keep grid/TOU mode."""
+    slot = _slots([1.0], house_load_kwh=0.100)[0]
+    slot.recommendation = Recommendations.BatteriesChargeGrid.value
+    slot.batteries_charged_kwh = 0.400
+    slot.grid_import_kwh = 0.102
+
+    _apply_sbu_to_primary_slot(slot, battery_export_min_price=0.50)
+
+    assert slot.grid_import_kwh == pytest.approx(0.002)
+    assert slot.recommendation == Recommendations.BatteriesChargeGrid.value
+
+
 def test_sbu_relabels_primary_discharge_export_as_force() -> None:
     """Allowed SBU-created export must use an executable Huawei mode."""
     slot = _slots([1.0], house_load_kwh=0.100)[0]
@@ -285,6 +311,36 @@ def test_sbu_relabels_primary_discharge_export_as_force() -> None:
     assert slot.grid_export_kwh == pytest.approx(0.100)
     assert slot.recommendation == Recommendations.ForceBatteriesDischarge.value
     assert slot.batteries_discharged_kwh == original_discharge
+
+
+def test_sbu_one_wh_export_residue_keeps_self_consumption() -> None:
+    """Post-SBU 0.001 kWh export residue must not enable Fully Fed mode."""
+    slot = _slots([1.0], house_load_kwh=0.100)[0]
+    slot.price = SlotPrice(import_price=1.0, export_price=1.00)
+    slot.recommendation = Recommendations.BatteriesDischargeMode.value
+    slot.batteries_discharged_kwh = 0.400
+    slot.grid_import_kwh = 0.099
+
+    result = _apply_sbu_to_primary_slot(slot, battery_export_min_price=0.50)
+
+    assert result is not None
+    assert slot.grid_export_kwh == pytest.approx(0.001)
+    assert slot.recommendation == Recommendations.BatteriesDischargeMode.value
+
+
+def test_sbu_two_wh_export_uses_forced_discharge() -> None:
+    """Post-SBU export above publication residue must enable Fully Fed mode."""
+    slot = _slots([1.0], house_load_kwh=0.100)[0]
+    slot.price = SlotPrice(import_price=1.0, export_price=1.00)
+    slot.recommendation = Recommendations.BatteriesDischargeMode.value
+    slot.batteries_discharged_kwh = 0.400
+    slot.grid_import_kwh = 0.098
+
+    result = _apply_sbu_to_primary_slot(slot, battery_export_min_price=0.50)
+
+    assert result is not None
+    assert slot.grid_export_kwh == pytest.approx(0.002)
+    assert slot.recommendation == Recommendations.ForceBatteriesDischarge.value
 
 
 def test_sbu_rejects_material_export_in_site_limited_slot(

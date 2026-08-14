@@ -630,6 +630,27 @@ class TestZeroVsMissingDistinction:
             "Explicit zero PV should NOT be flagged as missing data."
         )
 
+    def test_unavailable_zero_pv_is_missing_and_incomplete(self) -> None:
+        """The same numeric zero is missing when its source did not publish it."""
+        pv = [
+            SolcastSlot(
+                hour=h,
+                pv_estimate=0.0,
+                pv_estimate_available=h != 12,
+            )
+            for h in range(24)
+        ]
+        inp = _make_48h_input(
+            price_points=_today_price_points(),
+            solcast_slots=pv,
+        )
+
+        result = run_planner(inp)
+
+        assert result.data_quality.tomorrow_pv_missing_hours == [12]
+        assert result.data_quality.tomorrow_pv_complete is False
+        assert result.data_quality.is_complete is False
+
     def test_explicit_zero_prices_not_flagged_as_missing(self) -> None:
         """Price slots explicitly set to 0.0 must not appear in missing price lists."""
         prices = [
@@ -707,3 +728,58 @@ class TestDataQualityAsDict:
         assert d["tomorrow_price_missing_hours"] == sorted(
             d["tomorrow_price_missing_hours"]
         )
+
+
+class TestPublishedPriceActionablePrefix:
+    """Unpublished values must never enter price-driven planner decisions."""
+
+    def test_unpublished_tomorrow_is_visible_and_non_actionable(self) -> None:
+        prices = _today_price_points() + [
+            PricePoint(
+                hour=h,
+                import_price=0.0,
+                export_price=0.0,
+                day_offset=1,
+                import_price_available=False,
+                export_price_available=False,
+            )
+            for h in range(24)
+        ]
+        result = run_planner(_make_48h_input(price_points=prices))
+
+        assert result.data_quality.tomorrow_price_missing_hours == list(range(24))
+        assert result.data_quality.price_actionable_slots == 24
+        assert result.data_quality.price_actionable_until == (
+            "2024-06-16T00:00:00+02:00"
+        )
+        tomorrow = [slot for slot in result.slots if slot.start.date().day == 16]
+        assert tomorrow
+        assert all(not slot.price_actionable for slot in tomorrow)
+        assert not any(
+            slot.recommendation
+            in {
+                "batteries_charge_grid",
+                "force_batteries_discharge",
+                "force_export",
+            }
+            for slot in tomorrow
+        )
+
+    def test_genuine_zero_tomorrow_prices_remain_actionable(self) -> None:
+        prices = _today_price_points() + [
+            PricePoint(
+                hour=h,
+                import_price=0.0,
+                export_price=-0.1,
+                day_offset=1,
+            )
+            for h in range(24)
+        ]
+        result = run_planner(_make_48h_input(price_points=prices))
+
+        assert result.data_quality.tomorrow_price_missing_hours == []
+        assert result.data_quality.price_actionable_slots == 48
+        tomorrow = [slot for slot in result.slots if slot.start.date().day == 16]
+        assert all(slot.price_actionable for slot in tomorrow)
+        assert all(slot.price.import_price == 0.0 for slot in tomorrow)
+        assert all(slot.price.export_price == -0.1 for slot in tomorrow)

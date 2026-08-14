@@ -47,6 +47,17 @@ def secondary_slot_cost(
     export_price: float,
 ) -> tuple[float, float, float]:
     """Return conversion, cycle, and terminal costs for one secondary slot."""
+    charge = slot.secondary_storage_charged_kwh
+    discharge = slot.secondary_storage_discharged_kwh
+    cycle = max(charge, discharge) * max(
+        weights.secondary_storage_cycle_cost_per_kwh,
+        0.0,
+    )
+    if not slot.price_actionable:
+        # Wear remains a physical cost, but unknown prices cannot create
+        # conversion valuation or a replacement/terminal incentive.
+        return (0.0, cycle, 0.0)
+
     raw_import_price = import_price
     import_price = max(import_price, 0.0)
     if weights.export_min_price > 1e-9 and export_price < weights.export_min_price:
@@ -54,16 +65,9 @@ def secondary_slot_cost(
     export_price = min(export_price, raw_import_price)
     charge_eff = clamp_efficiency(weights.secondary_storage_charge_efficiency_pct)
     discharge_eff = clamp_efficiency(weights.secondary_storage_discharge_efficiency_pct)
-    charge = slot.secondary_storage_charged_kwh
-    discharge = slot.secondary_storage_discharged_kwh
-
     conversion = (
         charge * (1.0 - charge_eff) + discharge * (1.0 - discharge_eff)
     ) * import_price
-    cycle = max(charge, discharge) * max(
-        weights.secondary_storage_cycle_cost_per_kwh,
-        0.0,
-    )
 
     terminal = 0.0
     replacement = weights.secondary_storage_replacement_price_per_kwh

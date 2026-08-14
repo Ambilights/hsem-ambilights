@@ -8,7 +8,7 @@ from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.planner.charging._charge_helpers import (
     _already_planned_charge_kwh,
 )
-from custom_components.hsem.utils.datetime_utils import as_tz
+from custom_components.hsem.utils.datetime_utils import utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.recommendations import Recommendations
 
@@ -88,11 +88,12 @@ def apply_opportunistic_charge(
         (
             slot
             for slot in slots
-            if as_tz(slot.end, now.tzinfo) > now
+            if utc_key(slot.end) > utc_key(now)
+            and slot.price_actionable
             and slot.recommendation is None
             and slot.price.import_price < 0
         ),
-        key=lambda x: (x.price.import_price, x.start),
+        key=lambda x: (x.price.import_price, utc_key(x.start)),
     ):
         if charged >= remaining_capacity:
             break
@@ -113,11 +114,12 @@ def apply_opportunistic_charge(
             (
                 slot
                 for slot in slots
-                if as_tz(slot.end, now.tzinfo) > now
+                if utc_key(slot.end) > utc_key(now)
+                and slot.price_actionable
                 and slot.recommendation is None
                 and 0 <= slot.price.import_price < effective_threshold
             ),
-            key=lambda x: (x.price.import_price, x.start),
+            key=lambda x: (x.price.import_price, utc_key(x.start)),
         ):
             if charged >= remaining_capacity:
                 break

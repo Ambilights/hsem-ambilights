@@ -19,6 +19,7 @@ from custom_components.hsem.planner.secondary_storage import (
     secondary_charge_limits_kwh,
     secondary_site_load_offset_kwh,
 )
+from custom_components.hsem.utils.datetime_utils import utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import clamp_efficiency
 from custom_components.hsem.utils.recommendations import Recommendations
@@ -61,6 +62,7 @@ def _extend_secondary_constraints(
     primary_discharge_efficiency_fraction: float,
     primary_site_discharge_limited: np.ndarray,  # type: ignore[name-defined]
     primary_site_discharge_cap_kwh: np.ndarray,  # type: ignore[name-defined]
+    price_actionable: np.ndarray,  # type: ignore[name-defined]
 ) -> dict[str, Any]:
     """Add site balance, secondary SoC, discrete modes, and no-transfer rows."""
     charge_eff = clamp_efficiency(config.charge_efficiency_pct)
@@ -194,12 +196,21 @@ def _extend_secondary_constraints(
     constraints["A_ub"] = a_ub
     constraints["b_ub"] = b_ub
     constraints["bounds"] += (
-        [(0.0, maximum_charge)] * m
-        + [(0.0, config.usable_kwh)] * m
+        [
+            ((0.0, maximum_charge) if bool(price_actionable[t]) else (0.0, 0.0))
+            for t in range(m)
+        ]
+        + [
+            ((0.0, config.usable_kwh) if bool(price_actionable[t]) else (0.0, 0.0))
+            for t in range(m)
+        ]
         + [(0.0, None)] * m
-        + [(0.0, 1.0)] * m
-        + [(0.0, 1.0)] * m
-        + [(0.0, float(maximum_steps))] * m
+        + [((0.0, 1.0) if bool(price_actionable[t]) else (0.0, 0.0)) for t in range(m)]
+        + [((0.0, 1.0) if bool(price_actionable[t]) else (0.0, 0.0)) for t in range(m)]
+        + [
+            ((0.0, float(maximum_steps)) if bool(price_actionable[t]) else (0.0, 0.0))
+            for t in range(m)
+        ]
     )
     return constraints
 
@@ -222,10 +233,13 @@ def _add_secondary_objective(
     use_discount = time_discount_rate < 1.0 - 1e-9
 
     for t, slot_i in enumerate(future_idx):
+        if not slots[slot_i].price_actionable:
+            continue
         discount = 1.0
         if use_discount:
             slot = slots[slot_i]
-            midpoint = slot.start + (slot.end - slot.start) / 2
+            start_utc = utc_key(slot.start)
+            midpoint = start_utc + (utc_key(slot.end) - start_utc) / 2
             discount = time_discount_rate ** hours_ahead(now, midpoint)
 
         objective[layout["charge"] + t] += (1.0 - charge_eff) * p_imp_obj[t] * discount
@@ -347,10 +361,14 @@ def _write_secondary_results(
         # Apply the secondary branch once to that reconstructed base flow.
         slot.grid_import_kwh = round(max(net_grid, 0.0), 3)
         slot.grid_export_kwh = round(max(-net_grid, 0.0), 3)
-        slot.estimated_cost_currency = round(
-            slot.grid_import_kwh * max(slot.price.import_price, 0.0)
-            - slot.grid_export_kwh * slot.price.export_price,
-            4,
+        slot.estimated_cost_currency = (
+            round(
+                slot.grid_import_kwh * max(slot.price.import_price, 0.0)
+                - slot.grid_export_kwh * slot.price.export_price,
+                4,
+            )
+            if slot.price_actionable
+            else 0.0
         )
 
         # Huawei is physically constrained to self-consumption in these slots:
@@ -386,7 +404,7 @@ def _write_secondary_results(
         if (
             slot.recommendation == Recommendations.BatteriesChargeGrid.value
             and slot.batteries_charged_kwh > minimum_action_kwh
-            and slot.grid_import_kwh <= 0.0
+            and not is_material_planned_energy_kwh(slot.grid_import_kwh)
         ):
             slot.recommendation = Recommendations.BatteriesChargeSolar.value
         elif (
@@ -398,7 +416,7 @@ def _write_secondary_results(
             and slot.batteries_discharged_kwh > minimum_action_kwh
         ):
             if (
-                slot.grid_export_kwh > 0.0
+                is_material_planned_energy_kwh(slot.grid_export_kwh)
                 and slot.price.export_price >= battery_export_min_price
             ):
                 slot.recommendation = Recommendations.ForceBatteriesDischarge.value

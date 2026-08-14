@@ -7,20 +7,44 @@ or from a pre-collected :class:`StateSnapshot` (snapshot).
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta
 from typing import Any
+
+from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 
 from custom_components.hsem.models.hourly_recommendation import HourlyRecommendation
 from custom_components.hsem.models.sensor_config import SensorConfig
 from custom_components.hsem.models.state_snapshot import StateSnapshot
-from custom_components.hsem.utils.conversion import convert_to_float
+from custom_components.hsem.utils.conversion import convert_to_boolean, convert_to_float
 from custom_components.hsem.utils.datetime_utils import (
     normalize_datetime,
     normalize_slot_start,
+    utc_key,
 )
 from custom_components.hsem.utils.logger import HSEM_LOGGER as _LOGGER
 
 from . import _resolve_cached  # noqa: F401
+
+_TOMORROW_ONLY_PRICE_ATTRIBUTES = frozenset({"raw_tomorrow", "prices_tomorrow"})
+
+
+def _source_attributes_available(state: Any) -> bool:
+    """Return whether a HA state can authoritatively publish its attributes."""
+    raw_state = getattr(state, "state", None)
+    return not (
+        isinstance(raw_state, str)
+        and raw_state.strip().lower() in {STATE_UNKNOWN, STATE_UNAVAILABLE}
+    )
+
+
+def _tomorrow_attribute_available(attributes: dict[str, Any], attr: str) -> bool:
+    """Honor an explicit source withdrawal of tomorrow-only price arrays."""
+    if attr not in _TOMORROW_ONLY_PRICE_ATTRIBUTES:
+        return True
+    if "tomorrow_valid" not in attributes:
+        return True
+    return convert_to_boolean(attributes["tomorrow_valid"])
 
 
 async def async_populate_price_and_solcast(
@@ -100,7 +124,8 @@ async def async_populate_price_and_solcast(
     if import_matched == 0:
         _LOGGER.warning(
             "No import price data matched from sensor(s) %s — "
-            "planner will use 0.0 for all slots. "
+            "slots retain 0.0 only as a display fallback; unavailable prices "
+            "are non-actionable and automatic storage uses strict Hold. "
             "Check that the sensor is available and its attribute format is supported.",
             cfg.import_electricity_price_sensor,
         )
@@ -128,7 +153,8 @@ async def async_populate_price_and_solcast(
     if export_matched == 0:
         _LOGGER.warning(
             "No export price data matched from sensor(s) %s — "
-            "planner will use 0.0 for all slots. "
+            "slots retain 0.0 only as a display fallback; unavailable prices "
+            "are non-actionable and automatic storage uses strict Hold. "
             "Check that the sensor is available and its attribute format is supported.",
             cfg.export_electricity_price_sensor,
         )
@@ -202,6 +228,11 @@ async def _async_update_hourly_field(
     if not sensor_state:
         _LOGGER.debug(f"Input sensor {sensor_id} was not found for data.")
         return 0
+    if not _source_attributes_available(sensor_state):
+        _LOGGER.debug(
+            "Input sensor %s is unavailable; ignoring stale attributes.", sensor_id
+        )
+        return 0
 
     # Each source exposes a different attribute key / time-key / value-key
     data_sources: dict[str, list[dict[str, str]]] = {
@@ -232,6 +263,8 @@ async def _async_update_hourly_field(
 
     matched = 0
     for attr, kv_list in data_sources.items():
+        if not _tomorrow_attribute_available(sensor_state.attributes, attr):
+            continue
         sensor_data = sensor_state.attributes.get(attr) or []
         if not sensor_data:
             continue
@@ -262,7 +295,7 @@ async def _async_update_hourly_field(
                     continue
 
                 value = convert_to_float(data.get(kv["v"]))
-                if value is None:
+                if value is None or not math.isfinite(value):
                     continue
 
                 # Scale raw value down to one recommendation-slot's share of the
@@ -282,6 +315,8 @@ async def _async_update_hourly_field(
                 # receives the original hourly-equivalent rate or energy quantity.
                 value = value / share
 
+                window_start = utc_key(dt_key)
+                window_end = window_start + source_window
                 for obj in recommendations:
                     # A data point covers every slot whose start falls inside
                     # the source window that begins at dt_key:
@@ -290,9 +325,13 @@ async def _async_update_hourly_field(
                     #     to all four quarter-hour slots of the hour
                     # Flooring dt_key to the *hour* (old behavior) collapsed
                     # all four quarter-hour prices onto one key (issue #720).
-                    obj_start = normalize_datetime(obj.start)
-                    if dt_key <= obj_start < dt_key + source_window:
+                    obj_start = utc_key(normalize_datetime(obj.start))
+                    if window_start <= obj_start < window_end:
                         setattr(obj, field_name, round(value, 5))
+                        if field_name in {"import_price", "export_price"}:
+                            setattr(obj, f"{field_name}_available", True)
+                        elif field_name == "solcast_pv_estimate_kwh":
+                            obj.solcast_pv_estimate_available = True
                         matched += 1
 
     return matched
@@ -347,7 +386,8 @@ def populate_price_and_solcast_from_snapshot(
     if import_matched == 0:
         _LOGGER.warning(
             "No import price data matched from sensor(s) %s — "
-            "planner will use 0.0 for all slots. "
+            "slots retain 0.0 only as a display fallback; unavailable prices "
+            "are non-actionable and automatic storage uses strict Hold. "
             "Check that the sensor is available and its attribute format is supported.",
             cfg.import_electricity_price_sensor,
         )
@@ -373,7 +413,8 @@ def populate_price_and_solcast_from_snapshot(
     if export_matched == 0:
         _LOGGER.warning(
             "No export price data matched from sensor(s) %s — "
-            "planner will use 0.0 for all slots. "
+            "slots retain 0.0 only as a display fallback; unavailable prices "
+            "are non-actionable and automatic storage uses strict Hold. "
             "Check that the sensor is available and its attribute format is supported.",
             cfg.export_electricity_price_sensor,
         )
@@ -464,6 +505,8 @@ def _update_hourly_field_from_attrs(
 
     matched = 0
     for attr, kv_list in data_sources.items():
+        if not _tomorrow_attribute_available(attributes, attr):
+            continue
         sensor_data = attributes.get(attr) or []
         if not sensor_data:
             continue
@@ -489,15 +532,21 @@ def _update_hourly_field_from_attrs(
                     continue
 
                 value = convert_to_float(data.get(kv["v"]))
-                if value is None:
+                if value is None or not math.isfinite(value):
                     continue
 
                 value = value / share
 
+                window_start = utc_key(dt_key)
+                window_end = window_start + source_window
                 for obj in recommendations:
-                    obj_start = normalize_datetime(obj.start)
-                    if dt_key <= obj_start < dt_key + source_window:
+                    obj_start = utc_key(normalize_datetime(obj.start))
+                    if window_start <= obj_start < window_end:
                         setattr(obj, field_name, round(value, 5))
+                        if field_name in {"import_price", "export_price"}:
+                            setattr(obj, f"{field_name}_available", True)
+                        elif field_name == "solcast_pv_estimate_kwh":
+                            obj.solcast_pv_estimate_available = True
                         matched += 1
 
     return matched

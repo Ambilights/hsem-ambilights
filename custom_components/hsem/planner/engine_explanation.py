@@ -9,6 +9,7 @@ directly testable with plain ``pytest`` without a running HA instance.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 
 from custom_components.hsem.const import (
@@ -22,7 +23,7 @@ from custom_components.hsem.models.plan_explanation import PlanExplanation
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.planner_input import PlannerInput
 from custom_components.hsem.models.rejected_plan import RejectedPlan
-from custom_components.hsem.utils.datetime_utils import as_tz
+from custom_components.hsem.utils.datetime_utils import utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import calculate_recommended_threshold
 from custom_components.hsem.utils.recommendations import Recommendations
@@ -66,8 +67,12 @@ def _derive_windows(
         if not group:
             return
         total_e = round(sum(s.batteries_charged_kwh for s in group), 3)
-        prices = [s.price.import_price for s in group]
-        avg_p = round(sum(prices) / len(prices), 4)
+        prices = [
+            s.price.import_price
+            for s in group
+            if s.price_actionable and math.isfinite(s.price.import_price)
+        ]
+        avg_p = round(sum(prices) / len(prices), 4) if prices else 0.0
         charge_windows.append(
             ChargeWindow(
                 start=group[0].start,
@@ -81,8 +86,12 @@ def _derive_windows(
     def _flush_discharge(group: list[PlannedSlot]) -> None:
         if not group:
             return
-        prices = [s.price.import_price for s in group]
-        avg_p = round(sum(prices) / len(prices), 4)
+        prices = [
+            s.price.import_price
+            for s in group
+            if s.price_actionable and math.isfinite(s.price.import_price)
+        ]
+        avg_p = round(sum(prices) / len(prices), 4) if prices else 0.0
         discharge_windows.append(
             DischargeWindow(
                 start=group[0].start,
@@ -158,11 +167,12 @@ def _build_explanation(
         battery_soc_at_end,
         now.isoformat(),
     )
-    future_slots = [s for s in slots if as_tz(s.end, now.tzinfo) > now]
+    future_slots = [s for s in slots if utc_key(s.end) > utc_key(now)]
 
     # --- Price metrics ---------------------------------------------------
-    import_prices = [s.price.import_price for s in future_slots]
-    export_prices = [s.price.export_price for s in future_slots]
+    priced_future_slots = [s for s in future_slots if s.price_actionable]
+    import_prices = [s.price.import_price for s in priced_future_slots]
+    export_prices = [s.price.export_price for s in priced_future_slots]
     peak_import = max(import_prices) if import_prices else 0.0
     off_peak_import = min(import_prices) if import_prices else 0.0
     price_spread = round(peak_import - off_peak_import, 4)
@@ -182,7 +192,10 @@ def _build_explanation(
     forecast_usable = any(s.solcast_pv_estimate_kwh > 0.0 for s in future_slots)
 
     # --- Cost of the selected plan ---------------------------------------
-    selected_cost = round(sum(s.estimated_cost_currency for s in future_slots), 4)
+    selected_cost = round(
+        sum(s.estimated_cost_currency for s in future_slots if s.price_actionable),
+        4,
+    )
 
     # --- Do-nothing baseline cost (battery fully idle, pay import for all load) ---
     # Computed here so strategy detection can use it in summaries.
@@ -190,6 +203,7 @@ def _build_explanation(
         sum(
             max(s.estimated_net_consumption_kwh, 0.0) * s.price.import_price
             for s in future_slots
+            if s.price_actionable
         ),
         4,
     )
