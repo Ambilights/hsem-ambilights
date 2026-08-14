@@ -693,6 +693,59 @@ class TestSelectBestCandidate:
             if candidate is not winner and candidate.name != CANDIDATE_NO_ACTION:
                 assert candidate.name in rejected_names
 
+    def test_rejected_plan_keeps_money_cost_distinct_from_selector_score(self):
+        """Rejected diagnostics expose total_cost and score in separate fields."""
+        winner_candidate = CandidatePlan(
+            name="ordinary",
+            slots=[
+                _make_simple_slot(
+                    recommendation=Recommendations.BatteriesWaitMode.value
+                )
+            ],
+        )
+        rejected_candidate = CandidatePlan(
+            name="forced",
+            slots=[
+                _make_simple_slot(
+                    recommendation=Recommendations.BatteriesChargeGrid.value
+                )
+            ],
+        )
+        candidates = [winner_candidate, rejected_candidate]
+        weights = self._cost_weights()
+        weights.override_penalty_per_slot = 10.0
+        winner, rejected, _ = select_best_candidate(
+            candidates,
+            now=_NOW,
+            current_kwh=4.5,
+            usable_kwh=9.0,
+            max_soc_capacity_kwh=9.0,
+            max_charge_per_slot=1.25,
+            max_discharge_per_slot=None,
+            rated_kwh=10.0,
+            end_of_discharge_soc_pct=10.0,
+            cost_weights=weights,
+            slot_duration_hours=1.0,
+        )
+        candidates_by_name = {candidate.name: candidate for candidate in candidates}
+        assert winner is winner_candidate
+        assert rejected
+        rejected_candidates = [candidates_by_name[plan.name] for plan in rejected]
+        assert any(
+            candidate._cost is not None
+            and abs(candidate._cost.total_cost - candidate._cost.score) > 1e-6
+            for candidate in rejected_candidates
+        )
+
+        for rejected_plan in rejected:
+            candidate = candidates_by_name[rejected_plan.name]
+            assert candidate is not winner
+            assert candidate._cost is not None
+            assert rejected_plan.estimated_cost == pytest.approx(
+                candidate._cost.total_cost
+            )
+            assert rejected_plan.score == pytest.approx(candidate._cost.score)
+
     def test_winner_has_lowest_cost_among_valid(self):
         """The winner must not cost more than any other valid candidate."""
         inp = make_summer_day_input()

@@ -16,6 +16,7 @@ from custom_components.hsem.utils.units import (
     ev_dc_to_ac_kwh,
     fuse_max_energy_per_slot_kwh,
     implied_price_per_kwh,
+    is_material_planned_energy_kwh,
     kilowatt_to_watt,
     kilowatthours_to_watthours,
     power_to_energy_kwh,
@@ -183,6 +184,18 @@ class TestEnergyToPowerKw:
         duration = 0.5
         kwh = power_to_energy_kwh(original_kw, duration)
         assert energy_to_power_kw(kwh, duration) == pytest.approx(original_kw)
+
+
+class TestMaterialPlannedEnergy:
+    """Three-decimal planner residue must not become hardware intent."""
+
+    @pytest.mark.parametrize("energy_kwh", [-1.0, 0.0, 0.0009, 0.001, 0.001000001])
+    def test_rounding_residue_is_not_material(self, energy_kwh: float) -> None:
+        assert is_material_planned_energy_kwh(energy_kwh) is False
+
+    @pytest.mark.parametrize("energy_kwh", [0.001000002, 0.002, 0.25])
+    def test_energy_above_rounding_residue_is_material(self, energy_kwh: float) -> None:
+        assert is_material_planned_energy_kwh(energy_kwh) is True
 
 
 # ---------------------------------------------------------------------------

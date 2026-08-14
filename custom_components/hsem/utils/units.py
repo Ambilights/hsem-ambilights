@@ -31,6 +31,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+PLANNED_ENERGY_ROUNDING_KWH = 0.001
+
 # ---------------------------------------------------------------------------
 # Power conversions (W ↔ kW)
 # ---------------------------------------------------------------------------
@@ -175,6 +177,16 @@ def energy_to_power_kw(energy_kwh: float, duration_h: float) -> float:
         return 0.0
 
     return energy_kwh / duration_h
+
+
+def is_material_planned_energy_kwh(energy_kwh: float) -> bool:
+    """Return whether planned energy exceeds HSEM's 3-decimal residue.
+
+    Planner flow fields are published to three decimal places. Exactly
+    0.001 kWh can therefore be a rounding artefact, while any larger value is
+    treated as intentional solver output and must be preserved by execution.
+    """
+    return energy_kwh > PLANNED_ENERGY_ROUNDING_KWH + 1e-9
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ from dataclasses import asdict
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pytest
 
 from custom_components.hsem.models.planned_slot import PlannedSlot
@@ -18,6 +19,10 @@ from custom_components.hsem.planner.milp import _secondary_diagnostics
 from custom_components.hsem.planner.milp._secondary_diagnostics import (
     SecondaryResultSummary,
 )
+from custom_components.hsem.planner.milp._secondary_storage import (
+    _allocate_secondary_variables,
+    _write_secondary_results,
+)
 from custom_components.hsem.planner.milp_optimizer import (
     is_scipy_available,
     solve_milp,
@@ -25,8 +30,10 @@ from custom_components.hsem.planner.milp_optimizer import (
 from custom_components.hsem.planner.secondary_storage import (
     SECONDARY_MODE_CHARGE,
     SECONDARY_MODE_SBU,
+    SECONDARY_MODE_UTILITY,
 )
 from custom_components.hsem.utils.prices import SlotPrice
+from custom_components.hsem.utils.recommendations import Recommendations
 
 _NOW = datetime(2026, 8, 11, 0, 0, tzinfo=ZoneInfo("Europe/Stockholm"))
 
@@ -96,6 +103,10 @@ def _solve(
     secondary: SecondaryStorageConfig,
     *,
     primary_current_kwh: float = 0.0,
+    no_export: bool = True,
+    min_export_price: float = 0.0,
+    battery_export_min_price: float = 0.0,
+    primary_max_discharge_per_slot: float = 2.0,
 ) -> tuple[list[PlannedSlot], dict]:
     """Solve a small deterministic secondary-storage scenario."""
     result = solve_milp(
@@ -104,11 +115,13 @@ def _solve(
         current_kwh=primary_current_kwh,
         usable_kwh=9.0,
         max_charge_per_slot=2.0,
-        max_discharge_per_slot=2.0,
+        max_discharge_per_slot=primary_max_discharge_per_slot,
         charge_efficiency_pct=97.0,
         discharge_efficiency_pct=97.0,
         time_discount_rate=1.0,
-        no_export=True,
+        no_export=no_export,
+        min_export_price=min_export_price,
+        battery_export_min_price=battery_export_min_price,
         secondary_storage=secondary,
     )
     assert result is not None
@@ -208,6 +221,193 @@ def test_secondary_sbu_removes_included_load_from_site_import() -> None:
     assert result[0].secondary_storage_grid_import_kwh == pytest.approx(0.0)
     assert result[0].grid_import_kwh == pytest.approx(0.0)
     assert result[0].grid_export_kwh == pytest.approx(0.0)
+
+
+def _apply_sbu_to_primary_slot(
+    slot: PlannedSlot,
+    *,
+    battery_export_min_price: float,
+    primary_site_discharge_limited: bool = False,
+) -> dict[str, float | int] | None:
+    """Apply one deterministic SBU write-out to an existing primary slot."""
+    config = _powmr(
+        current_soc_pct=80.0,
+        base_load_includes_dedicated_load=True,
+    )
+    slot.secondary_storage_load_kwh = 0.100
+    layout, n_vars = _allocate_secondary_variables(0, 1)
+    result_x = np.zeros(n_vars)
+    result_x[layout["discharge"]] = 0.100 / 0.93 + 0.055
+    result_x[layout["sbu_mode"]] = 1.0
+
+    return _write_secondary_results(
+        [slot],
+        result_x=result_x,
+        layout=layout,
+        config=config,
+        future_idx=[0],
+        minimum_action_kwh=1e-4,
+        battery_export_min_price=battery_export_min_price,
+        primary_site_discharge_limited=np.asarray(
+            [primary_site_discharge_limited], dtype=bool
+        ),
+    )
+
+
+def test_sbu_relabels_zero_import_primary_charge_as_solar() -> None:
+    """SBU load removal must not leave a zero-import forced-grid label."""
+    slot = _slots([1.0], house_load_kwh=0.100)[0]
+    slot.recommendation = Recommendations.BatteriesChargeGrid.value
+    slot.batteries_charged_kwh = 0.400
+    slot.grid_import_kwh = 0.100
+    original_charge = slot.batteries_charged_kwh
+
+    _apply_sbu_to_primary_slot(slot, battery_export_min_price=0.50)
+
+    assert slot.grid_import_kwh == pytest.approx(0.0)
+    assert slot.grid_export_kwh == pytest.approx(0.0)
+    assert slot.recommendation == Recommendations.BatteriesChargeSolar.value
+    assert slot.batteries_charged_kwh == original_charge
+
+
+def test_sbu_relabels_primary_discharge_export_as_force() -> None:
+    """Allowed SBU-created export must use an executable Huawei mode."""
+    slot = _slots([1.0], house_load_kwh=0.100)[0]
+    slot.price = SlotPrice(import_price=1.0, export_price=1.00)
+    slot.recommendation = Recommendations.BatteriesDischargeMode.value
+    slot.batteries_discharged_kwh = 0.400
+    original_discharge = slot.batteries_discharged_kwh
+
+    result = _apply_sbu_to_primary_slot(slot, battery_export_min_price=0.50)
+
+    assert result is not None
+    assert slot.grid_import_kwh == pytest.approx(0.0)
+    assert slot.grid_export_kwh == pytest.approx(0.100)
+    assert slot.recommendation == Recommendations.ForceBatteriesDischarge.value
+    assert slot.batteries_discharged_kwh == original_discharge
+
+
+def test_sbu_rejects_material_export_in_site_limited_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blocked export is an invalid candidate, not a cosmetic BDM label."""
+    messages: list[tuple] = []
+    monkeypatch.setattr(
+        "custom_components.hsem.planner.milp._secondary_storage.log_planner",
+        lambda *args: messages.append(args),
+    )
+    slot = _slots([1.0], house_load_kwh=0.100)[0]
+    slot.price = SlotPrice(import_price=1.0, export_price=0.49)
+    slot.recommendation = Recommendations.BatteriesDischargeMode.value
+    slot.batteries_discharged_kwh = 0.400
+
+    result = _apply_sbu_to_primary_slot(
+        slot,
+        battery_export_min_price=0.50,
+        primary_site_discharge_limited=True,
+    )
+
+    assert result is None
+    assert messages
+    assert messages[0][0] == "warning"
+    assert "invariant failed" in messages[0][1]
+
+
+@pytest.mark.parametrize(
+    ("no_export", "min_export_price", "battery_export_min_price"),
+    [
+        (True, 0.0, 0.0),
+        (False, 0.50, 0.0),
+        (False, 0.0, 0.50),
+    ],
+)
+def test_sbu_and_primary_discharge_cannot_create_blocked_export(
+    no_export: bool,
+    min_export_price: float,
+    battery_export_min_price: float,
+) -> None:
+    """The solver must cap Huawei against the load SBU removes."""
+    slot = _slots([10.0], house_load_kwh=0.200)[0]
+    slot.price = SlotPrice(import_price=10.0, export_price=0.40)
+
+    planned, _diagnostics = _solve(
+        [slot],
+        _powmr(
+            current_soc_pct=80.0,
+            base_load_includes_dedicated_load=True,
+            replacement_price_per_kwh=0.0,
+            inverter_standby_power_w=0.0,
+            discharge_efficiency_pct=100.0,
+        ),
+        primary_current_kwh=1.0,
+        no_export=no_export,
+        min_export_price=min_export_price,
+        battery_export_min_price=battery_export_min_price,
+        primary_max_discharge_per_slot=0.103,
+    )
+
+    solved = planned[0]
+    assert solved.secondary_storage_mode == SECONDARY_MODE_SBU
+    assert solved.batteries_discharged_kwh > 0.0
+    # House load is 0.200 kWh and SBU removes the included 0.100 kWh NAS
+    # load, leaving exactly 0.100 kWh AC that Huawei may serve without export.
+    assert solved.batteries_discharged_kwh * 0.97 == pytest.approx(
+        0.100,
+        abs=0.001,
+    )
+    assert solved.grid_import_kwh == pytest.approx(0.0)
+    assert solved.grid_export_kwh == pytest.approx(0.0)
+    assert solved.recommendation == Recommendations.BatteriesDischargeMode.value
+
+
+def test_site_limited_pv_export_with_utility_mode_is_not_rejected() -> None:
+    """PV-only export remains valid when Huawei contributes no discharge."""
+    slot = _slots([1.0], house_load_kwh=0.100)[0]
+    slot.solcast_pv_estimate_kwh = 0.300
+    slot.price = SlotPrice(import_price=1.0, export_price=0.40)
+
+    planned, _diagnostics = _solve(
+        [slot],
+        _powmr(
+            current_soc_pct=100.0,
+            base_load_includes_dedicated_load=True,
+            replacement_price_per_kwh=10.0,
+        ),
+        primary_current_kwh=9.0,
+        no_export=True,
+    )
+
+    solved = planned[0]
+    assert solved.secondary_storage_mode == SECONDARY_MODE_UTILITY
+    assert solved.batteries_discharged_kwh == pytest.approx(0.0)
+    assert solved.secondary_storage_discharged_kwh == pytest.approx(0.0)
+    assert solved.grid_export_kwh == pytest.approx(0.200)
+
+
+def test_profitable_sbu_can_reveal_pv_export_without_primary_discharge() -> None:
+    """SBU may remove only the demand present and reveal surplus PV."""
+    slot = _slots([10.0], house_load_kwh=0.100)[0]
+    slot.solcast_pv_estimate_kwh = 0.050
+    slot.price = SlotPrice(import_price=10.0, export_price=0.40)
+
+    planned, _diagnostics = _solve(
+        [slot],
+        _powmr(
+            current_soc_pct=80.0,
+            base_load_includes_dedicated_load=True,
+            replacement_price_per_kwh=0.0,
+            inverter_standby_power_w=0.0,
+            discharge_efficiency_pct=100.0,
+        ),
+        primary_current_kwh=0.0,
+        no_export=True,
+    )
+
+    solved = planned[0]
+    assert solved.secondary_storage_mode == SECONDARY_MODE_SBU
+    assert solved.batteries_discharged_kwh == pytest.approx(0.0)
+    assert solved.grid_import_kwh == pytest.approx(0.0)
+    assert solved.grid_export_kwh == pytest.approx(0.050)
 
 
 def test_mixed_history_cannot_model_powmr_backfeed() -> None:

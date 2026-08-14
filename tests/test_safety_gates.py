@@ -1029,6 +1029,33 @@ class TestFullyFedBatteryExportControl:
         ]
 
     @pytest.mark.asyncio
+    async def test_rounding_level_import_does_not_throttle_msc(self):
+        """A 0.001-kWh import residue is not a deliberate partial allocation."""
+        sensor = _make_sensor()
+        cfg = self._cfg()
+        live = self._live()
+        live.huawei_batteries_working_mode = "maximise_self_consumption"
+        live.huawei_batteries_max_discharge_power_w = 400.0
+        live.huawei_batteries_excess_pv_use_in_tou = "charge"
+        rec = _make_planned_rec(
+            "batteries_discharge_mode",
+            discharged_kwh=0.10,
+        )
+        rec.grid_export_kwh = 0.0
+        rec.grid_import_kwh = 0.001
+
+        with patch(
+            "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+            new_callable=AsyncMock,
+            side_effect=_ok_apply_result,
+        ) as verifier:
+            await async_apply_battery_settings(
+                sensor, cfg, live, rec, 20.0, now=rec.start
+            )
+
+        assert [call.kwargs["desired"] for call in verifier.await_args_list] == [10000]
+
+    @pytest.mark.asyncio
     async def test_partial_msc_plan_cap_respects_hardware_maximum(self):
         """A large partial allocation cannot exceed the physical battery limit."""
         sensor = _make_sensor()

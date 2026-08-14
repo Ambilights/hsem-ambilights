@@ -19,9 +19,12 @@ from custom_components.hsem.planner.secondary_storage import (
     secondary_charge_limits_kwh,
     secondary_site_load_offset_kwh,
 )
+from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import clamp_efficiency
+from custom_components.hsem.utils.recommendations import Recommendations
 from custom_components.hsem.utils.units import (
     hours_ahead,
+    is_material_planned_energy_kwh,
     slot_duration_hours,
 )
 
@@ -55,6 +58,9 @@ def _extend_secondary_constraints(
     future_idx: list[int],
     primary_discharge_off: int,
     primary_max_discharge_kwh: float,
+    primary_discharge_efficiency_fraction: float,
+    primary_site_discharge_limited: np.ndarray,  # type: ignore[name-defined]
+    primary_site_discharge_cap_kwh: np.ndarray,  # type: ignore[name-defined]
 ) -> dict[str, Any]:
     """Add site balance, secondary SoC, discrete modes, and no-transfer rows."""
     charge_eff = clamp_efficiency(config.charge_efficiency_pct)
@@ -105,7 +111,8 @@ def _extend_secondary_constraints(
     old_b_ub = constraints["b_ub"]
     old_ub_rows = old_a_ub.shape[0]
     transfer_rows = 0 if config.allow_primary_battery_transfer else m
-    added_rows = 7 * m + transfer_rows
+    site_discharge_rows = int(np.count_nonzero(primary_site_discharge_limited))
+    added_rows = 7 * m + transfer_rows + site_discharge_rows
     a_ub = np.zeros((old_ub_rows + added_rows, n_vars))
     b_ub = np.zeros(old_ub_rows + added_rows)
     a_ub[:old_ub_rows, : old_a_ub.shape[1]] = old_a_ub
@@ -157,6 +164,30 @@ def _extend_secondary_constraints(
             a_ub[row + t, primary_discharge_off + t] = 1.0
             a_ub[row + t, charge_mode_off + t] = primary_max_discharge_kwh
             b_ub[row + t] = primary_max_discharge_kwh
+        row += m
+
+    # The base primary cap is computed before PowMr mode variables exist. In a
+    # site-limited slot, SBU removes the included dedicated load from the same
+    # AC demand Huawei may serve. Couple both decisions so the MILP cannot
+    # solve a primary discharge that becomes forbidden export after write-out:
+    #   primary_discharge * eta + included_load * sbu <= primary_site_cap.
+    discharge_eff = min(max(primary_discharge_efficiency_fraction, 0.01), 1.0)
+    for t, limited in enumerate(primary_site_discharge_limited):
+        if not bool(limited):
+            continue
+        site_cap_kwh = max(float(primary_site_discharge_cap_kwh[t]), 0.0)
+        included_load_kwh = (
+            min(
+                secondary_site_load_offset_kwh(slots[future_idx[t]], config),
+                site_cap_kwh,
+            )
+            if config.base_load_includes_dedicated_load
+            else 0.0
+        )
+        a_ub[row, primary_discharge_off + t] = discharge_eff
+        a_ub[row, sbu_mode_off + t] = included_load_kwh
+        b_ub[row] = site_cap_kwh + 1e-6
+        row += 1
 
     constraints["A_eq"] = a_eq
     constraints["b_eq"] = b_eq
@@ -241,14 +272,24 @@ def _write_secondary_results(
     config: SecondaryStorageConfig,
     future_idx: list[int],
     minimum_action_kwh: float,
-) -> dict[str, float | int]:
-    """Write solved secondary flows, modes, current targets, and SoC."""
+    battery_export_min_price: float = 0.0,
+    primary_site_discharge_limited: np.ndarray | None = None,  # type: ignore[name-defined]
+) -> dict[str, float | int] | None:
+    """Write solved secondary flows, modes, current targets, SoC, and labels.
+
+    The primary writer classifies Huawei actions before the PowMr site-bus
+    delta is applied. Reconcile only those Huawei action labels whose source
+    or destination changes after that final balance adjustment; solved primary
+    charge/discharge energy remains authoritative and is never mutated here.
+    """
     charge_eff = clamp_efficiency(config.charge_efficiency_pct)
     running_capacity = config.current_usable_kwh
     charge_slots = 0
     sbu_slots = 0
     total_charge = 0.0
     total_discharge = 0.0
+    if primary_site_discharge_limited is None:
+        primary_site_discharge_limited = np.zeros(len(future_idx), dtype=bool)
 
     for t, slot_i in enumerate(future_idx):
         slot = out_slots[slot_i]
@@ -311,6 +352,58 @@ def _write_secondary_results(
             - slot.grid_export_kwh * slot.price.export_price,
             4,
         )
+
+        # Huawei is physically constrained to self-consumption in these slots:
+        # export is disabled, its price is below a configured floor, or the
+        # non-co-optimised EV guard applies. The MILP coupling above makes
+        # Huawei-derived post-SBU export impossible, while independent PV
+        # export remains valid. Do not hide a broken battery-energy allocation
+        # behind a BDM label: reject the candidate so the caller can retain or
+        # fall back to a plan whose flows are executable.
+        if (
+            bool(primary_site_discharge_limited[t])
+            and is_material_planned_energy_kwh(slot.grid_export_kwh)
+            and is_material_planned_energy_kwh(slot.batteries_discharged_kwh)
+        ):
+            log_planner(
+                "warning",
+                "[milp] secondary write-out invariant failed  slot=%s  "
+                "grid_export=%.3f  export_price=%.4f  export_floor=%.4f",
+                slot.start.isoformat(),
+                slot.grid_export_kwh,
+                slot.price.export_price,
+                battery_export_min_price,
+            )
+            return None
+
+        # Recommendation labels drive materially different Huawei modes. A
+        # primary charge that needed grid energy before SBU removed the
+        # dedicated load may be fully PV-backed in the final site balance, so
+        # it must use MSC rather than forced TOU grid charge. Likewise, MSC
+        # cannot execute a solved primary discharge that now exports after the
+        # SBU adjustment; use fully-fed-to-grid only when the final export also
+        # clears the configured battery-export price floor.
+        if (
+            slot.recommendation == Recommendations.BatteriesChargeGrid.value
+            and slot.batteries_charged_kwh > minimum_action_kwh
+            and slot.grid_import_kwh <= 0.0
+        ):
+            slot.recommendation = Recommendations.BatteriesChargeSolar.value
+        elif (
+            slot.recommendation
+            in {
+                Recommendations.BatteriesDischargeMode.value,
+                Recommendations.ForceBatteriesDischarge.value,
+            }
+            and slot.batteries_discharged_kwh > minimum_action_kwh
+        ):
+            if (
+                slot.grid_export_kwh > 0.0
+                and slot.price.export_price >= battery_export_min_price
+            ):
+                slot.recommendation = Recommendations.ForceBatteriesDischarge.value
+            else:
+                slot.recommendation = Recommendations.BatteriesDischargeMode.value
 
         total_charge += charge_kwh
         total_discharge += discharge_kwh

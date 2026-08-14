@@ -355,6 +355,22 @@ PowMr grid charging is active, preventing an inefficient Huawei DC→AC→PowMr 
 transfer. The advanced transfer option must be explicitly enabled to relax this
 guard.
 
+Huawei recommendation labels are reconciled after the PowMr site-bus adjustment
+without changing either battery's solved energy. If SBU removes the remaining
+site import from a primary charge slot, that charge is labelled solar and runs
+in Maximize Self Consumption rather than forced grid-charge mode. If SBU makes a
+positive primary-discharge slot export, it is labelled forced battery discharge
+only when the final export price clears both the economic and user-configured
+battery-export floors; otherwise it remains self-consumption discharge. EV,
+session, and explicit battery-hold intents are not rewritten by this pass.
+
+For no-export slots and slots below either export-price floor, the primary
+discharge cap is coupled to the SBU binary before solving. When the house
+forecast includes the dedicated load, Huawei AC discharge plus the included
+load removed by SBU may not exceed the original site-load cap. This prevents a
+nominally valid primary self-consumption allocation from becoming unexecutable
+export when PowMr changes from utility to SBU.
+
 The MILP and authoritative candidate scorer both include secondary conversion
 loss, cycle wear, time discount, and a horizon-tail value for stored energy.
 Non-MILP candidates receive a physically valid utility-bypass plan so candidate
@@ -411,6 +427,11 @@ the PowMr adapter for that cycle.
 - charge current is always a supported 10 A increment
 - PowMr charge and utility/SBU load transitions affect only its configured phase
 - Huawei discharge is zero during PowMr charging unless transfer is enabled
+- post-SBU Huawei charge/discharge labels match the final executable site flow
+  and respect the configured battery-export price floor
+- no-export and below-floor slots couple Huawei discharge to SBU load removal,
+  so Huawei cannot create grid export without post-hoc energy mutation;
+  independent PV export remains valid
 - disabled secondary storage is numerically identical to the upstream planner
 - missing required PowMr telemetry produces no secondary plan and blocks control
 - global read-only and the feature control switch each independently block writes
@@ -616,11 +637,16 @@ accepted plan already at its endpoint is rejected, and an expired slot commands
 0 W on the next applier callback. Accurate adaptive tapering would require
 integrated primary-battery energy.
 
-While such a slot is active, a separate lightweight coordinator timer samples
-only live house and PV power every 10 seconds. It compares residual AC demand
+While a forced-export slot or a materially partial normal-discharge slot is
+active, a separate lightweight coordinator timer samples only live house and
+PV power every 10 seconds. It compares residual AC demand
 (`max(house_power - solar_power, 0)`) with the slot's planned AC battery
-delivery (`batteries_discharged_kwh * discharge_efficiency / slot_hours`). When
-the residual exceeds planned delivery by more than `max(150 W, 10%)`
+delivery (`batteries_discharged_kwh * discharge_efficiency / slot_hours`) plus
+any material grid-import share already solved for a partial normal-discharge
+slot. A rounded import residue of 0.001 kWh or less is treated as numerical
+noise: it neither throttles MSC nor enables the partial-slot monitor. Any
+larger planned import remains authoritative. When residual demand exceeds the
+solved battery-plus-grid supply by more than `max(150 W, 10% of that supply)`
 continuously for 30 seconds, HSEM requests one corrective planner run for that
 slot. The trigger is disabled with less than 60 seconds remaining, when required
 live state is unavailable/degraded, and while an EV is charging if the house
@@ -637,15 +663,32 @@ time-limit incumbent may replace the active plan. A passive/no-action fallback
 is logged but cannot replace the previous validated plan; the attempt is then
 closed for that slot to avoid repeated solver timeouts. The
 normal-self-consumption transition requires a real solved battery-discharge
-allocation. When the solved slot deliberately retains some grid import, Huawei
-MSC is bounded to `batteries_discharged_kwh / slot_hours` (and the physical
-maximum), so it cannot consume energy the MILP reserved for later. When modeled
-grid import is zero, MSC retains the normal hardware maximum and follows live
-house demand without exporting. The
+allocation. When the solved slot deliberately retains a material grid-import
+share, Huawei MSC is bounded to `batteries_discharged_kwh / slot_hours` (and
+the physical maximum), so it cannot consume energy the MILP reserved for
+later. If live demand then remains materially above the solved battery-plus-grid
+supply for 30 seconds, the guarded corrective path asks the MILP to re-evaluate
+the split rather than bypassing its reserve. When modeled grid import is zero
+or only a rounding residue, MSC retains the normal hardware maximum and follows
+live house demand without exporting. The
 once-per-slot attempt is otherwise consumed only after the complete coordinator
 snapshot is successfully published. A busy or failed update leaves the request
 pending for the next 10-second monitor tick. Read-only and degraded-mode
 hardware-write gates remain unchanged.
+
+Secondary-storage state listeners do not route every PowMr sample through the
+full coordinator. Raw battery net power is not a planning trigger. Secondary
+SoC and the smoothed dedicated-load input use lightweight event callbacks and
+request one coalesced update only after changing by at least 1 percentage point
+or 25 W respectively; output/charger priority and charge-current control state
+changes use the same short debounce but remain immediately material. The
+comparison baseline advances only after a newly accepted plan has been
+successfully published. Reused plans and rejected corrective candidates must
+not swallow cumulative secondary-storage drift. Failed cycles therefore retry
+on a later material state event. If the coordinator is already running when a
+debounce expires, the material event waits for the current cycle's lock and is
+processed once instead of being dropped. All listener and debounce handles are
+cancelled during coordinator teardown.
 
 For non-MILP candidates (`milp_prepopulated=False`, the default),
 the simulation continues to derive discharge and grid flows greedily
@@ -1656,6 +1699,10 @@ planner always receives the original price rate regardless of configuration.
 ## Candidate plans
 
 Every candidate plan must be fully simulated and scored.
+
+Rejected-plan diagnostics keep the two cost aggregates distinct:
+``estimated_cost`` is the auditable monetary ``total_cost``, while ``score``
+is the selector objective including synthetic penalties and terminal-SoC value.
 
 Required candidates:
 
