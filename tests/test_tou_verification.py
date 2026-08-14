@@ -337,3 +337,79 @@ class TestGridChargeToWait:
         _, verifier = await _apply(cfg, live, rec, _ok)
 
         assert CHARGE_ENTITY not in [entity for entity, _ in _writes(verifier)]
+
+    @pytest.mark.asyncio
+    async def test_no_pre_disarm_when_restore_power_unknown(self):
+        """Never disarm to 0 W without a known way to re-arm."""
+        cfg = _config()
+        live = _live(WorkingModes.TimeOfUse.value, DEFAULT_HSEM_TOU_MODES_FORCE_CHARGE)
+        live.huawei_batteries_max_charge_power_w = None
+        rec = _recommendation(Recommendations.BatteriesWaitMode.value)
+
+        _, verifier = await _apply(cfg, live, rec, _ok)
+
+        assert CHARGE_ENTITY not in [entity for entity, _ in _writes(verifier)]
+
+
+class TestRoundTripWithoutPhaseAwareCharging:
+    """Grid charging must survive a Wait -> GridCharge cycle with no limit.
+
+    Phase-aware charging is disabled by default, so ``grid_charge_power_limit_w``
+    is ``None``.  Entry must still re-arm a 0 W limit left by a previous exit,
+    otherwise planned grid charging silently never starts.
+    """
+
+    @pytest.mark.asyncio
+    async def test_entry_rearms_zero_limit_without_phase_aware_limit(self):
+        cfg = _config()
+        live = _live(WorkingModes.TimeOfUse.value, DEFAULT_HSEM_BATTERIES_WAIT_MODE)
+        live.huawei_batteries_grid_charge_max_power_w = 0.0  # left by a prior exit
+        rec = _recommendation(Recommendations.BatteriesChargeGrid.value)
+
+        _, verifier = await _apply(cfg, live, rec, _ok)
+        writes = _writes(verifier)
+
+        assert (CHARGE_ENTITY, 10000.0) in writes
+        entities = [entity for entity, _ in writes]
+        assert entities.index(CHARGE_ENTITY) < entities.index(TOU_ENTITY)
+
+    @pytest.mark.asyncio
+    async def test_entry_does_not_override_user_chosen_limit(self):
+        """A positive limit is the user's; re-arming must not clobber it."""
+        cfg = _config()
+        live = _live(WorkingModes.TimeOfUse.value, DEFAULT_HSEM_BATTERIES_WAIT_MODE)
+        live.huawei_batteries_grid_charge_max_power_w = 3000.0
+        rec = _recommendation(Recommendations.BatteriesChargeGrid.value)
+
+        _, verifier = await _apply(cfg, live, rec, _ok)
+
+        assert CHARGE_ENTITY not in [entity for entity, _ in _writes(verifier)]
+
+    @pytest.mark.asyncio
+    async def test_full_round_trip_leaves_charging_restorable(self):
+        """Exit disarms to 0 W; the next entry re-arms it without phase-aware."""
+        cfg = _config()
+        exit_live = _live(
+            WorkingModes.TimeOfUse.value, DEFAULT_HSEM_TOU_MODES_FORCE_CHARGE
+        )
+        _, exit_verifier = await _apply(
+            cfg,
+            exit_live,
+            _recommendation(Recommendations.BatteriesWaitMode.value),
+            _ok,
+        )
+        assert (CHARGE_ENTITY, 0.0) in _writes(exit_verifier)
+
+        # Hardware now reports the disarmed limit on the next cycle.
+        entry_live = _live(
+            WorkingModes.TimeOfUse.value, DEFAULT_HSEM_BATTERIES_WAIT_MODE
+        )
+        entry_live.huawei_batteries_grid_charge_max_power_w = 0.0
+        _, entry_verifier = await _apply(
+            cfg,
+            entry_live,
+            _recommendation(Recommendations.BatteriesChargeGrid.value),
+            _ok,
+        )
+
+        assert (CHARGE_ENTITY, 10000.0) in _writes(entry_verifier)

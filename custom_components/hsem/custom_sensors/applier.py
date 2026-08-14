@@ -762,9 +762,8 @@ async def async_apply_battery_settings(
         _rated_capacity if _rated_capacity is not None else 0
     )
 
-    if (
-        recommendation == Recommendations.BatteriesChargeGrid.value
-        and grid_charge_power_limit_w is not None
+    if recommendation == Recommendations.BatteriesChargeGrid.value and (
+        grid_charge_power_limit_w is not None or _grid_charge_needs_rearm(live)
     ):
         charge_entity = cfg.huawei_solar_batteries_grid_charge_maximum_power
         if charge_entity is None:
@@ -773,7 +772,16 @@ async def async_apply_battery_settings(
                 "is not configured"
             )
             return summary
-        desired_charge_w = max(grid_charge_power_limit_w, 0.0)
+        if grid_charge_power_limit_w is not None:
+            desired_charge_w = max(grid_charge_power_limit_w, 0.0)
+        else:
+            # No phase-aware constraint this cycle (it is disabled by default,
+            # and also inactive on non-three-phase or invalid phase telemetry),
+            # but the limit sits at 0 W — the value this applier writes when
+            # leaving a previous GridCharge slot.  Re-arm at the hardware
+            # maximum so grid charging can start.  A positive user-chosen limit
+            # is never touched, because _grid_charge_needs_rearm() is False.
+            desired_charge_w = _grid_charge_restore_power_w(live)
         if live.huawei_batteries_max_charge_power_w is not None:
             desired_charge_w = min(
                 desired_charge_w,
@@ -810,6 +818,13 @@ async def async_apply_battery_settings(
             _LOGGER.warning(
                 "Leaving grid charge but grid charge maximum power entity is "
                 "not configured; cannot pre-disarm charging"
+            )
+        elif _grid_charge_restore_power_w(live) <= 0.0:
+            # Never disarm without a known way back: a 0 W limit that cannot be
+            # restored would block every future grid-charge slot.
+            _LOGGER.warning(
+                "Leaving grid charge but battery maximum charging power is "
+                "unknown; skipping 0 W pre-disarm to keep charging restorable"
             )
         else:
             _dis: str = charge_entity  # narrowed for closure
@@ -1160,6 +1175,39 @@ def _read_number_state(
         return float(state.state)
     except ValueError, TypeError:
         return None
+
+
+def _grid_charge_restore_power_w(live: LiveState) -> float:
+    """Return the power used to re-arm grid charging, or ``0.0`` when unknown.
+
+    Args:
+        live: Current hardware snapshot.
+
+    Returns:
+        The battery's maximum charging power, or ``0.0`` when unavailable.
+    """
+    return max(live.huawei_batteries_max_charge_power_w or 0.0, 0.0)
+
+
+def _grid_charge_needs_rearm(live: LiveState) -> bool:
+    """Return ``True`` when a 0 W grid-charge limit must be restored.
+
+    Leaving GridCharge pre-disarms the limit to 0 W.  Phase-aware charging is
+    disabled by default (and inactive on non-three-phase installs or invalid
+    phase telemetry), so entry cannot rely on a phase-aware limit to restore it.
+    Only a limit that is actually at 0 W is re-armed; a positive user-chosen
+    limit is left untouched.
+
+    Args:
+        live: Current hardware snapshot.
+
+    Returns:
+        ``True`` when the limit is 0 W and a restore power is known.
+    """
+    current = live.huawei_batteries_grid_charge_max_power_w
+    if current is None or current > 0.0:
+        return False
+    return _grid_charge_restore_power_w(live) > 0.0
 
 
 def _grid_charging_is_armed(live: LiveState) -> bool:
