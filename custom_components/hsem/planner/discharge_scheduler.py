@@ -215,6 +215,60 @@ def calculate_required_battery_until_solar(
     return result
 
 
+def best_alternative_import_price(
+    slots: list[PlannedSlot],
+    after: datetime,
+    refill_kwh: float,
+) -> float:
+    """Return what a stored kWh is worth if kept instead of exported now.
+
+    Exporting battery energy and buying it back later is a loss whenever the
+    later import price exceeds the export price.  Both sides of that choice
+    move the same kWh out of the battery through the same inverter, so the
+    efficiency and cycle-wear terms cancel and the comparison reduces to
+    ``export_price`` against the highest import price the battery could still
+    displace.
+
+    The scan stops once forecast solar surplus would put ``refill_kwh`` back
+    into the battery: beyond that point the energy held would merely displace
+    free PV rather than paid import, so keeping it buys nothing.  This is why
+    the scan cannot simply stop at the first surplus slot — a single sunny
+    quarter-hour does not refill a battery, and stopping there undervalues
+    every evening hour that follows.
+
+    Args:
+        slots: All planned slots; scanned in chronological order.
+        after: Only slots starting strictly after this instant are considered.
+        refill_kwh: Energy that solar must return before held energy stops
+            being the marginal source.  Non-positive disables the cutoff.
+
+    Returns:
+        The highest displaceable import price, or ``0.0`` when no later slot
+        needs the battery before solar refills it.
+    """
+    best = 0.0
+    surplus_kwh = 0.0
+    for slot in sorted(slots, key=lambda s: utc_key(s.start)):
+        if utc_key(slot.start) <= utc_key(after):
+            continue
+        if not slot.price_actionable:
+            # An unpublished price is not evidence that the energy is
+            # worthless; it simply cannot be compared.  Skip it.
+            continue
+        net = slot.estimated_net_consumption_kwh
+        if net is None:
+            continue
+        if net < 0:
+            surplus_kwh += -net
+            if refill_kwh > 1e-9 and surplus_kwh >= refill_kwh:
+                break
+            continue
+        price = slot.price.import_price
+        if price is not None and float(price) > best:
+            best = float(price)
+    return best
+
+
 def apply_excess_export(
     slots: list[PlannedSlot],
     now: datetime,
@@ -291,6 +345,11 @@ def apply_excess_export(
     # where battery ≈ min(max_discharge, net_demand) and house ≈ net_demand.
     # Conservative: require export ≥ import + cycle_wear when house > 0,
     # or export ≥ cycle_wear when PV covers house (net < 0).
+    # Energy the battery holds beyond what it needs before solar returns.  Used
+    # as the refill yardstick: once forecast PV would put this much back, held
+    # energy stops being the marginal source and selling it costs nothing.
+    exportable_kwh = max(current_capacity - required_capacity, 0.0)
+
     candidates = sorted(
         (
             s
@@ -303,10 +362,18 @@ def apply_excess_export(
                 Recommendations.BatteriesDischargeMode.value,
             )
             and (
-                # Solar surplus: house already covered by PV, pure export profit
+                # PV already covers the house this slot, so nothing discharged
+                # here offsets an import *now* — it is sold.  That only pays if
+                # the price beats what the same stored kWh would save later:
+                # exporting at 0.66 to buy back at 0.96 four hours on is a loss
+                # no static floor can detect.  ``refill_kwh`` is the energy
+                # under consideration, so the comparison ends once solar would
+                # have replaced it anyway (issue #752 follow-up).
                 (
                     s.estimated_net_consumption_kwh is not None
                     and s.estimated_net_consumption_kwh < 0
+                    and s.price.export_price
+                    >= best_alternative_import_price(slots, s.start, exportable_kwh)
                 )
                 or (
                     # No PV surplus: must cover house import cost
