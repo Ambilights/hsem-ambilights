@@ -220,9 +220,12 @@ def _write_milp_results_to_slots(
                 + ev_ac_solved[lp_t]
                 - pv_avail[lp_t]
             )
-            headroom_ac_by_slot[slot_i] = (
-                math.inf if net_flow > 1e-9 else float(-net_flow)
-            )
+            # An importing slot has *no* unused PV surplus.  Granting it
+            # unlimited headroom contradicted the surplus-only rows the LP
+            # carries for charge_past_target: energy concentrated there would
+            # be funded by grid import, which is exactly what those rows
+            # forbid.  Only genuinely unused surplus counts.
+            headroom_ac_by_slot[slot_i] = max(-net_flow, 0.0)
 
         session_evs = set(session_ev_indices or [])
         for ev_idx, ev in enumerate(active_evs):
@@ -266,7 +269,7 @@ def _write_milp_results_to_slots(
                 # it would drop the charge rather than concentrate it.
                 max_extra_dc=(
                     {
-                        slot_i: headroom_ac_by_slot.get(slot_i, math.inf)
+                        slot_i: headroom_ac_by_slot.get(slot_i, 0.0)
                         * ev.charger_efficiency
                         for slot_i in solved_dc
                     }
@@ -283,6 +286,18 @@ def _write_milp_results_to_slots(
                     unplaceable_dc,
                     ev.charger_min_power_w,
                 )
+            if ev.charge_past_target:
+                # The surplus is one pool, not one per EV.  Without spending it
+                # down, two surplus-only EVs could each claim the same kWh and
+                # together pull the slot into import.
+                for slot_i, dc in placed_dc.items():
+                    claimed_ac = max((dc - solved_dc.get(slot_i, 0.0)), 0.0) / max(
+                        ev.charger_efficiency, 1e-9
+                    )
+                    headroom_ac_by_slot[slot_i] = max(
+                        headroom_ac_by_slot.get(slot_i, 0.0) - claimed_ac, 0.0
+                    )
+
             placed_dc_by_ev.append(placed_dc)
             session_dc_by_ev.append(session_dc)
 

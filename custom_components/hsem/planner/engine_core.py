@@ -148,8 +148,14 @@ def _apply_main_fuse_throttle(
 
     Runs after candidate selection, regardless of which candidate won, and
     lowers the *commands* for an over-limit slot: EV charger power first, then
-    battery charge energy.  Every derived field on that slot is then brought
-    back in step, so the published plan describes what will actually be sent.
+    battery charge energy.  The slot's own grid import, EV energy, net
+    consumption and cost are then brought back in step.
+
+    Battery state of charge is **not** among them, so the plan is not fully
+    consistent after a battery throttle: simulate_soc runs inside candidate
+    selection so a winner's score matches its slots, and re-running it here
+    would decouple the two.  A throttled slot keeps the SoC the unthrottled
+    plan would have reached, which is optimistic for the rest of the horizon.
 
     Args:
         slots: Winner slots, modified in place.
@@ -201,14 +207,21 @@ def _apply_main_fuse_throttle(
                 s.batteries_charged_kwh = round(
                     max(0.0, s.batteries_charged_kwh - dc_cut), 3
                 )
-                removed_ac_kwh += (before_dc - s.batteries_charged_kwh) / chg_eff
+                battery_ac_removed = (before_dc - s.batteries_charged_kwh) / chg_eff
+                removed_ac_kwh += battery_ac_removed
 
                 # If we zeroed battery charging, clear the recommendation
                 # so the applier does not enable TOU charge for this slot.
                 if s.batteries_charged_kwh < 1e-6:
                     s.recommendation = None
 
-                excess_power_w = 0
+                # Report what is genuinely left.  Forcing this to zero hid the
+                # warning whenever the battery held less charge than the excess
+                # required, so a slot could still exceed the fuse silently.
+                excess_power_w = max(
+                    0,
+                    excess_power_w - round((battery_ac_removed / slot_hours) * 1000.0),
+                )
 
             # Bring the published plan back in step with what will be
             # commanded.  Throttling only lowered the power and energy
@@ -675,6 +688,13 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
                 s.ev_total_planned_load_kwh = round(
                     s.ev_planned_load_kwh + s.ev_accounted_load_kwh, 3
                 )
+
+                # The load is gone from the slot, so the import that funded it
+                # must go too.  This block runs *after* the main-fuse throttle,
+                # so a slot throttled below the charger minimum lands here and
+                # would otherwise keep publishing the import for energy no
+                # longer commanded — undoing the throttle's own correction.
+                s.grid_import_kwh = round(max(0.0, s.grid_import_kwh - ev_energy), 3)
 
                 # Recompute net consumption and cost with the reduced EV load.
                 s.estimated_net_consumption_kwh = (

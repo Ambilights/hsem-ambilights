@@ -275,3 +275,33 @@ class TestThroughTheSolver:
             assert supply == pytest.approx(demand, abs=0.05), (
                 f"slot {slot.start}: supply {supply:.3f} != demand {demand:.3f}"
             )
+
+
+class TestSurplusOnlyHeadroom:
+    """Surplus-only EVs may use unused PV, never grid import."""
+
+    def test_an_importing_slot_offers_no_surplus(self) -> None:
+        """Granting inf there funded concentration from the grid."""
+        placed, unplaceable = _redistribute_below_minimum_power(
+            {0: 0.45, 1: 0.45},
+            slot_hours={0: 0.25, 1: 0.25},
+            charger_efficiency=EFF,
+            charger_min_power_w=MIN_W,
+            rated_ac_power_w=RATED_W,
+            max_extra_dc={0: 0.0, 1: 0.0},
+        )
+
+        assert placed == {}
+        assert unplaceable == pytest.approx(0.90)
+
+    def test_real_surplus_is_still_usable(self) -> None:
+        placed, _ = _redistribute_below_minimum_power(
+            {0: 0.45, 1: 0.45},
+            slot_hours={0: 0.25, 1: 0.25},
+            charger_efficiency=EFF,
+            charger_min_power_w=MIN_W,
+            rated_ac_power_w=RATED_W,
+            max_extra_dc={0: 0.45, 1: 0.0},
+        )
+
+        assert placed[0] == pytest.approx(0.90)

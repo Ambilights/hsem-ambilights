@@ -106,30 +106,27 @@ def build_phase_aware_charge_commands(
             )
         return PhaseAwareChargeCommands(recommendation=rec)
 
-    primary_grid_charge = (
-        rec.recommendation == Recommendations.BatteriesChargeGrid.value
-    )
     battery_power_w = live.huawei_batteries_charge_discharge_power_w
-    if primary_grid_charge and (
-        battery_power_w is None or not math.isfinite(battery_power_w)
-    ):
-        # The limiter reconstructs house load by removing the battery's own
-        # contribution from the meter snapshot.  A discharging battery is
+    if charging and (battery_power_w is None or not math.isfinite(battery_power_w)):
+        # The limiter reconstructs house load by removing the Huawei's own
+        # contribution from the meter snapshot.  A discharging Huawei is
         # suppressing metered import, so without this reading the remaining
         # import looks like spare fuse capacity: at 3 kW/phase of house load
-        # with the battery covering it, the meter shows ~60 W/phase and the
-        # full 10 kW charge gets authorised — 27 A on a 16 A fuse.
+        # with the battery covering it the meter shows ~60 W/phase, and the
+        # full charge gets authorised.
         #
-        # Substituting 0.0 is only conservative while the battery charges; in
-        # the discharge-to-grid-charge transition, which is exactly when a
-        # grid-charge slot opens, it errs the unsafe way.  Refuse the charge
-        # instead of sizing it from an incomplete snapshot.
+        # Required for *either* actuator, not just a Huawei grid charge.  The
+        # PowMr is allocated whatever remains on its phase after the Huawei's
+        # share, so it is sized from the same reconstruction.
         return _blocked_commands(
             rec,
             "Huawei battery charge/discharge power is unavailable, so "
             "per-phase headroom cannot be computed",
         )
 
+    primary_grid_charge = (
+        rec.recommendation == Recommendations.BatteriesChargeGrid.value
+    )
     measured_phase_power_w = live_phase_power_w
     slot_hours = slot_duration_hours(rec.start, rec.end)
     desired_primary_w = 0.0
@@ -175,11 +172,25 @@ def build_phase_aware_charge_commands(
         measured_phase_power_w=measured_phase_power_w,
         fuse_amps=float(cfg.main_fuse_amps),
         desired_primary_charge_power_w=desired_primary_w,
-        primary_is_controlled=primary_grid_charge,
-        # Validated above for grid-charge slots; when the primary is not being
-        # controlled compute_phase_charge_limits ignores this value entirely.
+        # Remove the Huawei's present contribution whenever *any* charge is
+        # being sized, not only when the Huawei itself is grid-charging.
+        #
+        # async_apply_battery_settings runs before async_apply_secondary_storage,
+        # so a plan of "Huawei Wait + PowMr Charge" stops the Huawei's discharge
+        # first and only then starts the PowMr.  Leaving that discharge inside
+        # the base made the meter's suppressed import read as spare capacity:
+        # 3 kW/phase of house load hidden behind a 9 kW discharge shows ~60 W on
+        # the meter, authorising the PowMr's full 60 A — 20 A on a 16 A phase
+        # once the discharge stops.  Removing it first makes ``base`` mean
+        # "house load without the battery", which is the reference the planned
+        # primary draw is then added back to.
+        primary_is_controlled=charging,
+        # Validated above whenever a charge is being sized, so this is finite
+        # here.  Gating it on ``primary_grid_charge`` — as an earlier version
+        # did — silently passed 0.0 on a "Huawei Wait + PowMr Charge" slot, so
+        # the base was never corrected and the flag above had no effect.
         primary_actual_battery_power_w=(
-            battery_power_w if primary_grid_charge and battery_power_w else 0.0
+            battery_power_w if charging and battery_power_w is not None else 0.0
         ),
         primary_charge_efficiency_pct=cfg.batteries_charge_efficiency,
         primary_discharge_efficiency_pct=cfg.batteries_discharge_efficiency,
