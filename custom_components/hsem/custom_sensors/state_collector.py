@@ -436,15 +436,25 @@ async def async_collect_live_state(
         )
     )
 
-    if cfg.phase_aware_charging_enabled:
-        state.huawei_batteries_grid_charge_max_power_w = convert_to_float(
-            _read(
-                cfg.huawei_solar_batteries_grid_charge_maximum_power,
-                "float",
-                label="batteries_grid_charge_maximum_power",
-                service_target=not cfg.read_only,
-            )
+    # Read unconditionally.  The applier writes this cap to 0 W when leaving a
+    # grid-charge slot, and ``_grid_charge_needs_rearm`` must be able to observe
+    # that 0 W on the next slot to restore it.  Reading it only when phase-aware
+    # charging was enabled left the field at ``None`` for everyone else, so the
+    # re-arm guard never fired and grid charging stayed dead at 0 W: TOU armed
+    # the full-day charge window while the power limit held the battery at zero.
+    # Only *required* under phase-aware charging, where the limiter genuinely
+    # cannot work without it; otherwise an unconfigured entity stays benign.
+    state.huawei_batteries_grid_charge_max_power_w = convert_to_float(
+        _read(
+            cfg.huawei_solar_batteries_grid_charge_maximum_power,
+            "float",
+            label="batteries_grid_charge_maximum_power",
+            required=cfg.phase_aware_charging_enabled,
+            service_target=not cfg.read_only,
         )
+    )
+
+    if cfg.phase_aware_charging_enabled:
         state.huawei_batteries_charge_discharge_power_w = convert_to_float(
             _read(
                 cfg.huawei_solar_batteries_charge_discharge_power,
@@ -899,6 +909,27 @@ async def _register_listeners(
             )
             new_unsubs.append(unsub)
             tracked_entities.add(entity_id)
+
+    # Phase telemetry only matters for safety while phase-aware charging is on.
+    # The handler ignores idle slots and rate-limits refreshes during an active
+    # charge, so a meter publishing every few seconds cannot drive continuous
+    # hardware work.
+    if cfg.phase_aware_charging_enabled:
+        for entity_id in (
+            cfg.huawei_solar_power_meter_phase_a_active_power,
+            cfg.huawei_solar_power_meter_phase_b_active_power,
+            cfg.huawei_solar_power_meter_phase_c_active_power,
+            cfg.huawei_solar_batteries_charge_discharge_power,
+        ):
+            if entity_id and entity_id not in tracked_entities:
+                _LOGGER.debug("Starting phase-safety tracking for %s", entity_id)
+                unsub = async_track_state_change_event(
+                    sensor.hass,
+                    [entity_id],
+                    sensor._async_handle_phase_safety_change,
+                )
+                new_unsubs.append(unsub)
+                tracked_entities.add(entity_id)
 
     # PowMr telemetry updates every few seconds. Register only material
     # replan/control inputs. Battery net power is sampled by each accepted plan

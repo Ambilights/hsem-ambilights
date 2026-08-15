@@ -33,7 +33,7 @@ import asyncio
 import contextlib
 import math
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, override
@@ -65,6 +65,7 @@ from custom_components.hsem.custom_sensors.hourly_data_populator.prices_solcast 
 from custom_components.hsem.custom_sensors.ocpp_server import OCPPServer
 from custom_components.hsem.custom_sensors.state_collector import (  # noqa: F401 — kept for backward compat
     async_collect_all_states,
+    async_collect_live_state,
     build_battery_schedules,
     build_sensor_config,
 )
@@ -86,7 +87,10 @@ from custom_components.hsem.models.state_snapshot import StateSnapshot
 from custom_components.hsem.planner import run_planner
 from custom_components.hsem.planner.charge_scheduler import apply_window_hysteresis
 from custom_components.hsem.planner.ev_planner import EVChargingPlan
-from custom_components.hsem.planner.secondary_storage import SECONDARY_MODE_UTILITY
+from custom_components.hsem.planner.secondary_storage import (
+    SECONDARY_MODE_CHARGE,
+    SECONDARY_MODE_UTILITY,
+)
 from custom_components.hsem.utils.capacity_learner import CapacityLearner
 from custom_components.hsem.utils.charge_rate_learner import CHARGE_RATE_LEARNER
 from custom_components.hsem.utils.datetime_utils import (
@@ -144,6 +148,12 @@ SECONDARY_STORAGE_UPDATE_DEBOUNCE_SECONDS = 1.0
 SECONDARY_STORAGE_SOC_REPLAN_DELTA_PCT = 1.0
 SECONDARY_STORAGE_LOAD_REPLAN_DELTA_W = 25.0
 PRICE_SOURCE_UPDATE_DEBOUNCE_SECONDS = 0.25
+# Phase meters update roughly every ten seconds.  While a charge actuator is
+# actually running, publish a fresh live snapshot promptly so the runtime cap
+# tracks the real load, without re-solving the 192-slot horizon.  Both delays
+# rate-limit that refresh so telemetry churn cannot drive continuous writes.
+PHASE_SAFETY_UPDATE_DEBOUNCE_SECONDS = 2.0
+PHASE_SAFETY_UPDATE_COOLDOWN_SECONDS = 8.0
 
 # Lightweight live-demand monitor for active forced export and materially
 # partial normal discharge. It is deliberately separate from the normal
@@ -686,6 +696,8 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._last_planner_output: PlannerOutput | None = None
         self._price_source_update_debounce_task: asyncio.Task[None] | None = None
         self._price_source_update_pending: bool = False
+        self._phase_safety_update_debounce_task: asyncio.Task[None] | None = None
+        self._phase_safety_update_pending: bool = False
 
         # Previous planner winner name and score for hysteresis (issue #372).
         # Persisted across cycles so the planner can compare against the
@@ -943,7 +955,12 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         if price_task is not None and not price_task.done():
             price_task.cancel()
             self._price_source_update_debounce_task = None
+        phase_task = getattr(self, "_phase_safety_update_debounce_task", None)
+        if phase_task is not None and not phase_task.done():
+            phase_task.cancel()
+            self._phase_safety_update_debounce_task = None
         self._price_source_update_pending = False
+        self._phase_safety_update_pending = False
 
     async def async_options_updated(self) -> None:
         """Schedule a debounced pipeline re-run after an options change.
@@ -1049,6 +1066,87 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         finally:
             if self._secondary_storage_update_debounce_task is asyncio.current_task():
                 self._secondary_storage_update_debounce_task = None
+
+    async def _async_handle_phase_safety_change(self, _event: Event) -> None:
+        """Refresh the live phase snapshot while a charge actuator is running.
+
+        Phase-aware charging sizes the grid-charge cap from a meter snapshot
+        taken just before the write.  Between coordinator cycles that snapshot
+        goes stale, so a load that appears mid-slot is not seen until the next
+        cycle.  This republishes the live state — and only the live state — so
+        the working-mode entity recomputes the cap against current load.
+
+        Does nothing unless a charge is actually in progress: an idle or
+        discharging slot cannot overload the fuse by charging.
+        """
+        if not self._cfg.phase_aware_charging_enabled:
+            return
+        rec = self._hourly_recommendation
+        if rec is None or not (
+            rec.recommendation == Recommendations.BatteriesChargeGrid.value
+            or rec.secondary_storage_mode == SECONDARY_MODE_CHARGE
+        ):
+            return
+
+        # Record the request before checking for a running task, so a meter
+        # change arriving during the debounce or cooldown is not dropped.  Some
+        # sensors publish only on change, so losing the final event would leave
+        # the cap stale until the next full cycle.
+        self._phase_safety_update_pending = True
+        task = self._phase_safety_update_debounce_task
+        if task is not None and not task.done():
+            return
+        self._phase_safety_update_debounce_task = self.hass.async_create_task(
+            self._async_phase_safety_update_debounced(),
+            name="hsem_phase_safety_update_debounce",
+            eager_start=False,
+        )
+
+    async def _async_phase_safety_update_debounced(self) -> None:
+        """Publish fresh live snapshots without re-solving the horizon plan."""
+        try:
+            while self._phase_safety_update_pending and not self._tearing_down:
+                self._phase_safety_update_pending = False
+                await asyncio.sleep(PHASE_SAFETY_UPDATE_DEBOUNCE_SECONDS)
+                async with self._update_lock:
+                    await self._async_publish_live_phase_snapshot()
+                await asyncio.sleep(PHASE_SAFETY_UPDATE_COOLDOWN_SECONDS)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001 -- background safety task
+            _LOGGER.warning("Phase-safety live refresh failed: %s", exc, exc_info=True)
+        finally:
+            if self._phase_safety_update_debounce_task is asyncio.current_task():
+                self._phase_safety_update_debounce_task = None
+
+    async def _async_publish_live_phase_snapshot(self) -> None:
+        """Re-read live state and republish it against the accepted plan."""
+        current_data = self.data
+        cfg = current_data.cfg if current_data is not None else self._cfg
+        if current_data is None or cfg is None:
+            # No accepted plan to preserve yet; a normal cycle is cheaper than
+            # inventing one.
+            await self._async_run_update_cycle()
+            return
+
+        live, fwm_entity, new_unsubs = await async_collect_live_state(
+            self,
+            cfg,
+            self._force_working_mode_entity,
+            self._tracked_entities,
+            entry_id=self._config_entry.entry_id,
+        )
+        self._force_working_mode_entity = fwm_entity
+        self._listener_unsubs.extend(new_unsubs)
+        self._live = live
+        snapshot = self._snapshot
+        if snapshot is not None:
+            self._snapshot = replace(snapshot, live=live)
+
+        # Reuse the accepted plan and swap in only the new hardware snapshot.
+        self.async_set_updated_data(
+            replace(current_data, cfg=cfg, live=live, last_updated=utc_now_iso())
+        )
 
     async def _async_handle_price_source_change(self, _event: Event) -> None:
         """Coalesce price state/attribute changes into one durable refresh."""

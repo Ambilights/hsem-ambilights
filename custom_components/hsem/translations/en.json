@@ -316,9 +316,9 @@
           "hsem_huawei_solar_device_id_inverter_1": "Select your primary Huawei inverter device.",
           "hsem_huawei_solar_device_id_inverter_2": "Select your secondary Huawei inverter device, if applicable.",
           "hsem_huawei_solar_inverter_active_power_control": "Select the sensor that controls the active power output of your Huawei inverter.",
-          "hsem_huawei_solar_power_meter_phase_a_active_power": "Signed Huawei grid-meter power for phase A; positive is import and negative is export.",
-          "hsem_huawei_solar_power_meter_phase_b_active_power": "Signed Huawei grid-meter power for phase B; positive is import and negative is export.",
-          "hsem_huawei_solar_power_meter_phase_c_active_power": "Signed Huawei grid-meter power for phase C; positive is import and negative is export."
+          "hsem_huawei_solar_power_meter_phase_a_active_power": "Raw Huawei grid-meter power for phase A; negative is import and positive is export. HSEM normalises the sign internally.",
+          "hsem_huawei_solar_power_meter_phase_b_active_power": "Raw Huawei grid-meter power for phase B; negative is import and positive is export. HSEM normalises the sign internally.",
+          "hsem_huawei_solar_power_meter_phase_c_active_power": "Raw Huawei grid-meter power for phase C; negative is import and positive is export. HSEM normalises the sign internally."
         },
         "description": "Configure the working mode for Huawei solar batteries.",
         "title": "Huawei Solar Sensors"
@@ -876,9 +876,9 @@
           "hsem_huawei_solar_device_id_inverter_1": "Select your primary Huawei inverter device.",
           "hsem_huawei_solar_device_id_inverter_2": "Select your secondary Huawei inverter device, if applicable.",
           "hsem_huawei_solar_inverter_active_power_control": "Select the sensor that controls the active power output of your Huawei inverter.",
-          "hsem_huawei_solar_power_meter_phase_a_active_power": "Signed Huawei grid-meter power for phase A; positive is import and negative is export.",
-          "hsem_huawei_solar_power_meter_phase_b_active_power": "Signed Huawei grid-meter power for phase B; positive is import and negative is export.",
-          "hsem_huawei_solar_power_meter_phase_c_active_power": "Signed Huawei grid-meter power for phase C; positive is import and negative is export."
+          "hsem_huawei_solar_power_meter_phase_a_active_power": "Raw Huawei grid-meter power for phase A; negative is import and positive is export. HSEM normalises the sign internally.",
+          "hsem_huawei_solar_power_meter_phase_b_active_power": "Raw Huawei grid-meter power for phase B; negative is import and positive is export. HSEM normalises the sign internally.",
+          "hsem_huawei_solar_power_meter_phase_c_active_power": "Raw Huawei grid-meter power for phase C; negative is import and positive is export. HSEM normalises the sign internally."
         },
         "description": "Configure the working mode for Huawei solar batteries.",
         "title": "Huawei Solar Sensors"
