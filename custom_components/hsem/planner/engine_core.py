@@ -12,6 +12,7 @@ from dataclasses import replace
 from datetime import datetime
 
 from custom_components.hsem.models.ev_config import EVConfig
+from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.planner_input import PlannerInput
 from custom_components.hsem.models.planner_output import PlannerOutput
 from custom_components.hsem.planner.candidate_generator import (
@@ -136,6 +137,143 @@ def _select_candidate(
         f"applied={hyst.applied}" if hyst.applied else "inactive",
     )
     return candidates, winner, rejected, hyst
+
+
+def _apply_main_fuse_throttle(
+    slots: list[PlannedSlot],
+    inp: PlannerInput,
+    warnings: list[str],
+) -> None:
+    """Throttle EV and battery charging in slots that exceed the main fuse.
+
+    Runs after candidate selection, regardless of which candidate won, and
+    lowers the *commands* for an over-limit slot: EV charger power first, then
+    battery charge energy.  Every derived field on that slot is then brought
+    back in step, so the published plan describes what will actually be sent.
+
+    Args:
+        slots: Winner slots, modified in place.
+        inp: Planner input, for the fuse rating and slot width.
+        warnings: Mutable list for any excess that throttling cannot resolve.
+    """
+    # Post-hoc main fuse check — runs regardless of which candidate won.
+    # If any slot exceeds the fuse rating, throttle EV charger power and
+    # battery charge energy to bring total grid import within the limit.
+    if inp.main_fuse_amps is not None and inp.main_fuse_amps > 0:
+        slot_hours = inp.interval_minutes / 60.0
+        max_per_slot_kwh = fuse_max_energy_per_slot_kwh(
+            inp.main_fuse_amps,
+            inp.main_fuse_phases,
+            slot_hours,
+        )
+
+        for s in slots:
+            if s.grid_import_kwh <= max_per_slot_kwh + 1e-9:
+                continue
+
+            excess_kwh = s.grid_import_kwh - max_per_slot_kwh
+            excess_power_w = round((excess_kwh / slot_hours) * 1000.0)
+            # AC energy actually removed from the slot, accumulated so the
+            # published flows can be brought back in step with the commands.
+            removed_ac_kwh = 0.0
+            ev_removed_ac_kwh = 0.0
+
+            # Step 1 — throttle EV charger power first.
+            for attr in (
+                "ev_charger_calculated_power",
+                "ev_second_charger_calculated_power",
+            ):
+                ev_w = round(getattr(s, attr))
+                if ev_w > 0 and excess_power_w > 0:
+                    cut = min(ev_w, excess_power_w)
+                    setattr(s, attr, ev_w - cut)
+                    excess_power_w -= cut
+                    ev_removed_ac_kwh += (cut / 1000.0) * slot_hours
+
+            removed_ac_kwh += ev_removed_ac_kwh
+
+            # Step 2 — throttle battery charging with remaining excess.
+            if excess_power_w > 0 and s.batteries_charged_kwh > 1e-9:
+                chg_eff = clamp_efficiency(inp.battery_charge_efficiency_pct)
+                excess_ac_kwh = (excess_power_w / 1000.0) * slot_hours
+                dc_cut = excess_ac_kwh * chg_eff
+                before_dc = s.batteries_charged_kwh
+                s.batteries_charged_kwh = round(
+                    max(0.0, s.batteries_charged_kwh - dc_cut), 3
+                )
+                removed_ac_kwh += (before_dc - s.batteries_charged_kwh) / chg_eff
+
+                # If we zeroed battery charging, clear the recommendation
+                # so the applier does not enable TOU charge for this slot.
+                if s.batteries_charged_kwh < 1e-6:
+                    s.recommendation = None
+
+                excess_power_w = 0
+
+            # Bring the published plan back in step with what will be
+            # commanded.  Throttling only lowered the power and energy
+            # *commands*; without this the slot still advertised the original
+            # grid import, EV load and cost, so the plan disagreed with the
+            # hardware it was about to drive.
+            #
+            # Battery state of charge is deliberately not re-simulated here.
+            # simulate_soc() runs inside the candidate selector so the winner's
+            # score matches its slots (see step 5 above); re-running it after
+            # the fact would decouple the two.  A throttled slot therefore
+            # still reports the SoC the untrottled plan would have reached,
+            # which is optimistic for the remainder of the horizon.
+            if removed_ac_kwh > 1e-9:
+                s.grid_import_kwh = round(
+                    max(0.0, s.grid_import_kwh - removed_ac_kwh), 3
+                )
+                if ev_removed_ac_kwh > 1e-9:
+                    # Take it out of the bucket that feeds net consumption
+                    # first, then the one already inside the house baseline.
+                    from_planned = min(s.ev_planned_load_kwh, ev_removed_ac_kwh)
+                    s.ev_planned_load_kwh = round(
+                        max(0.0, s.ev_planned_load_kwh - from_planned), 3
+                    )
+                    s.ev_accounted_load_kwh = round(
+                        max(
+                            0.0,
+                            s.ev_accounted_load_kwh
+                            - (ev_removed_ac_kwh - from_planned),
+                        ),
+                        3,
+                    )
+                    s.ev_total_planned_load_kwh = round(
+                        s.ev_planned_load_kwh + s.ev_accounted_load_kwh, 3
+                    )
+                s.estimated_net_consumption_kwh = (
+                    s.avg_house_consumption_kwh
+                    + s.ev_planned_load_kwh
+                    - s.solcast_pv_estimate_kwh
+                )
+                net = s.estimated_net_consumption_kwh
+                if not s.price_actionable:
+                    s.estimated_cost_currency = 0.0
+                elif net > 0:
+                    s.estimated_cost_currency = round(net * s.price.import_price, 4)
+                else:
+                    s.estimated_cost_currency = round(net * s.price.export_price, 4)
+
+            if excess_power_w > 0:
+                log_planner(
+                    "warning",
+                    "[core] Main fuse violation in slot %s: "
+                    "grid_import=%.3f kWh  limit=%.3f kWh  "
+                    "unresolved_excess=%d W",
+                    s.start.isoformat(),
+                    s.grid_import_kwh,
+                    max_per_slot_kwh,
+                    excess_power_w,
+                )
+                warnings.append(
+                    f"Main fuse ({inp.main_fuse_amps:.0f} A) exceeded in slot "
+                    f"{s.start.isoformat()}: "
+                    f"{excess_kwh:.3f} kWh above limit "
+                    f"(EV/battery throttling insufficient)."
+                )
 
 
 def run_planner(inp: PlannerInput) -> PlannerOutput:
@@ -454,68 +592,7 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
     # drift and to ensure the final score matches the selector's score.
     slots = winner.slots
 
-    # Post-hoc main fuse check — runs regardless of which candidate won.
-    # If any slot exceeds the fuse rating, throttle EV charger power and
-    # battery charge energy to bring total grid import within the limit.
-    if inp.main_fuse_amps is not None and inp.main_fuse_amps > 0:
-        slot_hours = inp.interval_minutes / 60.0
-        max_per_slot_kwh = fuse_max_energy_per_slot_kwh(
-            inp.main_fuse_amps,
-            inp.main_fuse_phases,
-            slot_hours,
-        )
-
-        for s in slots:
-            if s.grid_import_kwh <= max_per_slot_kwh + 1e-9:
-                continue
-
-            excess_kwh = s.grid_import_kwh - max_per_slot_kwh
-            excess_power_w = round((excess_kwh / slot_hours) * 1000.0)
-
-            # Step 1 — throttle EV charger power first.
-            for attr in (
-                "ev_charger_calculated_power",
-                "ev_second_charger_calculated_power",
-            ):
-                ev_w = round(getattr(s, attr))
-                if ev_w > 0 and excess_power_w > 0:
-                    cut = min(ev_w, excess_power_w)
-                    setattr(s, attr, ev_w - cut)
-                    excess_power_w -= cut
-
-            # Step 2 — throttle battery charging with remaining excess.
-            if excess_power_w > 0 and s.batteries_charged_kwh > 1e-9:
-                chg_eff = clamp_efficiency(inp.battery_charge_efficiency_pct)
-                excess_ac_kwh = (excess_power_w / 1000.0) * slot_hours
-                dc_cut = excess_ac_kwh * chg_eff
-                s.batteries_charged_kwh = round(
-                    max(0.0, s.batteries_charged_kwh - dc_cut), 3
-                )
-
-                # If we zeroed battery charging, clear the recommendation
-                # so the applier does not enable TOU charge for this slot.
-                if s.batteries_charged_kwh < 1e-6:
-                    s.recommendation = None
-
-                excess_power_w = 0
-
-            if excess_power_w > 0:
-                log_planner(
-                    "warning",
-                    "[core] Main fuse violation in slot %s: "
-                    "grid_import=%.3f kWh  limit=%.3f kWh  "
-                    "unresolved_excess=%d W",
-                    s.start.isoformat(),
-                    s.grid_import_kwh,
-                    max_per_slot_kwh,
-                    excess_power_w,
-                )
-                warnings.append(
-                    f"Main fuse ({inp.main_fuse_amps:.0f} A) exceeded in slot "
-                    f"{s.start.isoformat()}: "
-                    f"{excess_kwh:.3f} kWh above limit "
-                    f"(EV/battery throttling insufficient)."
-                )
+    _apply_main_fuse_throttle(slots, inp, warnings)
 
     # Re-apply per-EV minimum-power floor after MILP and fuse throttling.
     #
