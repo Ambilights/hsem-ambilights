@@ -6,6 +6,7 @@ Extracted from ``solve_milp`` so the orchestrator remains under 30 KB.
 from __future__ import annotations
 
 import copy
+import math
 from datetime import datetime
 
 import numpy as np
@@ -28,6 +29,7 @@ def _redistribute_below_minimum_power(
     charger_efficiency: float,
     charger_min_power_w: float,
     rated_ac_power_w: float,
+    max_extra_dc: dict[int, float] | None = None,
 ) -> tuple[dict[int, float], float]:
     """Concentrate an EV allocation into slots the charger can actually run.
 
@@ -48,6 +50,12 @@ def _redistribute_below_minimum_power(
         charger_efficiency: Charger efficiency as a fraction (0-1).
         charger_min_power_w: Minimum AC power the charger needs to start.
         rated_ac_power_w: Charger nameplate AC power, the per-slot ceiling.
+        max_extra_dc: Per-slot ceiling on how much may be *added* to a slot
+            beyond what the solver put there.  The solved plan satisfies the
+            fuse, surplus-only and import constraints as solved; raising a
+            slot's load past what unused PV or already-accepted import can
+            fund would break them, so the ceiling keeps redistribution inside
+            the feasible region rather than trusting the nameplate alone.
 
     Returns:
         ``(dc_by_slot, unplaceable_dc_kwh)`` — the concentrated allocation, and
@@ -58,11 +66,15 @@ def _redistribute_below_minimum_power(
 
     placed: dict[int, float] = {}
     deficit = 0.0
+    ceilings = max_extra_dc or {}
     for slot_i in sorted(dc_by_slot, reverse=True):
         hours = slot_hours[slot_i]
+        solved = dc_by_slot[slot_i]
         min_dc = charger_min_power_w * hours * charger_efficiency / 1000.0
         max_dc = rated_ac_power_w * hours * charger_efficiency / 1000.0
-        amount = dc_by_slot[slot_i] + deficit
+        # Never push a slot past what its own constraints can fund.
+        max_dc = min(max_dc, solved + max(ceilings.get(slot_i, math.inf), 0.0))
+        amount = solved + deficit
         accepted = min(amount, max_dc)
         deficit = amount - accepted
         if accepted >= min_dc - 1e-9:
@@ -98,6 +110,7 @@ def _write_milp_results_to_slots(
     usable_kwh: float,
     curt_sol_full: np.ndarray,  # type: ignore[name-defined]
     *,
+    session_ev_indices: list[int] | None = None,
     _min_action_kwh: float = 1e-4,
 ) -> list[PlannedSlot]:
     """Write MILP solution into a deep-copied slot list.
@@ -121,6 +134,10 @@ def _write_milp_results_to_slots(
         min_export_price: Minimum export price threshold.
         _has_session_demand: Whether any EV has active session demand.
         session_slots_set: Session slot indices where grid-charge is blocked.
+        session_ev_indices: Indices into *active_evs* of the EVs that actually
+            have a live session.  A slot in ``session_slots_set`` is a fixed
+            LP equality only for those EVs; another EV's allocation in the same
+            slot stays flexible.
         current_kwh: Battery energy at horizon start (above floor, kWh).
         usable_kwh: Maximum usable energy (kWh).
         curt_sol_full: Solved curtailment per LP slot (kWh).
@@ -178,9 +195,44 @@ def _write_milp_results_to_slots(
             else:
                 hours_by_slot[slot_i] = full_slot_hours
 
+        # Per-slot ceiling used when an EV charges past target on surplus
+        # only.  The LP carries explicit surplus-only rows for that mode, so
+        # concentrating energy there could manufacture grid import in a slot
+        # the solver restricted to PV.  A slot the plan already imports in
+        # has accepted grid energy at that price and may take more; a slot
+        # funded purely by PV may absorb only the surplus still unused.
+        ev_ac_solved = np.zeros(m)
+        for ev_idx, ev in enumerate(active_evs):
+            ev_off = ev_var_offsets[ev_idx]
+            sol = result_x[ev_off : ev_off + m]
+            for lp_t in range(m):
+                dc = float(sol[lp_t])
+                if dc >= _min_action_kwh:
+                    ev_ac_solved[lp_t] += ev_dc_to_ac_kwh(dc, ev.charger_efficiency)
+
+        headroom_ac_by_slot: dict[int, float] = {}
+        for lp_t, slot_i in enumerate(future_idx):
+            net_flow = (
+                base_load[lp_t]
+                + float(ec_sol[lp_t]) / charge_eff
+                - float(ed_sol[lp_t]) * discharge_eff
+                + float(curt_sol_full[lp_t])
+                + ev_ac_solved[lp_t]
+                - pv_avail[lp_t]
+            )
+            headroom_ac_by_slot[slot_i] = (
+                math.inf if net_flow > 1e-9 else float(-net_flow)
+            )
+
+        session_evs = set(session_ev_indices or [])
         for ev_idx, ev in enumerate(active_evs):
             ev_off = ev_var_offsets[ev_idx]
             ev_c_sol = result_x[ev_off : ev_off + m]
+            # Only this EV's own session fixes its energy.  Keying on the slot
+            # alone made one EV's live session freeze a second EV's flexible
+            # allocation, which then kept the minimum-power zeroing and was
+            # commanded 0 W while still counted as charged in the plan.
+            ev_has_session = _has_session_demand and ev_idx in session_evs
             rated_ac_power_w = round(
                 (
                     ev_dc_to_ac_kwh(ev.max_charge_per_slot, ev.charger_efficiency)
@@ -194,7 +246,7 @@ def _write_milp_results_to_slots(
                 ev_dc = float(ev_c_sol[lp_t])
                 if ev_dc < _min_action_kwh:
                     continue
-                if _has_session_demand and lp_t in session_slots_set:
+                if ev_has_session and lp_t in session_slots_set:
                     # A live session is a fixed LP equality — the car is
                     # already drawing this power.  Observed demand, not a
                     # schedulable allocation, so it must never be moved.
@@ -208,6 +260,19 @@ def _write_milp_results_to_slots(
                 charger_efficiency=ev.charger_efficiency,
                 charger_min_power_w=ev.charger_min_power_w,
                 rated_ac_power_w=rated_ac_power_w,
+                # The surplus-only rows the LP carries apply solely to an EV
+                # charging past its target, so only that EV needs the ceiling.
+                # Target-driven charging may legitimately import, and capping
+                # it would drop the charge rather than concentrate it.
+                max_extra_dc=(
+                    {
+                        slot_i: headroom_ac_by_slot.get(slot_i, math.inf)
+                        * ev.charger_efficiency
+                        for slot_i in solved_dc
+                    }
+                    if ev.charge_past_target
+                    else None
+                ),
             )
             if unplaceable_dc > 1e-6:
                 log_planner(

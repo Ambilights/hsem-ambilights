@@ -102,6 +102,10 @@ def _make_data(
     live.battery_current_capacity_kwh = 0.0
     live.huawei_batteries_rated_capacity_wh = 30000.0
     live.huawei_batteries_max_charge_power_w = 10000.0
+    # Phase-aware grid charging needs this reading: without it the limiter
+    # cannot separate the battery's own draw from real house load, so it
+    # now refuses the charge rather than sizing it from a partial snapshot.
+    live.huawei_batteries_charge_discharge_power_w = 0.0
     start = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
     rec = HourlyRecommendation(
         start=start,

@@ -640,6 +640,7 @@ def _build_solve_and_finalize(
         current_kwh,
         usable_kwh,
         curt_sol_full,
+        session_ev_indices=session_ev_indices,
         _min_action_kwh=min_action_kwh,
     )
 

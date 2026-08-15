@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import math
 from dataclasses import dataclass, replace
 
 from custom_components.hsem.models.hourly_recommendation import HourlyRecommendation
@@ -20,6 +22,8 @@ from custom_components.hsem.utils.phase_power import (
 )
 from custom_components.hsem.utils.recommendations import Recommendations
 from custom_components.hsem.utils.units import slot_duration_hours
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -52,11 +56,34 @@ def build_phase_aware_charge_commands(
     ):
         return PhaseAwareChargeCommands(recommendation=rec)
 
-    measured_phase_power_w = live_phase_power_w
-    slot_hours = slot_duration_hours(rec.start, rec.end)
     primary_grid_charge = (
         rec.recommendation == Recommendations.BatteriesChargeGrid.value
     )
+    battery_power_w = live.huawei_batteries_charge_discharge_power_w
+    if primary_grid_charge and (
+        battery_power_w is None or not math.isfinite(battery_power_w)
+    ):
+        # The limiter reconstructs house load by removing the battery's own
+        # contribution from the meter snapshot.  A discharging battery is
+        # suppressing metered import, so without this reading the remaining
+        # import looks like spare fuse capacity: at 3 kW/phase of house load
+        # with the battery covering it, the meter shows ~60 W/phase and the
+        # full 10 kW charge gets authorised — 27 A on a 16 A fuse.
+        #
+        # Substituting 0.0 is only conservative while the battery charges; in
+        # the discharge-to-grid-charge transition, which is exactly when a
+        # grid-charge slot opens, it errs the unsafe way.  Refuse the charge
+        # instead of sizing it from an incomplete snapshot.
+        _LOGGER.warning(
+            "Phase-aware grid charge blocked: Huawei battery charge/discharge "
+            "power is unavailable, so per-phase headroom cannot be computed"
+        )
+        return PhaseAwareChargeCommands(
+            recommendation=rec, primary_grid_charge_power_w=0.0
+        )
+
+    measured_phase_power_w = live_phase_power_w
+    slot_hours = slot_duration_hours(rec.start, rec.end)
     desired_primary_w = 0.0
     if primary_grid_charge and slot_hours > 1e-9:
         desired_primary_w = max(rec.batteries_charged_kwh, 0.0) * 1000.0 / slot_hours
@@ -101,8 +128,10 @@ def build_phase_aware_charge_commands(
         fuse_amps=float(cfg.main_fuse_amps),
         desired_primary_charge_power_w=desired_primary_w,
         primary_is_controlled=primary_grid_charge,
+        # Validated above for grid-charge slots; when the primary is not being
+        # controlled compute_phase_charge_limits ignores this value entirely.
         primary_actual_battery_power_w=(
-            live.huawei_batteries_charge_discharge_power_w or 0.0
+            battery_power_w if primary_grid_charge and battery_power_w else 0.0
         ),
         primary_charge_efficiency_pct=cfg.batteries_charge_efficiency,
         primary_discharge_efficiency_pct=cfg.batteries_discharge_efficiency,
