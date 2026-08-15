@@ -35,6 +35,43 @@ class PhaseAwareChargeCommands:
     limits: PhaseChargeLimits | None = None
 
 
+def _blocked_commands(
+    rec: HourlyRecommendation, reason: str
+) -> PhaseAwareChargeCommands:
+    """Refuse every charge actuator this cycle and say why.
+
+    Both actuators are limited from the same meter snapshot: the Huawei takes
+    its share of each phase and the PowMr is then allocated what remains on
+    its own phase.  When that snapshot cannot be reconstructed neither limit
+    exists, so neither may run on the plan's own figures — the plan was sized
+    against a forecast, not against the load that is on the fuse now.
+
+    The PowMr falls back to Utility at 0 A rather than SBU: it stops charging
+    but still serves its dedicated load from the grid, which is the same
+    behaviour as any non-charging slot.
+
+    Args:
+        rec: The recommendation being applied.
+        reason: Logged explanation of which telemetry was unusable.
+
+    Returns:
+        Commands with the primary pinned to 0 W and any secondary charge
+        rewritten to Utility at 0 A.
+    """
+    _LOGGER.warning("Phase-aware charge blocked: %s", reason)
+    adjusted = rec
+    if rec.secondary_storage_mode == SECONDARY_MODE_CHARGE:
+        adjusted = replace(
+            rec,
+            secondary_storage_mode=SECONDARY_MODE_UTILITY,
+            secondary_storage_charge_current_a=0.0,
+            secondary_storage_charged_kwh=0.0,
+        )
+    return PhaseAwareChargeCommands(
+        recommendation=adjusted, primary_grid_charge_power_w=0.0
+    )
+
+
 def build_phase_aware_charge_commands(
     cfg: SensorConfig,
     live: LiveState,
@@ -48,12 +85,25 @@ def build_phase_aware_charge_commands(
     against appliance changes since the plan was solved.
     """
     live_phase_power_w = live.grid_phase_power_w
-    if (
-        not cfg.phase_aware_charging_enabled
-        or cfg.main_fuse_phases != 3
-        or cfg.main_fuse_amps <= 0
-        or not phase_powers_valid(live_phase_power_w)
-    ):
+    if not cfg.phase_aware_charging_enabled:
+        # Never opted in; the plan's own figures are all there is.
+        return PhaseAwareChargeCommands(recommendation=rec)
+
+    charging = (
+        rec.recommendation == Recommendations.BatteriesChargeGrid.value
+        or rec.secondary_storage_mode == SECONDARY_MODE_CHARGE
+    )
+    if cfg.main_fuse_phases != 3 or cfg.main_fuse_amps <= 0:
+        if charging:
+            return _blocked_commands(
+                rec, "main-fuse configuration is not a valid three-phase supply"
+            )
+        return PhaseAwareChargeCommands(recommendation=rec)
+    if not phase_powers_valid(live_phase_power_w):
+        if charging:
+            return _blocked_commands(
+                rec, "one or more grid phase-power readings are unavailable"
+            )
         return PhaseAwareChargeCommands(recommendation=rec)
 
     primary_grid_charge = (
@@ -74,12 +124,10 @@ def build_phase_aware_charge_commands(
         # the discharge-to-grid-charge transition, which is exactly when a
         # grid-charge slot opens, it errs the unsafe way.  Refuse the charge
         # instead of sizing it from an incomplete snapshot.
-        _LOGGER.warning(
-            "Phase-aware grid charge blocked: Huawei battery charge/discharge "
-            "power is unavailable, so per-phase headroom cannot be computed"
-        )
-        return PhaseAwareChargeCommands(
-            recommendation=rec, primary_grid_charge_power_w=0.0
+        return _blocked_commands(
+            rec,
+            "Huawei battery charge/discharge power is unavailable, so "
+            "per-phase headroom cannot be computed",
         )
 
     measured_phase_power_w = live_phase_power_w

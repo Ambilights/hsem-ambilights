@@ -34,6 +34,11 @@ from custom_components.hsem.models.sensor_config import SensorConfig
 from custom_components.hsem.planner.milp._write_results import (
     _redistribute_below_minimum_power,
 )
+from custom_components.hsem.planner.secondary_storage import (
+    SECONDARY_MODE_CHARGE,
+    SECONDARY_MODE_SBU,
+    SECONDARY_MODE_UTILITY,
+)
 from custom_components.hsem.utils.phase_power import compute_phase_charge_limits
 from custom_components.hsem.utils.recommendations import Recommendations
 
@@ -213,3 +218,115 @@ class TestRedistributionCeiling:
 
     def test_an_infinite_ceiling_matches_no_ceiling(self) -> None:
         assert self._run({0: math.inf, 1: math.inf}) == self._run(None)
+
+
+# ---------------------------------------------------------------------------
+# Secondary storage must fail closed on the same telemetry
+# ---------------------------------------------------------------------------
+
+
+class TestSecondaryStorageFailsClosed:
+    """PowMr charging is limited from the same snapshot as the Huawei.
+
+    Its allowance is whatever remains on its own phase after the Huawei takes
+    its share, so a snapshot that cannot be reconstructed leaves it with no
+    limit either — and the plan's own current was sized against a forecast,
+    not against the load presently on the fuse.
+    """
+
+    @staticmethod
+    def _commands(
+        *,
+        phase_aware: bool = True,
+        phases: int = 3,
+        phase_power: tuple[float | None, float | None, float | None] = (
+            500.0,
+            500.0,
+            500.0,
+        ),
+        battery_power_w: float | None = 0.0,
+        secondary_mode: str = SECONDARY_MODE_CHARGE,
+        recommendation: str = Recommendations.BatteriesWaitMode.value,
+    ) -> PhaseAwareChargeCommands:
+        from datetime import UTC, datetime, timedelta
+
+        cfg = SensorConfig()
+        cfg.phase_aware_charging_enabled = phase_aware
+        cfg.main_fuse_amps = int(FUSE_A)
+        cfg.main_fuse_phases = phases
+        cfg.secondary_storage.enabled = True
+        cfg.secondary_storage.grid_phase = 3
+        cfg.secondary_storage.nominal_voltage_v = 25.6
+        cfg.secondary_storage.min_charge_current_a = 10.0
+        cfg.secondary_storage.max_charge_current_a = 60.0
+        live = LiveState()
+        live.grid_phase_power_w = phase_power
+        live.huawei_batteries_charge_discharge_power_w = battery_power_w
+        live.huawei_batteries_max_charge_power_w = 10000.0
+        start = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
+        rec = HourlyRecommendation(
+            start=start,
+            end=start + timedelta(minutes=15),
+            avg_house_consumption_kwh=0.5,
+            avg_house_consumption_1d_kwh=0.5,
+            avg_house_consumption_3d_kwh=0.5,
+            avg_house_consumption_7d_kwh=0.5,
+            avg_house_consumption_14d_kwh=0.5,
+            batteries_charged_kwh=0.0,
+            batteries_discharged_kwh=0.0,
+            estimated_battery_capacity_kwh=6.0,
+            estimated_battery_soc_pct=25.0,
+            estimated_cost_currency=0.0,
+            estimated_net_consumption_kwh=0.5,
+            export_price=0.1,
+            grid_export_kwh=0.0,
+            grid_import_kwh=0.5,
+            import_price=1.0,
+            recommendation=recommendation,
+            solcast_pv_estimate_kwh=0.0,
+        )
+        rec.secondary_storage_mode = secondary_mode
+        rec.secondary_storage_charge_current_a = 60.0
+        return build_phase_aware_charge_commands(cfg, live, rec)
+
+    def test_unreadable_phase_meter_stops_powmr_charging(self) -> None:
+        cmds = self._commands(phase_power=(500.0, None, 500.0))
+
+        assert cmds.recommendation.secondary_storage_mode == SECONDARY_MODE_UTILITY
+        assert cmds.recommendation.secondary_storage_charge_current_a == 0.0
+
+    def test_a_non_three_phase_supply_stops_powmr_charging(self) -> None:
+        cmds = self._commands(phases=1)
+
+        assert cmds.recommendation.secondary_storage_mode == SECONDARY_MODE_UTILITY
+
+    def test_missing_huawei_battery_power_stops_powmr_too(self) -> None:
+        """The Huawei's share is subtracted before PowMr's allowance."""
+        cmds = self._commands(
+            battery_power_w=None,
+            recommendation=Recommendations.BatteriesChargeGrid.value,
+        )
+
+        assert cmds.recommendation.secondary_storage_mode == SECONDARY_MODE_UTILITY
+        assert cmds.primary_grid_charge_power_w == 0.0
+
+    def test_a_non_charging_powmr_slot_is_left_alone(self) -> None:
+        """Nothing is being armed, so nothing needs blocking."""
+        cmds = self._commands(
+            phase_power=(500.0, None, 500.0), secondary_mode=SECONDARY_MODE_SBU
+        )
+
+        assert cmds.recommendation.secondary_storage_mode == SECONDARY_MODE_SBU
+
+    def test_phase_aware_disabled_leaves_powmr_charging(self) -> None:
+        """Never opted in, so the plan's own current stands."""
+        cmds = self._commands(phase_aware=False, phase_power=(500.0, None, 500.0))
+
+        assert cmds.recommendation.secondary_storage_mode == SECONDARY_MODE_CHARGE
+
+    def test_valid_telemetry_still_throttles_rather_than_blocks(self) -> None:
+        """The normal path is a limit, not a refusal."""
+        cmds = self._commands(phase_power=(500.0, 500.0, 3000.0))
+
+        assert cmds.limits is not None
+        assert 0.0 < cmds.limits.secondary_charge_current_a < 60.0
