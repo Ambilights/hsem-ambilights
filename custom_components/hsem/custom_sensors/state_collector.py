@@ -72,6 +72,22 @@ from custom_components.hsem.utils.sensornames.ev import (
 # ---------------------------------------------------------------------------
 
 
+def _negate_optional(value: float | None) -> float | None:
+    """Return ``-value``, preserving ``None`` for an unreadable sensor.
+
+    Used to flip a meter whose sign convention is the reverse of the one
+    :mod:`custom_components.hsem.utils.phase_power` documents.  ``None`` must
+    survive unchanged so ``phase_powers_valid`` can still reject the reading.
+
+    Args:
+        value: Converted sensor reading, or ``None`` when unreadable.
+
+    Returns:
+        The negated reading, or ``None``.
+    """
+    return None if value is None else -value
+
+
 async def async_collect_live_state(
     sensor: Any,  # NOSONAR -- HA internal type; circular import risk
     cfg: SensorConfig,
@@ -248,26 +264,42 @@ async def async_collect_live_state(
         or 0.0
     )
     if cfg.phase_aware_charging_enabled:
+        # The Huawei power meter reports **negative for import** and positive
+        # for export, the opposite of the convention `utils.phase_power`
+        # documents and every consumer assumes.  Verified against a three-hour
+        # overnight window with zero PV and an idle battery, where the house
+        # could only import: all 932 samples were negative, none positive.
+        #
+        # Left unnegated, `compute_phase_charge_limits` adds the import to the
+        # fuse allowance instead of subtracting it, so the headroom it reports
+        # grows as the house draws more — relaxing exactly when it must clamp.
+        # Normalise here so the pure helpers keep their documented contract.
         state.grid_phase_power_w = (
-            convert_to_float(
-                _read(
-                    cfg.huawei_solar_power_meter_phase_a_active_power,
-                    "float",
-                    label="power_meter_phase_a_active_power",
+            _negate_optional(
+                convert_to_float(
+                    _read(
+                        cfg.huawei_solar_power_meter_phase_a_active_power,
+                        "float",
+                        label="power_meter_phase_a_active_power",
+                    )
                 )
             ),
-            convert_to_float(
-                _read(
-                    cfg.huawei_solar_power_meter_phase_b_active_power,
-                    "float",
-                    label="power_meter_phase_b_active_power",
+            _negate_optional(
+                convert_to_float(
+                    _read(
+                        cfg.huawei_solar_power_meter_phase_b_active_power,
+                        "float",
+                        label="power_meter_phase_b_active_power",
+                    )
                 )
             ),
-            convert_to_float(
-                _read(
-                    cfg.huawei_solar_power_meter_phase_c_active_power,
-                    "float",
-                    label="power_meter_phase_c_active_power",
+            _negate_optional(
+                convert_to_float(
+                    _read(
+                        cfg.huawei_solar_power_meter_phase_c_active_power,
+                        "float",
+                        label="power_meter_phase_c_active_power",
+                    )
                 )
             ),
         )

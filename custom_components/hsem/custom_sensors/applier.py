@@ -763,7 +763,9 @@ async def async_apply_battery_settings(
     )
 
     if recommendation == Recommendations.BatteriesChargeGrid.value and (
-        grid_charge_power_limit_w is not None or _grid_charge_needs_rearm(live)
+        grid_charge_power_limit_w is not None
+        or cfg.phase_aware_charging_enabled
+        or _grid_charge_needs_rearm(live)
     ):
         charge_entity = cfg.huawei_solar_batteries_grid_charge_maximum_power
         if charge_entity is None:
@@ -774,11 +776,23 @@ async def async_apply_battery_settings(
             return summary
         if grid_charge_power_limit_w is not None:
             desired_charge_w = max(grid_charge_power_limit_w, 0.0)
+        elif cfg.phase_aware_charging_enabled:
+            # Phase-aware charging is on, but no per-phase limit could be
+            # computed this cycle — the meter readings were missing or
+            # non-finite, or the supply is not three-phase.  Re-arming at the hardware maximum would silently
+            # remove the fuse protection the user opted into, so fall back to
+            # the plan's own charge power instead: the MILP sizes it under a
+            # per-phase constraint, the hardware maximum is unconstrained.
+            desired_charge_w = _planned_grid_charge_power_w(rec, live)
+            _LOGGER.warning(
+                "Phase telemetry unusable; limiting grid charge to the planned "
+                "%.0f W instead of the hardware maximum",
+                desired_charge_w,
+            )
         else:
-            # No phase-aware constraint this cycle (it is disabled by default,
-            # and also inactive on non-three-phase or invalid phase telemetry),
-            # but the limit sits at 0 W — the value this applier writes when
-            # leaving a previous GridCharge slot.  Re-arm at the hardware
+            # Phase-aware charging is switched off, so the user has not asked
+            # for per-phase protection, but the limit sits at 0 W — the value
+            # this applier writes when leaving a previous GridCharge slot.  Re-arm at the hardware
             # maximum so grid charging can start.  A positive user-chosen limit
             # is never touched, because _grid_charge_needs_rearm() is False.
             desired_charge_w = _grid_charge_restore_power_w(live)
@@ -1187,6 +1201,30 @@ def _grid_charge_restore_power_w(live: LiveState) -> float:
         The battery's maximum charging power, or ``0.0`` when unavailable.
     """
     return max(live.huawei_batteries_max_charge_power_w or 0.0, 0.0)
+
+
+def _planned_grid_charge_power_w(rec: HourlyRecommendation, live: LiveState) -> float:
+    """Return the grid-charge power the plan asked for in this slot, in watts.
+
+    Mirrors the ``desired_primary_w`` calculation in
+    :mod:`custom_components.hsem.custom_sensors.phase_charge_limiter` so the
+    fallback and the live correction size the charge identically.
+
+    Args:
+        rec: The recommendation being applied.
+        live: Current live state, for the hardware charge-power ceiling.
+
+    Returns:
+        The planned charge power, clamped to the hardware maximum.
+    """
+    slot_hours = slot_duration_hours(rec.start, rec.end)
+    if slot_hours <= 1e-9:
+        return 0.0
+    planned_w = max(rec.batteries_charged_kwh, 0.0) * 1000.0 / slot_hours
+    max_charge_w = live.huawei_batteries_max_charge_power_w
+    if max_charge_w is not None:
+        planned_w = min(planned_w, max(max_charge_w, 0.0))
+    return planned_w
 
 
 def _grid_charge_needs_rearm(live: LiveState) -> bool:
