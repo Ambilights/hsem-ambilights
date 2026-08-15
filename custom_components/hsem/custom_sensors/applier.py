@@ -777,17 +777,24 @@ async def async_apply_battery_settings(
         if grid_charge_power_limit_w is not None:
             desired_charge_w = max(grid_charge_power_limit_w, 0.0)
         elif cfg.phase_aware_charging_enabled:
-            # Phase-aware charging is on, but no per-phase limit could be
-            # computed this cycle — the meter readings were missing or
-            # non-finite, or the supply is not three-phase.  Re-arming at the hardware maximum would silently
-            # remove the fuse protection the user opted into, so fall back to
-            # the plan's own charge power instead: the MILP sizes it under a
-            # per-phase constraint, the hardware maximum is unconstrained.
-            desired_charge_w = _planned_grid_charge_power_w(rec, live)
+            # Phase-aware charging is on but no per-phase limit could be
+            # computed: the meter readings are missing or non-finite, or the
+            # supply is not three-phase.  Fail closed.
+            #
+            # An earlier version clamped to the plan's own charge power on the
+            # grounds that the MILP had sized it under a per-phase constraint.
+            # That is false: _phase_fuse_enabled needs a valid phase imbalance
+            # and coordinator_builder only produces one when the same readings
+            # are valid, so the identical failure disables both.  Worse, the
+            # planned power can itself be the hardware maximum — a full-power
+            # 15-minute charge plans 2.5 kWh, which is 10 kW — leaving the
+            # clamp indistinguishable from no protection in exactly the case
+            # that matters.  Only the aggregate fuse model survives, and it
+            # cannot see a single overloaded phase.
+            desired_charge_w = 0.0
             _LOGGER.warning(
-                "Phase telemetry unusable; limiting grid charge to the planned "
-                "%.0f W instead of the hardware maximum",
-                desired_charge_w,
+                "Phase-aware grid charge blocked: per-phase headroom cannot be "
+                "computed from the current telemetry"
             )
         else:
             # Phase-aware charging is switched off, so the user has not asked
@@ -1201,30 +1208,6 @@ def _grid_charge_restore_power_w(live: LiveState) -> float:
         The battery's maximum charging power, or ``0.0`` when unavailable.
     """
     return max(live.huawei_batteries_max_charge_power_w or 0.0, 0.0)
-
-
-def _planned_grid_charge_power_w(rec: HourlyRecommendation, live: LiveState) -> float:
-    """Return the grid-charge power the plan asked for in this slot, in watts.
-
-    Mirrors the ``desired_primary_w`` calculation in
-    :mod:`custom_components.hsem.custom_sensors.phase_charge_limiter` so the
-    fallback and the live correction size the charge identically.
-
-    Args:
-        rec: The recommendation being applied.
-        live: Current live state, for the hardware charge-power ceiling.
-
-    Returns:
-        The planned charge power, clamped to the hardware maximum.
-    """
-    slot_hours = slot_duration_hours(rec.start, rec.end)
-    if slot_hours <= 1e-9:
-        return 0.0
-    planned_w = max(rec.batteries_charged_kwh, 0.0) * 1000.0 / slot_hours
-    max_charge_w = live.huawei_batteries_max_charge_power_w
-    if max_charge_w is not None:
-        planned_w = min(planned_w, max(max_charge_w, 0.0))
-    return planned_w
 
 
 def _grid_charge_needs_rearm(live: LiveState) -> bool:

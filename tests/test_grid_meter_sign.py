@@ -30,7 +30,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from custom_components.hsem.custom_sensors.applier import (
-    _planned_grid_charge_power_w,
     async_apply_battery_settings,
 )
 from custom_components.hsem.custom_sensors.state_collector import _negate_optional
@@ -216,36 +215,46 @@ async def _apply(
     ]
 
 
-class TestPlannedGridChargePower:
-    """The fallback must size the charge exactly as the live limiter would."""
-
-    def test_planned_energy_becomes_power(self) -> None:
-        live = _live()
-
-        # 0.051 kWh over a 15-minute slot is 204 W.
-        assert _planned_grid_charge_power_w(
-            _recommendation(0.051), live
-        ) == pytest.approx(204.0)
-
-    def test_clamped_to_the_hardware_maximum(self) -> None:
-        live = _live()
-        live.huawei_batteries_max_charge_power_w = 5000.0
-
-        assert _planned_grid_charge_power_w(
-            _recommendation(10.0), live
-        ) == pytest.approx(5000.0)
-
-
 class TestUnusableTelemetryFallback:
-    """A meter dropout must not re-arm at the hardware maximum."""
+    """A meter dropout must fail closed, not re-arm the charge."""
+
+    @staticmethod
+    def _armed_live() -> LiveState:
+        """A live state whose grid-charge limit is currently armed."""
+        live = _live()
+        live.huawei_batteries_grid_charge_max_power_w = 9600.0
+        return live
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_planned_power_not_hardware_max(self) -> None:
-        writes = await _apply(_config(phase_aware=True), _live(), _recommendation(0.4))
-        charge_writes = [d for e, d in writes if e == CHARGE_ENTITY]
+    async def test_an_armed_limit_is_disarmed(self) -> None:
+        """Clamping to planned power was not protection.
 
-        # 0.4 kWh / 0.25 h = 1600 W planned, not the 10000 W hardware maximum.
-        assert charge_writes == [1600.0]
+        The plan is per-phase constrained only when the phase imbalance is
+        valid — the same condition the runtime limiter needs — and a
+        full-power slot plans 2.5 kWh, i.e. the 10 kW hardware maximum.  So
+        the clamp collapsed to no protection exactly when it mattered.
+        """
+        writes = await _apply(
+            _config(phase_aware=True), self._armed_live(), _recommendation(2.5)
+        )
+
+        assert [d for e, d in writes if e == CHARGE_ENTITY] == [0.0]
+
+    @pytest.mark.asyncio
+    async def test_a_modest_planned_charge_is_blocked_too(self) -> None:
+        """Not a cap on the plan — the charge is refused outright."""
+        writes = await _apply(
+            _config(phase_aware=True), self._armed_live(), _recommendation(0.4)
+        )
+
+        assert [d for e, d in writes if e == CHARGE_ENTITY] == [0.0]
+
+    @pytest.mark.asyncio
+    async def test_an_already_disarmed_limit_needs_no_write(self) -> None:
+        """Idempotent: 0 W is already the safe value."""
+        writes = await _apply(_config(phase_aware=True), _live(), _recommendation(2.5))
+
+        assert [d for e, d in writes if e == CHARGE_ENTITY] == []
 
     @pytest.mark.asyncio
     async def test_phase_aware_disabled_still_restores_hardware_max(self) -> None:
