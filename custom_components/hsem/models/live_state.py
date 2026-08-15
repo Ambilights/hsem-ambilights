@@ -194,10 +194,14 @@ class LiveState:
     battery_current_capacity_kwh: float = 0.0
     battery_rated_capacity_min_kwh: float = 0.0
 
-    # EV planned load live state — primary EV
+    # EV planned load live state — primary EV.
+    #
+    # ``*_current_soc_pct`` is ``None`` when a configured SoC sensor cannot be
+    # read (vehicle integration offline).  Consumers must treat ``None`` as
+    # "unknown" and disable EV planning rather than substituting 0 %.
     ev_planned_load_connected: bool = False
     ev_planned_load_smart_charging_enabled: bool = True
-    ev_planned_load_current_soc_pct: float = 0.0
+    ev_planned_load_current_soc_pct: float | None = None
     ev_planned_load_target_soc_pct: float = 80.0
     ev_planned_load_deadline: Any = (
         None  # datetime | None, typed as Any to avoid import
@@ -205,7 +209,7 @@ class LiveState:
     # EV planned load live state — second EV
     ev_second_planned_load_connected: bool = False
     ev_second_planned_load_smart_charging_enabled: bool = True
-    ev_second_planned_load_current_soc_pct: float = 0.0
+    ev_second_planned_load_current_soc_pct: float | None = None
     ev_second_planned_load_target_soc_pct: float = 80.0
     ev_second_planned_load_deadline: Any = None  # datetime | None
 

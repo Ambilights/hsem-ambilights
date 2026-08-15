@@ -97,6 +97,7 @@ from custom_components.hsem.utils.datetime_utils import (
     utc_key,
     utc_now_iso,
 )
+from custom_components.hsem.utils.degraded_mode import DegradedMode
 from custom_components.hsem.utils.dynamic_floor import DynamicDischargeFloor
 from custom_components.hsem.utils.forecast_tracker import (
     ForecastTracker,
@@ -1375,9 +1376,29 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             # 6. Determine working state: forced, missing, or full pipeline.
             state: str | None = None
 
-            if live.missing_entities and live.force_working_mode_state == "auto":
+            # Only a *critical* absence halts planning.  A non-critical one
+            # (an EV sensor, a price feed) classifies as Degraded, which
+            # utils.degraded_mode defines as "read-only calculations continue
+            # on best-effort values" — so the battery keeps being optimised
+            # while the unavailable feature sits out the cycle.
+            if live.missing_entities and live.degraded_mode is not DegradedMode.Error:
+                async_log(
+                    "debug",
+                    "Non-critical input entities missing (%s); "
+                    "continuing on best-effort values.",
+                    ", ".join(live.missing_entities_list) or "unknown",
+                )
+
+            if (
+                live.degraded_mode is DegradedMode.Error
+                and live.force_working_mode_state == "auto"
+            ):
                 state = Recommendations.MissingInputEntities.value
-                async_log("debug", "Missing input entities, skipping calculations.")
+                async_log(
+                    "debug",
+                    "Critical input entities missing (%s), skipping calculations.",
+                    ", ".join(live.missing_entities_list) or "unknown",
+                )
 
             elif not consumption_ok and live.force_working_mode_state == "auto":
                 # Energy average sensors not yet ready.  Still populate prices
@@ -1433,7 +1454,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
             if (
                 live.force_working_mode_state == "auto"
-                and not live.missing_entities
+                and live.degraded_mode is not DegradedMode.Error
                 and consumption_ok
             ):
                 # Compute dynamic discharge floor BEFORE the planner runs
@@ -1528,7 +1549,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                     and utc_key(active_force_slot.start) == utc_key(pending_force_slot)
                     and (utc_key(active_force_slot.end) - utc_key(now)).total_seconds()
                     >= FORCE_DISCHARGE_REPLAN_MIN_REMAINING_SECONDS
-                    and not live.missing_entities
+                    and live.degraded_mode is not DegradedMode.Error
                     and not (
                         cfg.house_power_includes_ev_charger_power
                         and live.any_ev_charging
@@ -2193,7 +2214,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         """
         slot = self._active_force_discharge_slot(now)
         live = self._live
-        if slot is None or live is None or live.missing_entities:
+        if slot is None or live is None or live.degraded_mode is DegradedMode.Error:
             self._force_discharge_live_replan_pending_slot = None
             self._clear_force_discharge_excess_window()
             return

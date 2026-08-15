@@ -179,6 +179,24 @@ def _normalize_live_house_for_secondary(
 # ---------------------------------------------------------------------------
 
 
+def _ev_soc_valid(soc_pct: float | None) -> bool:
+    """Return whether an EV state-of-charge reading is usable this cycle.
+
+    A missing or out-of-range SoC (an unavailable vehicle integration, a
+    cloud API outage) must disable the EV feature rather than be coerced to
+    0 %, which the planner would read as an empty battery and schedule a
+    full charge against.  Mirrors the ``telemetry_valid`` gate used for
+    secondary storage.
+
+    Args:
+        soc_pct: Converted SoC reading, or ``None`` when unreadable.
+
+    Returns:
+        ``True`` when the reading is present and within 0-100 %.
+    """
+    return soc_pct is not None and 0.0 <= soc_pct <= 100.0
+
+
 def build_planner_input(
     *,
     cfg: SensorConfig,
@@ -446,7 +464,8 @@ def build_planner_input(
         live_house_consumption_w=live_house_w,
         is_read_only=bool(cfg.read_only),
         # EV planned load
-        ev_planned_load_enabled=bool(cfg.ev_planned_load_enabled),
+        ev_planned_load_enabled=bool(cfg.ev_planned_load_enabled)
+        and _ev_soc_valid(convert_to_float(live.ev_planned_load_current_soc_pct)),
         ev_planned_load_connected=bool(live.ev_planned_load_connected),
         ev_planned_load_smart_charging_enabled=bool(
             live.ev_planned_load_smart_charging_enabled
@@ -487,7 +506,10 @@ def build_planner_input(
         )
         or 0.9,
         # Second EV planned load
-        ev_second_planned_load_enabled=bool(cfg.ev_second_planned_load_enabled),
+        ev_second_planned_load_enabled=bool(cfg.ev_second_planned_load_enabled)
+        and _ev_soc_valid(
+            convert_to_float(live.ev_second_planned_load_current_soc_pct)
+        ),
         ev_second_planned_load_connected=bool(live.ev_second_planned_load_connected),
         ev_second_planned_load_smart_charging_enabled=bool(
             live.ev_second_planned_load_smart_charging_enabled

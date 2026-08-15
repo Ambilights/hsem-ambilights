@@ -716,8 +716,19 @@ def _read_ev_planned_load_state(
         setattr(state, f"{p}_connected", True)
 
     if soc_sensor:
-        _soc = convert_to_float(_read(soc_sensor, "float", label=f"{p}_soc"))
-        setattr(state, f"{p}_current_soc_pct", _soc if _soc is not None else 0.0)
+        # Keep ``None`` when the vehicle integration is unreachable.  Coercing
+        # to 0 % here is indistinguishable from a genuinely empty battery and
+        # would make the planner schedule a full charge against a phantom SoC.
+        setattr(
+            state,
+            f"{p}_current_soc_pct",
+            convert_to_float(_read(soc_sensor, "float", label=f"{p}_soc")),
+        )
+    else:
+        # No SoC sensor configured at all: keep the historical assumption of an
+        # empty battery so the planner charges to target.  This is a deliberate
+        # user choice, unlike a configured sensor that has gone unreadable.
+        setattr(state, f"{p}_current_soc_pct", 0.0)
 
     # Target SoC is read from the HSEM number entity config option.
     target_soc_config_key = (

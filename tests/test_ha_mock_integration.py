@@ -142,6 +142,17 @@ def make_fake_hass(entity_states: dict[str, str | dict]) -> MagicMock:
     hass.async_create_task = MagicMock()
     hass.services = MagicMock()
     hass.services.async_call = AsyncMock()
+
+    async def _run_in_executor(func: Any, *args: Any) -> Any:
+        """Run the callable inline.
+
+        The dry-run cycle reaches the planner, which offloads the MILP solve
+        via ``async_add_executor_job``.  Running it inline keeps the test
+        single-threaded and deterministic.
+        """
+        return func(*args)
+
+    hass.async_add_executor_job = _run_in_executor
     return hass
 
 
@@ -238,6 +249,10 @@ def make_bare_coordinator(
     coord._current_slot_price_actionable = None
     coord._current_slot_ev_power_w = 0.0
     coord._current_slot_ev_second_power_w = 0.0
+    # Planner hysteresis state (issue #372).  Reached whenever the mock cycle
+    # is only Degraded rather than Error, which is now the common case.
+    coord._previous_planner_winner_name = None
+    coord._previous_planner_winner_score = 0.0
 
     from custom_components.hsem.models.data_quality import DataQuality
     from custom_components.hsem.models.plan_explanation import PlanExplanation
@@ -256,6 +271,74 @@ def make_bare_coordinator(
 
     coord._forecast_tracker = ForecastTracker(max_slots=192)
     coord._last_accumulation_ts = None
+
+    # The remaining per-cycle state that ``HSEMDataUpdateCoordinator.__init__``
+    # sets up.  A dry-run cycle now reaches the planner whenever the mock is
+    # merely Degraded rather than Error, so these can no longer be omitted.
+    from custom_components.hsem.models.daily_plan_vs_actual_tracker import (
+        DailyPlanVsActualTracker,
+    )
+    from custom_components.hsem.models.financial_tracker import FinancialTracker
+    from custom_components.hsem.models.savings_tracker import SavingsTracker
+    from custom_components.hsem.utils.capacity_learner import CapacityLearner
+    from custom_components.hsem.utils.dynamic_floor import DynamicDischargeFloor
+    from custom_components.hsem.utils.prediction_tracker import PredictionTracker
+    from custom_components.hsem.utils.solar_corrector import SolarForecastCorrector
+
+    coord._slot_boundary_timer_unsub = None
+    coord._slot_boundary_interval_minutes = None
+    coord._window_hysteresis_timer_unsub = None
+    coord._window_hysteresis_expiry = None
+    coord._window_hysteresis_expiry_replan_pending = False
+    coord._tearing_down = False
+    coord._last_apply_summary = None
+    coord._last_planner_input = None
+    coord._price_source_update_debounce_task = None
+    coord._price_source_update_pending = False
+    coord._window_hys_previous_rec = None
+    coord._window_hys_previous_slot_start = None
+    coord._previous_planner_winner_name = None
+    coord._previous_planner_winner_score = 0.0
+    coord._last_plan_ev_connected = False
+    coord._last_plan_ev_charging = False
+    coord._last_plan_ev_soc_below_target = False
+    coord._last_plan_ev_second_connected = False
+    coord._last_plan_ev_second_charging = False
+    coord._last_plan_ev_second_soc_below_target = False
+    coord._last_plan_force_mode = "auto"
+    coord._last_plan_import_price = None
+    coord._last_plan_price_forecast_signature = None
+    coord._last_plan_ev_target_soc = None
+    coord._last_plan_ev_smart_charging = None
+    coord._last_plan_ev_deadline = None
+    coord._last_plan_ev2_target_soc = None
+    coord._last_plan_ev2_smart_charging = None
+    coord._last_plan_ev2_deadline = None
+    coord._last_plan_secondary_soc_pct = None
+    coord._last_plan_secondary_load_power_w = None
+    coord._last_plan_secondary_output_priority = None
+    coord._solar_corrector = SolarForecastCorrector()
+    coord._solar_corrector_processed = set()
+    coord._prediction_tracker = PredictionTracker(max_records=2880)
+    coord._daily_tracker = DailyPlanVsActualTracker()
+    coord._daily_tracker_initialized = False
+    coord._savings_tracker = SavingsTracker()
+    coord._savings_tracker_initialized = False
+    coord._financial_tracker = FinancialTracker()
+    coord._financial_tracker_initialized = False
+    coord._midnight_unsub = None
+    coord._daily_plan_last_accumulated = None
+    coord._last_soc_pct = None
+    coord._dynamic_floor = DynamicDischargeFloor()
+    coord._effective_discharge_floor_pct = None
+    coord._effective_discharge_floor_diag = None
+    coord._capacity_learner = CapacityLearner()
+    coord._ocpp_server = None
+    coord._ocpp_sessions = []
+    coord._ml_predictor = None
+    coord._options_update_task = None
+    coord._options_update_debounce_task = None
+    coord._secondary_storage_update_debounce_task = None
     coord._override_expiry = None
 
     # CoordinatorEntity support — some entity methods call this

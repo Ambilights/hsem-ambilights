@@ -45,7 +45,10 @@ from custom_components.hsem.custom_sensors.secondary_storage_applier import (
     build_secondary_write_plan,
 )
 from custom_components.hsem.entity import HSEMCoordinatorEntity, HSEMEntity
-from custom_components.hsem.utils.degraded_mode import hardware_writes_allowed
+from custom_components.hsem.utils.degraded_mode import (
+    DegradedMode,
+    hardware_writes_allowed,
+)
 from custom_components.hsem.utils.inverter_verify import (
     ApplyStatus,
     CycleApplySummary,
@@ -210,7 +213,12 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
                 "unique_id": self._attr_unique_id,
             }
 
-        if live.missing_entities:
+        # Only a *critical* absence empties the payload.  When a non-critical
+        # sensor is unavailable the planner still ran, so the schedule must
+        # stay published — dashboards and automations read
+        # ``hourly_recommendations`` from here and would otherwise go blind
+        # for the duration of an unrelated integration's outage.
+        if live.degraded_mode is DegradedMode.Error:
             return {
                 "status": "error",
                 "description": (
@@ -344,6 +352,10 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
             ),
             "data_quality": data.data_quality.as_dict(),
         }
+        if live.missing_entities:
+            # Non-critical absence: the plan below is real, but say which
+            # sensors were unavailable when it was computed.
+            status["missing_input_entities_list"] = live.missing_entities_list
 
         return dict(sorted({**attributes, **extended, **status}.items()))
 
