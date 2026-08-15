@@ -439,6 +439,23 @@ class _SimpleSlot:
 # ---------------------------------------------------------------------------
 
 
+_EV_FORCE_CHARGE_RESCUED_STATES: frozenset[str] = frozenset(
+    {
+        "smart_charging_disabled",
+        "waiting",
+        "not_connected",
+        "fully_charged",
+    }
+)
+"""Plan states a forced charge overrides.
+
+Every state except ``charging`` itself: the user has explicitly asked for
+power now, so neither a deferred schedule ("waiting"), a disabled feature, a
+connection the integration has not noticed, nor a target already believed met
+should keep the charger off.
+"""
+
+
 def _apply_force_charge_now(
     *,
     config_entry: ConfigEntry,
@@ -492,9 +509,13 @@ def _apply_force_charge_now(
         now_slot.ev_charger_calculated_power = (
             round(pwr_kw * 1000) if pwr_kw > 0 else 0.0
         )
-        # Flip plan state so the sensor shows "charging" instead of
-        # "smart_charging_disabled" when the user forces a charge.
-        if ev_plan is not None and ev_plan.state == "smart_charging_disabled":
+        # Flip the plan state so the sensor reports "charging" whenever the
+        # user forces a charge.  Automations gate on this state, so any
+        # non-charging state must be rescued — not just
+        # "smart_charging_disabled".  "waiting" is the common case: the
+        # planner has scheduled the charge for a later slot, and a forced
+        # charge must override that, which is the whole point of the switch.
+        if ev_plan is not None and ev_plan.state in _EV_FORCE_CHARGE_RESCUED_STATES:
             ev_plan.state = "charging"
         async_log(
             "debug",
@@ -515,11 +536,12 @@ def _apply_force_charge_now(
         now_slot.ev_second_charger_calculated_power = (
             round(pwr_kw * 1000) if pwr_kw > 0 else 0.0
         )
-        # Flip plan state so the sensor shows "charging" instead of
-        # "smart_charging_disabled" when the user forces a charge.
+        # Flip the plan state so the sensor reports "charging" (see the
+        # primary-EV branch above for why every non-charging state is
+        # rescued, not only "smart_charging_disabled").
         if (
             ev_second_plan is not None
-            and ev_second_plan.state == "smart_charging_disabled"
+            and ev_second_plan.state in _EV_FORCE_CHARGE_RESCUED_STATES
         ):
             ev_second_plan.state = "charging"
         async_log(

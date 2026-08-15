@@ -13,11 +13,66 @@ import numpy as np
 from custom_components.hsem.models.ev_config import EVConfig
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.utils.datetime_utils import slot_contains
+from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.units import (
     ev_dc_to_ac_kwh,
     is_material_planned_energy_kwh,
     slot_duration_hours,
 )
+
+
+def _redistribute_below_minimum_power(
+    dc_by_slot: dict[int, float],
+    *,
+    slot_hours: dict[int, float],
+    charger_efficiency: float,
+    charger_min_power_w: float,
+    rated_ac_power_w: float,
+) -> tuple[dict[int, float], float]:
+    """Concentrate an EV allocation into slots the charger can actually run.
+
+    The MILP models EV charge as a continuous variable, so it may spread a
+    small amount of energy thinly across many slots.  A charger cannot run
+    below its minimum operating power, so a slot whose implied AC power falls
+    short of that minimum delivers nothing at all.  Zeroing only the power
+    command leaves that energy in the plan's own accounting while no charger
+    is ever told to deliver it, and the schedule silently falls short of
+    ``total_kwh_needed``.
+
+    Energy is carried from later slots into earlier ones, never the reverse,
+    so nothing is pushed past the deadline the MILP already respected.
+
+    Args:
+        dc_by_slot: Battery-side kWh per output-slot index, as solved.
+        slot_hours: Charging hours actually available in each of those slots.
+        charger_efficiency: Charger efficiency as a fraction (0-1).
+        charger_min_power_w: Minimum AC power the charger needs to start.
+        rated_ac_power_w: Charger nameplate AC power, the per-slot ceiling.
+
+    Returns:
+        ``(dc_by_slot, unplaceable_dc_kwh)`` — the concentrated allocation, and
+        any energy no remaining slot could absorb.
+    """
+    if charger_min_power_w <= 1e-9 or not dc_by_slot:
+        return dict(dc_by_slot), 0.0
+
+    placed: dict[int, float] = {}
+    deficit = 0.0
+    for slot_i in sorted(dc_by_slot, reverse=True):
+        hours = slot_hours[slot_i]
+        min_dc = charger_min_power_w * hours * charger_efficiency / 1000.0
+        max_dc = rated_ac_power_w * hours * charger_efficiency / 1000.0
+        amount = dc_by_slot[slot_i] + deficit
+        accepted = min(amount, max_dc)
+        deficit = amount - accepted
+        if accepted >= min_dc - 1e-9:
+            placed[slot_i] = accepted
+        else:
+            # Still below the charger's minimum even after absorbing later
+            # slots; carry the whole amount further back rather than command
+            # a power the charger would ignore.
+            deficit += accepted
+    return placed, deficit
 
 
 def _write_milp_results_to_slots(
@@ -100,16 +155,83 @@ def _write_milp_results_to_slots(
     # equation when mutex resolution alters ec/ed (issue #659):
     #   gi + pv + ed·η_dis = base_load + ec/η_chg + ge + curt + Σ ev_c/eff
     ev_ac_load_by_slot: dict[int, float] = {}
+    # Battery-side kWh actually scheduled per EV, keyed by output-slot index,
+    # after concentrating allocations the charger could not physically run.
+    placed_dc_by_ev: list[dict[int, float]] = []
+    session_dc_by_ev: list[dict[int, float]] = []
+    hours_by_slot: dict[int, float] = {}
     if active_evs:
+        first_future_slot = out_slots[future_idx[0]]
+        full_slot_hours = slot_duration_hours(
+            first_future_slot.start, first_future_slot.end
+        )
+        for slot_i in future_idx:
+            slot_end = out_slots[slot_i].end
+            if slot_contains(out_slots[slot_i].start, slot_end, now):
+                # Only the remaining minutes of the current slot are usable,
+                # which changes both the power an energy implies and how much
+                # the slot can absorb.
+                hours_by_slot[slot_i] = max(
+                    slot_duration_hours(now, slot_end),
+                    1.0 / 3600.0,  # 1 s minimum guard
+                )
+            else:
+                hours_by_slot[slot_i] = full_slot_hours
+
         for ev_idx, ev in enumerate(active_evs):
             ev_off = ev_var_offsets[ev_idx]
             ev_c_sol = result_x[ev_off : ev_off + m]
-            for lp_t in range(m):
+            rated_ac_power_w = round(
+                (
+                    ev_dc_to_ac_kwh(ev.max_charge_per_slot, ev.charger_efficiency)
+                    / full_slot_hours
+                )
+                * 1000
+            )
+            solved_dc: dict[int, float] = {}
+            session_dc: dict[int, float] = {}
+            for lp_t, slot_i in enumerate(future_idx):
                 ev_dc = float(ev_c_sol[lp_t])
-                if ev_dc >= _min_action_kwh:
-                    ev_ac_load_by_slot[lp_t] = ev_ac_load_by_slot.get(
-                        lp_t, 0.0
-                    ) + ev_dc_to_ac_kwh(ev_dc, ev.charger_efficiency)
+                if ev_dc < _min_action_kwh:
+                    continue
+                if _has_session_demand and lp_t in session_slots_set:
+                    # A live session is a fixed LP equality — the car is
+                    # already drawing this power.  Observed demand, not a
+                    # schedulable allocation, so it must never be moved.
+                    session_dc[slot_i] = ev_dc
+                else:
+                    solved_dc[slot_i] = ev_dc
+
+            placed_dc, unplaceable_dc = _redistribute_below_minimum_power(
+                solved_dc,
+                slot_hours=hours_by_slot,
+                charger_efficiency=ev.charger_efficiency,
+                charger_min_power_w=ev.charger_min_power_w,
+                rated_ac_power_w=rated_ac_power_w,
+            )
+            if unplaceable_dc > 1e-6:
+                log_planner(
+                    "debug",
+                    "[milp] EV%s: %.3f kWh could not be placed at or above the "
+                    "charger minimum of %.0f W before the deadline",
+                    "2" if ev.is_second else "1",
+                    unplaceable_dc,
+                    ev.charger_min_power_w,
+                )
+            placed_dc_by_ev.append(placed_dc)
+            session_dc_by_ev.append(session_dc)
+
+            # Build the AC load map from the *placed* allocation so grid
+            # import/export, PV attribution and cost all derive from the
+            # schedule that will actually be commanded.  Deriving them from
+            # the raw LP solution instead would break the energy balance for
+            # every slot the redistribution moved energy into or out of.
+            lp_by_slot = {slot_i: lp_t for lp_t, slot_i in enumerate(future_idx)}
+            for slot_i, dc in {**session_dc, **placed_dc}.items():
+                lp_t = lp_by_slot[slot_i]
+                ev_ac_load_by_slot[lp_t] = ev_ac_load_by_slot.get(
+                    lp_t, 0.0
+                ) + ev_dc_to_ac_kwh(dc, ev.charger_efficiency)
 
     # ------------------------------------------------------------------
     # Single merged energy-flow write-out pass (issue #659).
@@ -304,20 +426,23 @@ def _write_milp_results_to_slots(
     # Write MILP-derived EV charging decisions to output slots
     # ------------------------------------------------------------------
     if active_evs:
-        # Pre-compute full slot hours for power calculation (same for all slots
-        # when interval is uniform).
-        first_future_slot = out_slots[future_idx[0]]
-        full_slot_hours = slot_duration_hours(
-            first_future_slot.start, first_future_slot.end
-        )
-
         for ev_idx, ev in enumerate(active_evs):
-            ev_off = ev_var_offsets[ev_idx]
-            ev_c_sol = result_x[ev_off : ev_off + m]
-            for lp_t, slot_i in enumerate(future_idx):
-                ev_dc_kwh = float(ev_c_sol[lp_t])
-                if ev_dc_kwh < _min_action_kwh:
-                    continue
+            # Charger nameplate: the MILP treats all slots as full-width, so
+            # it may allocate max_charge_per_slot to a slot with only minutes
+            # left.  The charger cannot exceed its rating either way.
+            rated_ac_power_w = round(
+                (
+                    ev_dc_to_ac_kwh(ev.max_charge_per_slot, ev.charger_efficiency)
+                    / full_slot_hours
+                )
+                * 1000
+            )
+            placed_dc = placed_dc_by_ev[ev_idx]
+            session_dc = session_dc_by_ev[ev_idx]
+
+            for slot_i in sorted({**session_dc, **placed_dc}):
+                ev_dc_kwh = placed_dc.get(slot_i, session_dc.get(slot_i, 0.0))
+                is_session_slot = slot_i in session_dc
                 # AC load = DC / charger_eff (grid/PV draw)
                 ac_load = round(ev_dc_to_ac_kwh(ev_dc_kwh, ev.charger_efficiency), 3)
                 # Accumulate into slot EV fields (additive for multiple EVs)
@@ -327,53 +452,27 @@ def _write_milp_results_to_slots(
                     out_slots[slot_i].ev_planned_load_kwh += ac_load
                 out_slots[slot_i].ev_total_planned_load_kwh += ac_load
 
-                # Compute AC charger target power (W) for this EV in this slot.
-                # For the current (partially elapsed) slot, use remaining time
-                # instead of the full slot width so the charger ramps to meet
-                # the MILP's energy target within the available minutes.
-                #
-                # Cap at the charger's rated AC power — the MILP treats all
-                # slots as full-width, so it may allocate max_charge_per_slot
-                # to a slot with only a few minutes remaining.  The charger
-                # physically cannot exceed its nameplate rating.
-                max_ac_power_w = round(
+                ac_power_w = round(
                     (
-                        ev_dc_to_ac_kwh(ev.max_charge_per_slot, ev.charger_efficiency)
-                        / full_slot_hours
+                        ev_dc_to_ac_kwh(ev_dc_kwh, ev.charger_efficiency)
+                        / hours_by_slot[slot_i]
                     )
                     * 1000
                 )
-                slot_start = out_slots[slot_i].start
-                slot_end = out_slots[slot_i].end
-                if slot_contains(slot_start, slot_end, now):
-                    remaining_hours = max(
-                        slot_duration_hours(now, slot_end),
-                        1.0 / 3600.0,  # 1 s minimum guard
-                    )
-                    ac_power_w = round(
-                        (
-                            ev_dc_to_ac_kwh(ev_dc_kwh, ev.charger_efficiency)
-                            / remaining_hours
-                        )
-                        * 1000
-                    )
-                else:
-                    ac_power_w = round(
-                        (
-                            ev_dc_to_ac_kwh(ev_dc_kwh, ev.charger_efficiency)
-                            / full_slot_hours
-                        )
-                        * 1000
-                    )
-                ac_power_w = min(ac_power_w, max_ac_power_w)
+                ac_power_w = min(ac_power_w, rated_ac_power_w)
 
-                # Floor at the charger's minimum operating power — if the
-                # target power is below the minimum the charger needs to
-                # start, it will never deliver any energy.  Zero out the
-                # field so the applier does not attempt to throttle below
-                # the minimum.
+                # Schedulable slots need no minimum-power zeroing: the
+                # redistribution has already removed every slot below the
+                # charger's minimum and moved its energy to a slot that can
+                # deliver it.  Zeroing the command alone would drop the energy
+                # from the schedule while leaving it in the plan's accounting.
+                #
+                # Session slots keep the original guard: their energy is fixed
+                # observed demand that cannot be moved, so an unreachable
+                # target power is still better left uncommanded.
                 if (
-                    ev.charger_min_power_w > 1e-9
+                    is_session_slot
+                    and ev.charger_min_power_w > 1e-9
                     and ac_power_w < ev.charger_min_power_w
                 ):
                     ac_power_w = 0

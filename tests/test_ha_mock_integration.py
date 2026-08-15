@@ -3058,3 +3058,79 @@ class TestEvSlotKeyNormalisation:
         assert utc_key(utc_dt) == utc_key(fixed_dt), (
             "utc_key must normalise timezone-representation mismatches"
         )
+
+
+class TestForceChargeRescuesEveryNonChargingState:
+    """A forced charge must override a deferred plan, not just a disabled one.
+
+    Charge automations gate on ``sensor.hsem_ev_optimal_charging_plan``'s
+    state.  When the planner defers a charge to a later slot the state is
+    ``waiting``, and force-charge previously left it that way — so the switch
+    set the slot recommendation and charger power while the automation, seeing
+    ``waiting``, kept the charger off.  Overriding a deferred schedule is the
+    whole point of the switch.
+    """
+
+    @staticmethod
+    def _force(plan_state: str) -> tuple[object, object]:  # NOSONAR -- HA types
+        from datetime import UTC, datetime, timedelta
+
+        from custom_components.hsem.coordinator import _apply_force_charge_now
+        from custom_components.hsem.models.hourly_recommendation import (
+            HourlyRecommendation,
+        )
+        from custom_components.hsem.planner.ev_planner import EVChargingPlan
+
+        now = datetime.now(UTC)
+        config_entry = make_fake_config_entry(
+            {
+                "hsem_ev_smart_charging": True,
+                "hsem_ev_force_charge_now": True,
+                "hsem_ev_planned_load_charger_power_kw": 11.0,
+            }
+        )
+        plan = EVChargingPlan(state=plan_state)
+        rec = HourlyRecommendation(
+            start=now - timedelta(minutes=5),
+            end=now + timedelta(minutes=10),
+            avg_house_consumption_kwh=0.25,
+            avg_house_consumption_1d_kwh=0.25,
+            avg_house_consumption_3d_kwh=0.25,
+            avg_house_consumption_7d_kwh=0.25,
+            avg_house_consumption_14d_kwh=0.25,
+            batteries_charged_kwh=0.0,
+            batteries_discharged_kwh=0.0,
+            estimated_battery_capacity_kwh=6.0,
+            estimated_battery_soc_pct=25.0,
+            estimated_cost_currency=0.0,
+            estimated_net_consumption_kwh=0.25,
+            export_price=1.0,
+            grid_export_kwh=0.0,
+            grid_import_kwh=0.25,
+            import_price=2.0,
+            recommendation="batteries_wait_mode",
+            solcast_pv_estimate_kwh=0.0,
+        )
+        _apply_force_charge_now(
+            config_entry=config_entry,
+            hourly_recommendations=[rec],
+            ev_plan=plan,
+            ev_second_plan=None,
+            now=now,
+        )
+        return plan, rec
+
+    @pytest.mark.parametrize(
+        "plan_state",
+        ["waiting", "smart_charging_disabled", "not_connected", "fully_charged"],
+    )
+    def test_non_charging_states_are_rescued(self, plan_state: str) -> None:
+        plan, rec = self._force(plan_state)
+
+        assert plan.state == "charging"  # type: ignore[attr-defined]
+        assert rec.ev_charger_calculated_power == 11000.0  # type: ignore[attr-defined]
+
+    def test_an_already_charging_plan_is_left_alone(self) -> None:
+        plan, _ = self._force("charging")
+
+        assert plan.state == "charging"  # type: ignore[attr-defined]
