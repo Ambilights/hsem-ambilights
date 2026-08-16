@@ -435,15 +435,32 @@ each independently prevent writes. The adapter applies ordered transitions and
 verifies each write before continuing:
 
 - SBU: set charger to `Only Solar`, then output to `SBU priority`
-- charge: set output to `Utility first`, set the 10 A-step current, then charger
-  to `Solar and Utility`
-- utility: set output to `Utility first`, then charger to `Only Solar`
+- charge start/increase: set output to `Utility first`, set the 10 A-step
+  current, then set charger to `Solar and Utility`
+- charge decrease: first verify charger `Only Solar`, set output to
+  `Utility first`, set the lower 10 A-step current, then set charger to
+  `Solar and Utility`
+- utility: first verify charger `Only Solar`, then set output to
+  `Utility first`
 
 At or below minimum SoC, a stale SBU plan is forced to utility. At maximum SoC,
 a stale charge plan is forced to utility, stopping grid charging with
 `Only Solar` before switching the output to `Utility first`.
-An invalid live SoC/load sample or an unverified preceding Huawei write blocks
-the PowMr adapter for that cycle.
+An invalid live SoC/load sample blocks the PowMr adapter for that cycle.
+A failed or unverified preceding Huawei write blocks PowMr-enabling Charge and
+SBU transitions, but must not block the independent fail-closed utility plan:
+charger `Only Solar`, then output `Utility first`. The adapter revalidates
+that the restricted plan contains only those two safe select targets before
+writing. If the charger stop fails or cannot be verified, the output write is
+blocked rather than adding the dedicated load to L3 while charging may remain
+armed.
+
+An already-active utility charge is disarmed with a verified `Only Solar`
+selection before a downward current change. If a current write in any charge
+transition fails or cannot be verified, the adapter does not reach the final
+`Solar and Utility` enable and attempts `Only Solar` unless that stop was
+already verified. `Only Solar` removes PowMr grid charging; on the target
+installation, which has no PowMr PV input, it stops PowMr charging completely.
 
 ### Secondary-storage invariants for tests
 
@@ -463,6 +480,14 @@ the PowMr adapter for that cycle.
 - disabled secondary storage is numerically identical to the upstream planner
 - missing required PowMr telemetry produces no secondary plan and blocks control
 - global read-only and the feature control switch each independently block writes
+- failed or unverified Huawei writes continue to block PowMr Charge/SBU enables
+  but cannot suppress the charger-first utility/`Only Solar` stop
+- an unconfirmed `Only Solar` stop blocks the subsequent utility-output write
+- a downward live PowMr current retarget verifies `Only Solar` before changing
+  the current and never re-enables utility charging after an unconfirmed number
+  write
+- serialized PlannerOutput slots contain all secondary-storage load, charge,
+  discharge, grid-import, capacity, SoC, current, and mode fields
 - successful enabled MILP solves emit one ``secondary_result`` line each
 - disabled or invalid secondary storage emits no ``secondary_result`` line
 - logged secondary conversion, cycle, and terminal terms equal the authoritative

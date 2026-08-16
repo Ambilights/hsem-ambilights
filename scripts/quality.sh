@@ -46,6 +46,7 @@ case "${1:-}" in
     all)
         echo "=== Lint ==="
         ruff format .
+        ruff check .
         echo ""
         echo "=== Type Check ==="
         mypy custom_components tests

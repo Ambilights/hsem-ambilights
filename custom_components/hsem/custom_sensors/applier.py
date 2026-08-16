@@ -750,7 +750,6 @@ async def async_apply_battery_settings(
     tou_modes = None
     working_mode = None
     recommendation = rec.recommendation
-    ev_active = live.any_ev_charging
     if (
         recommendation != Recommendations.ForceBatteriesDischarge.value
         and fully_fed_discharge_state is not None

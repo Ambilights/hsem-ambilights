@@ -43,6 +43,7 @@ from custom_components.hsem.custom_sensors.recommendation_resolver import (
 from custom_components.hsem.custom_sensors.secondary_storage_applier import (
     async_apply_secondary_storage,
     build_secondary_write_plan,
+    is_fail_closed_secondary_plan,
 )
 from custom_components.hsem.entity import HSEMCoordinatorEntity, HSEMEntity
 from custom_components.hsem.utils.degraded_mode import (
@@ -841,19 +842,32 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
                 )
                 combined_summary.results.extend(bat_summary.results)
 
-            if (
-                combined_summary.overall_status in {ApplyStatus.OK, ApplyStatus.SKIPPED}
-                and hourly_rec is not None
-            ):
-                secondary_summary = await async_apply_secondary_storage(
-                    self,
-                    cfg,
-                    live,
+            if hourly_rec is not None:
+                effective_secondary_rec = (
                     phase_commands.recommendation
                     if phase_commands is not None
-                    else hourly_rec,
+                    else hourly_rec
                 )
-                combined_summary.results.extend(secondary_summary.results)
+                fail_closed_only = combined_summary.overall_status not in {
+                    ApplyStatus.OK,
+                    ApplyStatus.SKIPPED,
+                }
+                secondary_operations = build_secondary_write_plan(
+                    cfg,
+                    live,
+                    effective_secondary_rec,
+                )
+                if not fail_closed_only or is_fail_closed_secondary_plan(
+                    cfg, secondary_operations
+                ):
+                    secondary_summary = await async_apply_secondary_storage(
+                        self,
+                        cfg,
+                        live,
+                        effective_secondary_rec,
+                        fail_closed_only=fail_closed_only,
+                    )
+                    combined_summary.results.extend(secondary_summary.results)
 
         # Persist the apply summary onto the coordinator data so the status
         # sensor and extra_state_attributes can surface it to HA.

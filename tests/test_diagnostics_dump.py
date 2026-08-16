@@ -265,6 +265,35 @@ class TestBuildDiagnosticsDump:
         assert "primary_battery_hold" in first_slot
         assert isinstance(first_slot["primary_battery_hold"], bool)
 
+    def test_slots_include_all_secondary_storage_outputs(self) -> None:
+        inp = make_summer_day_input()
+        out = run_planner(inp)
+        planned = out.slots[0]
+        planned.secondary_storage_load_kwh = 0.1234
+        planned.secondary_storage_charged_kwh = 0.2345
+        planned.secondary_storage_discharged_kwh = 0.3456
+        planned.secondary_storage_grid_import_kwh = 0.4567
+        planned.secondary_storage_estimated_capacity_kwh = 7.5678
+        planned.secondary_storage_estimated_soc_pct = 50.678
+        planned.secondary_storage_charge_current_a = 20.04
+        planned.secondary_storage_mode = "charge"
+
+        dump = build_diagnostics_dump(inp, out)
+        slot = dump["planner_output"]["slots"][0]
+
+        expected_float_outputs = {
+            "secondary_storage_load_kwh": 0.123,
+            "secondary_storage_charged_kwh": 0.234,
+            "secondary_storage_discharged_kwh": 0.346,
+            "secondary_storage_grid_import_kwh": 0.457,
+            "secondary_storage_estimated_capacity_kwh": 7.568,
+            "secondary_storage_estimated_soc_pct": 50.7,
+            "secondary_storage_charge_current_a": 20.0,
+        }
+        for field_name, expected in expected_float_outputs.items():
+            assert slot[field_name] == pytest.approx(expected)
+        assert slot["secondary_storage_mode"] == "charge"
+
     def test_entity_ids_in_extra_are_redacted(self) -> None:
         inp = _make_minimal_input()
         inp.extra["debug_entity"] = "sensor.batteries_state_of_capacity"

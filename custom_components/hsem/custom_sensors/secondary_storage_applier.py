@@ -96,6 +96,20 @@ def build_secondary_write_plan(
             configured.min_charge_current_a,
             configured.max_charge_current_a,
         )
+        if (
+            measured.charger_source_priority == POWMR_CHARGER_UTILITY
+            and measured.max_charge_current_a is not None
+            and target_current < measured.max_charge_current_a - 1e-9
+        ):
+            # Disarm grid charging before a downward current change.  If the
+            # number write cannot be verified, the old higher current must not
+            # remain live for the verifier retry/backoff interval.
+            return [
+                SecondaryWrite("select", charger_entity, POWMR_CHARGER_SOLAR_ONLY),
+                SecondaryWrite("select", output_entity, POWMR_OUTPUT_UTILITY),
+                SecondaryWrite("number", current_entity, target_current),
+                SecondaryWrite("select", charger_entity, POWMR_CHARGER_UTILITY),
+            ]
         return [
             SecondaryWrite("select", output_entity, POWMR_OUTPUT_UTILITY),
             SecondaryWrite("number", current_entity, target_current),
@@ -108,10 +122,36 @@ def build_secondary_write_plan(
                 SecondaryWrite("select", output_entity, POWMR_OUTPUT_UTILITY),
             ]
         return [
-            SecondaryWrite("select", output_entity, POWMR_OUTPUT_UTILITY),
             SecondaryWrite("select", charger_entity, POWMR_CHARGER_SOLAR_ONLY),
+            SecondaryWrite("select", output_entity, POWMR_OUTPUT_UTILITY),
         ]
     return []
+
+
+def is_fail_closed_secondary_plan(
+    cfg: SensorConfig,
+    operations: list[SecondaryWrite],
+) -> bool:
+    """Return whether a plan can only stop PowMr grid charging and discharge."""
+    configured = cfg.secondary_storage
+    output_entity = configured.output_source_priority_entity
+    charger_entity = configured.charger_source_priority_entity
+    stopped_charger = False
+    routed_load_to_utility = False
+    for operation in operations:
+        if operation.kind != "select":
+            return False
+        if operation.entity_id == charger_entity:
+            if operation.desired != POWMR_CHARGER_SOLAR_ONLY:
+                return False
+            stopped_charger = True
+        elif operation.entity_id == output_entity:
+            if operation.desired != POWMR_OUTPUT_UTILITY:
+                return False
+            routed_load_to_utility = True
+        else:
+            return False
+    return stopped_charger and routed_load_to_utility
 
 
 def _read_entity(sensor: Any, entity_id: str, numeric: bool) -> str | float | None:
@@ -148,6 +188,8 @@ async def async_apply_secondary_storage(
     cfg: SensorConfig,
     live: LiveState,
     rec: HourlyRecommendation,
+    *,
+    fail_closed_only: bool = False,
 ) -> CycleApplySummary:
     """Apply the current PowMr plan behind global and feature-specific gates."""
     summary = CycleApplySummary()
@@ -183,7 +225,14 @@ async def async_apply_secondary_storage(
     if not operations:
         _LOGGER.warning("PowMr write plan is empty; no hardware changes applied")
         return summary
+    fail_closed_stop = is_fail_closed_secondary_plan(cfg, operations)
+    if fail_closed_only and not fail_closed_stop:
+        _LOGGER.warning(
+            "PowMr enabling transition blocked after a failed/unverified Huawei write"
+        )
+        return summary
 
+    charger_safely_disabled = False
     for operation in operations:
         numeric = operation.kind == "number"
         result = await async_write_and_verify(
@@ -194,6 +243,34 @@ async def async_apply_secondary_storage(
             backoff=get_write_failure_backoff(sensor),
         )
         summary.results.append(result)
+        if (
+            operation.entity_id == cfg.secondary_storage.charger_source_priority_entity
+            and operation.desired == POWMR_CHARGER_SOLAR_ONLY
+            and result.status in {ApplyStatus.OK, ApplyStatus.SKIPPED}
+        ):
+            charger_safely_disabled = True
         if result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
+            if operation.kind == "number" and not charger_safely_disabled:
+                # A current that cannot be verified is unsafe while utility
+                # charging may still be armed.  This installation has no PowMr
+                # PV input, so Only Solar is a complete charging stop.
+                fallback = SecondaryWrite(
+                    "select",
+                    cfg.secondary_storage.charger_source_priority_entity or "",
+                    POWMR_CHARGER_SOLAR_ONLY,
+                )
+                fallback_result = await async_write_and_verify(
+                    entity_id=fallback.entity_id,
+                    desired=fallback.desired,
+                    writer=partial(_execute_write, sensor, fallback),
+                    reader=partial(
+                        _read_entity,
+                        sensor,
+                        fallback.entity_id,
+                        False,
+                    ),
+                    backoff=get_write_failure_backoff(sensor),
+                )
+                summary.results.append(fallback_result)
             break
     return summary

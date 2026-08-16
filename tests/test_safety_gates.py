@@ -1763,13 +1763,28 @@ class TestWorkingModeSensorTopLevelGate:
         mock_bat.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_unverified_huawei_write_blocks_powmr_applier(self):
-        """PowMr control must not proceed after an unconfirmed Huawei transition."""
+    async def test_unverified_huawei_write_blocks_powmr_charge_enable(self):
+        """An unconfirmed Huawei transition must still block PowMr Charge."""
         data = self._make_coordinator_data(
             read_only=False,
             degraded_mode=DegradedMode.OK,
         )
-        data.hourly_recommendation = MagicMock()
+        data.cfg.secondary_storage.enabled = True
+        data.cfg.secondary_storage.control_enabled = True
+        data.cfg.secondary_storage.output_source_priority_entity = (
+            "select.powmr_output_source_priority"
+        )
+        data.cfg.secondary_storage.charger_source_priority_entity = (
+            "select.powmr_charger_source_priority"
+        )
+        data.cfg.secondary_storage.max_charge_current_entity = (
+            "number.powmr_max_charge_current"
+        )
+        data.live.secondary_storage.soc_pct = 50.0
+        rec = MagicMock()
+        rec.secondary_storage_mode = "charge"
+        rec.secondary_storage_charge_current_a = 20.0
+        data.hourly_recommendation = rec
 
         from custom_components.hsem.utils.inverter_verify import (
             ApplyResult,

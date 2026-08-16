@@ -328,6 +328,24 @@ def _slot_to_dict(slot: Any) -> dict[str, Any]:
         "ev_planned_load_kwh": round(slot.ev_planned_load_kwh, 3),
         "ev_accounted_load_kwh": round(slot.ev_accounted_load_kwh, 3),
         "ev_total_planned_load_kwh": round(slot.ev_total_planned_load_kwh, 3),
+        "secondary_storage_load_kwh": round(slot.secondary_storage_load_kwh, 3),
+        "secondary_storage_charged_kwh": round(slot.secondary_storage_charged_kwh, 3),
+        "secondary_storage_discharged_kwh": round(
+            slot.secondary_storage_discharged_kwh, 3
+        ),
+        "secondary_storage_grid_import_kwh": round(
+            slot.secondary_storage_grid_import_kwh, 3
+        ),
+        "secondary_storage_estimated_capacity_kwh": round(
+            slot.secondary_storage_estimated_capacity_kwh, 3
+        ),
+        "secondary_storage_estimated_soc_pct": round(
+            slot.secondary_storage_estimated_soc_pct, 1
+        ),
+        "secondary_storage_charge_current_a": round(
+            slot.secondary_storage_charge_current_a, 1
+        ),
+        "secondary_storage_mode": slot.secondary_storage_mode,
     }
 
 

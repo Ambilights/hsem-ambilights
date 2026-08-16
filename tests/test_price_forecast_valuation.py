@@ -33,11 +33,11 @@ from custom_components.hsem.models.hourly_consumption_average import (
 )
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.planner_input import PlannerInput
-from custom_components.hsem.models.price_point import PricePoint
 from custom_components.hsem.models.price_forecast import (
     ForecastPricePoint,
     PriceForecast,
 )
+from custom_components.hsem.models.price_point import PricePoint
 from custom_components.hsem.models.secondary_storage_config import (
     SecondaryStorageConfig,
 )

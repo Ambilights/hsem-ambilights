@@ -255,8 +255,8 @@ def test_reserve_guard_overrides_sbu_to_utility() -> None:
     operations = build_secondary_write_plan(cfg, live, _rec(SECONDARY_MODE_SBU))
 
     assert [op.desired for op in operations] == [
-        POWMR_OUTPUT_UTILITY,
         POWMR_CHARGER_SOLAR_ONLY,
+        POWMR_OUTPUT_UTILITY,
     ]
 
 
@@ -310,8 +310,8 @@ def test_zero_phase_limited_current_disables_grid_charge() -> None:
     )
 
     assert [op.desired for op in operations] == [
-        POWMR_OUTPUT_UTILITY,
         POWMR_CHARGER_SOLAR_ONLY,
+        POWMR_OUTPUT_UTILITY,
     ]
 
 
@@ -355,6 +355,38 @@ async def test_feature_control_gate_blocks_adapter() -> None:
             cfg,
             live,
             _rec(SECONDARY_MODE_SBU),
+        )
+
+    assert summary.results == []
+    verifier.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "current_a"),
+    [(SECONDARY_MODE_CHARGE, 20.0), (SECONDARY_MODE_SBU, 0.0)],
+)
+async def test_fail_closed_only_rejects_enabling_transition(
+    mode: str,
+    current_a: float,
+) -> None:
+    """The adapter must revalidate the caller's restricted safety path."""
+    cfg = _config(read_only=False, control=True)
+    live = LiveState()
+    live.secondary_storage.soc_pct = 50.0
+    live.secondary_storage.load_power_w = 100.0
+    sensor = MagicMock()
+
+    with patch(
+        "custom_components.hsem.custom_sensors.secondary_storage_applier.async_write_and_verify",
+        new_callable=AsyncMock,
+    ) as verifier:
+        summary = await async_apply_secondary_storage(
+            sensor,
+            cfg,
+            live,
+            _rec(mode, current_a=current_a),
+            fail_closed_only=True,
         )
 
     assert summary.results == []
