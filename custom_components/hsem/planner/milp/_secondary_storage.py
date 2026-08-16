@@ -18,6 +18,7 @@ from custom_components.hsem.planner.secondary_storage import (
     SECONDARY_MODE_UTILITY,
     secondary_charge_limits_kwh,
     secondary_site_load_offset_kwh,
+    secondary_slot_duration_hours,
 )
 from custom_components.hsem.utils.datetime_utils import utc_key
 from custom_components.hsem.utils.logger import log_planner
@@ -26,7 +27,6 @@ from custom_components.hsem.utils.recommendations import Recommendations
 from custom_components.hsem.utils.units import (
     hours_ahead,
     is_material_planned_energy_kwh,
-    slot_duration_hours,
 )
 
 SecondaryLayout = dict[str, int]
@@ -63,6 +63,7 @@ def _extend_secondary_constraints(
     primary_site_discharge_limited: np.ndarray,  # type: ignore[name-defined]
     primary_site_discharge_cap_kwh: np.ndarray,  # type: ignore[name-defined]
     price_actionable: np.ndarray,  # type: ignore[name-defined]
+    now: datetime,
 ) -> dict[str, Any]:
     """Add site balance, secondary SoC, discrete modes, and no-transfer rows."""
     charge_eff = clamp_efficiency(config.charge_efficiency_pct)
@@ -85,7 +86,7 @@ def _extend_secondary_constraints(
     for t, slot_i in enumerate(future_idx):
         load_kwh = slots[slot_i].secondary_storage_load_kwh
         site_load_offset_kwh = secondary_site_load_offset_kwh(slots[slot_i], config)
-        hours = slot_duration_hours(slots[slot_i].start, slots[slot_i].end)
+        hours = secondary_slot_duration_hours(slots[slot_i], now)
         standby_kwh = max(config.inverter_standby_power_w, 0.0) * hours / 1000.0
         battery_draw_kwh = load_kwh / discharge_eff + standby_kwh
 
@@ -122,9 +123,13 @@ def _extend_secondary_constraints(
 
     current_kwh = min(max(config.current_usable_kwh, 0.0), config.usable_kwh)
     usable_kwh = config.usable_kwh
-    first_slot = slots[future_idx[0]]
-    slot_hours = slot_duration_hours(first_slot.start, first_slot.end)
-    minimum_charge, maximum_charge = secondary_charge_limits_kwh(config, slot_hours)
+    charge_limits = [
+        secondary_charge_limits_kwh(
+            config,
+            secondary_slot_duration_hours(slots[slot_i], now),
+        )
+        for slot_i in future_idx
+    ]
     maximum_steps = int(
         max(config.max_charge_current_a, 0.0) // max(config.charge_current_step_a, 1e-9)
     )
@@ -141,6 +146,7 @@ def _extend_secondary_constraints(
     row += 2 * m
 
     for t in range(m):
+        minimum_charge, maximum_charge = charge_limits[t]
         # Charge current can be non-zero only in charge mode.
         a_ub[row + t, charge_off + t] = 1.0
         a_ub[row + t, charge_mode_off + t] = -maximum_charge
@@ -197,7 +203,7 @@ def _extend_secondary_constraints(
     constraints["b_ub"] = b_ub
     constraints["bounds"] += (
         [
-            ((0.0, maximum_charge) if bool(price_actionable[t]) else (0.0, 0.0))
+            ((0.0, charge_limits[t][1]) if bool(price_actionable[t]) else (0.0, 0.0))
             for t in range(m)
         ]
         + [
@@ -286,6 +292,7 @@ def _write_secondary_results(
     config: SecondaryStorageConfig,
     future_idx: list[int],
     minimum_action_kwh: float,
+    now: datetime,
     battery_export_min_price: float = 0.0,
     primary_site_discharge_limited: np.ndarray | None = None,  # type: ignore[name-defined]
 ) -> dict[str, float | int] | None:
@@ -328,14 +335,15 @@ def _write_secondary_results(
         reserve_kwh = config.capacity_kwh * config.min_soc_pct / 100.0
         absolute_soc = (running_capacity + reserve_kwh) / config.capacity_kwh * 100.0
 
-        full_hours = slot_duration_hours(slot.start, slot.end)
+        effective_hours = secondary_slot_duration_hours(slot, now)
         current_a = 0.0
-        if charge_kwh > minimum_action_kwh and full_hours > 1e-9:
-            # Use the same full-slot duration as the integer current-step
-            # constraint. The planner is refreshed during a partial current
-            # slot; inflating the command to "catch up" would break the
-            # exact 10 A hardware-step model.
-            current_a = charge_kwh * 1000.0 / (config.nominal_voltage_v * full_hours)
+        if charge_kwh > minimum_action_kwh and effective_hours > 1e-9:
+            # Use the same effective duration as the integer current-step
+            # constraint so stored energy and the physical 10 A command stay
+            # identical when the active slot is already partly elapsed.
+            current_a = (
+                charge_kwh * 1000.0 / (config.nominal_voltage_v * effective_hours)
+            )
             current_a = min(
                 max(current_a, config.min_charge_current_a), config.max_charge_current_a
             )

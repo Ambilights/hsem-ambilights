@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from custom_components.hsem.planner.secondary_storage import (
     secondary_site_load_offset_kwh,
+    secondary_slot_duration_hours,
 )
 from custom_components.hsem.utils.misc import clamp_efficiency
 from custom_components.hsem.utils.phase_power import (
@@ -59,6 +61,15 @@ def _secondary_phase_terms(
     return fixed_utility_load_kwh, secondary_site_load_offset_kwh(slot, config)
 
 
+def _secondary_full_slot_scale(slot: PlannedSlot, now: datetime) -> float:
+    """Return the factor that expresses partial PowMr energy as full-slot power."""
+    full_hours = slot_duration_hours(slot.start, slot.end)
+    effective_hours = secondary_slot_duration_hours(slot, now)
+    if full_hours <= 1e-9 or effective_hours <= 1e-9:
+        return 0.0
+    return full_hours / effective_hours
+
+
 def _add_phase_fuse_constraints(
     constraints: dict[str, Any],
     *,
@@ -74,6 +85,7 @@ def _add_phase_fuse_constraints(
     phase_power_imbalance_w: PhasePowers,
     secondary_layout: SecondaryLayout | None,
     secondary_storage: SecondaryStorageConfig | None,
+    now: datetime,
 ) -> dict[str, Any]:
     """Append hard phase-import rows while preserving baseline feasibility.
 
@@ -107,6 +119,7 @@ def _add_phase_fuse_constraints(
     for t, slot_i in enumerate(future_idx):
         slot = slots[slot_i]
         hours = slot_duration_hours(slot.start, slot.end)
+        secondary_scale = _secondary_full_slot_scale(slot, now)
         phase_limit_kwh = phase_limit_w * hours / 1000.0
         base_net_kwh = float(base_load[t] - pv_avail[t])
         fixed_load_kwh, sbu_offset_kwh = _secondary_phase_terms(
@@ -117,7 +130,14 @@ def _add_phase_fuse_constraints(
         for phase_index in range(PHASE_COUNT):
             row = old_rows + phase_index * m + t
             on_secondary_phase = phase_index == secondary_phase_index
-            topology_factor = (1.0 if on_secondary_phase else 0.0) - (1.0 / PHASE_COUNT)
+            # ``gi-ge`` carries the actual partial-slot PowMr energy, while the
+            # live primary load and phase imbalance remain represented in the
+            # established full-slot power frame. Remove the actual PowMr delta
+            # from its balanced G/3 share, then add its full-slot-equivalent
+            # power only on the configured phase.
+            topology_factor = (secondary_scale if on_secondary_phase else 0.0) - (
+                1.0 / PHASE_COUNT
+            )
             imbalance_kwh = phase_power_imbalance_w[phase_index] * hours / 1000.0
 
             # Signed phase flow from total site-grid flow.
@@ -138,7 +158,7 @@ def _add_phase_fuse_constraints(
             baseline_phase_kwh = (
                 base_net_kwh / PHASE_COUNT
                 + imbalance_kwh
-                + (fixed_load_kwh if on_secondary_phase else 0.0)
+                + (fixed_load_kwh * secondary_scale if on_secondary_phase else 0.0)
             )
             allowed_phase_kwh = max(phase_limit_kwh, baseline_phase_kwh)
             b_ub[row] = (
@@ -161,6 +181,7 @@ def _phase_imports_from_solution_kwh(
     phase_power_imbalance_w: PhasePowers,
     secondary_layout: SecondaryLayout | None,
     secondary_storage: SecondaryStorageConfig | None,
+    now: datetime,
 ) -> list[PhasePowers]:
     """Reconstruct signed phase energy from a solved decision vector."""
     secondary_phase_index = (
@@ -178,6 +199,7 @@ def _phase_imports_from_solution_kwh(
     for t, slot_i in enumerate(future_idx):
         slot = slots[slot_i]
         hours = slot_duration_hours(slot.start, slot.end)
+        secondary_scale = _secondary_full_slot_scale(slot, now)
         total_grid_kwh = float(result_x[gi_off + t] - result_x[ge_off + t])
         fixed_load_kwh, sbu_offset_kwh = _secondary_phase_terms(
             slot=slot,
@@ -192,10 +214,15 @@ def _phase_imports_from_solution_kwh(
                 float(result_x[secondary_layout["sbu_mode"] + t]) * sbu_offset_kwh
             )
         balanced_kwh = (total_grid_kwh - secondary_delta_kwh) / PHASE_COUNT
+        normalized_secondary_delta_kwh = secondary_delta_kwh * secondary_scale
         values = tuple(
             balanced_kwh
             + phase_power_imbalance_w[phase_index] * hours / 1000.0
-            + (secondary_delta_kwh if phase_index == secondary_phase_index else 0.0)
+            + (
+                normalized_secondary_delta_kwh
+                if phase_index == secondary_phase_index
+                else 0.0
+            )
             for phase_index in range(PHASE_COUNT)
         )
         phase_imports.append((values[0], values[1], values[2]))

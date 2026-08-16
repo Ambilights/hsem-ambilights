@@ -86,7 +86,7 @@ class Recommendations(Enum):
     """Force PV export to grid — sets inverter to FullyFedToGrid mode.
 
     Hardware:  Fully Fed to Grid with maximum battery-discharge power 0 W
-    Battery:   discharge blocked; may absorb PV above inverter AC capacity
+    Battery:   hold; neither charge nor discharge
     Grid:      PV production is exported up to the inverter/export limit
 
     Different from ForceBatteriesDischarge: the same inverter mode is used,
@@ -114,7 +114,6 @@ DISCHARGE_RECS: frozenset[str] = frozenset(
     {
         Recommendations.BatteriesDischargeMode.value,
         Recommendations.ForceBatteriesDischarge.value,
-        Recommendations.ForceExport.value,
     }
 )
 """All modes where the battery discharges energy."""

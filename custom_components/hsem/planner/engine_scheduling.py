@@ -14,7 +14,7 @@ from custom_components.hsem.planner.charging.opportunistic_charge import (
 from custom_components.hsem.planner.charging.pre_charge import apply_charge_schedules
 from custom_components.hsem.planner.discharge_scheduler import (
     apply_discharge_schedules,
-    apply_excess_export,
+    apply_force_export_policy,
     apply_optimization_strategy,
     calculate_required_battery_until_solar,
 )
@@ -96,8 +96,14 @@ def _schedule_slots(
         )
     max_soc_kwh = usable_kwh
     populate_battery_capacity(slots, now, current_kwh, usable_kwh)
+    apply_force_export_policy(slots, inp.export_min_price)
     required_capacity = calculate_required_battery_until_solar(
-        slots, now, usable_kwh, inp.excess_export_discharge_buffer_pct
+        slots,
+        now,
+        usable_kwh,
+        inp.excess_export_discharge_buffer_pct,
+        discharge_efficiency_pct=inp.battery_discharge_efficiency_pct,
+        max_discharge_per_slot=max_discharge_per_slot,
     )
     log_planner(
         "debug",
@@ -112,28 +118,12 @@ def _schedule_slots(
         max_soc_kwh,
         required_capacity,
     )
-    if inp.excess_export_enabled:
-        apply_excess_export(
-            slots,
-            now,
-            current_kwh,
-            required_capacity,
-            inp.excess_export_price_threshold,
-            warnings,
-            export_min_price=inp.export_min_price,
-            recommended_threshold=rt,
-            battery_export_min_price=inp.battery_export_min_price,
-        )
-        log_planner(
-            "debug",
-            "[core] _schedule_slots  pass=excess_export  enabled=True",
-        )
-    else:
-        log_planner(
-            "debug",
-            "[core] _schedule_slots  pass=excess_export  enabled=False  "
-            "→ MILP no_export constraint active (battery will not export to grid)",
-        )
+    log_planner(
+        "debug",
+        "[core] _schedule_slots  pass=excess_export  heuristic=retired  "
+        "enabled=%s  authority=MILP",
+        inp.excess_export_enabled,
+    )
     apply_optimization_strategy(
         slots,
         now,
@@ -143,6 +133,10 @@ def _schedule_slots(
         inp.months_winter,
         export_min_price=inp.export_min_price,
         seasonal_fill_mode=inp.seasonal_fill_mode,
+        charge_efficiency_pct=inp.battery_charge_efficiency_pct,
+        discharge_efficiency_pct=inp.battery_discharge_efficiency_pct,
+        max_charge_per_slot=max_charge_per_slot,
+        max_discharge_per_slot=max_discharge_per_slot,
     )
     log_planner(
         "debug",

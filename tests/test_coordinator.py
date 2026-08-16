@@ -403,6 +403,72 @@ class TestPriceForecastAuthority:
             is True
         )
 
+    def test_valuation_attribute_changes_trigger_replan(self) -> None:
+        now = datetime(2026, 8, 14, 0, 5, tzinfo=UTC)
+        with patch(
+            "custom_components.hsem.coordinator_builder.hsem_now", return_value=now
+        ):
+            recommendations = generate_recommendation_intervals(15, 1)
+        live = LiveState()
+        live.import_electricity_price = 0.25
+        live.export_electricity_price = 0.10
+        live.import_electricity_price_available = True
+        live.export_electricity_price_available = True
+        accepted_attributes = {
+            "forecast": [
+                {
+                    "start": "2026-08-15T00:00:00+00:00",
+                    "value": 1.25,
+                }
+            ],
+            "mae": 0.10,
+        }
+        changed_attributes = {
+            "forecast": [
+                {
+                    "start": "2026-08-15T00:00:00+00:00",
+                    "value": 2.50,
+                }
+            ],
+            "mae": 0.20,
+        }
+        if (
+            "valuation_attributes"
+            in inspect.signature(_price_forecast_signature).parameters
+        ):
+            accepted = _price_forecast_signature(
+                recommendations,
+                live,
+                now,
+                valuation_attributes=accepted_attributes,
+                valuation_enabled=True,
+                valuation_margin=0.05,
+            )
+            changed = _price_forecast_signature(
+                recommendations,
+                live,
+                now,
+                valuation_attributes=changed_attributes,
+                valuation_enabled=True,
+                valuation_margin=0.05,
+            )
+        else:  # pragma: no cover - exercised only against the published .34 code
+            accepted = _price_forecast_signature(recommendations, live, now)
+            changed = _price_forecast_signature(recommendations, live, now)
+        coordinator = _make_bare_coordinator()
+        coordinator._last_planner_output = SimpleNamespace(slots=[])  # type: ignore[assignment]
+        coordinator._last_plan_price_forecast_signature = accepted
+
+        assert accepted != changed
+        assert (
+            coordinator._should_replan(
+                live,
+                now,
+                price_forecast_signature=changed,
+            )
+            is True
+        )
+
 
 def _make_bare_coordinator() -> HSEMDataUpdateCoordinator:
     """Return an HSEMDataUpdateCoordinator whose __init__ was NOT called.
@@ -723,8 +789,19 @@ class TestLightweightSecondaryStorageEvents:
         coordinator._last_plan_secondary_soc_pct = 75.0
         coordinator._last_plan_secondary_load_power_w = 190.0
         coordinator._last_plan_secondary_output_priority = "utility"
-        accepted_price_signature = ((True, 1.0), (True, 0.5), ())
-        candidate_price_signature = ((True, 1.1), (True, 0.6), ())
+        valuation_signature = (False, 0.0, 0.0, ())
+        accepted_price_signature = (
+            (True, 1.0),
+            (True, 0.5),
+            (),
+            valuation_signature,
+        )
+        candidate_price_signature = (
+            (True, 1.1),
+            (True, 0.6),
+            (),
+            valuation_signature,
+        )
         coordinator._last_plan_price_forecast_signature = accepted_price_signature
         live = LiveState()
         live.secondary_storage.soc_pct = 75.8

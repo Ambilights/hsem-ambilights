@@ -31,15 +31,25 @@ def secondary_charge_limits_kwh(
     return min(minimum, maximum), maximum
 
 
+def secondary_slot_duration_hours(slot: PlannedSlot, now: datetime) -> float:
+    """Return usable PowMr duration for a future or partially elapsed slot."""
+    if utc_key(slot.end) <= utc_key(now):
+        return 0.0
+    if utc_key(slot.start) < utc_key(now):
+        return slot_duration_hours(now, slot.end)
+    return slot_duration_hours(slot.start, slot.end)
+
+
 def populate_secondary_storage_load(
     slots: list[PlannedSlot],
     config: SecondaryStorageConfig,
+    now: datetime,
 ) -> None:
     """Populate the dedicated-load energy forecast on every slot."""
     if not config.valid:
         return
     for slot in slots:
-        hours = slot_duration_hours(slot.start, slot.end)
+        hours = secondary_slot_duration_hours(slot, now)
         slot.secondary_storage_load_kwh = round(
             max(config.load_power_w, 0.0) * hours / 1000.0,
             6,
@@ -69,7 +79,7 @@ def apply_secondary_utility_bypass(
     if not config.valid:
         return
 
-    populate_secondary_storage_load(slots, config)
+    populate_secondary_storage_load(slots, config, now)
     current_capacity = config.current_usable_kwh
     for slot in slots:
         if utc_key(slot.end) <= utc_key(now):

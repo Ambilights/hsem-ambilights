@@ -132,7 +132,7 @@ def solve_milp(
 
         slots = [copy.copy(slot) for slot in slots]
         assert secondary_storage is not None
-        populate_secondary_storage_load(slots, secondary_storage)
+        populate_secondary_storage_load(slots, secondary_storage, now)
 
     log_planner(
         "debug",

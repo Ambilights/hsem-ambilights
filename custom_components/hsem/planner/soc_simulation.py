@@ -307,12 +307,21 @@ def simulate_soc(
                 # Force discharge: pump battery at max rate to AC bus.
                 # House takes what it needs, excess goes to grid.
                 # Regular discharge: only cover house load.
-                force_export = slot.recommendation in (
-                    Recommendations.ForceBatteriesDischarge.value,
-                    Recommendations.ForceExport.value,
+                force_battery_export = (
+                    slot.recommendation == Recommendations.ForceBatteriesDischarge.value
                 )
-                if force_export:
-                    discharge = max_discharge_cap
+                if force_battery_export:
+                    planned_discharge = max(slot.batteries_discharged_kwh, 0.0)
+                    if planned_discharge > 1e-9:
+                        discharge = min(planned_discharge, max_discharge_cap)
+                    else:
+                        max_discharge_cap = min(
+                            max_discharge_cap,
+                            max(cap - required_capacity_kwh, 0.0),
+                        )
+                        discharge = max_discharge_cap
+                elif slot.recommendation == Recommendations.ForceExport.value:
+                    discharge = 0.0
                 else:
                     discharge_needed = net_demand / discharge_eff
                     discharge = min(discharge_needed, max_discharge_cap)
@@ -332,6 +341,10 @@ def simulate_soc(
             # We attribute as much of the scheduled charge as possible to PV surplus;
             # any remainder must be imported from the grid.
             discharge = 0.0
+            force_battery_export = (
+                slot.recommendation == Recommendations.ForceBatteriesDischarge.value
+            )
+            force_pv_export = slot.recommendation == Recommendations.ForceExport.value
             pv_surplus = abs(net_demand)  # kWh of PV beyond house load (≥ 0)
 
             # The EV charger draws from PV surplus first (free energy before
@@ -340,6 +353,27 @@ def simulate_soc(
             pv_for_ev = min(ev_load, pv_surplus)
             ev_grid_import = max(ev_load - pv_for_ev, 0.0)  # EV residual from grid
             pv_surplus_after_ev = max(pv_surplus - pv_for_ev, 0.0)
+            if force_battery_export and not primary_hold and ev_load <= 1e-9:
+                max_discharge_cap = cap
+                if max_discharge_per_slot is not None:
+                    max_discharge_cap = min(
+                        max_discharge_cap,
+                        max_discharge_per_slot,
+                    )
+                planned_discharge = max(slot.batteries_discharged_kwh, 0.0)
+                if planned_discharge > 1e-9:
+                    discharge = min(planned_discharge, max_discharge_cap)
+                else:
+                    max_discharge_cap = min(
+                        max_discharge_cap,
+                        max(cap - required_capacity_kwh, 0.0),
+                    )
+                    discharge = max_discharge_cap
+                scheduled_charge = 0.0
+                slot.batteries_charged_kwh = 0.0
+            elif force_pv_export:
+                scheduled_charge = 0.0
+                slot.batteries_charged_kwh = 0.0
 
             # How much PV input is needed to store scheduled_charge in the battery?
             scheduled_charge_pv_input = scheduled_charge / charge_eff
@@ -362,7 +396,7 @@ def simulate_soc(
             remaining_power = max(max_charge_per_slot - scheduled_charge, 0.0)
             max_additional_pv_input = (
                 0.0
-                if primary_hold
+                if primary_hold or force_battery_export or force_pv_export
                 else min(
                     pv_remaining,
                     remaining_headroom / charge_eff,
@@ -379,7 +413,10 @@ def simulate_soc(
             # Grid import: grid-sourced battery charge + EV residual not covered by PV
             grid_import = grid_charge_input + ev_grid_import
             # PV exported = remaining PV not absorbed by battery or EV
-            grid_export = max(pv_remaining - max_additional_pv_input, 0.0)
+            grid_export = max(
+                pv_remaining - max_additional_pv_input + discharge * discharge_eff,
+                0.0,
+            )
 
             # Override scheduled_charge for state update (include PV capture).
             # batteries_charged keeps the originally-scheduled value (no change).
@@ -415,11 +452,7 @@ def simulate_soc(
         if (
             not milp_prepopulated
             and discharge <= 1e-9
-            and slot.recommendation
-            in (
-                Recommendations.ForceBatteriesDischarge.value,
-                Recommendations.ForceExport.value,
-            )
+            and slot.recommendation == Recommendations.ForceBatteriesDischarge.value
         ):
             log_planner(
                 "debug",

@@ -15,7 +15,7 @@ Selection algorithm
    for edge cases.)
 3. Score all valid candidates with :func:`~cost_function.score_plan`.
 4. Pick the candidate with the **lowest total cost** (lower = better).
-5. If no candidate is valid (degenerate edge case), fall back to ``baseline``.
+5. If executable validation fails, use the fail-closed ``passive`` plan.
 6. Return the winning slots plus a list of
    :class:`~custom_components.hsem.models.planner_outputs.RejectedPlan`
    entries describing every non-selected candidate and the reason it lost.
@@ -40,9 +40,9 @@ from custom_components.hsem.models.secondary_storage_config import (
     SecondaryStorageConfig,
 )
 from custom_components.hsem.planner.candidate_generator import (
-    CANDIDATE_BASELINE,
     CANDIDATE_MILP,
     CANDIDATE_NO_ACTION,
+    CANDIDATE_PASSIVE,
     CandidatePlan,
 )
 from custom_components.hsem.planner.candidate_validation import (
@@ -250,6 +250,10 @@ def select_best_candidate(  # NOSONAR
             months_winter,
             export_min_price=export_min_price,
             seasonal_fill_mode=seasonal_fill_mode,
+            charge_efficiency_pct=charge_efficiency_pct,
+            discharge_efficiency_pct=discharge_efficiency_pct,
+            max_charge_per_slot=max_charge_per_slot,
+            max_discharge_per_slot=max_discharge_per_slot,
         )
         # Concentrate discharge on expensive slots (per-candidate)
         concentrate_discharge_on_expensive_slots(
@@ -327,16 +331,19 @@ def select_best_candidate(  # NOSONAR
     eligible = [c for c in valid if c.name != CANDIDATE_NO_ACTION]
 
     if not eligible:
-        # Degenerate case — fall back to baseline regardless of validity
-        winner = _find_by_name(candidates, CANDIDATE_BASELINE)
-        if winner is None and candidates:
-            winner = candidates[0]
+        # Passive is always generated and is the only fail-closed executable
+        # plan when the solver is unavailable or an executable plan is invalid.
+        winner = _find_by_name(candidates, CANDIDATE_PASSIVE)
+        if winner is None:
+            winner = next((c for c in eligible), None)
         if winner is None:
             raise RuntimeError("[selector] No candidates available")
         winner.is_valid = True
         winner.rejection_reason = ""
         log_planner(
-            "warning", "[selector] No eligible candidates — falling back to baseline"
+            "warning",
+            "[selector] No eligible candidates — falling back to %s",
+            winner.name,
         )
     else:
         # Provide the deferred-export correction (issue #592) with the

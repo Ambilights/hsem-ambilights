@@ -48,9 +48,13 @@ def _clear_all_charge_discharge(slots: list[PlannedSlot]) -> None:
     consumption; only battery scheduling is removed.
     """
     for slot in slots:
-        if slot.recommendation in _CHARGE_RECS | _DISCHARGE_RECS:
+        if (
+            slot.recommendation in _CHARGE_RECS | _DISCHARGE_RECS
+            or slot.recommendation == Recommendations.ForceExport.value
+        ):
             slot.recommendation = None
             slot.batteries_charged_kwh = 0.0
+            slot.batteries_discharged_kwh = 0.0
 
 
 def _apply_passive_solar(slots: list[PlannedSlot], now: datetime) -> None:
@@ -65,9 +69,13 @@ def _apply_passive_solar(slots: list[PlannedSlot], now: datetime) -> None:
     """
     for slot in slots:
         # Clear all active scheduling first
-        if slot.recommendation in _CHARGE_RECS | _DISCHARGE_RECS:
+        if (
+            slot.recommendation in _CHARGE_RECS | _DISCHARGE_RECS
+            or slot.recommendation == Recommendations.ForceExport.value
+        ):
             slot.recommendation = None
             slot.batteries_charged_kwh = 0.0
+            slot.batteries_discharged_kwh = 0.0
 
         # Passively absorb surplus into battery for future slots only
         # NaN < 0.0 is False in Python so no explicit NaN guard is needed

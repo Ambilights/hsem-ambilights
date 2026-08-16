@@ -160,11 +160,28 @@ def apply_discharge_schedules(
 # ---------------------------------------------------------------------------
 
 
+def apply_force_export_policy(
+    slots: list[PlannedSlot],
+    export_min_price: float,
+) -> None:
+    """Preclassify PV-only export slots before reserve and fill decisions."""
+    for slot in slots:
+        if (
+            slot.price_actionable
+            and slot.price.export_price > slot.price.import_price
+            and slot.price.export_price >= export_min_price
+            and slot.recommendation is None
+        ):
+            slot.recommendation = Recommendations.ForceExport.value
+
+
 def calculate_required_battery_until_solar(
     slots: list[PlannedSlot],
     now: datetime,
     usable_capacity: float,
     discharge_buffer_pct: float,
+    discharge_efficiency_pct: float = 100.0,
+    max_discharge_per_slot: float | None = None,
 ) -> float:
     """Estimate battery capacity needed until the first solar surplus slot.
 
@@ -179,10 +196,14 @@ def calculate_required_battery_until_solar(
         now: Timezone-aware current datetime.
         usable_capacity: Maximum usable battery energy in kWh.
         discharge_buffer_pct: Safety buffer as a percentage of usable capacity.
+        discharge_efficiency_pct: Battery-to-AC efficiency percentage.
+        max_discharge_per_slot: Battery-side energy limit per slot. ``None``
+            means the battery can serve the full non-EV load.
 
     Returns:
         Required battery capacity in kWh (including safety buffer).
     """
+    discharge_efficiency = clamp_efficiency(discharge_efficiency_pct)
     required = 0.0
     for slot in sorted(slots, key=lambda s: utc_key(s.start)):
         if utc_key(slot.start) < utc_key(now):
@@ -190,11 +211,24 @@ def calculate_required_battery_until_solar(
         if not slot.price_actionable:
             # Unknown-price slots are an authoritative storage Hold. Their PV
             # cannot promise a refill that changes earlier priced decisions.
-            continue
+            break
         if slot.estimated_net_consumption_kwh < 0:
+            if slot.primary_battery_hold or slot.recommendation in (
+                Recommendations.ForceBatteriesDischarge.value,
+                Recommendations.ForceExport.value,
+            ):
+                continue
             break
         if slot.estimated_net_consumption_kwh > 0:
-            required += slot.estimated_net_consumption_kwh
+            if slot.ev_total_planned_load_kwh > 1e-9:
+                continue
+            battery_load = slot.estimated_net_consumption_kwh / discharge_efficiency
+            if max_discharge_per_slot is not None:
+                battery_load = min(
+                    battery_load,
+                    max(max_discharge_per_slot, 0.0),
+                )
+            required += battery_load
 
     # Cap at usable_capacity — the battery can't hold more than this
     # anyway.  Without this cap, a multi-hour gap until the next solar
@@ -551,14 +585,113 @@ def concentrate_discharge_on_expensive_slots(
 # ---------------------------------------------------------------------------
 
 
+def _storable_solar_refill_kwh(
+    slot: PlannedSlot,
+    charge_efficiency: float,
+    max_charge_per_slot: float | None,
+) -> float:
+    """Return battery-side solar refill allowed by the slot power limit."""
+    stored = max(-slot.estimated_net_consumption_kwh, 0.0) * charge_efficiency
+    if max_charge_per_slot is not None:
+        stored = min(stored, max(max_charge_per_slot, 0.0))
+    return stored
+
+
+def _battery_load_kwh(
+    slot: PlannedSlot,
+    discharge_efficiency: float,
+    max_discharge_per_slot: float | None,
+) -> float:
+    """Return battery-side energy needed to serve this non-EV load slot."""
+    if slot.ev_total_planned_load_kwh > 1e-9:
+        return 0.0
+    needed = max(slot.estimated_net_consumption_kwh, 0.0) / discharge_efficiency
+    if max_discharge_per_slot is not None:
+        needed = min(needed, max(max_discharge_per_slot, 0.0))
+    return needed
+
+
+def _forced_discharge_target_kwh(
+    slot: PlannedSlot,
+    *,
+    available_capacity_kwh: float,
+    required_capacity_kwh: float,
+    max_discharge_per_slot: float | None,
+) -> float:
+    """Return the battery-side forced draw executable in this slot."""
+    if slot.primary_battery_hold or slot.ev_total_planned_load_kwh > 1e-9:
+        return 0.0
+
+    planned = max(slot.batteries_discharged_kwh, 0.0)
+    if planned <= 1e-9:
+        planned = max(available_capacity_kwh - required_capacity_kwh, 0.0)
+    if max_discharge_per_slot is not None:
+        planned = min(planned, max(max_discharge_per_slot, 0.0))
+    return min(planned, max(available_capacity_kwh, 0.0))
+
+
+def _future_forced_discharge_commitments(
+    slots: list[PlannedSlot],
+    *,
+    usable_capacity: float,
+    charge_efficiency: float,
+    max_charge_per_slot: float | None,
+    max_discharge_per_slot: float | None,
+) -> list[float]:
+    """Return future forced draws net of executable intervening refill."""
+    commitments_after = [0.0] * len(slots)
+    running_commitment = 0.0
+    for index in range(len(slots) - 1, -1, -1):
+        commitments_after[index] = running_commitment
+        slot = slots[index]
+        if not slot.price_actionable:
+            running_commitment = 0.0
+            continue
+        if (
+            slot.recommendation == Recommendations.ForceBatteriesDischarge.value
+            and not slot.primary_battery_hold
+            and slot.ev_total_planned_load_kwh <= 1e-9
+        ):
+            target = max(slot.batteries_discharged_kwh, 0.0)
+            if target <= 1e-9:
+                target = usable_capacity
+            if max_discharge_per_slot is not None:
+                target = min(target, max(max_discharge_per_slot, 0.0))
+            running_commitment += target
+            continue
+        if (
+            slot.primary_battery_hold
+            or slot.recommendation == Recommendations.ForceExport.value
+        ):
+            continue
+        refill_kwh = _storable_solar_refill_kwh(
+            slot,
+            charge_efficiency,
+            max_charge_per_slot,
+        )
+        if slot.recommendation == Recommendations.BatteriesChargeGrid.value:
+            scheduled_charge_kwh = max(slot.batteries_charged_kwh, 0.0)
+            if max_charge_per_slot is not None:
+                scheduled_charge_kwh = min(
+                    scheduled_charge_kwh,
+                    max(max_charge_per_slot, 0.0),
+                )
+            refill_kwh = max(refill_kwh, scheduled_charge_kwh)
+        running_commitment = max(running_commitment - refill_kwh, 0.0)
+    return commitments_after
+
+
 def _forward_refill_forecast(
     slots: list[PlannedSlot],
+    *,
+    charge_efficiency_pct: float = 100.0,
+    max_charge_per_slot: float | None = None,
 ) -> tuple[list[float], list[bool]]:
     """Return forward PV-surplus energy and Solcast usability per slot.
 
     Each value describes slots strictly *after* the corresponding slot and
-    stops before the next ``ForceBatteriesDischarge`` recommendation.  A
-    reverse pass resets both running values at each boundary, keeping the
+    stops at any primary-hold, forced-export, or price-authority boundary.
+    A reverse pass resets both running values at each boundary, keeping the
     calculation O(n) for the full horizon.
 
     Args:
@@ -569,11 +702,15 @@ def _forward_refill_forecast(
         flag indicating whether any positive Solcast value exists in that
         forward window.
     """
+    charge_efficiency = clamp_efficiency(charge_efficiency_pct)
     refill_after_kwh = [0.0] * len(slots)
     forecast_usable_after = [False] * len(slots)
     running_refill_kwh = 0.0
     running_forecast_usable = False
-    forced_discharge = Recommendations.ForceBatteriesDischarge.value
+    refill_boundaries = {
+        Recommendations.ForceBatteriesDischarge.value,
+        Recommendations.ForceExport.value,
+    }
 
     for index in range(len(slots) - 1, -1, -1):
         refill_after_kwh[index] = running_refill_kwh
@@ -584,13 +721,19 @@ def _forward_refill_forecast(
             # The unknown-price tail is a primary-battery Hold.  Do not expose
             # its PV or net surplus as refill headroom for an earlier priced
             # slot; that promised charge is forbidden later in finalization.
+            running_refill_kwh = 0.0
+            running_forecast_usable = False
             continue
-        if slot.recommendation == forced_discharge:
+        if slot.primary_battery_hold or slot.recommendation in refill_boundaries:
             running_refill_kwh = 0.0
             running_forecast_usable = False
             continue
 
-        running_refill_kwh += max(-slot.estimated_net_consumption_kwh, 0.0)
+        running_refill_kwh += _storable_solar_refill_kwh(
+            slot,
+            charge_efficiency,
+            max_charge_per_slot,
+        )
         running_forecast_usable = (
             running_forecast_usable or slot.solcast_pv_estimate_kwh > 0.0
         )
@@ -620,6 +763,10 @@ def apply_optimization_strategy(
     months_winter: list[int],
     export_min_price: float = 0.0,
     seasonal_fill_mode: str = SEASONAL_FILL_MODE_FORECAST,
+    charge_efficiency_pct: float = 100.0,
+    discharge_efficiency_pct: float = 100.0,
+    max_charge_per_slot: float | None = None,
+    max_discharge_per_slot: float | None = None,
 ) -> None:
     """Apply final optimization logic to remaining unassigned slots.
 
@@ -669,16 +816,10 @@ def apply_optimization_strategy(
         effective_fill_mode,
     )
     current_month = now.month
+    charge_efficiency = clamp_efficiency(charge_efficiency_pct)
+    discharge_efficiency = clamp_efficiency(discharge_efficiency_pct)
 
-    # ForceExport when export > import AND export >= export_min_price (A3 fix)
-    for rec in slots:
-        if (
-            rec.price_actionable
-            and rec.price.export_price > rec.price.import_price
-            and rec.price.export_price >= export_min_price
-            and rec.recommendation is None
-        ):
-            rec.recommendation = Recommendations.ForceExport.value
+    apply_force_export_policy(slots, export_min_price)
 
     # Solar charging per calendar day — each day gets its own
     # usable_capacity budget so tomorrow's solar charging isn't
@@ -708,8 +849,12 @@ def apply_optimization_strategy(
             # otherwise the planner labels grid-charging slots as
             # BatteriesChargeSolar (issue #720).
             if rec.estimated_net_consumption_kwh < 0.0:
-                slot_solar = abs(rec.estimated_net_consumption_kwh)
-                slot_energy = min(slot_solar, day_budget - day_charged)
+                slot_energy = min(
+                    _storable_solar_refill_kwh(
+                        rec, charge_efficiency, max_charge_per_slot
+                    ),
+                    day_budget - day_charged,
+                )
                 day_charged += slot_energy
                 rec.recommendation = Recommendations.BatteriesChargeSolar.value
                 rec.batteries_charged_kwh = round(slot_energy, 3)
@@ -717,19 +862,86 @@ def apply_optimization_strategy(
     # Precompute the forward refill signal once.  The running sum resets at
     # each forced battery-discharge slot, so later PV cannot be promised
     # across a planned export event.
-    refill_after_kwh, forecast_usable_after = _forward_refill_forecast(slots)
+    refill_after_kwh, forecast_usable_after = _forward_refill_forecast(
+        slots,
+        charge_efficiency_pct=charge_efficiency_pct,
+        max_charge_per_slot=max_charge_per_slot,
+    )
+    projected_capacity_kwh = min(max(current_capacity, 0.0), usable_capacity)
+    future_forced_commitment_kwh = _future_forced_discharge_commitments(
+        slots,
+        usable_capacity=usable_capacity,
+        charge_efficiency=charge_efficiency,
+        max_charge_per_slot=max_charge_per_slot,
+        max_discharge_per_slot=max_discharge_per_slot,
+    )
 
     # Fill remaining unassigned slots.
     for index, rec in enumerate(slots):
         if rec.recommendation is not None:
+            if not rec.primary_battery_hold and rec.recommendation in (
+                Recommendations.BatteriesChargeSolar.value,
+                Recommendations.BatteriesChargeGrid.value,
+                Recommendations.EVSmartCharging.value,
+            ):
+                available_headroom_kwh = max(
+                    usable_capacity - projected_capacity_kwh,
+                    0.0,
+                )
+                solar_absorption_kwh = _storable_solar_refill_kwh(
+                    rec,
+                    charge_efficiency,
+                    max_charge_per_slot,
+                )
+                scheduled_charge_kwh = 0.0
+                if rec.recommendation == Recommendations.BatteriesChargeGrid.value:
+                    scheduled_charge_kwh = max(rec.batteries_charged_kwh, 0.0)
+                    if max_charge_per_slot is not None:
+                        scheduled_charge_kwh = min(
+                            scheduled_charge_kwh,
+                            max(max_charge_per_slot, 0.0),
+                        )
+                projected_capacity_kwh += min(
+                    max(solar_absorption_kwh, scheduled_charge_kwh),
+                    available_headroom_kwh,
+                )
+            elif rec.recommendation == Recommendations.BatteriesDischargeMode.value:
+                projected_capacity_kwh -= min(
+                    projected_capacity_kwh,
+                    _battery_load_kwh(
+                        rec,
+                        discharge_efficiency,
+                        max_discharge_per_slot,
+                    ),
+                )
+            elif rec.recommendation == Recommendations.ForceBatteriesDischarge.value:
+                projected_capacity_kwh -= _forced_discharge_target_kwh(
+                    rec,
+                    available_capacity_kwh=projected_capacity_kwh,
+                    required_capacity_kwh=required_capacity,
+                    max_discharge_per_slot=max_discharge_per_slot,
+                )
+            projected_capacity_kwh = min(
+                max(projected_capacity_kwh, 0.0),
+                usable_capacity,
+            )
             continue
 
-        has_future_forced_export = any(
-            r.recommendation == Recommendations.ForceBatteriesDischarge.value
-            and utc_key(r.start) > utc_key(rec.start)
-            for r in slots
+        slot_load_kwh = _battery_load_kwh(
+            rec,
+            discharge_efficiency,
+            max_discharge_per_slot,
         )
-        if has_future_forced_export and current_capacity > required_capacity:
+        future_commitment_kwh = future_forced_commitment_kwh[index]
+        minimum_after_load_kwh = min(
+            required_capacity + future_commitment_kwh,
+            usable_capacity,
+        )
+        if (
+            future_commitment_kwh > 1e-9
+            and slot_load_kwh > 1e-9
+            and projected_capacity_kwh - slot_load_kwh + 1e-9 < minimum_after_load_kwh
+        ):
             rec.recommendation = Recommendations.BatteriesWaitMode.value
             continue
 
@@ -737,11 +949,25 @@ def apply_optimization_strategy(
             rec.estimated_net_consumption_kwh < 0.0 or forecast_usable_after[index]
         ):
             refill_forecast_kwh = refill_after_kwh[index]
-            headroom_kwh = refill_forecast_kwh - (required_capacity - current_capacity)
+            projected_excess_kwh = projected_capacity_kwh - required_capacity
+            headroom_kwh = projected_excess_kwh + refill_forecast_kwh
             if rec.estimated_net_consumption_kwh < 0.0:
+                stored_refill_kwh = min(
+                    _storable_solar_refill_kwh(
+                        rec, charge_efficiency, max_charge_per_slot
+                    ),
+                    max(usable_capacity - projected_capacity_kwh, 0.0),
+                )
+                rec.batteries_charged_kwh = round(stored_refill_kwh, 3)
+                projected_capacity_kwh += stored_refill_kwh
                 recommendation = Recommendations.BatteriesChargeSolar.value
-            elif headroom_kwh > 0.0:
+            elif (
+                slot_load_kwh > 1e-9
+                and headroom_kwh + 1e-9 >= slot_load_kwh
+                and projected_capacity_kwh + 1e-9 >= slot_load_kwh
+            ):
                 recommendation = Recommendations.BatteriesDischargeMode.value
+                projected_capacity_kwh -= slot_load_kwh
             else:
                 recommendation = Recommendations.BatteriesWaitMode.value
 
@@ -772,6 +998,22 @@ def apply_optimization_strategy(
             months_winter,
         )
         rec.recommendation = recommendation
+        if recommendation == Recommendations.BatteriesDischargeMode.value:
+            projected_capacity_kwh -= min(
+                projected_capacity_kwh,
+                slot_load_kwh,
+            )
+        elif recommendation == Recommendations.BatteriesChargeSolar.value:
+            stored_refill_kwh = min(
+                _storable_solar_refill_kwh(
+                    rec,
+                    charge_efficiency,
+                    max_charge_per_slot,
+                ),
+                max(usable_capacity - projected_capacity_kwh, 0.0),
+            )
+            rec.batteries_charged_kwh = round(stored_refill_kwh, 3)
+            projected_capacity_kwh += stored_refill_kwh
         log_planner(
             "debug",
             "[disch] seasonal_fill slot=%s  mode=months  reason=%s  net=%.3f  -> %s",

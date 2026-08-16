@@ -325,6 +325,7 @@ def _build_solve_and_finalize(
             primary_site_discharge_limited=primary_site_discharge_limited,
             primary_site_discharge_cap_kwh=primary_site_discharge_cap_kwh,
             price_actionable=price_actionable,
+            now=now,
         )
         integrality = _secondary_integrality(n_vars, m, secondary_layout)
 
@@ -360,6 +361,7 @@ def _build_solve_and_finalize(
             phase_power_imbalance_w=phase_power_imbalance_w,
             secondary_layout=secondary_layout,
             secondary_storage=secondary_storage,
+            now=now,
         )
         log_planner(
             "debug",
@@ -711,6 +713,7 @@ def _build_solve_and_finalize(
             phase_power_imbalance_w=phase_power_imbalance_w,
             secondary_layout=secondary_layout,
             secondary_storage=secondary_storage,
+            now=now,
         )
         diagnostics["max_phase_import_kwh"] = round(
             max(value for phases in phase_imports for value in phases),
@@ -737,6 +740,7 @@ def _build_solve_and_finalize(
             config=secondary_storage,
             future_idx=future_idx,
             minimum_action_kwh=min_action_kwh,
+            now=now,
             battery_export_min_price=max(
                 min_export_price,
                 battery_export_min_price,
@@ -760,6 +764,7 @@ def _build_solve_and_finalize(
             config=secondary_storage,
             future_idx=future_idx,
             min_export_price=min_export_price,
+            now=now,
         )
         diagnostics["secondary_result"] = asdict(secondary_result)
         log_secondary_result(secondary_result)

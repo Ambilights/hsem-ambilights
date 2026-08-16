@@ -1,39 +1,26 @@
 """Candidate plan generator for the HSEM planner (issues #296, #416).
 
-This module generates multiple independent charge/discharge strategy candidates
-from the same baseline slot population, so the selector can compare them and
-pick the best valid plan.
+Successful solves expose the MILP plan plus two diagnostic comparators.
+Solver failure deliberately leaves only the passive executable fallback; the
+retired heuristic baseline does not enforce the MILP's full safety constraints.
 
 Design principles
 -----------------
 - **Pure Python, no Home Assistant imports** — testable with plain pytest.
-- Each candidate is built from a *deep copy* of the pre-populated slots so
+- Each candidate is built from an independent copy of the populated slots so
   strategies cannot interfere with each other.
-- The generator only mutates ``recommendation`` and ``batteries_charged``; the
-  full SoC simulation (``simulate_soc``) must be called by the caller after
-  receiving the slots in order to populate ``grid_import_kwh``,
-  ``grid_export_kwh``, and ``estimated_battery_soc``.
-- The **baseline** candidate re-uses slots that have already been processed by
-  the normal scheduling pipeline (discharge → charge → excess export →
-  optimisation), so it captures the current HSEM behaviour exactly.
+- ``no_action`` remains diagnostic and can never win selection.
+- ``passive`` clears all forced actions and is the only solver-failure
+  fallback.
+- Normal successful solves remain MILP-owned; no heuristic mutation matrix is
+  revived.
 
 Candidates produced
 -------------------
-1. ``baseline``       — current HSEM scheduling output (slots already processed).
-2. ``no_action``      — all recommendations cleared; battery is completely idle.
-                        Diagnostic floor only — never eligible to win selection.
-3. ``passive``        — solar charging where PV surplus exists; no grid charge or
-                        forced discharge. Models the inverter default behaviour.
-4. ``grid_charge``    — grid-charge slots are kept; solar charging is removed.
-5. ``solar_only``     — only solar-charge slots are kept; grid charging cleared.
-6. ``discharge_only`` — discharge slots are kept; all charge slots cleared.
-7. ``aggressive``     — cheapest N slots forced to grid-charge regardless of
-                        schedule; most expensive M slots forced to discharge.
-                        N is derived dynamically from battery headroom and
-                        max charge per slot so it scales with the horizon and
-                        battery size (fix for issue #416 Bug 2).
-8. ``milp``           — globally-optimal LP solution (when scipy is available);
-                        falls back gracefully if the solver fails.
+1. ``no_action`` — diagnostic comparator with active storage actions
+   cleared before normal completion and simulation.
+2. ``passive`` — solar absorption without grid charge or forced discharge.
+3. ``milp`` — solver-owned plan, present only after a successful solve.
 """
 
 from __future__ import annotations
@@ -183,7 +170,7 @@ def generate_candidates(
 
     The *baseline_slots* list must have been fully processed by the normal
     scheduling pipeline (prices, consumption, net consumption, discharge
-    windows, charge windows, excess export, optimisation) **before** this
+    windows, charge windows, export policy, optimisation) **before** this
     function is called.  The SoC simulation has **not** yet been applied —
     it will be run separately by the selector for each candidate.
 
@@ -221,15 +208,16 @@ def generate_candidates(
             (backward-compatible behaviour).
 
     Returns:
-        Ordered list of :class:`CandidatePlan` objects.  The baseline is
-        always first so tie-breaking always prefers the current behaviour.
+        Ordered candidate list. Passive is the sole executable fallback after
+        solver failure; a successful solve also adds the MILP candidate.
     """
     candidates: list[CandidatePlan] = []
 
-    # MILP-only mode: only MILP + diagnostic baselines.
-    # The MILP finds the globally optimal solution; heuristics are disabled.
+    # MILP-only mode: no_action is diagnostic, passive is fail-closed, and
+    # the solver is the only authority for active optimization.
 
-    # 1. No-action — battery completely idle (diagnostic floor).
+    # 1. No-action — clear active storage actions for a non-winning diagnostic.
+    # Normal completion and SoC simulation may still model passive energy flow.
     no_action = _copy_slots(baseline_slots)
     _clear_all_charge_discharge(no_action)
     candidates.append(CandidatePlan(name=CANDIDATE_NO_ACTION, slots=no_action))
@@ -239,44 +227,7 @@ def generate_candidates(
     _apply_passive_solar(passive, now)
     candidates.append(CandidatePlan(name=CANDIDATE_PASSIVE, slots=passive))
 
-    # # 3. Baseline — current scheduling pipeline output
-    # candidates.append(
-    #     CandidatePlan(
-    #         name=CANDIDATE_BASELINE,
-    #         slots=_copy_slots(baseline_slots),
-    #     )
-    # )
-    #
-    # # 4. Grid-charge only
-    # grid_charge = _copy_slots(baseline_slots)
-    # _remove_solar_charge(grid_charge)
-    # candidates.append(CandidatePlan(name=CANDIDATE_GRID_CHARGE, slots=grid_charge))
-    #
-    # # 5. Solar-only
-    # solar_only = _copy_slots(baseline_slots)
-    # _remove_grid_charge(solar_only)
-    # candidates.append(CandidatePlan(name=CANDIDATE_SOLAR_ONLY, slots=solar_only))
-    #
-    # # 6. Discharge-only
-    # discharge_only = _copy_slots(baseline_slots)
-    # _remove_all_charge(discharge_only)
-    # candidates.append(
-    #     CandidatePlan(name=CANDIDATE_DISCHARGE_ONLY, slots=discharge_only)
-    # )
-    #
-    # # 7. Aggressive
-    # aggressive = _copy_slots(baseline_slots)
-    # _apply_aggressive_strategy(aggressive, now, max_charge_per_slot,
-    #     current_kwh=current_kwh, usable_kwh=usable_kwh,
-    #     max_discharge_per_slot=max_discharge_per_slot)
-    # candidates.append(CandidatePlan(name=CANDIDATE_AGGRESSIVE, slots=aggressive))
-    #
-    # # 8-13. Partial-SoC plans
-    # prev_charge_target: float | None = None
-    # for soc_candidate_name, charge_fraction in _SOC_FRACTIONS.items():
-    #     ...
-
-    # 9. MILP — globally-optimal LP solution (requires scipy, falls back gracefully)
+    # 3. MILP — globally optimal LP solution when the solver succeeds.
     if is_scipy_available():
         # Use the canonical resolve_cycle_cost() — same as engine_core and
         # cost_helpers.py — so the MILP optimises against the same value.
@@ -389,7 +340,7 @@ def generate_candidates(
         }
         for candidate in candidates:
             candidate.diagnostics = {"milp_attempt": dict(unavailable_attempt)}
-        log_planner("debug", "[gen] MILP candidate skipped — scipy not available")
+        log_planner("warning", "[gen] MILP unavailable — passive fallback only")
 
     # Log candidate slot-level recommendations for debugging
     log_planner(

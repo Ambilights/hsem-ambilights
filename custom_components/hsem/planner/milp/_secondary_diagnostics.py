@@ -6,6 +6,7 @@ import copy
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.secondary_storage_config import (
@@ -20,10 +21,10 @@ from custom_components.hsem.planner.secondary_storage import (
     SECONDARY_MODE_SBU,
     secondary_charge_limits_kwh,
     secondary_site_load_offset_kwh,
+    secondary_slot_duration_hours,
 )
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import clamp_efficiency
-from custom_components.hsem.utils.units import slot_duration_hours
 
 _EPSILON = 1e-9
 
@@ -119,10 +120,11 @@ def _actual_import_values(
 def _minimum_secondary_discharge_kwh(
     slot: PlannedSlot,
     config: SecondaryStorageConfig,
+    now: datetime,
 ) -> float:
     """Return battery energy required to serve this slot in SBU mode."""
     discharge_eff = clamp_efficiency(config.discharge_efficiency_pct)
-    hours = slot_duration_hours(slot.start, slot.end)
+    hours = secondary_slot_duration_hours(slot, now)
     standby_kwh = max(config.inverter_standby_power_w, 0.0) * hours / 1000.0
     return slot.secondary_storage_load_kwh / discharge_eff + standby_kwh
 
@@ -145,6 +147,7 @@ def _parked_reason(
     config: SecondaryStorageConfig,
     future_idx: list[int],
     weights: CostWeights,
+    now: datetime,
 ) -> str:
     """Return a conservative explanation for a solution with no cycling."""
     future_slots = [
@@ -154,7 +157,7 @@ def _parked_reason(
         return "unknown"
 
     required_draws = [
-        _minimum_secondary_discharge_kwh(slot, config)
+        _minimum_secondary_discharge_kwh(slot, config, now)
         for slot in future_slots
         if slot.secondary_storage_load_kwh > _EPSILON
     ]
@@ -167,7 +170,7 @@ def _parked_reason(
         minimum_charge = min(
             secondary_charge_limits_kwh(
                 config,
-                slot_duration_hours(slot.start, slot.end),
+                secondary_slot_duration_hours(slot, now),
             )[0]
             for slot in future_slots
         )
@@ -179,7 +182,7 @@ def _parked_reason(
     terminal_blocks_profitable_slot = False
 
     for slot in future_slots:
-        required_draw = _minimum_secondary_discharge_kwh(slot, config)
+        required_draw = _minimum_secondary_discharge_kwh(slot, config, now)
         if required_draw > current_usable + _EPSILON:
             continue
 
@@ -222,6 +225,7 @@ def build_secondary_result_summary(
     config: SecondaryStorageConfig,
     future_idx: list[int],
     min_export_price: float,
+    now: datetime,
 ) -> SecondaryResultSummary:
     """Build a read-only aggregate from one successful secondary MILP solve."""
     slot_count = len(future_idx)
@@ -268,7 +272,7 @@ def build_secondary_result_summary(
     reason = (
         "scheduled"
         if sbu_slots > 0 or charge_slots > 0
-        else _parked_reason(slots, config, future_idx, weights)
+        else _parked_reason(slots, config, future_idx, weights, now)
     )
 
     return SecondaryResultSummary(

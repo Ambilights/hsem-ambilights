@@ -247,6 +247,7 @@ def _apply_sbu_to_primary_slot(
         config=config,
         future_idx=[0],
         minimum_action_kwh=1e-4,
+        now=_NOW,
         battery_export_min_price=battery_export_min_price,
         primary_site_discharge_limited=np.asarray(
             [primary_site_discharge_limited], dtype=bool

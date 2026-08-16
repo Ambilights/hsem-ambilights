@@ -363,7 +363,7 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
     _inject_live_data_into_current_slot(slots, inp, now)
 
     if inp.secondary_storage.valid:
-        populate_secondary_storage_load(slots, inp.secondary_storage)
+        populate_secondary_storage_load(slots, inp.secondary_storage, now)
         secondary_replacement_price = resolve_secondary_terminal_price(
             slots,
             inp.secondary_storage,

@@ -150,13 +150,17 @@ async def validate_prices_input(
     Returns:
         A dict of field → error-key; empty dict when validation passes.
     """
+    required_entity_fields = [
+        "hsem_import_electricity_price_sensor",
+        "hsem_export_electricity_price_sensor",
+    ]
+    if bool(user_input.get("hsem_price_forecast_valuation_enabled")):
+        required_entity_fields.append("hsem_price_forecast_valuation_sensor")
+
     entity_errors = await async_validate_entity_ids(
         hass,
         user_input,
-        required_fields=[
-            "hsem_import_electricity_price_sensor",
-            "hsem_export_electricity_price_sensor",
-        ],
+        required_fields=required_entity_fields,
     )
     price_errors = validate_price(
         user_input,

@@ -91,21 +91,28 @@ in the same layer must not change it.
 1. Import price < 0 → `batteries_charge_grid`
 2. Import price ≤ depreciation threshold − cycle cost → `batteries_charge_grid`
 
-**Excess export** (only when enabled):
+**Intentional battery export:**
 
-1. Export price > threshold AND battery above required capacity → `force_batteries_discharge`
-2. In the MILP, any primary-battery discharge beyond house load activates an
-   export-mode binary. The battery SoC at the end of the following demand
-   window (immediately before the next forecast PV-surplus slot, or horizon
-   end) must then retain `hsem_batteries_excess_export_discharge_buffer`.
-   The reserve is conditional: normal self-consumption may use it, and a
-   planned cheap grid-charge before the checkpoint may restore it.
+1. The MILP is the only active-optimisation authority for primary-battery
+   export. With excess export disabled, it may discharge only into house load;
+   it cannot schedule battery-to-grid energy.
+2. With excess export enabled, any primary-battery discharge beyond house load
+   activates an export-mode binary. The battery SoC at the end of the following
+   demand window (immediately before the next forecast PV-surplus slot, or
+   horizon end) must then retain
+   `hsem_batteries_excess_export_discharge_buffer`. The reserve is conditional:
+   normal self-consumption may use it, and a planned cheap grid charge before
+   the checkpoint may restore it.
+3. `force_export` is separate PV routing: it holds the primary battery at zero
+   charge and zero discharge while exporting available PV. It is never evidence
+   of battery discharge.
 
 **Seasonal fill** (remaining `None` slots):
 
 1. Export price > import price AND export price ≥ `export_min_price` → `force_export`
 2. Actual PV surplus (`estimated_net_consumption_kwh < 0`) and battery not full → `batteries_charge_solar`
-3. Future `force_batteries_discharge` AND battery > required → `batteries_wait_mode`
+3. Insufficient projected energy for the reserve plus executable future
+   `force_batteries_discharge` targets → `batteries_wait_mode`
 4. With `hsem_seasonal_fill_mode = forecast` (default), use the forward
    refill-headroom decision below.
 5. With `hsem_seasonal_fill_mode = months`, or when the forward Solcast
@@ -114,25 +121,58 @@ in the same layer must not change it.
    `batteries_charge_solar`, and positive/zero net load →
    `batteries_discharge_mode`.
 
-For each idle slot, the forecast window contains slots strictly after it and
-ends immediately before the next slot already marked
-`force_batteries_discharge` (or at the planning-horizon end).  The scheduler
-computes the window values with one reverse suffix pass that resets at each
-forced-discharge boundary, so the full calculation is O(n):
+The pre-solar reserve is also battery-side: it sums actionable non-EV house
+load divided by discharge efficiency, caps each slot by discharge power, adds
+the configured buffer, and caps the result by usable capacity. The scan ends at
+the first PV surplus that storage is allowed to absorb or at the price-authority
+boundary. PV in a primary hold, `force_export`, or
+`force_batteries_discharge` slot is not a refill boundary.
+
+The forecast calculation is cumulative. It starts from the live usable energy
+and advances a projected capacity chronologically through existing and newly
+assigned recommendations, clamped to `[0, usable_capacity]` after every slot.
+It accounts for charge/discharge conversion efficiency, per-slot power, EV
+discharge suppression, primary-battery holds, and the executable stored or
+discharged energy on each preassigned slot. A preassigned solar-charge slot
+projects all PV the simulator can absorb, not merely its original target. A
+preassigned `force_batteries_discharge` slot projects its explicit target; when
+that slot is reached, a legacy zero target uses only executable energy above
+reserve. A missing future target is reserved conservatively as one
+power-limited usable-capacity draw. `force_export` projects no battery movement.
+
+For each idle slot, the forward window contains slots strictly after it. Its
+potential refill is cumulative battery-side energy that could actually pass the
+charge conversion and per-slot charge-power limit, not gross forecast PV:
 
 ```text
-refill_forecast_kwh
-    = Σ max(-estimated_net_consumption_kwh, 0) over the forecast window
+slot_refill_kwh
+    = min(max(-estimated_net_consumption_kwh, 0) × charge_efficiency,
+          max_charge_per_slot)
 
-headroom_kwh
-    = refill_forecast_kwh - (required_capacity - current_capacity)
+minimum_after_load_kwh
+    = required_capacity
+      + future_forced_discharge_targets_net_of_intervening_refill
 ```
+
+The forward suffix resets at a price-authority boundary, a primary-storage
+hold, `force_export`, or `force_batteries_discharge`; forbidden energy and PV
+sent deliberately to the grid cannot be promised as an earlier refill. An
+ordinary actionable `batteries_wait_mode` label is transparent to the suffix:
+under self-consumption-with-reserve it may still absorb PV, whereas
+`primary_battery_hold` explicitly forbids that refill. Future forced-discharge
+commitments are their cumulative, power-limited declared battery targets
+(or the conservative missing-target bound), reduced by executable intervening
+refill. The suffix passes and chronological projection keep the full
+calculation O(n).
 
 The forecast-mode decision is:
 
-1. Current slot has actual PV surplus → `batteries_charge_solar`
-2. Otherwise `headroom_kwh > 0` → `batteries_discharge_mode`
-3. Otherwise → `batteries_wait_mode`
+1. Current slot has storable PV surplus → `batteries_charge_solar`, limited by
+   efficiency, charge power, and projected battery headroom.
+2. Otherwise, the projected battery can serve the slot's battery-side load and
+   remain above `minimum_after_load_kwh`, while its bounded forward refill
+   provides positive headroom → `batteries_discharge_mode`.
+3. Otherwise → `batteries_wait_mode`.
 
 The forward forecast is usable only when at least one slot in that bounded
 window has `solcast_pv_estimate_kwh > 0`.  Missing or all-zero forward Solcast
@@ -154,10 +194,13 @@ the `[disch] seasonal_fill` prefix.
 - Seasonal fill and discharge concentration apply only to heuristic
   candidates. A validated MILP candidate is already a complete energy
   allocation and must not be changed by either heuristic after the solve.
-- The future forced-export reserve rule above remains higher priority than
-  forecast headroom.
-- PV forecast after the next forced battery-discharge slot is not counted as
-  refill headroom for an earlier slot.
+- Explicit future forced-battery-discharge targets reserve their cumulative
+  executable energy, net of intervening refill; one small future target must
+  not hold every prior load slot.
+- `force_export` neither changes battery SoC nor contributes refill. PV after a
+  forced battery discharge, primary-storage hold, or authority boundary is not
+  counted as earlier refill headroom.
+- Projected capacity never becomes negative or exceeds usable capacity.
 - A sunny winter forecast and an identical sunny summer forecast produce the
   same idle-slot decision; likewise for identical usable low-refill forecasts.
 - `months` mode and unusable forward Solcast preserve the legacy calendar
@@ -196,6 +239,14 @@ Applied to the current slot immediately before hardware writes, using live senso
 2. `batteries_charge_grid` → kept (must never be overridden by EV or discharge rule)
 3. Any EV actively charging → `ev_smart_charging`
 4. Battery energy > remaining discharge-schedule need → `batteries_discharge_mode`
+
+Runtime resolution is copy-on-write. The working-mode sensor detaches the
+current recommendation and, when its effective label changes, substitutes that
+copy into a sensor-local `CoordinatorData` view. It must never mutate the
+planner-owned accepted slot or recommendation list. An in-flight hardware
+worker therefore retains the exact snapshot it accepted, and each later live
+refresh resolves again from the canonical planner output so a transient EV or
+discharge override clears when its live condition clears.
 
 ### Invariants for tests
 
@@ -329,6 +380,13 @@ $$
 c_t = \frac{V \times \Delta I \times h_t}{1000} q_t
 $$
 
+For the current slot, $h_t$ is the physical time remaining from `now` to the
+slot end; an ended slot has zero duration. Future slots retain their nominal
+full duration. The same effective duration is used for dedicated load,
+standby overhead, minimum/maximum charge bounds, integer current-step energy,
+secondary SoC and grid flows, and conversion of solved charge energy back to a
+current command.
+
 The charge-mode constraints bind $c_t$ to the configured minimum and maximum
 current. With discharge efficiency $\eta_d$ and inverter overhead $P_o$:
 
@@ -375,6 +433,16 @@ balanced three-phase load. By default, Huawei discharge is forbidden while
 PowMr grid charging is active, preventing an inefficient Huawei DC→AC→PowMr DC
 transfer. The advanced transfer option must be explicitly enabled to relax this
 guard.
+
+The live primary house/PV frame remains the established full-slot projection,
+including energy already elapsed in the current slot. When that forecast
+includes the dedicated load, SBU removes only its remaining-duration portion;
+the elapsed portion remains in the site balance. Phase-fuse rows therefore
+also stay in that full-slot frame: reconstruction removes the actual partial
+PowMr delta from the balanced $G_t/3$ share, converts it to its full-slot power
+equivalent, and assigns that equivalent only to the configured phase. Thus a
+60 A command always represents $V\times60$ W at the fuse even late in a slot,
+while the secondary battery receives only the remaining-duration energy.
 
 Huawei recommendation labels are reconciled after the PowMr site-bus adjustment
 without changing either battery's solved energy. If SBU removes the remaining
@@ -465,12 +533,17 @@ installation, which has no PowMr PV input, it stops PowMr charging completely.
 ### Secondary-storage invariants for tests
 
 - secondary SoC never crosses the configured 20 % reserve or maximum SoC
+- current-slot secondary load, standby, charge/discharge energy, SoC movement,
+  and current-step energy use only the time remaining; future slots use their
+  nominal duration
 - SBU discharge equals dedicated load divided by discharge efficiency plus
   inverter overhead
 - secondary discharge is tied to the dedicated load and never directly backfeeds;
   it may only free Huawei PV that is independently eligible for export
 - charge current is always a supported 10 A increment
 - PowMr charge and utility/SBU load transitions affect only its configured phase
+- a current-slot PowMr command is checked against its full power on that phase,
+  not diluted by the fraction of the slot remaining
 - Huawei discharge is zero during PowMr charging unless transfer is enabled
 - post-SBU Huawei charge/discharge labels match the final executable site flow
   and respect the configured battery-export price floor
@@ -634,11 +707,13 @@ The simulator must enforce:
 - charge power limit
 - discharge power limit
 - grid import limit
-- export limit if configured
+- the MILP export limit when configured; a non-MILP simulation reports
+  natural PV export and leaves physical curtailment to the inverter/DNO
 
 The simulator must read the slot recommendation.
 
-If a slot recommends forced discharge, force export, or discharge-only behavior, that energy flow must appear in:
+If a slot recommends forced battery discharge or discharge-only behaviour,
+that energy flow must appear in:
 
 - `batteries_discharged`
 - SoC change
@@ -646,6 +721,10 @@ If a slot recommends forced discharge, force export, or discharge-only behavior,
 - plan cost
 
 No recommendation may be energetically invisible.
+
+`force_export` is intentionally different: the primary battery is held, so
+both battery charge and discharge are zero. Only PV remaining after site load
+may appear as grid export.
 
 ### MILP-pre-populated mode (issue #637)
 
@@ -953,10 +1032,20 @@ bounds** on the discharge variable `ed[t]` (implemented as variable bounds in
    intentional battery-to-grid export (`ForceBatteriesDischarge`); it
    does NOT restrict normal battery self-consumption, battery discharge
    for house load, direct PV export, or PV charging of the battery.  The
-   non-MILP `apply_excess_export` path applies the same floor by
-   requiring `export_price >= max(export_min_price,
-   recommended_threshold, battery_export_min_price)` for any slot it
-   would otherwise label `ForceBatteriesDischarge`.
+   same floor remains part of candidate scoring, but there is no
+   non-MILP battery-export scheduling path.
+
+   Historical correction for `v6.2.2-powmr.23`: that release described the
+   private `apply_excess_export()` helper as deciding force-discharge slots.
+   It did not author a selected executable plan: candidate generation cleared
+   its labels from the diagnostic and passive candidates, while the MILP solved
+   battery allocation independently. Because replacement valuation inspected
+   those pre-candidate labels, the helper could still change MILP terminal
+   valuation indirectly. That was a heuristic side channel, not an
+   authoritative export guard. The scheduling call is retired; intentional
+   battery export is now exclusively MILP-owned. `ForceExport` is also excluded
+   from the discharge-recommendation set so its PV-only label cannot affect
+   replacement valuation as if battery energy moved.
 
 4. **Conditional excess-export reserve** — when excess export is enabled and
    `excess_export_discharge_buffer_pct > 0`, each slot receives a binary
@@ -1264,6 +1353,15 @@ on the reference feed the 80 % lower bound proved flat across a whole day
 (0.001–0.021 SEK/kWh through an evening peak whose point estimate was 0.752),
 carrying no shape and clearing no break-even test.
 
+Enabling forecast valuation requires a configured, existing valuation sensor;
+a stale sensor option is ignored while the feature is disabled. The accepted
+forecast-authority signature includes the enabled state, normalized MAE and
+operator margin, and the sorted finite `(start, value)` forecast points. An
+attribute publication, withdrawal, or recovery therefore enters the normal
+debounced refresh path and must trigger a new planner run rather than reusing a
+plan valued from stale forecast data. Parser-rejected points do not enter the
+signature.
+
 The post-hoc `terminal_soc_credit` calculation in the diagnostics dict is
 retained as a consistency check but no longer drives the LP's decisions.
 
@@ -1408,20 +1506,25 @@ sustained overload.
 ### Grid export power limit (DNO/inverter export cap — issue #726)
 
 When `max_grid_export_power_kw` is provided and > 0, the MILP adds a
-**hard** per-slot bound on grid export:
+**hard** per-slot scheduling bound on grid export:
 
 ```
 ge[t] <= max_grid_export_power_kw * slot_hours
 ```
 
-- Implemented as a variable bound on `ge[t]`, not a penalty — the cap is
-  physically enforced by the inverter/DNO, so exceeding it is never
-  required for feasibility.
+- Implemented as a variable bound on `ge[t]`, not a penalty.
 - Battery export and PV export compete for the same cap through the
   energy-balance equality, so the optimal plan front-loads battery export
   into low-PV slots and tapers it as PV ramps.
 - PV that cannot be exported at the cap is absorbed by the free `curt[t]`
   curtailment variable.
+
+The option is a MILP planning constraint, not a separate HSEM hardware command.
+A passive solver fallback schedules no intentional battery export and reports
+its natural PV flow without inventing a clipped forecast; the inverter/DNO
+remains responsible for physical PV curtailment. A passive fallback slot may
+therefore report PV export above the configured MILP cap without authorizing
+intentional battery export.
 
 **When disabled** (`max_grid_export_power_kw` is `None` or 0): `ge[t]`
 remains unbounded above — behaviour is identical to the pre-#726 code.
@@ -1430,11 +1533,14 @@ remains unbounded above — behaviour is identical to the pre-#726 code.
 
 - When `max_grid_export_power_kw` is `None` or 0, the MILP produces
   identical results to the pre-#726 code (backward compatible).
-- Every slot's `grid_export_kwh` is ≤ `max_grid_export_power_kw ×
-  slot_hours` (within solver tolerance) when the cap is active.
+- Every MILP candidate slot's `grid_export_kwh` is ≤
+  `max_grid_export_power_kw × slot_hours` (within solver tolerance) when the
+  cap is active.
 - The battery never discharges purely to displace PV export at a saturated
   cap (export-destined discharge gains nothing once `ge[t]` is at its
   bound).
+- A passive fallback contains no intentional battery-to-grid energy; natural
+  PV flow is not fake-clamped in planner diagnostics.
 
 ## Cost function
 
@@ -1530,11 +1636,9 @@ revenue as 0 in both optimisation and scoring.
 **Battery export minimum price floor (``battery_export_min_price``, issue
 #752):** When ``battery_export_min_price > 0`` and a slot's raw
 ``export_price`` is strictly below this floor, the MILP forbids
-intentional battery-to-grid discharge in that slot (either by capping
-``ed[t]`` to ``base_load[t] / discharge_eff``, or by requiring
-``export_price >= battery_export_min_price`` before
-``apply_excess_export`` labels a slot ``ForceBatteriesDischarge``). To
-keep cost-function scores consistent with the optimisation assumptions:
+intentional battery-to-grid discharge in that slot by capping ``ed[t]`` to
+``base_load[t] / discharge_eff``. To keep cost-function scores consistent with
+the optimisation assumptions:
 
 - ``CostWeights.battery_export_min_price`` mirrors the floor in
   ``score_plan``.
@@ -1718,9 +1822,8 @@ case `terminal_soc_value = 0.0` and `score == total_cost + penalties`.
   `export_price` is strictly below this floor, the MILP never schedules
   intentional battery-to-grid export on that slot — `grid_export_kwh` may
   be > 0 there only when PV surplus alone would have been exported.
-- (issue #752) The non-MILP `apply_excess_export` path never labels a
-  slot `ForceBatteriesDischarge` when `export_price <
-  battery_export_min_price`.
+- (issue #752) A solver failure cannot reintroduce intentional battery
+  export through a non-MILP heuristic path.
 - (issue #752) With `battery_export_min_price = 0` (default) the
   planner produces identical results to the pre-#752 code (backward
   compatible).
@@ -1825,25 +1928,37 @@ Rejected-plan diagnostics keep the two cost aggregates distinct:
 ``estimated_cost`` is the auditable monetary ``total_cost``, while ``score``
 is the selector objective including synthetic penalties and terminal-SoC value.
 
-Required candidates:
+Required candidates on every run:
 
-- no-action baseline
-- current heuristic plan
-- grid-charge candidates
-- discharge candidates
-- excess-export candidates if enabled
-- aggressive candidates if enabled
+- `no_action`: a fully simulated and scored diagnostic comparator that is
+  never eligible to win;
+- `passive`: solar absorption and normal self-consumption, with no grid charge
+  or intentional battery export; this is the sole executable solver-failure
+  fallback;
+- `milp`: added only after an optimal solve or a fully validated time-limit
+  incumbent.
 
-The selected plan must be the lowest-cost valid candidate within the implemented search space.
+The retired baseline/grid-charge/discharge/export/aggressive heuristic matrix is
+not generated. In particular, a failed solver must never restore the
+pre-candidate scheduled baseline, because that baseline has not passed the
+MILP's fuse, phase, export, EV, and secondary-storage constraints. The MILP is
+the only candidate allowed to introduce actively optimized grid charge or
+intentional battery export.
+
+The selected plan must have the lowest score among valid, eligible executable
+candidates within this implemented search space. `no_action` remains diagnostic
+even when its score is lower.
 
 The final returned plan must be the same plan that was selected.
 
 Planner warnings have the same ownership rule. Global input-quality and solver
 diagnostics remain visible for every run, but recommendation-specific warnings
-created while building a candidate are surfaced only if that candidate wins. A
-heuristic `ForceBatteriesDischarge` decision discarded in favour of MILP or
-passive output must therefore remain debug-only and cannot appear as a warning
-about the selected schedule.
+created while building a candidate are surfaced only if that candidate wins.
+The retired `apply_excess_export` pass can no longer add heuristic export
+labels or warnings. Other pre-candidate schedules may still supply discharge
+labels as replacement-value context, but those labels do not author the
+selected plan; intentional battery export remains owned by the selected MILP
+candidate.
 
 This invariant must always hold:
 
@@ -1934,14 +2049,14 @@ failed expiry cycle leaves the forced-replan request pending until recovery.
 - Neutral recommendations never trigger hold behaviour.
 - Feature disabled (hold minutes = 0) always allows the switch.
 
-## No-action baseline
+## No-action diagnostic
 
 The no-action plan means:
 
 - no forced grid charge
-- no forced discharge
-- no force export
-- normal self-consumption behavior only
+- no intentional battery discharge or battery export
+- normal battery self-consumption and PV absorption when physically modelled
+- a PV-only `force_export` label may hold the battery and route available PV
 
 It must still account for:
 
@@ -1951,7 +2066,9 @@ It must still account for:
 - battery self-consumption behavior if modeled
 - terminal SoC
 
-No-action must not be treated as “zero battery movement” unless the physical model says no battery movement occurs.
+No-action must not be treated as “zero battery movement” unless the physical
+model says no battery movement occurs. It is always simulated and scored for
+diagnostics, but it is excluded from winner selection and is not a fallback.
 
 ## Safety gates
 
@@ -1980,6 +2097,11 @@ recovers normally. Read-only, Error-mode, and unload gates may still cancel
 immediately. Numeric inputs are compared in command-relevant integer units, so
 sub-Wh or sub-command floating-point noise cannot restart a write or prevent a
 matching apply summary from being published.
+
+The listener resolves live recommendation overrides on a detached sensor-local
+snapshot before calculating that fingerprint or queueing work. Neither the
+accepted planner output nor a snapshot already owned by the worker may be
+mutated by a later coordinator notification.
 
 ### EV discharge cap semantics (issue #592)
 
@@ -2012,7 +2134,8 @@ Add tests for these invariants:
 - Energy balance holds for every slot.
 - SoC never leaves configured bounds.
 - Forced discharge changes SoC and cost.
-- Force export changes SoC and export revenue.
+- `force_export` holds battery SoC and exports only available PV;
+  `force_batteries_discharge` changes SoC and may create export revenue.
 - Grid charge prices actual grid import, not stored energy.
 - Candidate winner cost equals final output cost.
 - Final output slots equal selected candidate slots.
@@ -2020,7 +2143,8 @@ Add tests for these invariants:
 - No-action includes normal PV/battery behavior.
 - Terminal SoC affects cost.
 - Emptying the battery is not free.
-- `winner.cost <= no_action.cost` within the implemented candidate set.
+- `no_action` is never selected, even when its diagnostic score is below the
+  executable candidates.
 - Current partial slot uses remaining duration only.
 - Missing price/PV data does not become real zero silently.
 - Read-only/degraded/dry-run gates block writes.

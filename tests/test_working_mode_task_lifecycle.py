@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -137,6 +138,7 @@ def _make_data(
     return CoordinatorData(
         cfg=cfg,
         live=live,
+        hourly_recommendations=[rec],
         hourly_recommendation=rec,
         state=recommendation,
         current_required_battery=current_required_battery,
@@ -407,6 +409,109 @@ class TestNoWriteAfterUnload:
 
 class TestSingleTaskInFlight:
     """Coordinator pushes are safely coalesced through one worker."""
+
+    @pytest.mark.asyncio
+    async def test_runtime_override_uses_detached_slot_and_clears(self) -> None:
+        """A live EV label must not become the next refresh's planner baseline."""
+        sensor = _make_sensor()
+        accepted = _make_data("batteries_wait_mode")
+        accepted_rec = accepted.hourly_recommendation
+        assert accepted_rec is not None
+        assert accepted.live is not None
+        accepted_rec.ev_charger_calculated_power = 7000.0
+        accepted.live.ev.is_charging = True
+
+        with patch.object(sensor, "_start_update_task"):
+            sensor.coordinator.data = accepted
+            sensor._handle_coordinator_update()
+
+            overridden = sensor._pending_update_data
+            assert overridden is not None
+            assert overridden.hourly_recommendation is not None
+            assert overridden.hourly_recommendation.recommendation == (
+                "ev_smart_charging"
+            )
+            assert overridden.hourly_recommendation is not accepted_rec
+            assert overridden.hourly_recommendations[0] is (
+                overridden.hourly_recommendation
+            )
+            assert sensor.state == "ev_smart_charging"
+            attributes = sensor.extra_state_attributes
+            assert attributes["hourly_recommendation"] is (
+                overridden.hourly_recommendation
+            )
+            assert attributes["hourly_recommendations"][0] is (
+                overridden.hourly_recommendation
+            )
+
+            # The accepted planner snapshot remains the baseline for a later
+            # live-only publication after the transient EV condition clears.
+            assert accepted_rec.recommendation == "batteries_wait_mode"
+            assert accepted.hourly_recommendations[0].recommendation == (
+                "batteries_wait_mode"
+            )
+            cleared_live = deepcopy(accepted.live)
+            cleared_live.ev.is_charging = False
+            live_refresh = replace(accepted, live=cleared_live)
+            sensor._pending_update_data = None
+            sensor.coordinator.data = live_refresh
+            sensor._handle_coordinator_update()
+
+        cleared = sensor._pending_update_data
+        assert cleared is not None
+        assert cleared.hourly_recommendation is accepted_rec
+        assert cleared.hourly_recommendation.recommendation == "batteries_wait_mode"
+        assert sensor.state == "batteries_wait_mode"
+        await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_live_override_cannot_mutate_inflight_snapshot(self) -> None:
+        """A new shared live snapshot cannot rewrite an active transaction."""
+        sensor = _make_sensor()
+        accepted = _make_data("batteries_wait_mode")
+        accepted_rec = accepted.hourly_recommendation
+        assert accepted_rec is not None
+        assert accepted.live is not None
+        accepted_rec.ev_charger_calculated_power = 7000.0
+        started = asyncio.Event()
+        release = asyncio.Event()
+        applied: list[CoordinatorData] = []
+
+        async def _apply(snapshot: CoordinatorData | None) -> None:
+            assert snapshot is not None
+            applied.append(snapshot)
+            started.set()
+            await release.wait()
+
+        object.__setattr__(sensor, "_async_apply_hardware_writes", _apply)
+        sensor.coordinator.data = accepted
+        sensor._handle_coordinator_update()
+        task = sensor._update_task
+        assert task is not None
+        await started.wait()
+
+        active = applied[0]
+        try:
+            assert active.hourly_recommendation is accepted_rec
+            updated_live = deepcopy(accepted.live)
+            updated_live.ev.is_charging = True
+            live_refresh = replace(accepted, live=updated_live)
+            sensor.coordinator.data = live_refresh
+            sensor._handle_coordinator_update()
+
+            pending = sensor._pending_update_data
+            assert pending is not None
+            assert pending.hourly_recommendation is not None
+            assert pending.hourly_recommendation.recommendation == "ev_smart_charging"
+            assert pending.hourly_recommendation is not active.hourly_recommendation
+            assert active.hourly_recommendation is not None
+            assert active.hourly_recommendation.recommendation == "batteries_wait_mode"
+            assert accepted_rec.recommendation == "batteries_wait_mode"
+        finally:
+            sensor._unloading = True
+            sensor._pending_update_data = None
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_same_intent_does_not_cancel_inflight_task(self) -> None:

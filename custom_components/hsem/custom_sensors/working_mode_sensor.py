@@ -16,6 +16,7 @@ coordinator.  This entity only reacts to coordinator pushes.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from math import isfinite
 from typing import Any, override
 
@@ -145,6 +146,13 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         # completed apply summary.  It prevents that diagnostics-only refresh
         # from scheduling the same hardware work again.
         self._publishing_apply_summary = False
+        # Runtime overrides belong to this entity, not to the coordinator's
+        # accepted planner snapshot. Keep the resolved view beside its source
+        # so state/attributes can expose the override without mutating shared
+        # recommendation objects that an older hardware transaction may still
+        # be using.
+        self._resolved_data: CoordinatorData | None = None
+        self._resolved_source_data: CoordinatorData | None = None
 
     # ------------------------------------------------------------------
     # HA entity properties
@@ -166,9 +174,10 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
     @override
     def state(self) -> str | None:
         """Return the working-mode recommendation for the current slot."""
-        if self.coordinator.data is None:
+        data = self._display_data()
+        if data is None:
             return None
-        return self.coordinator.data.state
+        return data.state
 
     @property
     @override
@@ -188,7 +197,7 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
     @override
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return entity state attributes."""
-        data: CoordinatorData | None = self.coordinator.data
+        data = self._display_data()
 
         if data is None or data.live is None:
             return {
@@ -360,6 +369,17 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
 
         return dict(sorted({**attributes, **extended, **status}.items()))
 
+    def _display_data(self) -> CoordinatorData | None:
+        """Return this entity's resolved view of the current coordinator data."""
+        source = self.coordinator.data
+        resolved_source: CoordinatorData | None = getattr(
+            self, "_resolved_source_data", None
+        )
+        resolved_data: CoordinatorData | None = getattr(self, "_resolved_data", None)
+        if resolved_source is source and resolved_data is not None:
+            return resolved_data
+        return source
+
     # ------------------------------------------------------------------
     # HA lifecycle
     # ------------------------------------------------------------------
@@ -369,9 +389,12 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         """Register the listener and queue an initial hardware-write pass."""
         await super().async_added_to_hass()
         if self.coordinator.data is not None:
-            self._resolve_current_state(self.coordinator.data)
+            source_data = self.coordinator.data
+            resolved_data = self._resolve_current_state(source_data)
+            self._resolved_source_data = source_data
+            self._resolved_data = resolved_data
             self.async_write_ha_state()
-            self._queue_hardware_update(self.coordinator.data)
+            self._queue_hardware_update(resolved_data)
 
     @override
     async def async_will_remove_from_hass(self) -> None:
@@ -385,6 +408,8 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         self._post_write_refresh_needed = False
         self._write_failure_backoff.clear()
         self._fully_fed_discharge_state.reset()
+        self._resolved_data = None
+        self._resolved_source_data = None
         self._cancel_update_task()
         await super().async_will_remove_from_hass()
 
@@ -437,9 +462,14 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
     @override
     def _handle_coordinator_update(self) -> None:
         """Publish state immediately, then coalesce hardware work in one worker."""
-        data = self.coordinator.data
-        if data is not None:
-            self._resolve_current_state(data)
+        source_data = self.coordinator.data
+        data = (
+            self._resolve_current_state(source_data)
+            if source_data is not None
+            else None
+        )
+        self._resolved_source_data = source_data
+        self._resolved_data = data
         self.async_write_ha_state()
         if self._publishing_apply_summary:
             return
@@ -448,32 +478,56 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
             self._queue_hardware_update(data)
 
     @staticmethod
-    def _resolve_current_state(data: CoordinatorData) -> None:
-        """Apply real-time overrides before publishing or queuing hardware."""
+    def _resolve_current_state(data: CoordinatorData) -> CoordinatorData:
+        """Return a detached runtime view without mutating the accepted plan."""
         live = data.live
         hourly_rec = data.hourly_recommendation
         if live is None or hourly_rec is None:
-            return
+            return data
 
+        resolved_rec = replace(hourly_rec)
         resolve_current_recommendation(
-            hourly_rec,
+            resolved_rec,
             live,
             data.batteries_schedules_remaining_capacity_needed,
         )
-        data.state = hourly_rec.recommendation
+        resolved_state = resolved_rec.recommendation
+        if resolved_state == hourly_rec.recommendation and data.state == resolved_state:
+            resolved_data = data
+        else:
+            # The active recommendation normally aliases one item in the
+            # published list. Replace only that item in the entity-local view;
+            # the coordinator's accepted list and any older worker snapshot
+            # retain the planner's original object and label.
+            resolved_slots = [
+                (
+                    resolved_rec
+                    if slot is hourly_rec
+                    or (slot.start == hourly_rec.start and slot.end == hourly_rec.end)
+                    else slot
+                )
+                for slot in data.hourly_recommendations
+            ]
+            resolved_data = replace(
+                data,
+                hourly_recommendations=resolved_slots,
+                hourly_recommendation=resolved_rec,
+                state=resolved_state,
+            )
         _LOGGER.debug(
             "Current hourly recommendation: state=%s  "
             "ev_charger_calculated_power=%dW  "
             "ev_second_charger_calculated_power=%dW  "
             "ev_total_planned_load_kwh=%.3f  "
             "ev_planned_load_kwh=%.3f  ev_accounted_load_kwh=%.3f",
-            hourly_rec.recommendation,
-            hourly_rec.ev_charger_calculated_power,
-            hourly_rec.ev_second_charger_calculated_power,
-            hourly_rec.ev_total_planned_load_kwh,
-            hourly_rec.ev_planned_load_kwh,
-            hourly_rec.ev_accounted_load_kwh,
+            resolved_rec.recommendation,
+            resolved_rec.ev_charger_calculated_power,
+            resolved_rec.ev_second_charger_calculated_power,
+            resolved_rec.ev_total_planned_load_kwh,
+            resolved_rec.ev_planned_load_kwh,
+            resolved_rec.ev_accounted_load_kwh,
         )
+        return resolved_data
 
     def _queue_hardware_update(self, data: CoordinatorData) -> None:
         """Keep the latest snapshot and safely redirect the write worker."""
@@ -661,7 +715,12 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
                 if self._unloading:
                     return
 
-                current = self.coordinator.data
+                current_source = self.coordinator.data
+                current = (
+                    self._resolve_current_state(current_source)
+                    if current_source is not None
+                    else None
+                )
                 if (
                     current is not None
                     and data.apply_summary is not None
@@ -731,7 +790,7 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         # The refresh callback normally queued this object already. Assign it
         # explicitly so the worker always drains the coordinator's newest
         # coherent snapshot, never an intermediate listener snapshot.
-        self._pending_update_data = fresh_data
+        self._pending_update_data = self._resolve_current_state(fresh_data)
         return True
 
     async def _async_apply_hardware_writes(self, data: CoordinatorData | None) -> None:

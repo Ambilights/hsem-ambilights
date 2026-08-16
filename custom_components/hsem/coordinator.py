@@ -123,6 +123,7 @@ from custom_components.hsem.utils.prediction_tracker import (
     PredictionTracker,
     _action_label,
 )
+from custom_components.hsem.utils.price_forecast import build_price_forecast
 from custom_components.hsem.utils.recommendations import Recommendations
 from custom_components.hsem.utils.solar_corrector import SolarForecastCorrector
 from custom_components.hsem.utils.units import (
@@ -176,10 +177,17 @@ type _PriceSlotSignature = tuple[
     _PriceChannelSignature,
     _PriceChannelSignature,
 ]
+type _ValuationForecastSignature = tuple[
+    bool,
+    float,
+    float,
+    tuple[tuple[str, float], ...],
+]
 type _PriceForecastSignature = tuple[
     _PriceChannelSignature,
     _PriceChannelSignature,
     tuple[_PriceSlotSignature, ...],
+    _ValuationForecastSignature,
 ]
 
 
@@ -217,6 +225,10 @@ def _price_forecast_signature(
     recommendations: list[HourlyRecommendation],
     live: LiveState,
     now: datetime,
+    *,
+    valuation_attributes: dict[str, Any] | None = None,
+    valuation_enabled: bool = False,
+    valuation_margin: float = 0.0,
 ) -> _PriceForecastSignature:
     """Return the canonical live and future populated price/PV authority."""
     now_utc = utc_key(now)
@@ -236,6 +248,25 @@ def _price_forecast_signature(
         )
         for rec in future_slots
     )
+    valuation = build_price_forecast(
+        valuation_attributes,
+        enabled=valuation_enabled,
+        margin=valuation_margin,
+    )
+    valuation_signature: _ValuationForecastSignature = (
+        valuation.enabled,
+        round(valuation.mae, 5),
+        round(valuation.margin, 5),
+        tuple(
+            sorted(
+                (
+                    utc_key(point.start).isoformat(),
+                    round(point.value, 5),
+                )
+                for point in valuation.points
+            )
+        ),
+    )
     return (
         _canonical_price_channel(
             live.import_electricity_price,
@@ -246,6 +277,7 @@ def _price_forecast_signature(
             live.export_electricity_price_available,
         ),
         slots,
+        valuation_signature,
     )
 
 
@@ -1574,10 +1606,17 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 # pending consumption history prevents a planner run below.
                 self._hourly_recommendation = price_outage_hold
                 state = price_outage_hold.recommendation
+            price_forecast_attributes = _price_forecast_attributes(
+                self._snapshot,
+                cfg,
+            )
             price_forecast_signature = _price_forecast_signature(
                 self._hourly_recommendations,
                 live,
                 now,
+                valuation_attributes=price_forecast_attributes,
+                valuation_enabled=cfg.price_forecast_valuation_enabled,
+                valuation_margin=cfg.price_forecast_valuation_margin,
             )
             price_authority_changed = price_forecast_signature != getattr(
                 self, "_last_plan_price_forecast_signature", None
@@ -1725,9 +1764,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                         capacity_learner=getattr(
                             self, "_capacity_learner", CapacityLearner()
                         ),
-                        price_forecast_attributes=_price_forecast_attributes(
-                            self._snapshot, cfg
-                        ),
+                        price_forecast_attributes=price_forecast_attributes,
                     )
                     # Wire the solar forecast corrector into the planner input so
                     # populate_solcast can apply per-hour accuracy corrections (issue #602).

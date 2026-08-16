@@ -888,6 +888,62 @@ class TestFlowValidatorsUseConfigValidator:
         assert errors == {}
 
     @pytest.mark.asyncio
+    async def test_validate_prices_requires_valuation_sensor_when_enabled(self):
+        from custom_components.hsem.flows.prices import validate_prices_input
+
+        hass = _hass_with_states("sensor.import", "sensor.export")
+        errors = await validate_prices_input(
+            hass,
+            {
+                "hsem_import_electricity_price_sensor": "sensor.import",
+                "hsem_export_electricity_price_sensor": "sensor.export",
+                "hsem_price_forecast_valuation_enabled": True,
+                "hsem_export_electricity_min_price": -0.05,
+                "hsem_electricity_price_update_interval": "15",
+            },
+        )
+
+        assert errors == {"hsem_price_forecast_valuation_sensor": "required"}
+
+    @pytest.mark.asyncio
+    async def test_validate_prices_checks_enabled_valuation_sensor(self):
+        from custom_components.hsem.flows.prices import validate_prices_input
+
+        hass = _hass_with_states("sensor.import", "sensor.export")
+        errors = await validate_prices_input(
+            hass,
+            {
+                "hsem_import_electricity_price_sensor": "sensor.import",
+                "hsem_export_electricity_price_sensor": "sensor.export",
+                "hsem_price_forecast_valuation_enabled": True,
+                "hsem_price_forecast_valuation_sensor": "sensor.valuation",
+                "hsem_export_electricity_min_price": -0.05,
+                "hsem_electricity_price_update_interval": "15",
+            },
+        )
+
+        assert errors == {"hsem_price_forecast_valuation_sensor": "entity_not_found"}
+
+    @pytest.mark.asyncio
+    async def test_validate_prices_ignores_valuation_sensor_when_disabled(self):
+        from custom_components.hsem.flows.prices import validate_prices_input
+
+        hass = _hass_with_states("sensor.import", "sensor.export")
+        errors = await validate_prices_input(
+            hass,
+            {
+                "hsem_import_electricity_price_sensor": "sensor.import",
+                "hsem_export_electricity_price_sensor": "sensor.export",
+                "hsem_price_forecast_valuation_enabled": False,
+                "hsem_price_forecast_valuation_sensor": "sensor.deleted",
+                "hsem_export_electricity_min_price": -0.05,
+                "hsem_electricity_price_update_interval": "15",
+            },
+        )
+
+        assert errors == {}
+
+    @pytest.mark.asyncio
     async def test_validate_solcast_entity_not_found(self):
         from custom_components.hsem.flows.solcast import validate_solcast_step_input
 

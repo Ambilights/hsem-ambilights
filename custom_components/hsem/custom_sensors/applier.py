@@ -972,9 +972,9 @@ async def async_apply_battery_settings(
     #   "charge" with no surplus       costs nothing
     #   "fed_to_grid" with surplus     sells it at the export price
     #
-    # Exporting is the intent in exactly two modes.  apply_excess_export has
-    # already priced the whole horizon in step 3 of run_planner and marks those
-    # slots itself; a plain wait slot is not an export decision, so routing
+    # Exporting is intentional in exactly two modes.  Intentional battery
+    # export is selected by the MILP; ForceExport is the separate PV-only
+    # export mode.  A plain wait slot is not an export decision, so routing
     # surplus there sells energy nobody decided to sell.  Observed on the
     # target installation: a wait slot latched fed_to_grid at a 179 W PV
     # deficit, PV then climbed to 7.6 kW over seven minutes, and the surplus
