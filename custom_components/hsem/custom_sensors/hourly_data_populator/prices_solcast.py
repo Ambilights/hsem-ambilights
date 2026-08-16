@@ -110,7 +110,9 @@ async def async_populate_price_and_solcast(
         cfg.solcast_pv_forecast_forecast_likelihood,
         price_source_minutes,
     )
-    # Import price — fallback to dedicated forecast sensor if configured
+    # Import price — gap-fill only from the dedicated forecast sensor.  A
+    # prediction must never displace a published price, so slots the primary
+    # source already covered are left alone.
     if cfg.import_electricity_price_forecast_sensor:
         import_matched += await _async_update_hourly_field(
             sensor,
@@ -120,6 +122,7 @@ async def async_populate_price_and_solcast(
             price_share,
             cfg.solcast_pv_forecast_forecast_likelihood,
             price_source_minutes,
+            only_if_missing=True,
         )
     if import_matched == 0:
         _LOGGER.warning(
@@ -139,7 +142,7 @@ async def async_populate_price_and_solcast(
         cfg.solcast_pv_forecast_forecast_likelihood,
         price_source_minutes,
     )
-    # Export price — fallback to dedicated forecast sensor
+    # Export price — gap-fill only, same contract as the import channel.
     if cfg.export_electricity_price_forecast_sensor:
         export_matched += await _async_update_hourly_field(
             sensor,
@@ -149,6 +152,7 @@ async def async_populate_price_and_solcast(
             price_share,
             cfg.solcast_pv_forecast_forecast_likelihood,
             price_source_minutes,
+            only_if_missing=True,
         )
     if export_matched == 0:
         _LOGGER.warning(
@@ -197,6 +201,19 @@ async def async_populate_price_and_solcast(
 # ---------------------------------------------------------------------------
 
 
+def _availability_attr(field_name: str) -> str | None:
+    """Return the availability flag paired with ``field_name``, if any.
+
+    The PV estimate does not follow the ``<field>_available`` convention, so
+    the mapping is explicit rather than derived.
+    """
+    if field_name in {"import_price", "export_price"}:
+        return f"{field_name}_available"
+    if field_name == "solcast_pv_estimate_kwh":
+        return "solcast_pv_estimate_available"
+    return None
+
+
 async def _async_update_hourly_field(
     sensor: Any,  # NOSONAR -- HA internal type; circular import risk
     recommendations: list[HourlyRecommendation],
@@ -205,6 +222,7 @@ async def _async_update_hourly_field(
     share: float,
     solcast_likelihood_key: str,
     source_interval_minutes: int,
+    only_if_missing: bool = False,
 ) -> int:
     """Match sensor attribute data to recommendation slots and write one field.
 
@@ -215,9 +233,12 @@ async def _async_update_hourly_field(
         field_name: Attribute name on :class:`HourlyRecommendation` to set.
         share: Divisor applied to each raw value (accounts for sub-hourly slots).
         solcast_likelihood_key: Attribute key for Solcast PV estimate field.
+        only_if_missing: When True, leave slots whose channel is already
+            available untouched.  Used for the dedicated forecast sensors so a
+            prediction cannot overwrite a published price.
 
     Returns:
-        Number of data points successfully matched to at least one slot.
+        Number of data points successfully written to at least one slot.
     """
     if sensor_id is None:
         return 0
@@ -261,6 +282,7 @@ async def _async_update_hourly_field(
         "forecasts": [{"k": "start_time", "v": "per_kwh"}],
     }
 
+    avail_attr = _availability_attr(field_name)
     matched = 0
     for attr, kv_list in data_sources.items():
         if not _tomorrow_attribute_available(sensor_state.attributes, attr):
@@ -327,11 +349,15 @@ async def _async_update_hourly_field(
                     # all four quarter-hour prices onto one key (issue #720).
                     obj_start = utc_key(normalize_datetime(obj.start))
                     if window_start <= obj_start < window_end:
+                        if (
+                            only_if_missing
+                            and avail_attr is not None
+                            and getattr(obj, avail_attr, False)
+                        ):
+                            continue
                         setattr(obj, field_name, round(value, 5))
-                        if field_name in {"import_price", "export_price"}:
-                            setattr(obj, f"{field_name}_available", True)
-                        elif field_name == "solcast_pv_estimate_kwh":
-                            obj.solcast_pv_estimate_available = True
+                        if avail_attr is not None:
+                            setattr(obj, avail_attr, True)
                         matched += 1
 
     return matched
@@ -372,6 +398,7 @@ def populate_price_and_solcast_from_snapshot(
         cfg.solcast_pv_forecast_forecast_likelihood,
         price_source_minutes,
     )
+    # Gap-fill only — a prediction must never displace a published price.
     if cfg.import_electricity_price_forecast_sensor:
         import_matched += _update_hourly_field_from_attrs(
             recommendations,
@@ -382,6 +409,7 @@ def populate_price_and_solcast_from_snapshot(
             price_share,
             cfg.solcast_pv_forecast_forecast_likelihood,
             price_source_minutes,
+            only_if_missing=True,
         )
     if import_matched == 0:
         _LOGGER.warning(
@@ -409,6 +437,7 @@ def populate_price_and_solcast_from_snapshot(
             price_share,
             cfg.solcast_pv_forecast_forecast_likelihood,
             price_source_minutes,
+            only_if_missing=True,
         )
     if export_matched == 0:
         _LOGGER.warning(
@@ -455,6 +484,7 @@ def _update_hourly_field_from_attrs(
     share: float,
     solcast_likelihood_key: str,
     source_interval_minutes: int,
+    only_if_missing: bool = False,
 ) -> int:
     """Match pre-read sensor attribute data to recommendation slots.
 
@@ -468,9 +498,12 @@ def _update_hourly_field_from_attrs(
         field_name: Attribute name on :class:`HourlyRecommendation` to set.
         share: Divisor applied to each raw value.
         solcast_likelihood_key: Attribute key for Solcast PV estimate field.
+        only_if_missing: When True, leave slots whose channel is already
+            available untouched.  Used for the dedicated forecast sensors so a
+            prediction cannot overwrite a published price.
 
     Returns:
-        Number of data points successfully matched to at least one slot.
+        Number of data points successfully written to at least one slot.
     """
     if attributes is None:
         return 0
@@ -503,6 +536,7 @@ def _update_hourly_field_from_attrs(
         "forecasts": [{"k": "start_time", "v": "per_kwh"}],
     }
 
+    avail_attr = _availability_attr(field_name)
     matched = 0
     for attr, kv_list in data_sources.items():
         if not _tomorrow_attribute_available(attributes, attr):
@@ -542,11 +576,15 @@ def _update_hourly_field_from_attrs(
                 for obj in recommendations:
                     obj_start = utc_key(normalize_datetime(obj.start))
                     if window_start <= obj_start < window_end:
+                        if (
+                            only_if_missing
+                            and avail_attr is not None
+                            and getattr(obj, avail_attr, False)
+                        ):
+                            continue
                         setattr(obj, field_name, round(value, 5))
-                        if field_name in {"import_price", "export_price"}:
-                            setattr(obj, f"{field_name}_available", True)
-                        elif field_name == "solcast_pv_estimate_kwh":
-                            obj.solcast_pv_estimate_available = True
+                        if avail_attr is not None:
+                            setattr(obj, avail_attr, True)
                         matched += 1
 
     return matched
