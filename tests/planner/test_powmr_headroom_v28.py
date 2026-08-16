@@ -51,6 +51,7 @@ def _commands(
     battery_power_w: float | None,
     recommendation: str = Recommendations.BatteriesWaitMode.value,
     secondary_mode: str = SECONDARY_MODE_CHARGE,
+    meter_w: float = MASKED_METER_W,
 ) -> PhaseAwareChargeCommands:
     cfg = SensorConfig()
     cfg.phase_aware_charging_enabled = True
@@ -63,11 +64,7 @@ def _commands(
     cfg.secondary_storage.min_charge_current_a = 10.0
     cfg.secondary_storage.max_charge_current_a = 60.0
     live = LiveState()
-    live.grid_phase_power_w = (
-        MASKED_METER_W,
-        MASKED_METER_W,
-        MASKED_METER_W,
-    )
+    live.grid_phase_power_w = (meter_w, meter_w, meter_w)
     live.huawei_batteries_charge_discharge_power_w = battery_power_w
     live.huawei_batteries_max_charge_power_w = 10000.0
     start = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
@@ -149,3 +146,65 @@ class TestBatteryTelemetryRequiredForEitherActuator:
 
         assert cmds.recommendation.secondary_storage_mode == SECONDARY_MODE_UTILITY
         assert cmds.primary_grid_charge_power_w is None
+
+
+class TestContributionMapping:
+    """Remove the present contribution only when the command will change it.
+
+    Three overload paths in this function were one gap: the contribution was
+    removed on the assumption it would stop, while the "add back" side was
+    populated for ``BatteriesChargeGrid`` alone.  Deciding from the
+    recommendation closes the class.
+    """
+
+    SOLAR = Recommendations.BatteriesChargeSolar.value
+    CHARGING_W = 4500.0 * 0.98
+    DISCHARGING_W = -9000.0
+
+    def test_a_continuing_solar_charge_stays_in_the_base(self) -> None:
+        """MaximizeSelfConsumption keeps charging, so its draw is still there."""
+        cmds = _commands(battery_power_w=self.CHARGING_W, recommendation=self.SOLAR)
+
+        assert cmds.limits is not None
+        assert cmds.limits.base_phase_power_w[2] == pytest.approx(
+            MASKED_METER_W, abs=1.0
+        )
+
+    def test_a_discharge_is_removed_even_on_a_solar_slot(self) -> None:
+        """It stops when the battery switches to charging."""
+        cmds = _commands(battery_power_w=self.DISCHARGING_W, recommendation=self.SOLAR)
+
+        assert cmds.limits is not None
+        assert cmds.limits.base_phase_power_w[2] == pytest.approx(
+            TRUE_HOUSE_W, abs=50.0
+        )
+
+    @pytest.mark.parametrize(
+        "recommendation",
+        [
+            Recommendations.BatteriesWaitMode.value,
+            Recommendations.BatteriesDischargeMode.value,
+            Recommendations.BatteriesChargeGrid.value,
+        ],
+    )
+    def test_every_other_mode_removes_the_contribution(
+        self, recommendation: str
+    ) -> None:
+        cmds = _commands(
+            battery_power_w=self.DISCHARGING_W, recommendation=recommendation
+        )
+
+        assert cmds.limits is not None
+        assert cmds.limits.base_phase_power_w[2] == pytest.approx(
+            TRUE_HOUSE_W, abs=50.0
+        )
+
+    def test_powmr_stays_under_the_fuse_on_a_solar_slot(self) -> None:
+        """The reproduced overload: 20.2 A on a 16 A phase before the fix."""
+        cfg_meter_loaded = _commands(
+            battery_power_w=self.CHARGING_W, recommendation=self.SOLAR
+        )
+        amps = cfg_meter_loaded.recommendation.secondary_storage_charge_current_a
+        powmr_ac_w = amps * VOLT / EFF
+
+        assert MASKED_METER_W + powmr_ac_w <= PHASE_LIMIT_W

@@ -35,6 +35,49 @@ class PhaseAwareChargeCommands:
     limits: PhaseChargeLimits | None = None
 
 
+def _primary_contribution_changes(
+    rec: HourlyRecommendation, battery_power_w: float | None
+) -> bool:
+    """Return whether the Huawei's present grid contribution is about to change.
+
+    ``compute_phase_charge_limits`` subtracts the Huawei's current contribution
+    from the meter snapshot when this is true, so ``base`` becomes "house load
+    without the battery" and the planned primary draw is added back on top.
+    That is right only when the upcoming command actually changes what the
+    Huawei is doing.  Charging the battery shifts net grid power by its full AC
+    draw whether PV or the grid funds it, so a charge that *continues* has to
+    stay inside the base instead.
+
+    ======================  ==========================================
+    upcoming recommendation  present contribution
+    ======================  ==========================================
+    ChargeGrid              replaced by the planned grid-charge power
+    ChargeSolar, charging    kept — MaximizeSelfConsumption continues it
+    ChargeSolar, discharging removed — the discharge stops
+    Wait / discharge modes   removed, nothing added back (conservative:
+                             assumes the battery stops helping)
+    ======================  ==========================================
+
+    Three overload paths in this function were all one gap: the contribution
+    was removed on the assumption it would stop, while the "add back" side was
+    populated for ``ChargeGrid`` alone.  Deciding from the recommendation
+    closes the class rather than another instance.
+
+    Args:
+        rec: The recommendation about to be applied.
+        battery_power_w: Present Huawei battery power, positive when charging.
+
+    Returns:
+        ``True`` when the present contribution should be removed from the base.
+    """
+    if rec.recommendation != Recommendations.BatteriesChargeSolar.value:
+        return True
+    # Solar charging continues under MaximizeSelfConsumption, so its draw is
+    # still on the phase after the command.  A battery that is discharging now
+    # will stop when it switches to charging, so that one is still removed.
+    return not (battery_power_w is not None and battery_power_w > 0.0)
+
+
 def _blocked_commands(
     rec: HourlyRecommendation, reason: str
 ) -> PhaseAwareChargeCommands:
@@ -172,19 +215,8 @@ def build_phase_aware_charge_commands(
         measured_phase_power_w=measured_phase_power_w,
         fuse_amps=float(cfg.main_fuse_amps),
         desired_primary_charge_power_w=desired_primary_w,
-        # Remove the Huawei's present contribution whenever *any* charge is
-        # being sized, not only when the Huawei itself is grid-charging.
-        #
-        # async_apply_battery_settings runs before async_apply_secondary_storage,
-        # so a plan of "Huawei Wait + PowMr Charge" stops the Huawei's discharge
-        # first and only then starts the PowMr.  Leaving that discharge inside
-        # the base made the meter's suppressed import read as spare capacity:
-        # 3 kW/phase of house load hidden behind a 9 kW discharge shows ~60 W on
-        # the meter, authorising the PowMr's full 60 A — 20 A on a 16 A phase
-        # once the discharge stops.  Removing it first makes ``base`` mean
-        # "house load without the battery", which is the reference the planned
-        # primary draw is then added back to.
-        primary_is_controlled=charging,
+        primary_is_controlled=_primary_contribution_changes(rec, battery_power_w)
+        and charging,
         # Validated above whenever a charge is being sized, so this is finite
         # here.  Gating it on ``primary_grid_charge`` — as an earlier version
         # did — silently passed 0.0 on a "Huawei Wait + PowMr Charge" slot, so
