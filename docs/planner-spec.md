@@ -1199,6 +1199,46 @@ so the LP's decisions and the selector's score never diverge.
 - The differential uses the sanitised import price (`max(p_imp, 0)`) so
   negative import prices cannot artificially inflate the terminal premium.
 
+##### Where `replacement_price` comes from
+
+`replacement_price_from_next_discharge()` values stored energy from the first
+contiguous upcoming discharge block whose slots are `price_actionable`. On a
+day-ahead market the actionable prefix ends where publication does, so past
+that point there is nothing to compare against and the battery has no reason
+to fill today for an expensive tomorrow.
+
+When `PlannerInput.price_forecast` is populated (opt-in, off by default), the
+predicted unpublished tail is valued by the same rule — the mean of its `top_n`
+dearest prices — and the **higher of the two wins**:
+
+```
+replacement_price = max(published_only, forecast_derived)
+```
+
+`resolve_secondary_terminal_price()` applies the identical `max()` rule for the
+secondary storage, using its own mean-of-window aggregation rather than
+`top_n`, because a dedicated load spends stored energy across the window
+instead of concentrating it on the dearest hour.
+
+Two invariants hold, and both are covered by tests:
+
+1. **Charge-only.** Taking the maximum means a cheap forecast collapses to the
+   published-only value. A prediction can raise the worth of stored energy —
+   encouraging charging — but can never lower it into justifying a discharge or
+   an export.
+2. **Never actionable.** Forecast points live only in
+   `PlannerInput.price_forecast`. They never populate `PlannedSlot.price`, never
+   extend `price_actionable`, and are passed to no other function, so no
+   actuator, MILP bound, or export decision can observe one. The isolation is
+   structural rather than a flag each consumer must check.
+
+Every predicted price is reduced by `mae + margin` before use, where `mae` is
+the source's own published error for that horizon and `margin` is an operator
+haircut defaulting to `0`. A confidence *interval* is deliberately not used:
+on the reference feed the 80 % lower bound proved flat across a whole day
+(0.001–0.021 SEK/kWh through an evening peak whose point estimate was 0.752),
+carrying no shape and clearing no break-even test.
+
 The post-hoc `terminal_soc_credit` calculation in the diagnostics dict is
 retained as a consistency check but no longer drives the LP's decisions.
 
