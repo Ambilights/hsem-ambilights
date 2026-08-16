@@ -38,30 +38,30 @@ class PhaseAwareChargeCommands:
 def _primary_contribution_changes(
     rec: HourlyRecommendation, battery_power_w: float | None
 ) -> bool:
-    """Return whether the Huawei's present grid contribution is about to change.
+    """Return whether the Huawei's present grid contribution is about to stop.
 
-    ``compute_phase_charge_limits`` subtracts the Huawei's current contribution
-    from the meter snapshot when this is true, so ``base`` becomes "house load
-    without the battery" and the planned primary draw is added back on top.
-    That is right only when the upcoming command actually changes what the
-    Huawei is doing.  Charging the battery shifts net grid power by its full AC
-    draw whether PV or the grid funds it, so a charge that *continues* has to
-    stay inside the base instead.
+    ``compute_phase_charge_limits`` subtracts the present contribution when this
+    is true, so ``base`` becomes "house load without the battery" and the
+    planned primary draw is added back on top.  Removing a contribution that
+    actually persists overstates the headroom left for the PowMr.
 
-    ======================  ==========================================
-    upcoming recommendation  present contribution
-    ======================  ==========================================
-    ChargeGrid              replaced by the planned grid-charge power
-    ChargeSolar, charging    kept — MaximizeSelfConsumption continues it
-    ChargeSolar, discharging removed — the discharge stops
-    Wait / discharge modes   removed, nothing added back (conservative:
-                             assumes the battery stops helping)
-    ======================  ==========================================
+    The decision is made from the **direction of the current battery power**,
+    not from the recommendation label:
 
-    Three overload paths in this function were all one gap: the contribution
-    was removed on the assumption it would stop, while the "add back" side was
-    populated for ``ChargeGrid`` alone.  Deciding from the recommendation
-    closes the class rather than another instance.
+    - A **charge** is kept in the base.  Only a controlled grid charge replaces
+      it with a known target; every other mode may let it continue, because the
+      Huawei keeps absorbing surplus PV under MaximizeSelfConsumption *and*
+      under TimeOfUse whenever ``excess_pv_energy_use_in_tou`` is ``charge``.
+    - A **discharge** is removed.  Assuming the house loses that support is the
+      conservative direction, and a discharge genuinely stops in wait, charge
+      and hold modes.
+
+    An earlier version decided from the label and enumerated the modes that
+    keep charging.  That could not hold: ``engine_core`` relabels *any* slot
+    carrying EV load to ``EVSmartCharging``, so the same physical solar charge
+    was treated differently depending on whether an EV happened to be charging
+    in that slot.  Direction is a property of the hardware; the label is a
+    property of the dashboard.
 
     Args:
         rec: The recommendation about to be applied.
@@ -70,12 +70,13 @@ def _primary_contribution_changes(
     Returns:
         ``True`` when the present contribution should be removed from the base.
     """
-    if rec.recommendation != Recommendations.BatteriesChargeSolar.value:
+    if battery_power_w is None or battery_power_w <= 0.0:
+        # Idle or discharging: nothing to preserve, and removing a discharge is
+        # the conservative assumption.
         return True
-    # Solar charging continues under MaximizeSelfConsumption, so its draw is
-    # still on the phase after the command.  A battery that is discharging now
-    # will stop when it switches to charging, so that one is still removed.
-    return not (battery_power_w is not None and battery_power_w > 0.0)
+    # Charging.  Only a controlled grid charge substitutes a known target for
+    # it; anything else may let it continue at its present rate.
+    return rec.recommendation == Recommendations.BatteriesChargeGrid.value
 
 
 def _blocked_commands(

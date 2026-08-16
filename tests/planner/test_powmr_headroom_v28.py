@@ -148,48 +148,63 @@ class TestBatteryTelemetryRequiredForEitherActuator:
         assert cmds.primary_grid_charge_power_w is None
 
 
-class TestContributionMapping:
-    """Remove the present contribution only when the command will change it.
+class TestContributionDirection:
+    """Decide from battery direction, not the recommendation label.
 
-    Three overload paths in this function were one gap: the contribution was
-    removed on the assumption it would stop, while the "add back" side was
-    populated for ``BatteriesChargeGrid`` alone.  Deciding from the
-    recommendation closes the class.
+    ``engine_core`` relabels *any* slot carrying EV load to
+    ``EVSmartCharging``, so a label-based rule treated the same physical solar
+    charge differently depending on whether an EV happened to be charging.  The
+    Huawei also keeps absorbing surplus PV under TimeOfUse whenever
+    ``excess_pv_energy_use_in_tou`` is ``charge``, which no label reveals.
     """
 
-    SOLAR = Recommendations.BatteriesChargeSolar.value
     CHARGING_W = 4500.0 * 0.98
     DISCHARGING_W = -9000.0
-
-    def test_a_continuing_solar_charge_stays_in_the_base(self) -> None:
-        """MaximizeSelfConsumption keeps charging, so its draw is still there."""
-        cmds = _commands(battery_power_w=self.CHARGING_W, recommendation=self.SOLAR)
-
-        assert cmds.limits is not None
-        assert cmds.limits.base_phase_power_w[2] == pytest.approx(
-            MASKED_METER_W, abs=1.0
-        )
-
-    def test_a_discharge_is_removed_even_on_a_solar_slot(self) -> None:
-        """It stops when the battery switches to charging."""
-        cmds = _commands(battery_power_w=self.DISCHARGING_W, recommendation=self.SOLAR)
-
-        assert cmds.limits is not None
-        assert cmds.limits.base_phase_power_w[2] == pytest.approx(
-            TRUE_HOUSE_W, abs=50.0
-        )
+    LOADED_METER_W = 3000.0
 
     @pytest.mark.parametrize(
         "recommendation",
         [
+            Recommendations.BatteriesChargeSolar.value,
+            Recommendations.EVSmartCharging.value,
             Recommendations.BatteriesWaitMode.value,
             Recommendations.BatteriesDischargeMode.value,
-            Recommendations.BatteriesChargeGrid.value,
         ],
     )
-    def test_every_other_mode_removes_the_contribution(
+    def test_a_charge_is_kept_whatever_the_label_says(
         self, recommendation: str
     ) -> None:
+        cmds = _commands(
+            battery_power_w=self.CHARGING_W,
+            recommendation=recommendation,
+            meter_w=self.LOADED_METER_W,
+        )
+
+        assert cmds.limits is not None
+        assert cmds.limits.base_phase_power_w[2] == pytest.approx(
+            self.LOADED_METER_W, abs=1.0
+        )
+
+    def test_a_controlled_grid_charge_replaces_it(self) -> None:
+        """Only this mode substitutes a known target for the present draw."""
+        cmds = _commands(
+            battery_power_w=self.CHARGING_W,
+            recommendation=Recommendations.BatteriesChargeGrid.value,
+            meter_w=self.LOADED_METER_W,
+        )
+
+        assert cmds.limits is not None
+        assert cmds.limits.base_phase_power_w[2] < self.LOADED_METER_W
+
+    @pytest.mark.parametrize(
+        "recommendation",
+        [
+            Recommendations.BatteriesChargeSolar.value,
+            Recommendations.EVSmartCharging.value,
+            Recommendations.BatteriesWaitMode.value,
+        ],
+    )
+    def test_a_discharge_is_always_removed(self, recommendation: str) -> None:
         cmds = _commands(
             battery_power_w=self.DISCHARGING_W, recommendation=recommendation
         )
@@ -199,12 +214,13 @@ class TestContributionMapping:
             TRUE_HOUSE_W, abs=50.0
         )
 
-    def test_powmr_stays_under_the_fuse_on_a_solar_slot(self) -> None:
-        """The reproduced overload: 20.2 A on a 16 A phase before the fix."""
-        cfg_meter_loaded = _commands(
-            battery_power_w=self.CHARGING_W, recommendation=self.SOLAR
+    def test_the_relabelled_slot_stays_under_the_fuse(self) -> None:
+        """The route a label-based rule missed: 22 A before this fix."""
+        cmds = _commands(
+            battery_power_w=self.CHARGING_W,
+            recommendation=Recommendations.EVSmartCharging.value,
+            meter_w=self.LOADED_METER_W,
         )
-        amps = cfg_meter_loaded.recommendation.secondary_storage_charge_current_a
-        powmr_ac_w = amps * VOLT / EFF
+        amps = cmds.recommendation.secondary_storage_charge_current_a
 
-        assert MASKED_METER_W + powmr_ac_w <= PHASE_LIMIT_W
+        assert self.LOADED_METER_W + amps * VOLT / EFF <= PHASE_LIMIT_W
