@@ -920,14 +920,6 @@ async def async_apply_battery_settings(
             # Unrecognised recommendation — nothing to apply.
             return summary
 
-    wait_mode_self_consumption = (
-        recommendation == Recommendations.BatteriesWaitMode.value
-        and cfg.batteries_wait_mode_behavior == "self_consumption_with_reserve"
-        and not rec.primary_battery_hold
-        and working_mode == WorkingModes.MaximizeSelfConsumption.value
-        and not ev_active
-    )
-
     # The new Fully Fed path never starts forcible discharge. Clean up only a
     # command left active by an older release, a manual action, or a failed
     # transition before applying any new battery mode.
@@ -971,29 +963,38 @@ async def async_apply_battery_settings(
             return summary
         current_discharge_cap_w = float(pre_mode_cap_w)
 
-    # Excess PV use in TOU — fed_to_grid for strict wait/fully-fed modes, charge
-    # otherwise.  Wait-mode self-consumption keeps excess PV in the battery so
-    # the surplus above the reserve can be used for household self-consumption.
-    # Both export recommendations map to FullyFedToGrid. The power cap
-    # distinguishes PV-only export from planned battery export.
-    ev_smart_holds_primary = (
-        recommendation == Recommendations.EVSmartCharging.value
-        and rec.primary_battery_hold
+    # Excess PV use in TOU.
+    #
+    # Routing surplus PV to the grid is an *export decision*, and this setting
+    # latches in hardware until the next coordinator cycle — so it is applied
+    # from one snapshot and then governs however much surplus appears over the
+    # following minutes.  That asymmetry matters:
+    #
+    #   "charge" with no surplus       costs nothing
+    #   "fed_to_grid" with surplus     sells it at the export price
+    #
+    # Exporting is the intent in exactly two modes.  apply_excess_export has
+    # already priced the whole horizon in step 3 of run_planner and marks those
+    # slots itself; a plain wait slot is not an export decision, so routing
+    # surplus there sells energy nobody decided to sell.  Observed on the
+    # target installation: a wait slot latched fed_to_grid at a 179 W PV
+    # deficit, PV then climbed to 7.6 kW over seven minutes, and the surplus
+    # left at 0.066 against an import price of 0.907.
+    #
+    # The exception is a validated MILP idle allocation.  primary_battery_hold
+    # is an explicit zero-energy decision for the primary battery, and charging
+    # into it would execute energy absent from the solved flow fields — the
+    # plan-versus-command divergence class of v27/v28.
+    export_is_intended = recommendation in (
+        Recommendations.ForceExport.value,
+        Recommendations.ForceBatteriesDischarge.value,
+    )
+    primary_explicitly_held = rec.primary_battery_hold and recommendation in (
+        Recommendations.BatteriesWaitMode.value,
+        Recommendations.EVSmartCharging.value,
     )
     desired_excess = (
-        "charge"
-        if wait_mode_self_consumption
-        else (
-            "fed_to_grid"
-            if recommendation
-            in (
-                Recommendations.BatteriesWaitMode.value,
-                Recommendations.ForceExport.value,
-                Recommendations.ForceBatteriesDischarge.value,
-            )
-            or ev_smart_holds_primary
-            else "charge"
-        )
+        "fed_to_grid" if export_is_intended or primary_explicitly_held else "charge"
     )
     if live.huawei_batteries_excess_pv_use_in_tou != desired_excess:
         excess_entity = cfg.huawei_solar_batteries_excess_pv_energy_use_in_tou
