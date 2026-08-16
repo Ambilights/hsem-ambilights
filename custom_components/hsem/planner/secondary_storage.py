@@ -110,10 +110,14 @@ def resolve_secondary_terminal_price(
 ) -> float | None:
     """Return the configured or horizon-tail value of stored secondary energy.
 
-    With ``forecast`` supplied, the predicted unpublished tail is valued by the
-    same rule this function already uses for published prices — the mean of the
-    window, discounted for discharge efficiency — and the higher of the two
-    wins, so a prediction can only raise the worth of stored energy.
+    With ``forecast`` supplied, only its points beyond the published prefix are
+    eligible — a prediction never competes with a real price — and those are
+    valued by the same rule this function already uses for published prices:
+    the mean of the window, discounted for discharge efficiency.  The higher of
+    the two then wins, so a prediction can only raise the worth of stored
+    energy.  The filter matters more here than on the primary side, because a
+    mean taken over overlapping published and predicted estimates of the same
+    hours is arbitrary rather than merely conservative.
 
     The mean is deliberate rather than a peak: the PowMr serves its dedicated
     load continuously, so stored energy is spent across the window rather than
@@ -126,7 +130,7 @@ def resolve_secondary_terminal_price(
         return max(config.replacement_price_per_kwh, 0.0)
 
     discharge_eff = clamp_efficiency(config.discharge_efficiency_pct)
-    predicted = forecast_effective_prices(forecast, now)
+    predicted = forecast_effective_prices(forecast, now, slots)
     predicted_value = (
         (sum(predicted) / len(predicted)) * discharge_eff if predicted else None
     )

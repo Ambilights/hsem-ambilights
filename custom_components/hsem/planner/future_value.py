@@ -12,28 +12,63 @@ from custom_components.hsem.utils.datetime_utils import utc_key
 from custom_components.hsem.utils.recommendations import DISCHARGE_RECS
 
 
+def published_horizon_end(
+    slots: Sequence[PlannedSlot],
+    now: datetime,
+) -> datetime | None:
+    """Return the end of the contiguous future prefix that carries real prices.
+
+    ``price_actionable`` is set only across that prefix and is closed
+    permanently at its first gap (see ``engine_population``), so the furthest
+    actionable end *is* the boundary between published and unpublished.
+
+    ``None`` means nothing ahead is published.
+    """
+    now_utc = utc_key(now)
+    end: datetime | None = None
+    for slot in slots:
+        if utc_key(slot.end) <= now_utc or not slot.price_actionable:
+            continue
+        slot_end = utc_key(slot.end)
+        if end is None or slot_end > end:
+            end = slot_end
+    return end
+
+
 def forecast_effective_prices(
     forecast: PriceForecast | None,
     now: datetime,
+    slots: Sequence[PlannedSlot] = (),
 ) -> list[float]:
-    """Return future predicted prices after the confidence haircut.
+    """Return predicted prices for the unpublished tail, after the haircut.
 
-    Each point is reduced by the source's own published error plus any
-    operator margin, floored at zero, so a valuation is only ever taken on
-    margin that survives the forecast's measured accuracy.  Points at or
-    before ``now`` are dropped: the past cannot be charged for.
+    A prediction is only ever a stand-in for a price the market has not
+    published yet.  Once real prices exist for a slot the forecast has nothing
+    to add there and must not compete with them, so every point falling inside
+    the published prefix is dropped.  Without that filter an over-optimistic
+    forecast could beat a published price through the callers' ``max()`` and
+    size a plan on fiction while the real answer was already known.
 
-    Returns an empty list when the feature is off or the feed is empty, which
-    callers treat as "no forecast contribution" rather than "worth nothing".
+    Each surviving point is reduced by the source's own published error plus
+    any operator margin, floored at zero, so a valuation is only taken on
+    margin that survives the forecast's measured accuracy.  Points at or before
+    ``now`` are dropped: the past cannot be charged for.
+
+    Returns an empty list when the feature is off, the feed is empty, or the
+    whole feed is already published — all of which callers treat as "no
+    forecast contribution" rather than "worth nothing".
     """
     if forecast is None or not forecast.usable:
         return []
     now_utc = utc_key(now)
+    published_until = published_horizon_end(slots, now)
     cut = forecast.haircut
     return [
         max(point.value - cut, 0.0)
         for point in forecast.points
-        if math.isfinite(point.value) and utc_key(point.start) > now_utc
+        if math.isfinite(point.value)
+        and utc_key(point.start) > now_utc
+        and (published_until is None or utc_key(point.start) >= published_until)
     ]
 
 
@@ -50,15 +85,16 @@ def replacement_price_from_next_discharge(
     multi-day horizon must not inflate the value assigned at this horizon's
     endpoint. Only slots with published import/export prices are eligible.
 
-    When ``forecast`` is supplied, the predicted unpublished tail is valued the
-    same way — the mean of its ``top_n`` dearest haircut prices — and the
-    higher of the two wins.  Taking the maximum is what keeps the feature
-    charge-only: a cheap forecast collapses to the published-only answer, so a
-    prediction can raise the worth of stored energy but never lower it into
-    justifying a discharge.
+    When ``forecast`` is supplied, only its points beyond the published prefix
+    are eligible — a prediction never competes with a real price — and those
+    are valued the same way, as the mean of the ``top_n`` dearest haircut
+    prices.  The higher of the two then wins.  Taking the maximum is what keeps
+    the feature charge-only: a cheap forecast collapses to the published-only
+    answer, so a prediction can raise the worth of stored energy but never
+    lower it into justifying a discharge.
     """
     published = _published_replacement_price(slots, now, top_n, interval_minutes)
-    predicted = _top_n_mean(forecast_effective_prices(forecast, now), top_n)
+    predicted = _top_n_mean(forecast_effective_prices(forecast, now, slots), top_n)
     if published is None:
         return predicted
     if predicted is None:
