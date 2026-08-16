@@ -6,9 +6,11 @@ import math
 from datetime import datetime, timedelta
 
 from custom_components.hsem.models.planned_slot import PlannedSlot
+from custom_components.hsem.models.price_forecast import PriceForecast
 from custom_components.hsem.models.secondary_storage_config import (
     SecondaryStorageConfig,
 )
+from custom_components.hsem.planner.future_value import forecast_effective_prices
 from custom_components.hsem.utils.datetime_utils import utc_key
 from custom_components.hsem.utils.misc import clamp_efficiency
 from custom_components.hsem.utils.units import slot_duration_hours
@@ -104,13 +106,44 @@ def resolve_secondary_terminal_price(
     slots: list[PlannedSlot],
     config: SecondaryStorageConfig,
     now: datetime,
+    forecast: PriceForecast | None = None,
 ) -> float | None:
-    """Return the configured or horizon-tail value of stored secondary energy."""
+    """Return the configured or horizon-tail value of stored secondary energy.
+
+    With ``forecast`` supplied, the predicted unpublished tail is valued by the
+    same rule this function already uses for published prices — the mean of the
+    window, discounted for discharge efficiency — and the higher of the two
+    wins, so a prediction can only raise the worth of stored energy.
+
+    The mean is deliberate rather than a peak: the PowMr serves its dedicated
+    load continuously, so stored energy is spent across the window rather than
+    concentrated on its dearest hour.  That makes this side less sensitive to a
+    forecast peak than the primary battery's ``top_n`` valuation.
+    """
     if not config.valid:
         return None
     if config.replacement_price_per_kwh is not None:
         return max(config.replacement_price_per_kwh, 0.0)
 
+    discharge_eff = clamp_efficiency(config.discharge_efficiency_pct)
+    predicted = forecast_effective_prices(forecast, now)
+    predicted_value = (
+        (sum(predicted) / len(predicted)) * discharge_eff if predicted else None
+    )
+    published_value = _published_secondary_terminal_price(slots, discharge_eff, now)
+    if published_value is None:
+        return predicted_value
+    if predicted_value is None:
+        return published_value
+    return max(published_value, predicted_value)
+
+
+def _published_secondary_terminal_price(
+    slots: list[PlannedSlot],
+    discharge_eff: float,
+    now: datetime,
+) -> float | None:
+    """Original published-price-only horizon-tail valuation, unchanged."""
     future = [
         slot
         for slot in slots
@@ -134,5 +167,4 @@ def resolve_secondary_terminal_price(
         return None
 
     # Battery-side energy can offset only discharge-efficiency-adjusted load.
-    discharge_eff = clamp_efficiency(config.discharge_efficiency_pct)
     return (sum(tail_prices) / len(tail_prices)) * discharge_eff

@@ -113,7 +113,10 @@
           "hsem_import_electricity_price_forecast_sensor": "Import-elprisprognose-sensor (valgfri)",
           "hsem_export_electricity_price_forecast_sensor": "Eksport-elprisprognose-sensor (valgfri)",
           "hsem_export_electricity_min_price": "Minimum eksportpris påkrævet",
-          "hsem_electricity_price_update_interval": "Elpris opdateringsinterval (minutter)"
+          "hsem_electricity_price_update_interval": "Elpris opdateringsinterval (minutter)",
+          "hsem_price_forecast_valuation_enabled": "Brug en prisprognose til at begrunde ekstra opladning",
+          "hsem_price_forecast_valuation_sensor": "Sensor til prisprognose-værdisætning (valgfri)",
+          "hsem_price_forecast_valuation_margin": "Ekstra sikkerhedsmargin for prognose"
         },
         "data_description": {
           "hsem_import_electricity_price_sensor": "Vælg den sensor, der leverer import-elpriser (f.eks. Energi Data Service, Nordpool, Amber Electric).",
@@ -121,7 +124,10 @@
           "hsem_import_electricity_price_forecast_sensor": "Valgfrit: vælg en separat sensor til importprisprognoser (bruges af Amber Electric og lignende integrationer).",
           "hsem_export_electricity_price_forecast_sensor": "Valgfrit: vælg en separat sensor til eksportprisprognoser.",
           "hsem_export_electricity_min_price": "Indstil minimumsprisen for eksport. Eksport under denne pris blokeres.",
-          "hsem_electricity_price_update_interval": "Hvor ofte din prissensor giver nye data (15, 30 eller 60 minutter)."
+          "hsem_electricity_price_update_interval": "Hvor ofte din prissensor giver nye data (15, 30 eller 60 minutter).",
+          "hsem_price_forecast_valuation_enabled": "Når slået til kan forudsagte priser for de timer, markedet endnu ikke har offentliggjort, hæve værdien af lagret energi, så planlæggeren kan lade op i dag til en dyr morgendag. Forudsigelser bruges aldrig til at aflade, eksportere eller styre hardware direkte.",
+          "hsem_price_forecast_valuation_sensor": "Valgfri: en sensor med et 'forecast'-attribut med {start, value}-punkter i samme prisgrundlag som din importsensor, samt et 'mae'-attribut med kildens egen fejl.",
+          "hsem_price_forecast_valuation_margin": "Ekstra beløb der trækkes fra hver forudsagt pris, oven i kildens offentliggjorte fejl. Lad stå på 0 for at bruge kildens egen nøjagtighed."
         },
         "description": "Konfigurer dine elprissensorer til import- og eksportpriser.",
         "title": "Elpriser"
@@ -664,7 +670,10 @@
           "hsem_import_electricity_price_forecast_sensor": "Import Electricity Price Forecast Sensor (optional)",
           "hsem_export_electricity_price_forecast_sensor": "Export Electricity Price Forecast Sensor (optional)",
           "hsem_export_electricity_min_price": "Export Minimum Price Required",
-          "hsem_electricity_price_update_interval": "Electricity Price Update Interval (minutes)"
+          "hsem_electricity_price_update_interval": "Electricity Price Update Interval (minutes)",
+          "hsem_price_forecast_valuation_enabled": "Brug en prisprognose til at begrunde ekstra opladning",
+          "hsem_price_forecast_valuation_sensor": "Sensor til prisprognose-værdisætning (valgfri)",
+          "hsem_price_forecast_valuation_margin": "Ekstra sikkerhedsmargin for prognose"
         },
         "data_description": {
           "hsem_import_electricity_price_sensor": "Select the sensor that provides import electricity prices (e.g. Energi Data Service, Nordpool, Amber Electric).",
@@ -672,7 +681,10 @@
           "hsem_import_electricity_price_forecast_sensor": "Optional: select a separate sensor for import price forecasts (used by Amber Electric and similar integrations).",
           "hsem_export_electricity_price_forecast_sensor": "Optional: select a separate sensor for export price forecasts.",
           "hsem_export_electricity_min_price": "Set the minimum export price. Exports below this price will be blocked.",
-          "hsem_electricity_price_update_interval": "How often your price sensor provides new data (15, 30, or 60 minutes)."
+          "hsem_electricity_price_update_interval": "How often your price sensor provides new data (15, 30, or 60 minutes).",
+          "hsem_price_forecast_valuation_enabled": "Når slået til kan forudsagte priser for de timer, markedet endnu ikke har offentliggjort, hæve værdien af lagret energi, så planlæggeren kan lade op i dag til en dyr morgendag. Forudsigelser bruges aldrig til at aflade, eksportere eller styre hardware direkte.",
+          "hsem_price_forecast_valuation_sensor": "Valgfri: en sensor med et 'forecast'-attribut med {start, value}-punkter i samme prisgrundlag som din importsensor, samt et 'mae'-attribut med kildens egen fejl.",
+          "hsem_price_forecast_valuation_margin": "Ekstra beløb der trækkes fra hver forudsagt pris, oven i kildens offentliggjorte fejl. Lad stå på 0 for at bruge kildens egen nøjagtighed."
         },
         "description": "Configure your electricity price sensors for import and export pricing.",
         "title": "Electricity Prices"

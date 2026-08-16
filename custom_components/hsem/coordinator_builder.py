@@ -17,6 +17,7 @@ directly.
 from __future__ import annotations
 
 from datetime import UTC, timedelta
+from typing import Any
 
 from custom_components.hsem.models.battery_schedule_input import BatteryScheduleInput
 from custom_components.hsem.models.hourly_consumption_average import (
@@ -45,6 +46,7 @@ from custom_components.hsem.utils.phase_power import (
     phase_powers_valid,
     secondary_site_power_delta_w,
 )
+from custom_components.hsem.utils.price_forecast import build_price_forecast
 
 
 def _clamp_charge_rate(configured_w: float) -> float:
@@ -208,6 +210,7 @@ def build_planner_input(
     ev_session_kw: dict[str, float] | None = None,
     capacity_learner: CapacityLearner | None = None,
     dynamic_discharge_floor_pct: float | None = None,
+    price_forecast_attributes: dict[str, Any] | None = None,
 ) -> PlannerInput:
     """Assemble a :class:`PlannerInput` from the coordinator's current pipeline state.
 
@@ -221,6 +224,10 @@ def build_planner_input(
             planner run, or ``None`` for the first run.
         previous_winner_score: Score of the winning candidate from the
             previous planner run.
+        price_forecast_attributes: Attributes of the configured price-forecast
+            valuation sensor, or None when unconfigured or unavailable. Passed
+            as the attribute dict rather than the whole snapshot so the builder
+            cannot reach any other entity through it.
 
     Returns:
         A fully populated :class:`PlannerInput` ready for the planner engine.
@@ -413,6 +420,11 @@ def build_planner_input(
         )
         or 95.0,
         secondary_storage=secondary_storage,
+        price_forecast=build_price_forecast(
+            price_forecast_attributes,
+            enabled=cfg.price_forecast_valuation_enabled,
+            margin=cfg.price_forecast_valuation_margin,
+        ),
         battery_purchase_price=convert_to_float(cfg.batteries_purchase_price) or 0.0,
         battery_expected_cycles=_cycles if _cycles is not None else 6000,
         battery_cycle_cost_per_kwh=convert_to_float(cfg.batteries_cycle_cost) or 0.0,

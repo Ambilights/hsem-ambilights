@@ -36,7 +36,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING, Any, override
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, HomeAssistant, callback
@@ -193,6 +193,24 @@ def _canonical_price_channel(
     if not math.isfinite(number):
         return (False, None)
     return (True, round(number, 5))
+
+
+def _price_forecast_attributes(
+    snapshot: StateSnapshot | None,
+    cfg: SensorConfig,
+) -> dict[str, Any] | None:
+    """Return the price-forecast sensor's attributes from the cycle snapshot.
+
+    Returns None when the feature is off, no sensor is configured, or the
+    entity was unreadable — all of which the parser treats as "no forecast
+    contribution" rather than as a reason to fail the cycle.
+    """
+    entity_id = cfg.price_forecast_valuation_sensor
+    if not cfg.price_forecast_valuation_enabled or not entity_id:
+        return None
+    if snapshot is None:
+        return None
+    return snapshot.sensor_attributes.get(entity_id)
 
 
 def _price_forecast_signature(
@@ -1706,6 +1724,9 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                         dynamic_discharge_floor_pct=_dynamic_floor_pct,
                         capacity_learner=getattr(
                             self, "_capacity_learner", CapacityLearner()
+                        ),
+                        price_forecast_attributes=_price_forecast_attributes(
+                            self._snapshot, cfg
                         ),
                     )
                     # Wire the solar forecast corrector into the planner input so

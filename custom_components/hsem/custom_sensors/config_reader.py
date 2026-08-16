@@ -335,6 +335,20 @@ def build_sensor_config(
         or 0.0
     )
 
+    # Predicted prices for the unpublished horizon (valuation only)
+    cfg.price_forecast_valuation_enabled = bool(
+        get_config_value(config_entry, "hsem_price_forecast_valuation_enabled")
+    )
+    cfg.price_forecast_valuation_sensor = _optional_entity(
+        get_config_value(config_entry, "hsem_price_forecast_valuation_sensor")
+    )
+    cfg.price_forecast_valuation_margin = (
+        convert_to_float(
+            get_config_value(config_entry, "hsem_price_forecast_valuation_margin")
+        )
+        or 0.0
+    )
+
     # First EV charger
     ev = EVChargerConfig()
     ev.status_entity = _optional_entity(

@@ -62,6 +62,10 @@ DEFAULT_CONFIG_VALUES = {
     "hsem_import_electricity_price_sensor": "sensor.energi_data_service",
     "hsem_import_electricity_price_forecast_sensor": vol.UNDEFINED,
     "hsem_export_electricity_price_forecast_sensor": vol.UNDEFINED,
+    # Predicted prices for the unpublished horizon (valuation only).
+    "hsem_price_forecast_valuation_enabled": False,
+    "hsem_price_forecast_valuation_sensor": vol.UNDEFINED,
+    "hsem_price_forecast_valuation_margin": 0.0,
     "hsem_ev_allow_charge_past_target_soc": False,
     "hsem_ev_past_target_confidence_factor": 0.9,
     "hsem_ev_charger_force_max_discharge_power": False,

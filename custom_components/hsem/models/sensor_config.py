@@ -221,6 +221,13 @@ class SensorConfig:
     export_electricity_price_forecast_sensor: str | None = None
     export_electricity_min_price: float = 0.0
 
+    # Predicted prices for the unpublished horizon. Valuation only — these
+    # never become actionable, so they can justify extra charging but never a
+    # discharge. See models/price_forecast.py.
+    price_forecast_valuation_enabled: bool = False
+    price_forecast_valuation_sensor: str | None = None
+    price_forecast_valuation_margin: float = 0.0
+
     # EV chargers
     ev: EVChargerConfig = field(default_factory=EVChargerConfig)
     ev_second_enabled: bool = False

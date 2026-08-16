@@ -15,6 +15,7 @@ from custom_components.hsem.models.battery_schedule_input import BatterySchedule
 from custom_components.hsem.models.hourly_consumption_average import (
     HourlyConsumptionAverage,
 )
+from custom_components.hsem.models.price_forecast import PriceForecast
 from custom_components.hsem.models.price_point import PricePoint
 from custom_components.hsem.models.secondary_storage_config import (
     SecondaryStorageConfig,
@@ -142,6 +143,12 @@ class PlannerInput:
     secondary_storage: SecondaryStorageConfig = field(
         default_factory=SecondaryStorageConfig
     )
+
+    # --- predicted prices for the unpublished horizon ---
+    #: Valuation only. These never populate ``PlannedSlot.price`` and never
+    #: extend ``price_actionable``, so no actuator, MILP bound or export
+    #: decision can see them; only the two terminal-value helpers do.
+    price_forecast: PriceForecast = field(default_factory=PriceForecast)
 
     # --- battery economics ---
     battery_purchase_price: float = 0.0

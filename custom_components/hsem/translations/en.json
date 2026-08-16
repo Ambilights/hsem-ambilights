@@ -198,7 +198,10 @@
           "hsem_import_electricity_price_forecast_sensor": "Import Electricity Price Forecast Sensor (optional)",
           "hsem_export_electricity_price_forecast_sensor": "Export Electricity Price Forecast Sensor (optional)",
           "hsem_export_electricity_min_price": "Export Minimum Price Required",
-          "hsem_electricity_price_update_interval": "Electricity Price Update Interval (minutes)"
+          "hsem_electricity_price_update_interval": "Electricity Price Update Interval (minutes)",
+          "hsem_price_forecast_valuation_enabled": "Use a price forecast to justify extra charging",
+          "hsem_price_forecast_valuation_sensor": "Price Forecast Valuation Sensor (optional)",
+          "hsem_price_forecast_valuation_margin": "Extra forecast safety margin"
         },
         "data_description": {
           "hsem_import_electricity_price_sensor": "Select the sensor that provides import electricity prices (e.g. Energi Data Service, Nordpool, Amber Electric).",
@@ -206,7 +209,10 @@
           "hsem_import_electricity_price_forecast_sensor": "Optional: select a separate sensor for import price forecasts (used by Amber Electric and similar integrations).",
           "hsem_export_electricity_price_forecast_sensor": "Optional: select a separate sensor for export price forecasts.",
           "hsem_export_electricity_min_price": "Set the minimum export price. Exports below this price will be blocked.",
-          "hsem_electricity_price_update_interval": "How often your price sensor provides new data (15, 30, or 60 minutes)."
+          "hsem_electricity_price_update_interval": "How often your price sensor provides new data (15, 30, or 60 minutes).",
+          "hsem_price_forecast_valuation_enabled": "When on, predicted prices for the hours the market has not published yet can raise the value of stored energy, so the planner may charge today for an expensive tomorrow. Predictions are never used to discharge, export, or drive any hardware directly.",
+          "hsem_price_forecast_valuation_sensor": "Optional: a sensor exposing a 'forecast' attribute of {start, value} points in the same price basis as your import sensor, plus a 'mae' attribute with the source's own error.",
+          "hsem_price_forecast_valuation_margin": "Extra amount subtracted from every predicted price, on top of the source's published error. Leave at 0 to rely on the source's own accuracy figure."
         },
         "description": "Configure your electricity price sensors for import and export pricing.",
         "title": "Electricity Prices"
@@ -758,7 +764,10 @@
           "hsem_import_electricity_price_forecast_sensor": "Import Electricity Price Forecast Sensor (optional)",
           "hsem_export_electricity_price_forecast_sensor": "Export Electricity Price Forecast Sensor (optional)",
           "hsem_export_electricity_min_price": "Export Minimum Price Required",
-          "hsem_electricity_price_update_interval": "Electricity Price Update Interval (minutes)"
+          "hsem_electricity_price_update_interval": "Electricity Price Update Interval (minutes)",
+          "hsem_price_forecast_valuation_enabled": "Use a price forecast to justify extra charging",
+          "hsem_price_forecast_valuation_sensor": "Price Forecast Valuation Sensor (optional)",
+          "hsem_price_forecast_valuation_margin": "Extra forecast safety margin"
         },
         "data_description": {
           "hsem_import_electricity_price_sensor": "Select the sensor that provides import electricity prices (e.g. Energi Data Service, Nordpool, Amber Electric).",
@@ -766,7 +775,10 @@
           "hsem_import_electricity_price_forecast_sensor": "Optional: select a separate sensor for import price forecasts (used by Amber Electric and similar integrations).",
           "hsem_export_electricity_price_forecast_sensor": "Optional: select a separate sensor for export price forecasts.",
           "hsem_export_electricity_min_price": "Set the minimum export price. Exports below this price will be blocked.",
-          "hsem_electricity_price_update_interval": "How often your price sensor provides new data (15, 30, or 60 minutes)."
+          "hsem_electricity_price_update_interval": "How often your price sensor provides new data (15, 30, or 60 minutes).",
+          "hsem_price_forecast_valuation_enabled": "When on, predicted prices for the hours the market has not published yet can raise the value of stored energy, so the planner may charge today for an expensive tomorrow. Predictions are never used to discharge, export, or drive any hardware directly.",
+          "hsem_price_forecast_valuation_sensor": "Optional: a sensor exposing a 'forecast' attribute of {start, value} points in the same price basis as your import sensor, plus a 'mae' attribute with the source's own error.",
+          "hsem_price_forecast_valuation_margin": "Extra amount subtracted from every predicted price, on top of the source's published error. Leave at 0 to rely on the source's own accuracy figure."
         },
         "description": "Configure your electricity price sensors for import and export pricing.",
         "title": "Electricity Prices"

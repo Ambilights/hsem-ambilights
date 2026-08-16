@@ -47,6 +47,10 @@ from custom_components.hsem.models.hourly_consumption_average import (
 )
 from custom_components.hsem.models.planner_input import PlannerInput
 from custom_components.hsem.models.planner_output import PlannerOutput
+from custom_components.hsem.models.price_forecast import (
+    ForecastPricePoint,
+    PriceForecast,
+)
 from custom_components.hsem.models.price_point import PricePoint
 from custom_components.hsem.models.secondary_storage_config import (
     SecondaryStorageConfig,
@@ -237,6 +241,31 @@ def _planner_input_from_dict(data: dict[str, Any]) -> PlannerInput:
     secondary_data = inp_data.get("secondary_storage")
     if isinstance(secondary_data, dict):
         inp_data["secondary_storage"] = SecondaryStorageConfig(**secondary_data)
+
+    # The forecast carries datetimes inside a nested tuple, so asdict() leaves
+    # a plain dict that would reach the valuation helpers untyped.
+    forecast_data = inp_data.get("price_forecast")
+    if isinstance(forecast_data, dict):
+        points = []
+        for raw_point in forecast_data.get("points", []):
+            if not isinstance(raw_point, dict):
+                continue
+            start = raw_point.get("start")
+            if isinstance(start, str):
+                start = datetime.fromisoformat(start)
+            if not isinstance(start, datetime):
+                continue
+            points.append(
+                ForecastPricePoint(
+                    start=start, value=float(raw_point.get("value", 0.0))
+                )
+            )
+        inp_data["price_forecast"] = PriceForecast(
+            points=tuple(points),
+            mae=float(forecast_data.get("mae", 0.0)),
+            margin=float(forecast_data.get("margin", 0.0)),
+            enabled=bool(forecast_data.get("enabled", False)),
+        )
 
     schedules = []
     for raw_sched in inp_data.get("battery_schedules", []):

@@ -896,6 +896,7 @@ async def _register_listeners(
         cfg.export_electricity_price_sensor,
         cfg.import_electricity_price_forecast_sensor,
         cfg.export_electricity_price_forecast_sensor,
+        cfg.price_forecast_valuation_sensor,
         cfg.solcast_pv_forecast_forecast_today,
         cfg.solcast_pv_forecast_forecast_tomorrow,
     ]
@@ -1055,6 +1056,7 @@ async def async_collect_all_states(
         cfg.export_electricity_price_sensor,
         cfg.import_electricity_price_forecast_sensor,
         cfg.export_electricity_price_forecast_sensor,
+        cfg.price_forecast_valuation_sensor,
         cfg.solcast_pv_forecast_forecast_today,
         cfg.solcast_pv_forecast_forecast_tomorrow,
     ):

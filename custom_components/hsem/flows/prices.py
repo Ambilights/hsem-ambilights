@@ -72,6 +72,33 @@ async def get_prices_step_schema(
                 ),
             ): selector({"entity": {"domain": "sensor"}}),
             vol.Required(
+                "hsem_price_forecast_valuation_enabled",
+                default=get_config_value(
+                    config_entry, "hsem_price_forecast_valuation_enabled"
+                ),
+            ): selector({"boolean": {}}),
+            vol.Optional(
+                "hsem_price_forecast_valuation_sensor",
+                default=get_config_value(
+                    config_entry, "hsem_price_forecast_valuation_sensor"
+                ),
+            ): selector({"entity": {"domain": "sensor"}}),
+            vol.Required(
+                "hsem_price_forecast_valuation_margin",
+                default=get_config_value(
+                    config_entry, "hsem_price_forecast_valuation_margin"
+                ),
+            ): selector(
+                {
+                    "number": {
+                        "min": 0.00,
+                        "max": 2.00,
+                        "step": 0.01,
+                        "mode": "slider",
+                    }
+                }
+            ),
+            vol.Required(
                 "hsem_export_electricity_min_price",
                 default=get_config_value(
                     config_entry, "hsem_export_electricity_min_price"

@@ -368,6 +368,7 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
             slots,
             inp.secondary_storage,
             now,
+            forecast=inp.price_forecast,
         )
         inp = replace(
             inp,
@@ -545,7 +546,11 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
     if mdps is not None and mdps > 1e-9:
         top_n = math.ceil(usable_kwh / mdps)
     rppk = replacement_price_from_next_discharge(
-        slots, now, top_n=top_n, interval_minutes=inp.interval_minutes
+        slots,
+        now,
+        top_n=top_n,
+        interval_minutes=inp.interval_minutes,
+        forecast=inp.price_forecast,
     )
     log_planner(
         "debug",
