@@ -147,8 +147,9 @@ class PlanCostBreakdown:
       to a real electricity bill.  Computed as
       ``import_cost − export_revenue + cycle_cost + conversion_loss_cost``.
     - :attr:`score` — selector objective.  Equals ``total_cost`` plus all
-      synthetic penalties and the terminal-SoC opportunity cost.  The
-      candidate selector minimises this value.
+      synthetic penalties, the terminal inventory value, and
+      ``primary_action_tiebreak``.  The candidate selector minimises this
+      value.
 
     Attributes:
         import_cost:

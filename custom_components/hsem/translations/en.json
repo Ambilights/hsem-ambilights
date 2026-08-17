@@ -211,7 +211,7 @@
           "hsem_export_electricity_min_price": "Set the minimum export price. Exports below this price will be blocked.",
           "hsem_electricity_price_update_interval": "How often your price sensor provides new data (15, 30, or 60 minutes).",
           "hsem_price_forecast_valuation_enabled": "When on, predicted prices for the hours the market has not published yet can raise the value of stored energy, so the planner may charge today for an expensive tomorrow. Predictions are never used to discharge, export, or drive any hardware directly.",
-          "hsem_price_forecast_valuation_sensor": "Required when forecast valuation is enabled: a sensor exposing a 'forecast' attribute of {start, value} points in the same price basis as your import sensor, plus a 'mae' attribute with the source's own error.",
+          "hsem_price_forecast_valuation_sensor": "Required when forecast valuation is enabled: a sensor exposing a 'forecast' attribute containing points with start and value fields in the same price basis as your import sensor, plus a 'mae' attribute with the source's own error.",
           "hsem_price_forecast_valuation_margin": "Extra amount subtracted from every predicted price, on top of the source's published error. Leave at 0 to rely on the source's own accuracy figure."
         },
         "description": "Configure your electricity price sensors for import and export pricing.",
@@ -777,7 +777,7 @@
           "hsem_export_electricity_min_price": "Set the minimum export price. Exports below this price will be blocked.",
           "hsem_electricity_price_update_interval": "How often your price sensor provides new data (15, 30, or 60 minutes).",
           "hsem_price_forecast_valuation_enabled": "When on, predicted prices for the hours the market has not published yet can raise the value of stored energy, so the planner may charge today for an expensive tomorrow. Predictions are never used to discharge, export, or drive any hardware directly.",
-          "hsem_price_forecast_valuation_sensor": "Required when forecast valuation is enabled: a sensor exposing a 'forecast' attribute of {start, value} points in the same price basis as your import sensor, plus a 'mae' attribute with the source's own error.",
+          "hsem_price_forecast_valuation_sensor": "Required when forecast valuation is enabled: a sensor exposing a 'forecast' attribute containing points with start and value fields in the same price basis as your import sensor, plus a 'mae' attribute with the source's own error.",
           "hsem_price_forecast_valuation_margin": "Extra amount subtracted from every predicted price, on top of the source's published error. Leave at 0 to rely on the source's own accuracy figure."
         },
         "description": "Configure your electricity price sensors for import and export pricing.",

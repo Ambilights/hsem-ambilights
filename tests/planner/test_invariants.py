@@ -705,11 +705,13 @@ class TestWinnerCostIdentity:
         )
         # Money outcome (``total_cost``) is a pure function of the slot
         # energy fields and weights — it can be reproduced from ``output.slots``
-        # alone.  The ``score`` field additionally includes the terminal-SoC
-        # opportunity cost which depends on horizon context (initial battery
-        # energy and replacement price); that context is not embedded in the
-        # slots themselves, so checking the money invariant is the right
-        # spec-invariant test for "plan_cost describes the actual output slots".
+        # alone.  The ``score`` field additionally includes selector-only
+        # terms, including the terminal inventory value and
+        # ``primary_action_tiebreak``.  Terminal inventory depends on horizon
+        # context (initial battery energy and replacement price); that context
+        # is not embedded in the slots themselves, so checking the money
+        # invariant is the right spec-invariant test for "plan_cost describes
+        # the actual output slots".
         fresh_bd = score_plan(result.slots, weights, slot_duration_hours=1.0)
         assert fresh_bd.total_cost == pytest.approx(
             result.plan_cost.total_cost, abs=1e-6
@@ -865,9 +867,10 @@ class TestNoPostSelectionMutation:
         # money cost.  ``total_cost`` is reproducible from the slot fields
         # alone (no horizon context required) so it is the canonical signal
         # that the engine re-simulated and re-scored after any fill pass.
-        # ``score`` additionally includes the terminal-SoC opportunity cost
-        # which depends on ``initial_battery_kwh``/``replacement_price`` that
-        # are not embedded in the slots themselves.
+        # ``score`` additionally includes selector-only terms, including the
+        # terminal inventory value and ``primary_action_tiebreak``.  Terminal
+        # inventory depends on ``initial_battery_kwh``/``replacement_price``,
+        # which are not embedded in the slots themselves.
         fresh = score_plan(result.slots, weights, slot_duration_hours=1.0)
         assert fresh.total_cost == pytest.approx(
             result.plan_cost.total_cost, abs=1e-6

@@ -1,6 +1,10 @@
 # HSEM Documentation
 
-> **Home Assistant Solar Energy Management (HSEM)** — version 5.1.0
+> **HSEM Ambilights** — documentation for the active standalone repository.
+
+Unless another repository is explicitly named, historical bare issue and pull
+request numbers in these inherited documents refer to upstream
+[`woopstar/hsem`](https://github.com/woopstar/hsem).
 
 ---
 
@@ -54,4 +58,5 @@
 5. Run `./scripts/quality.sh lint` before every commit
 6. Run `./scripts/quality.sh quality` after lint
 7. Run `./scripts/quality.sh test` before every PR
-8. See `AGENTS.md` and `CLAUDE.md` for full development rules
+8. See `AGENTS.md` for the full development rules; tool-specific instruction
+   files point back to that canonical source

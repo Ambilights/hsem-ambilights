@@ -1,9 +1,17 @@
-name: Code validation
+name: Home Assistant validation
 
 on:
+  workflow_dispatch:
   push:
-  schedule:
-    - cron: "0 0 * * *"
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: home-assistant-validation-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -12,20 +20,22 @@ jobs:
   validate-hassfest:
     name: Hassfest validation
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: checkout
-        uses: actions/checkout@v7.0.1
-      - name: validation
-        uses: home-assistant/actions/hassfest@master
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run Hassfest
+        uses: home-assistant/actions/hassfest@a7c616ce81ccda50150bf1595786c71b1883fabb # master
 
   validate-hacs:
     name: HACS validation
-    runs-on: "ubuntu-latest"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: checkout
-        uses: "actions/checkout@v7.0.1"
-      - name: validation
-        uses: "hacs/action@main"
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run HACS validation
+        uses: hacs/action@1ebf01c408f29afcb6406bd431bc98fd8cbb15aa # main
         with:
-          category: "integration"
-          ignore: "brands"
+          category: integration
+          ignore: brands

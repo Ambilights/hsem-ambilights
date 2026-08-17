@@ -1,6 +1,6 @@
 ---
 name: hsem-pre-flight
-description: Run before starting any HSEM code change. Checkout main, pull latest, read repository memory and relevant docs, create a feature branch.
+description: Run before starting any HSEM code change. Checkout main, pull latest, read repository rules and relevant docs, create a feature branch.
 ---
 
 # HSEM Pre-Flight — Start Any Code Change
@@ -14,17 +14,12 @@ git checkout main
 git pull
 ```
 
-## Step 2: Read Repository Memory
+## Step 2: Read Repository Rules
 
-Read `.github/memories.md`. Pay special attention to:
-- Module responsibility map (planner, ML, utils layers)
-- Canonical patterns (clamp_efficiency, DISCHARGE_RECS, calculate_recommended_threshold, HSEM_LOGGER)
-- MILP variable vector layout (8*n base, growing with EV co-optimisation)
-- File size limits (30 KB hard limit in planner/ and utils/)
-- Cycle cost formula with mandatory 2x denominator
-- File organization patterns (by responsibility, not by theme)
-- Huawei entity wiring protocol
-- Testing and logging rules
+Read `AGENTS.md` completely. It is the authoritative source for safety rules,
+canonical references, branch discipline, code standards, and quality gates. Do
+not rely on a cached MILP layout or module map; inspect the current source and
+`docs/planner-spec.md` for the task at hand.
 
 ## Step 3: Read Any Issue Being Solved
 

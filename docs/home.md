@@ -1,4 +1,4 @@
-# Huawei Solar Energy Management (HSEM)
+# HSEM Ambilights
 
 > **Home Assistant integration for optimizing Huawei solar batteries, inverters, and EV charging.**
 
@@ -136,7 +136,9 @@ Define up to three discharge schedules with time windows and minimum price diffe
 
 **Example:** Discharge 17:00–21:00 if the price difference exceeds your configured threshold.
 
-> See [How to Calculate the Minimum Charging Price](https://github.com/woopstar/hsem/wiki/How-to-Calculate-the-Minimum-Charging-Price-for-a-Battery-Schedule) for battery depreciation economics.
+> See the upstream HSEM guide,
+> [How to Calculate the Minimum Charging Price](https://github.com/woopstar/hsem/wiki/How-to-Calculate-the-Minimum-Charging-Price-for-a-Battery-Schedule),
+> for battery depreciation economics.
 
 ---
 

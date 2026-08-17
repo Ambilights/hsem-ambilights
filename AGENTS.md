@@ -33,7 +33,7 @@ If there is uncertainty, stop and request clarification.
 
 ## Repository Structure
 
-- `hsem/` — Core integration and business logic
+- `custom_components/hsem/` — Core integration and business logic
 - `tests/` — Unit and integration tests
 - `docs/` — Architecture documentation and design decisions
 - `scripts/` — Development utilities and testing scripts
@@ -46,7 +46,7 @@ The agent must use the exact versions defined in the project configuration files
 ### Requirements
 
 - Runtime: Python 3.14 (required - see `.python-version`)
-- Follow versions specified in `requirements.txt` and/or `setup.py`
+- Follow versions specified in the requirements files and `pyproject.toml`
 
 ## Huawei Solar Sensor Usage Rule (Mandatory)
 

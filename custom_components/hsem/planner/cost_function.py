@@ -134,12 +134,12 @@ def score_plan(
     - ``total_cost`` — money outcome only.  Equals
       ``import_cost − export_revenue + cycle_cost + conversion_loss_cost``.
     - ``score`` — selector objective.  Equals ``total_cost`` plus all
-      synthetic penalties (SoC guard, grid limit, override) and the
-      terminal-SoC opportunity cost.  The candidate selector minimises
-      this value.
+      synthetic penalties (SoC guard, grid limit, override), the terminal
+      inventory value, and ``primary_action_tiebreak``.  The candidate
+      selector minimises this value.
 
-    Terminal-SoC accounting (the spec-mandated
-    ``terminal_soc_penalty_or_credit`` term) is enabled when both
+    Terminal inventory accounting (the spec-mandated ``terminal_soc_value``
+    term) is enabled when both
     ``initial_battery_kwh`` and ``replacement_price_per_kwh`` are provided.
     It prevents the selector from preferring plans that look "cheap" only
     because they empty the battery before the end of the horizon.
@@ -168,14 +168,15 @@ def score_plan(
         initial_battery_kwh:
             Energy stored above the discharge floor (kWh) at the start of
             the horizon.  Required (together with
-            ``replacement_price_per_kwh``) to enable terminal-SoC accounting.
+            ``replacement_price_per_kwh``) to enable terminal inventory
+            accounting.
             ``None`` disables the term.
         replacement_price_per_kwh:
             Currency-per-kWh price used to value the change in stored
-            battery energy across the horizon.  A conservative choice is the
-            *average future import price* across the planning horizon.
-            Required (together with ``initial_battery_kwh``) to enable
-            terminal-SoC accounting.  ``None`` disables the term.
+            battery energy across the horizon.  The caller supplies the
+            applicable policy price.  Required (together with
+            ``initial_battery_kwh``) to enable terminal inventory accounting.
+            ``None`` disables the term.
 
     Returns:
         A :class:`PlanCostBreakdown` containing every cost component, the

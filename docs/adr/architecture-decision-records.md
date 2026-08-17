@@ -102,4 +102,5 @@ How are the negative consequences addressed?
 
 - **`docs/planner-spec.md`** — the canonical planner specification. ADRs explain *why* design decisions were made; the spec documents *what* the planner must do.
 - **`docs/architecture-overview.md`** — high-level architecture overview. ADRs provide the reasoning behind the architecture.
-- **`.github/memories.md`** — repository memory for AI agents. Key ADR conclusions are reflected there.
+- **`AGENTS.md`** — repository-wide development rules and links to the
+  normative references agents must read before changing the implementation.

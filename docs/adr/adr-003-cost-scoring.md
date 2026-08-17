@@ -45,7 +45,8 @@ score = total_cost + soc_penalties + grid_limit_penalty + override_penalty
 
 - Starts from `total_cost` (always includes real money).
 - Adds **synthetic penalties** (quadratic SoC guard, grid power limit, override cost).
-- Adds the **terminal SoC opportunity cost** — a value representing the lost future benefit of stored energy consumed during the horizon.
+- Adds the **terminal inventory value** — a path-independent value of the
+  battery inventory change across the actionable horizon.
 - Adds a separately named **primary-action structural tiebreak** so a true
   economic tie prefers battery-to-house discharge without rewarding
   charge/discharge or export/refill cycles.

@@ -167,7 +167,7 @@ primary blocks. No consumer derives any of these offsets from `9n`, EV count,
 fuse state, or optional-block assumptions; it asks `MilpColumnLayout` for the
 named block.
 
-### Secondary stationary-storage extension (PowMr fork, issue #1)
+### Secondary stationary-storage extension (PowMr dedicated-load topology)
 
 When a valid `SecondaryStorageConfig` is present, six `n`-slot blocks are
 appended after all previously declared core, EV, fuse, export-source, and

@@ -74,7 +74,7 @@ def _quarter_hour_slots(prices: list[float]) -> list[PlannedSlot]:
 
 
 def _powmr(**overrides: float | bool | None) -> SecondaryStorageConfig:
-    """Return the known PowMr/NAS topology used by the fork."""
+    """Return the reference installation's PowMr/NAS topology."""
     values: dict = {
         "enabled": True,
         "capacity_kwh": 15.0,

@@ -129,8 +129,8 @@ Power sensor configuration.
 
 Optional topology-aware planning for a non-exporting PowMr battery that powers
 only a dedicated AC load. The reference defaults match the PowMr/NAS installation
-for this fork; the feature is disabled and control is separately disabled by
-default.
+for which HSEM Ambilights is developed; the feature is disabled and control is
+separately disabled by default.
 
 | Field | Key | Default | Description |
 |---|---|---|---|

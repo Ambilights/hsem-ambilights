@@ -386,7 +386,7 @@ Battery energy to remove in order to deliver a target house load:
 battery_energy_removed_kwh = house_load_kwh / discharge_efficiency
 ```
 
-## Secondary stationary storage (PowMr fork, issue #1)
+## Secondary stationary storage (PowMr dedicated-load topology)
 
 The optional secondary-storage model represents a topology that is materially
 different from the Huawei battery:

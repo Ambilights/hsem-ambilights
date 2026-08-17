@@ -931,7 +931,8 @@ class TestRunPlannerIntegration:
         """plan_cost.score must be consistent with all its components (issue #413).
 
         Money cost (``total_cost``) excludes synthetic penalties; the selector
-        ``score`` adds them plus the terminal-SoC opportunity cost on top.
+        ``score`` adds them, the terminal inventory value, and
+        ``primary_action_tiebreak`` on top.
         """
         result = run_planner(make_summer_day_input())
         assert result.plan_cost is not None

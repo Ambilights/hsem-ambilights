@@ -1,46 +1,141 @@
 name: Release
 
 on:
-  workflow_dispatch:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to package (for example, v7.0.1)
+        required: true
+        type: string
 
 env:
-  COMPONENT_DIR: hsem
+  COMPONENT_DIR: custom_components/hsem
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  release_zip_file:
-    name: Prepare release asset
+  release:
+    name: Build and publish tagged component
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7.0.1
-      - name: Update manifest.json version to ${{ github.event.release.tag_name }}
-        run: |
-          python3 ${{ github.workspace }}/.github/scripts/update_hacs_manifest.py --version ${{ github.event.release.tag_name }} --path /custom_components/hsem/
-      - name: Commit manifest update
-        run: |
-          git config user.name github-actions
-          git config user.email github-actions@github.com
-          git add ./custom_components/hsem/manifest.json
-          if ! git diff --cached --quiet; then
-            git commit -m "Updated manifest.json"
-            git push origin HEAD:${{ github.event.release.target_commitish }}
-          fi
-      - name: Create zip
-        run: |
-          cd custom_components/hsem
-          zip hsem.zip -r ./
-      - name: Upload zip to release
-        uses: svenstaro/upload-release-action@2.11.5
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: ./custom_components/hsem/hsem.zip
-          asset_name: hsem.zip
-          tag: ${{ github.ref }}
-          overwrite: true
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Verify tag and manifest version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git check-ref-format "refs/tags/${RELEASE_TAG}"
+          tag_commit="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          head_commit="$(git rev-parse HEAD)"
+          if [[ "${head_commit}" != "${tag_commit}" ]]; then
+            echo "Checked-out commit ${head_commit} does not match ${RELEASE_TAG} (${tag_commit})."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          tag = os.environ["RELEASE_TAG"]
+          manifest_path = Path(os.environ["COMPONENT_DIR"]) / "manifest.json"
+          manifest_version = json.loads(manifest_path.read_text(encoding="utf-8"))["version"]
+          expected_tag = f"v{manifest_version}"
+          if tag != expected_tag:
+              raise SystemExit(
+                  f"Tag {tag!r} does not match manifest version {manifest_version!r}; "
+                  f"expected {expected_tag!r}. Bump the manifest before creating the tag."
+              )
+          PY
+
+          if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
+            echo "The tagged checkout is not clean."
+            git status --short
+            exit 1
+          fi
+
+      - name: Create release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${COMPONENT_DIR}"
+          zip -9 -r "${GITHUB_WORKSPACE}/hsem.zip" . \
+            -x '*/__pycache__/*' '*.pyc' '*.pyo'
+
+      - name: Verify archive matches tagged source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          component_dir = Path(os.environ["COMPONENT_DIR"])
+          expected = {
+              path.relative_to(component_dir).as_posix(): path
+              for path in component_dir.rglob("*")
+              if path.is_file()
+              and "__pycache__" not in path.parts
+              and path.suffix not in {".pyc", ".pyo"}
+          }
+
+          with ZipFile("hsem.zip") as archive:
+              archived = {
+                  info.filename.removeprefix("./")
+                  for info in archive.infolist()
+                  if not info.is_dir()
+              }
+              if archived != set(expected):
+                  missing = sorted(set(expected) - archived)
+                  extra = sorted(archived - set(expected))
+                  raise SystemExit(
+                      f"Archive/source mismatch: missing={missing}, extra={extra}"
+                  )
+
+              for relative_path, source_path in expected.items():
+                  if archive.read(relative_path) != source_path.read_bytes():
+                      raise SystemExit(f"Archive content differs for {relative_path}")
+          PY
+
+          archive_sha256="$(sha256sum hsem.zip | cut -d ' ' -f 1)"
+          {
+            echo "### Release asset"
+            echo
+            echo "- Tag: \`${RELEASE_TAG}\`"
+            echo "- Commit: \`$(git rev-parse HEAD)\`"
+            echo "- hsem.zip SHA-256: \`${archive_sha256}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload asset to GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --title "${RELEASE_TAG}" \
+              --generate-notes
+          fi
+          gh release upload "${RELEASE_TAG}" hsem.zip \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
