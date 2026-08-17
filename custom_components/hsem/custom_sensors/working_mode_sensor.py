@@ -247,6 +247,8 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
             extended = {
                 "import_electricity_price_sensor_entity": cfg.import_electricity_price_sensor,
                 "export_electricity_price_sensor_entity": cfg.export_electricity_price_sensor,
+                "import_electricity_price_entsoe_sensor_entity": cfg.import_electricity_price_entsoe_sensor,
+                "export_electricity_price_entsoe_sensor_entity": cfg.export_electricity_price_entsoe_sensor,
                 "ev_charger_power_entity": cfg.ev.power_entity,
                 "ev_charger_status_entity": cfg.ev.status_entity,
                 "ev_soc_entity": cfg.ev.soc_entity,
@@ -359,6 +361,7 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
                 apply_summary.failed_entities if apply_summary else []
             ),
             "data_quality": data.data_quality.as_dict(),
+            "entsoe_price_backup_status": data.entsoe_price_backup_status.as_dict(),
         }
         if live.missing_entities:
             # Non-critical absence: the plan below is real, but say which

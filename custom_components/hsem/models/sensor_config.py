@@ -91,6 +91,10 @@ class SensorConfig:
         export_electricity_price_sensor: Entity ID for the export price sensor.
         import_electricity_price_forecast_sensor: Optional entity ID for a separate import forecast sensor (e.g. Amber Electric).
         export_electricity_price_forecast_sensor: Optional entity ID for a separate export forecast sensor.
+        import_electricity_price_entsoe_sensor: Optional entity ID for the
+            tariff-, VAT-, and currency-adjusted ENTSO-E import backup sensor.
+        export_electricity_price_entsoe_sensor: Optional entity ID for the
+            tariff-, VAT-, and currency-adjusted ENTSO-E export backup sensor.
         export_electricity_min_price: Minimum export price to allow grid export.
 
         ev: First EV charger configuration.
@@ -201,6 +205,8 @@ class SensorConfig:
     export_electricity_price_sensor: str | None = None
     import_electricity_price_forecast_sensor: str | None = None
     export_electricity_price_forecast_sensor: str | None = None
+    import_electricity_price_entsoe_sensor: str | None = None
+    export_electricity_price_entsoe_sensor: str | None = None
     export_electricity_min_price: float = 0.0
 
     # Predicted prices for the unpublished horizon. Valuation only — these

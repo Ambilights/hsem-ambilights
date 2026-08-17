@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from custom_components.hsem.models.price_source import PriceSource
+
 
 @dataclass
 class HourlyRecommendation:
@@ -24,6 +26,8 @@ class HourlyRecommendation:
         export_price: Spot export price (local currency/kWh).
         import_price_available / export_price_available: Whether each numeric
             price came from its configured source. A genuine zero is available.
+        import_price_source / export_price_source: Optional provenance for each
+            price channel (``primary``, ``entsoe``, or ``forecast``).
         price_actionable: Whether price-driven control is allowed in the slot.
         avg_house_consumption_kwh: Weighted spike-aware consumption estimate (kWh).
         historical_avg_house_consumption_kwh: Weighted estimate before the
@@ -106,3 +110,5 @@ class HourlyRecommendation:
     export_price_available: bool = False
     price_actionable: bool = False
     solcast_pv_estimate_available: bool = False
+    import_price_source: PriceSource | None = None
+    export_price_source: PriceSource | None = None

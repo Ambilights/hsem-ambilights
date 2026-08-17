@@ -233,6 +233,49 @@ class TestReconfigureOptionsFlow:
         assert flow._user_input["device_name"] == "Fresh Config"
 
 
+class TestOptionsFlowClearsEntsoeBackup:
+    """Clearing an optional ENTSO-E pair must override stored values."""
+
+    @pytest.mark.asyncio
+    async def test_omitted_entsoe_pair_is_recorded_as_explicit_none(self) -> None:
+        from custom_components.hsem.options_flow import HSEMOptionsFlow
+
+        import_field = "hsem_import_electricity_price_entsoe_sensor"
+        export_field = "hsem_export_electricity_price_entsoe_sensor"
+        config_entry = MagicMock()
+        config_entry.data = {
+            import_field: "entsoe.adjusted_import_price",
+            export_field: "entsoe.adjusted_export_price",
+        }
+        config_entry.options = {}
+
+        flow = HSEMOptionsFlow(config_entry)
+        flow.hass = MagicMock()
+        flow.async_step_months = AsyncMock(  # type: ignore[method-assign]
+            return_value={"type": "form", "step_id": "months"}
+        )
+        submitted = {
+            "hsem_import_electricity_price_sensor": "sensor.nordpool_import",
+            "hsem_export_electricity_price_sensor": "sensor.nordpool_export",
+            "hsem_price_forecast_valuation_enabled": False,
+            "hsem_price_forecast_valuation_margin": 0.0,
+            "hsem_export_electricity_min_price": 0.0,
+            "hsem_electricity_price_update_interval": "15",
+        }
+
+        with patch(
+            "custom_components.hsem.options_flow.validate_prices_input",
+            new=AsyncMock(return_value={}),
+        ):
+            result = await flow.async_step_prices(user_input=submitted)
+
+        assert result == {"type": "form", "step_id": "months"}
+        assert import_field in flow._user_input
+        assert export_field in flow._user_input
+        assert flow._user_input[import_field] is None
+        assert flow._user_input[export_field] is None
+
+
 class TestOptionsFlowPreservesEntityManagedOptions:
     """Regression: saving the options flow must not reset entity-managed options.
 

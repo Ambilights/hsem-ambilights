@@ -77,6 +77,7 @@ from custom_components.hsem.models.plan_explanation import PlanExplanation
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.planner_input import PlannerInput
 from custom_components.hsem.models.planner_output import PlannerOutput
+from custom_components.hsem.models.price_source import PriceBackupStatus, PriceSource
 from custom_components.hsem.models.savings_tracker import SavingsTracker
 from custom_components.hsem.models.sensor_config import SensorConfig
 from custom_components.hsem.models.state_snapshot import StateSnapshot
@@ -171,6 +172,8 @@ type _PriceSlotSignature = tuple[
     _PriceChannelSignature,
     _PriceChannelSignature,
     _PriceChannelSignature,
+    PriceSource | None,
+    PriceSource | None,
 ]
 type _ValuationForecastSignature = tuple[
     bool,
@@ -240,6 +243,8 @@ def _price_forecast_signature(
                 rec.solcast_pv_estimate_kwh,
                 rec.solcast_pv_estimate_available,
             ),
+            rec.import_price_source if rec.import_price_available else None,
+            rec.export_price_source if rec.export_price_available else None,
         )
         for rec in future_slots
     )
@@ -637,6 +642,10 @@ class CoordinatorData:
     plan_explanation: PlanExplanation = field(default_factory=PlanExplanation)
     #: Structured data-quality report for price and PV inputs.
     data_quality: DataQuality = field(default_factory=DataQuality)
+    #: Selection/rejection status for the paired ENTSO-E published-price backup.
+    entsoe_price_backup_status: PriceBackupStatus = field(
+        default_factory=PriceBackupStatus
+    )
     #: EV optimal charging plan for the primary EV (None when disabled).
     ev_charging_plan: EVChargingPlan | None = None
     #: EV optimal charging plan for the second EV (None when disabled).
@@ -744,6 +753,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._plan_explanation: PlanExplanation = PlanExplanation()
         # Most recent data quality report produced by the planner engine.
         self._data_quality: DataQuality = DataQuality()
+        self._entsoe_price_backup_status: PriceBackupStatus = PriceBackupStatus()
         # Most recent EV charging plans from the planner engine.
         self._ev_charging_plan: EVChargingPlan | None = None
         self._ev_second_charging_plan: EVChargingPlan | None = None
@@ -1506,7 +1516,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
             # 7. Populate electricity prices and Solcast PV estimates — always
             #    run, independent of consumption data.
-            populate_price_and_solcast_from_snapshot(
+            self._entsoe_price_backup_status = populate_price_and_solcast_from_snapshot(
                 self._hourly_recommendations,
                 self._snapshot,
                 cfg,
@@ -2024,6 +2034,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             apply_summary=getattr(self, "_last_apply_summary", None),
             plan_explanation=self._plan_explanation,
             data_quality=self._data_quality,
+            entsoe_price_backup_status=self._entsoe_price_backup_status,
             ev_charging_plan=self._ev_charging_plan,
             ev_second_charging_plan=self._ev_second_charging_plan,
             override_expiry=(
@@ -2837,6 +2848,8 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             rec.primary_battery_hold = slot.primary_battery_hold
             rec.import_price_available = slot.import_price_available
             rec.export_price_available = slot.export_price_available
+            rec.import_price_source = slot.import_price_source
+            rec.export_price_source = slot.export_price_source
             rec.price_actionable = slot.price_actionable
             # Copy the planner's PV estimate so that solcast_pv_estimate,
             # estimated_net_consumption, and ev_planned_load_kwh are all

@@ -2359,6 +2359,45 @@ mutated; both factors are applied only at consumption time.
 
 ### Missing future data handling
 
+#### Published price-source precedence
+
+HSEM may be configured with a dedicated pair of ENTSO-E **published-price
+backup** sensors in addition to the primary import/export sensors and the
+legacy per-channel forecast inputs. The ENTSO-E entities are integration
+boundaries: they must already expose final prices in the same local-currency
+per-kWh unit and with the same tariff/VAT basis as their corresponding primary
+sensors. HSEM never applies VAT, tariffs, foreign-exchange conversion, or
+energy-unit scaling to this backup.
+
+Source selection is atomic per slot and follows this order:
+
+1. When both primary channels are finite and available, the primary pair is
+   authoritative. Genuine zero and negative prices remain valid.
+2. When either primary channel is missing, both channels may switch to ENTSO-E
+   for that slot, but only when the import and export backup arrays provide an
+   exact, aligned, complete local delivery day at the configured cadence.
+   Completeness is defined on the UTC timeline between consecutive local
+   midnights, so a 15-minute DST day contains 92, 96, or 100 physical points.
+   A partial, duplicated, conflicting, naive, off-cadence, non-finite, or
+   wrong-unit backup is rejected as a pair.
+3. The existing optional forecast sensors run last and retain their legacy
+   independent missing-channel behaviour. They cannot overwrite a primary or
+   accepted ENTSO-E value.
+
+Accepted ENTSO-E values are redundant publications of executable day-ahead
+prices, not the opt-in valuation forecast described under
+`replacement_price`. They populate `PlannedSlot.price` and can extend the
+price-actionable prefix. Source labels (`primary`, `entsoe`, or `forecast`)
+are carried with both channels through `HourlyRecommendation`, `PricePoint`,
+`PlannedSlot`, the plan-reuse signature, and diagnostics. A source-only
+change therefore cannot leave stale provenance on a reused plan.
+
+This backup is deliberately scoped to the publication-gap case where the
+primary live entities remain healthy while a future array is missing. It does
+not override the current-slot live-price outage gate: if a primary scalar
+entity is unavailable, automatic control still enters the strict price-outage
+hold described below.
+
 For every day in the horizon the engine detects and surfaces missing price
 and PV data explicitly.  Day-labelled `missing_inputs` entries are emitted
 with the format:

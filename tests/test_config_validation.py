@@ -12,6 +12,7 @@ Covers:
 - Integration: flow-level validators delegate to the centralized module
 """
 
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -44,6 +45,79 @@ def _hass_with_states(*entity_ids: str) -> MagicMock:
 
     hass.states.get = _get_state
     return hass
+
+
+def _hass_with_attribute_states(
+    entity_attributes: dict[str, dict],
+) -> MagicMock:
+    """Return a hass mock with concrete state attributes per entity."""
+    hass = MagicMock()
+    states: dict[str, MagicMock] = {}
+    for entity_id, attributes in entity_attributes.items():
+        state = MagicMock()
+        state.state = "ok"
+        state.attributes = attributes
+        states[entity_id] = state
+    hass.states.get.side_effect = states.get
+    return hass
+
+
+def _entsoe_points(
+    *,
+    start: str = "2026-08-17T00:00:00+02:00",
+    interval_minutes: int = 15,
+    count: int = 3,
+    time_key: str = "time",
+) -> list[dict]:
+    """Return timestamped finite ENTSO-E-style prices."""
+    first = datetime.fromisoformat(start)
+    return [
+        {
+            time_key: (first + timedelta(minutes=interval_minutes * index)).isoformat(),
+            "price": (-0.05, 0.0, 0.25)[index % 3],
+        }
+        for index in range(count)
+    ]
+
+
+def _entsoe_price_hass(
+    import_points: list[dict],
+    export_points: list[dict],
+    *,
+    primary_import_unit: str = "SEK/kWh",
+    primary_export_unit: str = "SEK/kWh",
+    entsoe_import_unit: str = "SEK/kWh",
+    entsoe_export_unit: str = "SEK/kWh",
+) -> MagicMock:
+    """Return a hass mock containing primary and ENTSO-E price entities."""
+    return _hass_with_attribute_states(
+        {
+            "sensor.import": {"unit_of_measurement": primary_import_unit},
+            "sensor.export": {"unit_of_measurement": primary_export_unit},
+            "sensor.entsoe_import": {
+                "unit_of_measurement": entsoe_import_unit,
+                "prices": import_points,
+            },
+            "sensor.entsoe_export": {
+                "unit_of_measurement": entsoe_export_unit,
+                "prices": export_points,
+            },
+        }
+    )
+
+
+def _entsoe_price_input(**overrides: object) -> dict[str, object]:
+    """Return a complete price-step payload with the ENTSO-E pair enabled."""
+    payload = {
+        "hsem_import_electricity_price_sensor": "sensor.import",
+        "hsem_export_electricity_price_sensor": "sensor.export",
+        "hsem_import_electricity_price_entsoe_sensor": "sensor.entsoe_import",
+        "hsem_export_electricity_price_entsoe_sensor": "sensor.entsoe_export",
+        "hsem_export_electricity_min_price": -0.05,
+        "hsem_electricity_price_update_interval": "15",
+    }
+    payload.update(overrides)
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -740,6 +814,183 @@ class TestFlowValidatorsUseConfigValidator:
             },
         )
         assert errors == {}
+
+    @pytest.mark.asyncio
+    async def test_prices_schema_contains_optional_entsoe_pair(self):
+        from custom_components.hsem.flows.prices import get_prices_step_schema
+
+        schema = await get_prices_step_schema(None)
+        keys = {str(key) for key in schema.schema}
+
+        assert {
+            "hsem_import_electricity_price_entsoe_sensor",
+            "hsem_export_electricity_price_entsoe_sensor",
+        } <= keys
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "hsem_import_electricity_price_entsoe_sensor",
+            "hsem_export_electricity_price_entsoe_sensor",
+        ],
+    )
+    @pytest.mark.parametrize(
+        "entity_id",
+        ["sensor.adjusted_entsoe_price", "entsoe.adjusted_entsoe_price"],
+    )
+    async def test_prices_schema_entsoe_selectors_allow_sensor_and_entsoe_domains(
+        self, field, entity_id
+    ):
+        from custom_components.hsem.flows.prices import get_prices_step_schema
+
+        schema = await get_prices_step_schema(None)
+        field_selector = next(
+            value for key, value in schema.schema.items() if str(key) == field
+        )
+
+        assert field_selector(entity_id) == entity_id
+
+    @pytest.mark.asyncio
+    async def test_validate_prices_accepts_adjusted_aligned_entsoe_pair(self):
+        from custom_components.hsem.flows.prices import validate_prices_input
+
+        import_points = _entsoe_points()
+        export_points = _entsoe_points(
+            start="2026-08-16T22:00:00+00:00", time_key="start"
+        )
+        hass = _entsoe_price_hass(
+            import_points,
+            export_points,
+            primary_import_unit=" SEK/kWh ",
+            entsoe_import_unit="SEK/kWh",
+        )
+
+        errors = await validate_prices_input(hass, _entsoe_price_input())
+
+        assert errors == {}
+
+    @pytest.mark.asyncio
+    async def test_validate_prices_requires_both_entsoe_sensors(self):
+        from custom_components.hsem.flows.prices import validate_prices_input
+
+        user_input = _entsoe_price_input()
+        user_input.pop("hsem_export_electricity_price_entsoe_sensor")
+        hass = _hass_with_states(
+            "sensor.import", "sensor.export", "sensor.entsoe_import"
+        )
+
+        errors = await validate_prices_input(hass, user_input)
+
+        assert errors == {
+            "hsem_export_electricity_price_entsoe_sensor": (
+                "entsoe_sensor_pair_required"
+            )
+        }
+
+    @pytest.mark.asyncio
+    async def test_validate_prices_checks_entsoe_entity_existence(self):
+        from custom_components.hsem.flows.prices import validate_prices_input
+
+        hass = _hass_with_states(
+            "sensor.import", "sensor.export", "sensor.entsoe_import"
+        )
+
+        errors = await validate_prices_input(hass, _entsoe_price_input())
+
+        assert errors == {
+            "hsem_export_electricity_price_entsoe_sensor": "entity_not_found"
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "invalid_points",
+        [
+            [],
+            [
+                {"time": "2026-08-17T00:00:00", "price": 0.1},
+                {"time": "2026-08-17T00:15:00", "price": 0.2},
+            ],
+            [
+                {"time": "2026-08-17T00:00:00+02:00", "price": float("inf")},
+                {"time": "2026-08-17T00:15:00+02:00", "price": 0.2},
+            ],
+        ],
+    )
+    async def test_validate_prices_rejects_invalid_entsoe_arrays(self, invalid_points):
+        from custom_components.hsem.flows.prices import validate_prices_input
+
+        hass = _entsoe_price_hass(invalid_points, _entsoe_points())
+
+        errors = await validate_prices_input(hass, _entsoe_price_input())
+
+        assert (
+            errors["hsem_import_electricity_price_entsoe_sensor"]
+            == "entsoe_price_data_invalid"
+        )
+
+    @pytest.mark.asyncio
+    async def test_validate_prices_rejects_misaligned_entsoe_timestamps(self):
+        from custom_components.hsem.flows.prices import validate_prices_input
+
+        hass = _entsoe_price_hass(
+            _entsoe_points(),
+            _entsoe_points(start="2026-08-17T00:15:00+02:00"),
+        )
+
+        errors = await validate_prices_input(hass, _entsoe_price_input())
+
+        assert (
+            errors["hsem_export_electricity_price_entsoe_sensor"]
+            == "entsoe_price_timestamps_misaligned"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("points", "interval"),
+        [
+            (_entsoe_points(interval_minutes=30), "15"),
+            (_entsoe_points(start="2026-08-17T00:07:00+02:00"), "15"),
+        ],
+    )
+    async def test_validate_prices_rejects_wrong_or_off_boundary_cadence(
+        self, points, interval
+    ):
+        from custom_components.hsem.flows.prices import validate_prices_input
+
+        hass = _entsoe_price_hass(points, points)
+
+        errors = await validate_prices_input(
+            hass,
+            _entsoe_price_input(hsem_electricity_price_update_interval=interval),
+        )
+
+        assert (
+            errors["hsem_import_electricity_price_entsoe_sensor"]
+            == "entsoe_price_cadence_mismatch"
+        )
+        assert (
+            errors["hsem_export_electricity_price_entsoe_sensor"]
+            == "entsoe_price_cadence_mismatch"
+        )
+
+    @pytest.mark.asyncio
+    async def test_validate_prices_rejects_entsoe_unit_mismatch(self):
+        from custom_components.hsem.flows.prices import validate_prices_input
+
+        points = _entsoe_points()
+        hass = _entsoe_price_hass(
+            points,
+            points,
+            entsoe_import_unit="EUR/kWh",
+        )
+
+        errors = await validate_prices_input(hass, _entsoe_price_input())
+
+        assert (
+            errors["hsem_import_electricity_price_entsoe_sensor"]
+            == "entsoe_price_unit_mismatch"
+        )
 
     @pytest.mark.asyncio
     async def test_validate_prices_requires_valuation_sensor_when_enabled(self):

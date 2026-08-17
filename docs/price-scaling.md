@@ -68,11 +68,42 @@ HSEM is provider-agnostic. Prices are read from generic electricity price sensor
 | `hsem_export_electricity_price_sensor` | Live export price (required) |
 | `hsem_import_electricity_price_forecast_sensor` | Optional dedicated import forecast (e.g. Amber Electric) |
 | `hsem_export_electricity_price_forecast_sensor` | Optional dedicated export forecast |
+| `hsem_import_electricity_price_entsoe_sensor` | Optional ENTSO-E published-price import backup |
+| `hsem_export_electricity_price_entsoe_sensor` | Optional ENTSO-E published-price export backup |
 
-Supported providers include Energi Data Service, Nordpool, Amber Electric, and any
-sensor that publishes hourly (or sub-hourly) price records with a `raw_today` / `raw_tomorrow`
-attribute structure. The populator reads the full time-series from sensor attributes
-and projects them onto the planning horizon.
+Supported providers include Energi Data Service, Nord Pool, Amber Electric, and any
+sensor that publishes hourly or sub-hourly price records through supported
+timestamped attributes. Primary sensors commonly expose `raw_today` /
+`raw_tomorrow`; ENTSO-E average-price sensors expose `prices`,
+`prices_today`, and `prices_tomorrow`. The populator reads the time series
+and projects it onto the planning horizon.
+
+The ENTSO-E fields are an optional pair. Nord Pool or another configured
+primary source keeps priority for every valid published price; ENTSO-E is a
+published-price backup, not a prediction source. HSEM validates that both
+backup channels exist, have aligned timezone-aware finite records, use the
+configured cadence, and report the same non-empty units as their corresponding
+primary channels.
+
+## Final-price basis
+
+Every configured sensor must already report the final price rate HSEM should
+optimize, in the same currency/kWh basis. HSEM deliberately performs no
+currency conversion and adds no VAT, tariff, markup, or grid fee. This keeps
+source-specific billing rules outside the planner and prevents the primary and
+backup paths from applying different transformations.
+
+For the HACS `JaccoR/hass-entso-e` integration, configure separate import and
+export entries when their adjustments differ, then select each entry's
+**Average electricity price** entity. In v0.7.5, the currency option labels the
+unit but does not convert the ENTSO-E EUR price, the VAT value is a fraction
+(`0.25` means 25%, not `25`), and VAT is applied after the price modifier.
+Perform currency conversion and tariff adjustments in that integration's
+sensor configuration, then compare overlapping primary and ENTSO-E points in
+Developer Tools before enabling the backup. A matching unit proves only the
+declared basis, not that the numeric transformation is correct. See
+[ENTSO-E Price Backup](entsoe-price-backup.md) for a complete configuration and
+validation example.
 
 ---
 
@@ -87,6 +118,10 @@ For any configuration:
    price input must not change the price seen by the planner engine
 5. Negative prices must survive the full pipeline unchanged (no absolute-value
    clipping, no zero-flooring)
+6. A valid primary value, including zero or a negative price, must never be
+   overwritten by the ENTSO-E backup
+7. ENTSO-E import and export prices must be accepted as one aligned pair, never
+   mixed independently
 
 ---
 

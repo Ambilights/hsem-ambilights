@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from custom_components.hsem.models.price_source import PriceSource
+
 
 @dataclass
 class PricePoint:
@@ -35,6 +37,9 @@ class PricePoint:
             keeps an unpublished price distinct from a genuine zero price.
         export_price_available:
             Whether ``export_price`` came from the configured source.
+        import_price_source / export_price_source:
+            Optional provenance for the corresponding channel (``primary``,
+            ``entsoe``, or ``forecast``).
     """
 
     hour: int  # 0-23
@@ -44,3 +49,5 @@ class PricePoint:
     slot_in_day: int | None = None
     import_price_available: bool = True
     export_price_available: bool = True
+    import_price_source: PriceSource | None = None
+    export_price_source: PriceSource | None = None

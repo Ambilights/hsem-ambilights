@@ -19,6 +19,35 @@ HSEM exposes these entity types:
 
 ---
 
+## Electricity-price input sensors
+
+These are external Home Assistant entities selected in HSEM's **Electricity
+Prices** step; HSEM does not create them.
+
+| Config key | Role |
+|---|---|
+| `hsem_import_electricity_price_sensor` | Required primary import price |
+| `hsem_export_electricity_price_sensor` | Required primary export price |
+| `hsem_import_electricity_price_forecast_sensor` | Optional legacy import forecast/gap-fill source |
+| `hsem_export_electricity_price_forecast_sensor` | Optional legacy export forecast/gap-fill source |
+| `hsem_import_electricity_price_entsoe_sensor` | Optional ENTSO-E published-price import backup |
+| `hsem_export_electricity_price_entsoe_sensor` | Optional ENTSO-E published-price export backup |
+
+The ENTSO-E entities must be configured together and must expose aligned,
+timezone-aware, finite `{time|start, price}` records in a non-empty `prices`,
+`prices_today`, or `prices_tomorrow` list. Their cadence must match
+`hsem_electricity_price_update_interval`, including exact interval boundaries,
+and their trimmed units must match the corresponding primary sensors exactly.
+
+All four primary/backup entities must already use the final price basis. HSEM
+does not convert currency or add VAT, tariffs, markup, or grid fees. Configure
+those adjustments on the source sensors. The ENTSO-E selections do not create
+new HSEM sensor entities; the selected source is reflected in the planner's
+normal import/export price values and provenance attributes. See
+[ENTSO-E Price Backup](entsoe-price-backup.md) for setup and validation.
+
+---
+
 ## Working mode sensor
 
 The primary HSEM sensor. Exposes the active battery recommendation and carries
@@ -70,6 +99,7 @@ all planner output as attributes.
 | `apply_status` | string | Last apply result: `ok`, `unverified`, `failed`, `skipped` |
 | `apply_failed_entities` | list[string] | Entities that failed the last hardware write |
 | `data_quality` | dict | Structured input completeness report |
+| `entsoe_price_backup_status` | dict | Paired backup status: `configured`, `matched_slots`, and `rejection_reason` |
 | `force_working_mode_state` | string | Active override mode or `auto` |
 
 ### Plan output attributes
@@ -90,6 +120,8 @@ Each entry in the `hourly_recommendations` list is a dictionary with these keys:
 | `recommendation` | string \| null | Working-mode value (see state table above) |
 | `import_price` | float | Spot import price (local currency/kWh) |
 | `export_price` | float | Spot export price (local currency/kWh) |
+| `import_price_source` | string \| null | Import provenance: `primary`, `entsoe`, or `forecast` |
+| `export_price_source` | string \| null | Export provenance: `primary`, `entsoe`, or `forecast` |
 | `avg_house_consumption_kwh` | float | Weighted spike-aware consumption estimate (kWh) |
 | `avg_house_consumption_1d_kwh` | float | 1-day window contribution (kWh) |
 | `avg_house_consumption_3d_kwh` | float | 3-day window contribution (kWh) |

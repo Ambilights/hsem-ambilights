@@ -398,6 +398,8 @@ class TestPriceSourceListenerRouting:
         cfg = SensorConfig()
         cfg.import_electricity_price_sensor = "sensor.import"
         cfg.export_electricity_price_sensor = "sensor.export"
+        cfg.import_electricity_price_entsoe_sensor = "sensor.entsoe_import"
+        cfg.export_electricity_price_entsoe_sensor = "sensor.entsoe_export"
         cfg.import_electricity_price_forecast_sensor = "sensor.import_forecast"
         cfg.export_electricity_price_forecast_sensor = "sensor.export_forecast"
         cfg.solcast_pv_forecast_forecast_today = "sensor.pv_today"
@@ -416,6 +418,8 @@ class TestPriceSourceListenerRouting:
         for entity_id in {
             "sensor.import",
             "sensor.export",
+            "sensor.entsoe_import",
+            "sensor.entsoe_export",
             "sensor.import_forecast",
             "sensor.export_forecast",
             "sensor.pv_today",

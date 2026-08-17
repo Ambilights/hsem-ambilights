@@ -17,5 +17,5 @@
     "documentation": "https://github.com/Ambilights/hsem-ambilights/blob/main/README.md",
     "iot_class": "cloud_polling",
     "issue_tracker": "https://github.com/Ambilights/hsem-ambilights/issues",
-    "version": "7.0.2"
+    "version": "7.1.0"
 }

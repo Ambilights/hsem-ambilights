@@ -24,6 +24,7 @@ request numbers in these inherited documents refer to upstream
 | [Consumption Prediction](consumption-prediction.md) | Weighted-average model, IQR outlier detection, spike suppression |
 | [Safety Modes](safety-modes.md) | Degraded mode, read-only gate, write-verify applier, runtime resolver |
 | [Price Scaling](price-scaling.md) | EDS price scaling, eds_share conversion factor |
+| [ENTSO-E Price Backup](entsoe-price-backup.md) | Configure final-price backup sensors, ECB currency conversion, and validation |
 | [Services Reference](services-reference.md) | All 5 HSEM services with examples |
 | [Sensors Reference](sensors-reference.md) | Complete entity reference: all sensor, select, switch, number, and time entities |
 | [Dashboard Setup](dashboard-setup.md) | Step-by-step ApexCharts dashboard with full YAML, layout reference, and troubleshooting |
