@@ -21,6 +21,9 @@ updates:
       time: "04:00"
       timezone: Europe/Stockholm
     open-pull-requests-limit: 5
+    # Home Assistant pins Voluptuous exactly. Update both together when that pin changes.
+    ignore:
+      - dependency-name: voluptuous
     groups:
       python-dependencies:
         patterns:
