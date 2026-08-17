@@ -12,6 +12,4 @@ planner, cost function, solar correction and EV co-optimisation are upstream wor
 modified since 2026-08-11. If you find HSEM useful,
 [support the author](https://www.buymeacoffee.com/woopstar).
 
-HACS custom repository: `https://github.com/Ambilights/hsem-ambilights`
-
 Licensed under [AGPL-3.0](LICENSE), inherited from upstream.
