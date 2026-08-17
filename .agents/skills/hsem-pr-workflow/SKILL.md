@@ -36,7 +36,7 @@ Before opening a PR, check and update ALL documentation that describes changed b
 - [ ] `docs/planner-spec.md` — if planner semantics changed
 - [ ] `docs/config-flow-reference.md` — if config/options flow steps changed
 - [ ] `docs/ev-charge-plan-setup.md` — if EV planned load changed
-- [ ] `.github/memories.md` — if canonical patterns or module map changed
+- [ ] `docs/architecture-overview.md` / `docs/adr/` — if architecture or module boundaries changed
 - [ ] `README.md` — if user-facing features changed
 - [ ] `docs/huawei_entities.md` — if new Huawei entities wired
 - [ ] `translations/en.json` — if user-facing strings changed

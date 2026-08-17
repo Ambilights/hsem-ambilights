@@ -1,6 +1,6 @@
 {
     "domain": "hsem",
-    "name": "Huawei Solar Energy Management \u2013 PowMr Fork",
+    "name": "HSEM Ambilights",
     "after_dependencies": [
         "huawei_solar",
         "lovelace",
@@ -11,12 +11,11 @@
         "utility_meter"
     ],
     "codeowners": [
-        "@woopstar",
-        "@heinoskov"
+        "@Ambilights"
     ],
     "config_flow": true,
-    "documentation": "https://github.com/Ambilights/hsem-PowMr/blob/main/README.md",
+    "documentation": "https://github.com/Ambilights/hsem-ambilights/blob/main/README.md",
     "iot_class": "cloud_polling",
-    "issue_tracker": "https://github.com/Ambilights/hsem-PowMr/issues",
-    "version": "7.0.0"
+    "issue_tracker": "https://github.com/Ambilights/hsem-ambilights/issues",
+    "version": "7.0.1"
 }

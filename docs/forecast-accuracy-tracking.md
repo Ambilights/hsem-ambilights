@@ -3,7 +3,7 @@
 This document explains how HSEM tracks forecast-vs-actual accuracy for PV
 production and house load predictions.  The system is purely diagnostic — it
 does **not** influence planner decisions.  It was introduced in
-[issue #373](https://github.com/woopstar/hsem/issues/373).
+[upstream HSEM issue #373](https://github.com/woopstar/hsem/issues/373).
 
 ---
 

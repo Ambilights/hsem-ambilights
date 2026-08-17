@@ -1,25 +1,32 @@
 name: Lint and Test
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
   pull_request:
+    branches:
+      - main
     types: [opened, synchronize, reopened]
 
-permissions: {}
+concurrency:
+  group: lint-and-test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   validate:
     name: Validate configs and scripts
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.14"
 
@@ -30,23 +37,24 @@ jobs:
         run: python3 scripts/validate-json.py
 
       - name: Lint shell scripts
-        uses: ludeeus/action-shellcheck@2.0.0
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38 # 2.0.0
         with:
           scandir: './scripts'
 
   quality:
     name: Quality gates (devcontainer)
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Create mount stubs for CI
-        run: mkdir -p ~/.ssh ~/.gnupg ~/.gitconfig
+        run: |
+          mkdir -p "$HOME/.ssh" "$HOME/.gnupg"
+          touch "$HOME/.gitconfig"
 
       - name: Run all quality gates
-        uses: devcontainers/ci@v0.3
+        uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3
         with:
           runCmd: scripts/quality.sh all
 
@@ -63,28 +71,3 @@ jobs:
             exit 1
           fi
           echo "All tests passed (failures=$FAILURES errors=$ERRORS)"
-
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: coverage
-          path: ./coverage.xml
-          retention-days: 1
-
-  codecov:
-    name: Upload coverage to Codecov
-    runs-on: ubuntu-latest
-    needs: quality
-    steps:
-      - name: Download coverage artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: coverage
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v7
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage.xml
-          flags: unittests
-          name: codecov-umbrella

@@ -176,9 +176,9 @@ def select_best_candidate(  # NOSONAR
             :func:`~soc_simulation.simulate_soc`.  Defaults to 100 %.
         replacement_price_per_kwh:
             Currency-per-kWh price used by :func:`~cost_function.score_plan`
-            to evaluate the terminal-SoC opportunity cost (issue #413).
-            A conservative choice is the average future import price across
-            the horizon.  ``None`` disables the terminal-SoC term.
+            to evaluate the terminal inventory value introduced by issue #413.
+            The caller derives it from the next relevant discharge block.
+            ``None`` disables the terminal inventory value.
         required_capacity:
             Battery reserve needed until the next forecast solar surplus.
         months_winter:

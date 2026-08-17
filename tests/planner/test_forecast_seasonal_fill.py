@@ -1,4 +1,4 @@
-"""Regression tests for forecast-driven idle-slot fill (fork issue #3).
+"""Regression tests for forecast-driven idle-slot fill.
 
 All fixtures use 15-minute slots and energy values in kWh.  These tests stop
 at the recommendation pass, before SoC simulation, so battery trajectory and

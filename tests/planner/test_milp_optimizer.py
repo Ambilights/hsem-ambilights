@@ -1721,7 +1721,7 @@ def test_main_fuse_default_phase_preserves_behavior():
 
 
 # ---------------------------------------------------------------------------
-# Hard per-phase battery-charge protection (PowMr fork)
+# Hard per-phase battery-charge protection.
 # ---------------------------------------------------------------------------
 
 

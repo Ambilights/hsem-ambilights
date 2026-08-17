@@ -18,7 +18,7 @@ When behaviour changes, check **every** file below. If it describes something yo
 | `docs/config-flow-reference.md` | Config/options flow steps changed |
 | `docs/ev-charge-plan-setup.md` | EV planned load setup changed |
 | `docs/huawei_entities.md` | New Huawei entities wired or existing ones changed |
-| `.github/memories.md` | Canonical patterns, module map, open issues, or architectural decisions changed |
+| `docs/architecture-overview.md` and `docs/adr/` | Architecture, module ownership, or an architectural decision changed |
 | `README.md` | User-facing features, descriptions, or links changed |
 | `translations/en.json` | Any user-facing string added, changed, or removed |
 
@@ -30,12 +30,10 @@ When behaviour changes, check **every** file below. If it describes something yo
 - If a change intentionally alters planner semantics, update the spec in the same commit
 - The spec is the source of truth — code must match it exactly
 
-### Memories.md
+### Architecture records
 
-- Module responsibility map must reflect current file layout
-- Canonical patterns must be accurate
-- Open issue numbers must be up to date
-- New architectural decisions must be recorded
+- `docs/architecture-overview.md` must reflect the current module boundaries
+- New durable design decisions belong in an ADR, not in duplicated agent memory
 
 ### Translations
 
@@ -56,7 +54,7 @@ Before opening a PR:
 - [ ] Read every docs file listed above
 - [ ] For each file: does it describe something I changed? If yes, update it
 - [ ] `docs/planner-spec.md` consistent with planner implementation
-- [ ] `.github/memories.md` module map matches current file layout
+- [ ] Architecture overview and ADRs match any changed module boundaries or decisions
 - [ ] `translations/en.json` has entries for all new/changed user-facing strings
 - [ ] No stale or misleading documentation remains
 
@@ -67,4 +65,4 @@ Before opening a PR:
 - ❌ Changing a feature but leaving old behavior in `README.md`
 - ❌ Adding a user-facing string but skipping `translations/en.json`
 - ❌ Wiring a new Huawei entity but not `docs/huawei_entities.md`
-- ❌ Recording a pattern in code but not in `.github/memories.md`
+- ❌ Duplicating volatile implementation layouts in agent instructions instead of inspecting current source

@@ -572,7 +572,7 @@ If you've checked everything and HSEM still doesn't work:
    HA config directory. The log shows every planning step in detail.
 
 6. **Check for known issues:** Review open issues at
-   [github.com/woopstar/hsem/issues](https://github.com/woopstar/hsem/issues).
+   [github.com/Ambilights/hsem-ambilights/issues](https://github.com/Ambilights/hsem-ambilights/issues).
 
 ---
 

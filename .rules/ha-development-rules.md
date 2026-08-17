@@ -3,7 +3,6 @@
 This checklist enforces Home Assistant development guidelines from:
 - https://developers.home-assistant.io/docs/creating_component_code_review
 - https://developers.home-assistant.io/docs/development_guidelines
-- Validated in issue #491
 
 Apply these rules to **every** PR, regardless of scope.
 
@@ -14,7 +13,7 @@ Apply these rules to **every** PR, regardless of scope.
 ```bash
 git checkout main
 git pull
-cat .github/memories.md
+cat AGENTS.md
 ```
 
 Branch naming: `<type>/<issue-number>-<slug>`

@@ -204,7 +204,7 @@ class SensorConfig:
     #: uses this as a hard bound on per-slot grid export energy.
     max_grid_export_power_kw: float = 0.0
 
-    # Optional dedicated-load secondary storage (PowMr in this fork)
+    # Optional dedicated-load secondary storage (PowMr topology).
     secondary_storage: SecondaryStorageEntityConfig = field(
         default_factory=SecondaryStorageEntityConfig
     )
