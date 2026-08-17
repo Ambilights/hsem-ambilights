@@ -1,13 +1,17 @@
-# HSEM-PowMr
+# HSEM — Ambilights
 
-Personal fork of **[HSEM by woopstar](https://github.com/woopstar/hsem)**, adding a PowMr inverter as a second battery alongside the Huawei system.
+Personal home energy planner. Plans a Huawei battery and a PowMr inverter against
+Nord Pool SE4 prices, using solar and consumption forecasts, EV charging, and
+per-phase fuse protection.
 
-All the hard parts — the MILP planner, cost function, solar correction, EV co-optimisation — are woopstar's work. If you find HSEM useful, [support the author](https://www.buymeacoffee.com/woopstar).
+Built for one specific installation. Not general-purpose, not supported, and
+changed without notice.
 
-> **Modified fork.** Forked from [woopstar/hsem](https://github.com/woopstar/hsem) on 2026-08-11 and modified since. Upstream is not responsible for anything here.
+Derived from **[HSEM by woopstar](https://github.com/woopstar/hsem)** — the MILP
+planner, cost function, solar correction and EV co-optimisation are upstream work,
+modified since 2026-08-11. If you find HSEM useful,
+[support the author](https://www.buymeacoffee.com/woopstar).
 
-Documentation for everything inherited from upstream is in the [HSEM Wiki](https://github.com/woopstar/hsem/wiki) and [`docs/`](docs/).
-
-HACS custom repository URL for this fork: `https://github.com/Ambilights/hsem-PowMr`
+HACS custom repository: `https://github.com/Ambilights/hsem-ambilights`
 
 Licensed under [AGPL-3.0](LICENSE), inherited from upstream.
