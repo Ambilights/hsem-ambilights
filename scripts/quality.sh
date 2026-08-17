@@ -18,7 +18,7 @@ Commands:
   typing    Type check with mypy
   quality   Static quality checks (pyright + vulture)
   test      Run tests with pytest and coverage
-  all       Run lint, typing, quality, and test in sequence
+  all       Check the dependency lock, then run lint, typing, quality, and test
 EOF
     exit 1
 }
@@ -44,6 +44,9 @@ case "${1:-}" in
             "${@:2}"
         ;;
     all)
+        echo "=== Dependency Lock ==="
+        uv lock --check
+        echo ""
         echo "=== Lint ==="
         ruff format .
         ruff check .
