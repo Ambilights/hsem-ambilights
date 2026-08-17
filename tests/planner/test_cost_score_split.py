@@ -151,20 +151,16 @@ class TestTerminalSoCCredit:
     def test_credit_when_battery_grows(self) -> None:
         """Charging with a net capacity gain → terminal_soc_value < 0 → reduces score.
 
-        The terminal-SoC term is computed per-slot, capped by the
-        differential between ``replacement_price_per_kwh`` and that slot's
-        own import price (issue #655) — it must match
-        ``milp_optimizer.py``'s identical formula.  Using ``import_price=0.0``
-        makes the differential equal to the full replacement price, so the
-        expected numbers below match what the flat pre-#655 formula would
-        have produced for this scenario, while still exercising the new
-        per-slot, flow-based calculation (``batteries_charged_kwh``) rather
-        than an ungrounded ``estimated_battery_capacity_kwh`` that no real
-        SoC simulation would ever produce on its own.
+        The path-independent terminal term values every charged DC kWh at the
+        same ``replacement_price_per_kwh``, independent of the slot import
+        price. This still exercises the flow-based
+        ``batteries_charged_kwh`` calculation rather than an ungrounded
+        ``estimated_battery_capacity_kwh`` that no real SoC simulation would
+        produce on its own.
         """
         # Battery charges 5 kWh this slot (3 -> 8 kWh); price 0.30 DKK/kWh.
-        # terminal_premium = max(0, 0.30 - 0.0) = 0.30.
-        # terminal_soc_value = (discharged - charged) * premium = (0 - 5) * 0.30 = -1.50.
+        # terminal_soc_value = R * (discharged - charged)
+        #                    = 0.30 * (0 - 5) = -1.50.
         slot = _make_slot(
             import_price=0.0,
             export_price=0.0,
@@ -183,7 +179,11 @@ class TestTerminalSoCCredit:
         # Money cost is unaffected.
         assert bd.total_cost == pytest.approx(0.0, abs=1e-9)
         # Score includes the credit.
-        assert bd.score == pytest.approx(0.0 - 1.50, abs=1e-9)
+        assert bd.primary_action_tiebreak == pytest.approx(0.00005, abs=1e-9)
+        assert bd.score == pytest.approx(
+            bd.total_cost + bd.terminal_soc_value + bd.primary_action_tiebreak,
+            abs=1e-9,
+        )
 
 
 class TestTerminalSoCPenalty:
@@ -221,7 +221,11 @@ class TestTerminalSoCPenalty:
             abs=1e-9,
         )
         # Score includes the terminal-SoC penalty.
-        assert bd.score == pytest.approx(bd.total_cost + 2.80, abs=1e-9)
+        assert bd.primary_action_tiebreak == pytest.approx(-0.000035, abs=1e-9)
+        assert bd.score == pytest.approx(
+            bd.total_cost + bd.terminal_soc_value + bd.primary_action_tiebreak,
+            abs=1e-9,
+        )
 
 
 class TestTerminalSoCDisabledByDefault:

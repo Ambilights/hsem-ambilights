@@ -25,12 +25,18 @@ def _build_solve_and_finalize(
         m,
         n_vars,
         base_n_vars,
+        column_layout,
         ec_off,
         ed_off,
         gi_off,
         ge_off,
         pv_off,
         m_off,
+        primary_export_off,
+        pv_export_off,
+        export_source_mode_off,
+        primary_action_mode_off,
+        grid_flow_mode_off,
         s_max_off,
         s_min_off,
         curt_off,
@@ -56,6 +62,9 @@ def _build_solve_and_finalize(
         secondary_storage,
         price_actionable,
         pv_avail,
+        pv_export_ub_per_slot,
+        grid_import_ub_per_slot,
+        grid_export_ub_per_slot,
         base_load,
         ev_accounted,
         charge_eff,
@@ -95,12 +104,18 @@ def _build_solve_and_finalize(
         "m",
         "n_vars",
         "base_n_vars",
+        "column_layout",
         "ec_off",
         "ed_off",
         "gi_off",
         "ge_off",
         "pv_off",
         "m_off",
+        "primary_export_off",
+        "pv_export_off",
+        "export_source_mode_off",
+        "primary_action_mode_off",
+        "grid_flow_mode_off",
         "s_max_off",
         "s_min_off",
         "curt_off",
@@ -126,6 +141,9 @@ def _build_solve_and_finalize(
         "secondary_storage",
         "price_actionable",
         "pv_avail",
+        "pv_export_ub_per_slot",
+        "grid_import_ub_per_slot",
+        "grid_export_ub_per_slot",
         "base_load",
         "ev_accounted",
         "charge_eff",
@@ -179,6 +197,7 @@ def _build_solve_and_finalize(
         gi_off,
         ge_off,
         m_off,
+        primary_export_off,
         s_max_off,
         s_min_off,
         gi_pen_off,
@@ -258,6 +277,11 @@ def _build_solve_and_finalize(
         max_grid_export_per_slot_kwh=max_grid_export_per_slot_kwh,
         export_limit_active=export_limit_active,
         battery_export_blocked=primary_export_blocked,
+        primary_action_mode_off=primary_action_mode_off,
+        pv_export_ub_per_slot=pv_export_ub_per_slot,
+        grid_flow_mode_off=grid_flow_mode_off,
+        grid_import_ub_per_slot=grid_import_ub_per_slot,
+        grid_export_ub_per_slot=grid_export_ub_per_slot,
     )
 
     if export_mode_off is not None:
@@ -282,18 +306,13 @@ def _build_solve_and_finalize(
             residual_house_load=base_load,
             checkpoints=export_reserve_checkpoints,
             reserve_kwh=export_reserve_kwh,
+            primary_export_off=primary_export_off,
         )
 
-    primary_site_discharge_limited = np.logical_or(
-        np.logical_or(
-            primary_export_blocked,
-            np.logical_or(
-                np.full(m, no_export, dtype=bool),
-                np.logical_not(price_actionable),
-            ),
-        ),
-        np.logical_and(not active_evs, ev_accounted > 1e-9),
-    )
+    # Explicit destination rows supersede the legacy static site-load cap.
+    # Retain the helper mask for direct-call compatibility, but do not add its
+    # narrower rows to production models.
+    primary_site_discharge_limited = np.zeros(m, dtype=bool)
     primary_site_discharge_cap_kwh = base_load.copy()
     if not active_evs:
         primary_site_discharge_cap_kwh = np.where(
@@ -328,10 +347,40 @@ def _build_solve_and_finalize(
             now=now,
         )
         integrality = _secondary_integrality(n_vars, m, secondary_layout)
+    from custom_components.hsem.planner.milp._export_sources import (
+        _add_export_source_constraints,
+    )
+
+    constraints = _add_export_source_constraints(
+        constraints,
+        n_vars=n_vars,
+        m=m,
+        slots=slots,
+        future_idx=future_idx,
+        ed_off=ed_off,
+        gi_off=gi_off,
+        ge_off=ge_off,
+        primary_export_off=primary_export_off,
+        pv_export_off=pv_export_off,
+        export_source_mode_off=export_source_mode_off,
+        grid_flow_mode_off=grid_flow_mode_off,
+        discharge_eff=discharge_eff,
+        primary_site_discharge_cap_kwh=primary_site_discharge_cap_kwh,
+        primary_discharge_ub_per_slot=constraints["ed_ub_per_slot"],
+        pv_export_ub_per_slot=pv_export_ub_per_slot,
+        grid_import_ub_per_slot=grid_import_ub_per_slot,
+        grid_export_ub_per_slot=grid_export_ub_per_slot,
+        secondary_layout=secondary_layout,
+        secondary_storage=secondary_storage,
+    )
+
+    if integrality is None:
+        integrality = np.zeros(n_vars, dtype=int)
+    integrality[export_source_mode_off : export_source_mode_off + m] = 1
+    integrality[primary_action_mode_off : primary_action_mode_off + m] = 1
+    integrality[grid_flow_mode_off : grid_flow_mode_off + m] = 1
 
     if export_mode_off is not None:
-        if integrality is None:
-            integrality = np.zeros(n_vars, dtype=int)
         integrality[export_mode_off : export_mode_off + m] = 1
 
     from custom_components.hsem.planner.milp._phase_fuse import (
@@ -375,29 +424,33 @@ def _build_solve_and_finalize(
     b_ub = constraints["b_ub"]
     bounds = constraints["bounds"]
 
-    # Every per-slot decision block must align with the active horizon before
-    # a time-limited incumbent may be decoded. Single scalar penalty variables
-    # are covered by the full-vector length, bound, and matrix checks.
-    variable_blocks: dict[str, tuple[int, int]] = {
-        "primary_charge": (ec_off, m),
-        "primary_discharge": (ed_off, m),
-        "grid_import": (gi_off, m),
-        "grid_export": (ge_off, m),
-        "pv": (pv_off, m),
-        "primary_throughput": (m_off, m),
-        "soc_max_penalty": (s_max_off, m),
-        "soc_min_penalty": (s_min_off, m),
-        "curtailment": (curt_off, m),
-    }
-    for ev_index, offset in enumerate(ev_var_offsets):
-        variable_blocks[f"ev_{ev_index}_charge"] = (offset, m)
-    if fuse_active:
-        variable_blocks["grid_import_penalty"] = (gi_pen_off, m)
-    if export_mode_off is not None:
-        variable_blocks["battery_export_mode"] = (export_mode_off, m)
-    if secondary_layout is not None:
-        for name, offset in secondary_layout.items():
-            variable_blocks[f"secondary_{name}"] = (offset, m)
+    # One declaration owns every block and validates all hand-built consumers.
+    if n_vars != column_layout.column_count:
+        raise ValueError(
+            f"MILP variable count {n_vars} != declared {column_layout.column_count}"
+        )
+    column_layout.assert_model_width(
+        objective=c_obj,
+        a_eq=A_eq,
+        a_ub=A_ub,
+        bounds=bounds,
+    )
+    if integrality is not None and len(integrality) != n_vars:
+        raise ValueError(
+            f"MILP integrality width {len(integrality)} != declared {n_vars}"
+        )
+    variable_blocks = column_layout.variable_blocks()
+    integral_blocks = [
+        name
+        for name, block in column_layout.blocks.items()
+        if integrality is not None
+        and block.width > 0
+        and bool(
+            np.all(
+                integrality[block.offset : block.offset + block.width] != 0,
+            )
+        )
+    ]
 
     # ------------------------------------------------------------------
     # Solve using HiGHS
@@ -406,7 +459,7 @@ def _build_solve_and_finalize(
         "time_limit": solver_time_limit,
         "disp": False,
     }
-    if secondary_active or export_reserve_active:
+    if integrality is not None:
         solver_options["mip_rel_gap"] = 0.005
     solve_started = perf_counter()
     try:
@@ -556,58 +609,43 @@ def _build_solve_and_finalize(
             f"{mip_gap:.6f}" if mip_gap is not None else "n/a",
         )
 
-    # ------------------------------------------------------------------
-    # Compute the terminal-value objective contribution for diagnostics.
-    # Only price-actionable slots receive this incentive, matching
-    # milp/_objective.py. An initial-vs-final shortcut would incorrectly
-    # attribute passive energy changes in the unpublished tail to terminal
-    # economics.
-    # ------------------------------------------------------------------
+    # Uniform, path-independent final-inventory value. Non-actionable primary
+    # blocks are fixed at zero, so the solved sum is the published-price prefix.
     ec_sol = result.x[ec_off : ec_off + m]
     ed_sol = result.x[ed_off : ed_off + m]
+    primary_export_sol = result.x[primary_export_off : primary_export_off + m]
 
-    # Compute final SoC from the LP solution
     final_soc_kwh = current_kwh + float(np.sum(ec_sol)) - float(np.sum(ed_sol))
-    final_soc_kwh = max(0.0, min(final_soc_kwh, usable_kwh))  # clamp to bounds
+    final_soc_kwh = max(0.0, min(final_soc_kwh, usable_kwh))
 
-    # Negative means a charge credit; positive means a discharge penalty.
-    terminal_soc_credit = 0.0
-    if replacement_price_per_kwh is not None and abs(replacement_price_per_kwh) > 1e-9:
-        from custom_components.hsem.planner.cost_helpers import (
-            compute_charge_premium,
-            deferred_export_price_by_slot,
-        )
+    replacement_price = max(replacement_price_per_kwh or 0.0, 0.0)
+    if not math.isfinite(replacement_price):
+        replacement_price = 0.0
+    terminal_inventory_value = replacement_price * (
+        float(np.sum(ed_sol)) - float(np.sum(ec_sol))
+    )
+    from custom_components.hsem.planner.cost_helpers import (
+        PRIMARY_ACTION_TIEBREAK_COST,
+    )
 
-        deferred_prices = deferred_export_price_by_slot(
-            slots,
-            usable_kwh=usable_kwh,
-            max_charge_per_slot=max_charge_per_slot,
-            now=now,
-        )
-        for t, slot_i in enumerate(future_idx):
-            if not slots[slot_i].price_actionable:
-                continue
-            discharge_premium = max(0.0, replacement_price_per_kwh - p_imp_obj[t])
-            charge_premium = compute_charge_premium(
-                replacement_price_per_kwh=replacement_price_per_kwh,
-                imp_price_obj=p_imp_obj[t],
-                exp_price=p_exp[t],
-                charge_eff=charge_eff,
-                deferred_export_price=deferred_prices[slot_i],
-            )
-            terminal_soc_credit += (
-                -float(ec_sol[t]) * charge_premium
-                + float(ed_sol[t]) * discharge_premium
-            )
-        log_planner(
-            "debug",
-            "[milp] Terminal objective: initial=%.3f  final=%.3f  repl_price=%.4f  value=%.4f",
-            current_kwh,
-            final_soc_kwh,
-            replacement_price_per_kwh,
-            terminal_soc_credit,
-        )
+    primary_action_tiebreak = PRIMARY_ACTION_TIEBREAK_COST * (
+        float(np.sum(ec_sol))
+        + float(np.sum(ed_sol))
+        - 1.5 * float(np.sum(ed_sol - primary_export_sol))
+    )
 
+    # Compatibility alias retained for diagnostics consumers.
+    terminal_soc_credit = terminal_inventory_value
+    log_planner(
+        "debug",
+        "[milp] Terminal inventory: initial=%.3f final=%.3f R=%.4f "
+        "inventory=%.4f action_tie=%.6f",
+        current_kwh,
+        final_soc_kwh,
+        replacement_price,
+        terminal_inventory_value,
+        primary_action_tiebreak,
+    )
     # Pre-compute curtailment solution (needed by both write-out and diagnostics)
     curt_sol_full = result.x[curt_off : curt_off + m]
 
@@ -616,6 +654,7 @@ def _build_solve_and_finalize(
         _compute_milp_diagnostics,
     )
     from custom_components.hsem.planner.milp._write_results import (
+        _reconcile_export_sources,
         _write_milp_results_to_slots,
     )
 
@@ -646,31 +685,7 @@ def _build_solve_and_finalize(
         _min_action_kwh=min_action_kwh,
     )
 
-    # Compute diagnostics
-    diagnostics = _compute_milp_diagnostics(
-        result,
-        out_slots,
-        slots,
-        future_idx,
-        m,
-        s_max_off,
-        s_min_off,
-        curt_off,
-        gi_off,
-        gi_pen_off,
-        replacement_price_per_kwh,
-        min_export_price,
-        p_imp_obj,
-        discharge_loss,
-        fuse_active,
-        max_grid_import_per_slot_kwh,
-        active_evs,
-        ev_var_offsets,
-        ev_pen_offsets,
-        terminal_soc_credit,
-        _min_action_kwh=min_action_kwh,
-    )
-    diagnostics.update(attempt)
+    diagnostics = dict(attempt)
 
     diagnostics["phase_fuse_active"] = phase_fuse_active
 
@@ -769,4 +784,92 @@ def _build_solve_and_finalize(
         diagnostics["secondary_result"] = asdict(secondary_result)
         log_secondary_result(secondary_result)
 
+    export_source_error = _reconcile_export_sources(
+        out_slots,
+        future_idx=future_idx,
+        primary_export_dc=primary_export_sol,
+        discharge_eff=discharge_eff,
+    )
+
+    # Publish the objective terms from the same three-decimal executable
+    # flows consumed by score_plan. Exact action binaries ensure this is only
+    # publication-rounding reconciliation, never concealment of a raw cycle.
+    terminal_inventory_value = replacement_price * sum(
+        out_slots[i].batteries_discharged_kwh - out_slots[i].batteries_charged_kwh
+        for i in future_idx
+    )
+    primary_action_tiebreak = 0.0
+    for slot_i in future_idx:
+        slot = out_slots[slot_i]
+        primary_export_dc = min(
+            max(slot.primary_battery_export_kwh, 0.0) / discharge_eff,
+            max(slot.batteries_discharged_kwh, 0.0),
+        )
+        local_discharge_dc = max(
+            slot.batteries_discharged_kwh - primary_export_dc,
+            0.0,
+        )
+        primary_action_tiebreak += PRIMARY_ACTION_TIEBREAK_COST * (
+            slot.batteries_charged_kwh
+            + slot.batteries_discharged_kwh
+            - 1.5 * local_discharge_dc
+        )
+    terminal_soc_credit = terminal_inventory_value
+
+    diagnostics.update(
+        _compute_milp_diagnostics(
+            result,
+            out_slots,
+            slots,
+            future_idx,
+            m,
+            s_max_off,
+            s_min_off,
+            curt_off,
+            gi_off,
+            gi_pen_off,
+            replacement_price_per_kwh,
+            min_export_price,
+            p_imp_obj,
+            discharge_loss,
+            fuse_active,
+            max_grid_import_per_slot_kwh,
+            active_evs,
+            ev_var_offsets,
+            ev_pen_offsets,
+            terminal_soc_credit,
+            _min_action_kwh=min_action_kwh,
+        )
+    )
+    diagnostics["terminal_inventory_value"] = round(terminal_inventory_value, 6)
+    diagnostics["primary_action_tiebreak"] = round(
+        primary_action_tiebreak,
+        6,
+    )
+    diagnostics["primary_battery_export_kwh"] = round(
+        sum(out_slots[i].primary_battery_export_kwh for i in future_idx),
+        6,
+    )
+    diagnostics["pv_export_kwh"] = round(
+        sum(out_slots[i].pv_export_kwh for i in future_idx),
+        6,
+    )
+    diagnostics["export_source_balance_max_error_kwh"] = round(
+        export_source_error,
+        6,
+    )
+    raw_grid_import = np.maximum(result.x[gi_off : gi_off + m], 0.0)
+    raw_grid_export = np.maximum(result.x[ge_off : ge_off + m], 0.0)
+    diagnostics["grid_import_export_overlap_max_kwh"] = round(
+        float(np.max(np.minimum(raw_grid_import, raw_grid_export))),
+        9,
+    )
+    diagnostics["model_variable_blocks"] = column_layout.as_dict()
+    diagnostics["model_integral_blocks"] = integral_blocks
+    diagnostics["model_integrality_count"] = int(np.count_nonzero(integrality))
+    diagnostics["model_column_count"] = column_layout.column_count
+    diagnostics["model_bounds_count"] = len(bounds)
+    diagnostics["model_objective_column_count"] = len(c_obj)
+    diagnostics["model_equality_column_count"] = int(A_eq.shape[1])
+    diagnostics["model_inequality_column_count"] = int(A_ub.shape[1])
     return out_slots, diagnostics

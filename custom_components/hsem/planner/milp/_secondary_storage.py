@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -30,22 +30,43 @@ from custom_components.hsem.utils.units import (
 )
 
 SecondaryLayout = dict[str, int]
+if TYPE_CHECKING:
+    from custom_components.hsem.planner.milp._layout import MilpColumnLayout
 
 
 def _allocate_secondary_variables(
     base_n_vars: int,
     m: int,
+    *,
+    column_layout: MilpColumnLayout | None = None,
 ) -> tuple[SecondaryLayout, int]:
     """Append secondary energy, mode, and integer-current-step blocks."""
+    if column_layout is None:
+        layout = {
+            "charge": base_n_vars,
+            "discharge": base_n_vars + m,
+            "throughput": base_n_vars + 2 * m,
+            "charge_mode": base_n_vars + 3 * m,
+            "sbu_mode": base_n_vars + 4 * m,
+            "charge_steps": base_n_vars + 5 * m,
+        }
+        return layout, base_n_vars + 6 * m
+
+    if column_layout.column_count != base_n_vars:
+        raise ValueError(
+            f"secondary MILP layout starts at {column_layout.column_count}, "
+            f"expected {base_n_vars}"
+        )
+
     layout = {
-        "charge": base_n_vars,
-        "discharge": base_n_vars + m,
-        "throughput": base_n_vars + 2 * m,
-        "charge_mode": base_n_vars + 3 * m,
-        "sbu_mode": base_n_vars + 4 * m,
-        "charge_steps": base_n_vars + 5 * m,
+        "charge": column_layout.add("secondary_charge", m),
+        "discharge": column_layout.add("secondary_discharge", m),
+        "throughput": column_layout.add("secondary_throughput", m),
+        "charge_mode": column_layout.add("secondary_charge_mode", m),
+        "sbu_mode": column_layout.add("secondary_sbu_mode", m),
+        "charge_steps": column_layout.add("secondary_charge_steps", m),
     }
-    return layout, base_n_vars + 6 * m
+    return layout, column_layout.column_count
 
 
 def _extend_secondary_constraints(

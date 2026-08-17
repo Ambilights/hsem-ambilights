@@ -72,6 +72,12 @@ class PlannedSlot:
         grid_export_kwh:
             Energy exported to the grid during this slot (kWh, ≥ 0).
             Equals surplus PV and battery discharge beyond local load.
+        primary_battery_export_kwh:
+            AC energy in ``grid_export_kwh`` sourced from the primary battery.
+        pv_export_kwh:
+            AC energy in ``grid_export_kwh`` not sourced from the primary
+            battery, normally direct PV. Together the two source fields equal
+            ``grid_export_kwh`` within solver/writeback precision.
         recommendation:
             The ``Recommendations`` enum value chosen for this slot
             (stored as its string value so the output stays framework-free)
@@ -155,5 +161,7 @@ class PlannedSlot:
     batteries_discharged_kwh: float = 0.0
     grid_import_kwh: float = 0.0
     grid_export_kwh: float = 0.0
+    primary_battery_export_kwh: float = 0.0
+    pv_export_kwh: float = 0.0
     recommendation: str | None = None
     primary_battery_hold: bool = False

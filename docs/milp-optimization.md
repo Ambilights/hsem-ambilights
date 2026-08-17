@@ -1,6 +1,6 @@
 # HSEM MILP Optimization
 
-The MILP solver (`planner/milp_optimizer.py`) finds the globally optimal battery charge/discharge schedule using scipy's HiGHS linear programming solver. It is the **primary planner** — heuristic candidates are generated alongside it for benchmarking and fallback, but when scipy is available the MILP solution is preferred.
+The MILP solver (`planner/milp_optimizer.py`) finds the globally optimal battery charge/discharge schedule using scipy's HiGHS linear programming solver. It is the **only active optimiser**. The planner also scores a diagnostic no-action comparator and keeps one passive, non-arbitrage fallback for solver failure.
 
 ---
 
@@ -14,15 +14,15 @@ flowchart TD
     D{EV configs provided?}
     E[Rebuild net_load without pre-computed EV planned loads]
     F[Keep fixed EV planned load in net_load]
-    G[Build objective vector c_obj: import cost, export revenue, cycle cost, conversion loss, terminal-SoC credit, SoC penalties, EV deadline penalties, EV pre-deadline benefit, EV charge-past-target benefit]
-    H[Build equality constraints A_eq: energy balance per slot inc. EV charger load]
-    I[Build inequality constraints A_ub: SoC recurrence soft bounds, mutual exclusion, cycle cost auxiliary m >= ec/ed, EV cumulative SOC, EV deadline target, EV post-deadline zero-charge, EV surplus-only]
-    J[Build variable bounds: ec, ed capped; pv fixed to actual surplus; penalties >= 0]
-    K[linprog method = highs, timeout = 2s]
+    G[Build objective vector c_obj: money terms, uniform terminal inventory value, primary-action structural tiebreak, penalties, EV terms]
+    H[Build equality constraints A_eq: site energy balance, exact battery/PV export-source balance, EV charger load]
+    I[Build inequalities: SoC soft bounds, exact battery and meter directions, causal export-source split, cycle auxiliary, EV and fuse rows]
+    J[Build bounds and integrality: finite import/export, source/action/grid binaries, optional reserve/PowMr modes]
+    K[linprog with HiGHS integrality and configured solve-time budget]
     L{Solution found?}
-    M[Decode solution: ec, ed, gi, ge, pv, m, penalties, EV charging]
+    M[Decode solution: ec, ed, gi, ge, pv, bx, pv_export, penalties, EV charging]
     N[Write recommendations to output slots BatteriesChargeGrid, BatteriesChargeSolar, BatteriesDischargeMode, ForceBatteriesDischarge]
-    N2[Write LP-derived energy flow fields: batteries_discharged_kwh, grid_import_kwh, grid_export_kwh — these are the source of truth]
+    N2[Write reconciled MILP energy flows and exact battery/PV export attribution — these are the source of truth]
     O[Compute penalty violation diagnostics]
     P[Return slots and diagnostics]
     Q[Return None: solver failed or no future slots]
@@ -39,9 +39,9 @@ flowchart TD
 
 ## Variable layout
 
-### Base battery variables (9 × n slots)
+### Core primary variables (9 × n slots)
 
-For each slot `t ∈ 0…n-1` the LP variable vector `x` contains nine decision variables:
+For each slot `t ∈ 0…n-1`, the layout first allocates nine core blocks:
 
 | Offset | Variable | Name | Description | Bounds |
 |---|---|---|---|---|
@@ -63,20 +63,40 @@ $$
 
 Penalty variables `s_max_pen` and `s_min_pen` prevent infeasibility when the initial SoC lies outside `[0, usable_kwh]`. Their objective coefficient is extremely high (`max(p_imp) × 100`), so they are only used when the initial state is physically out of bounds.
 
+`MilpColumnLayout` is the single source of truth for all allocation. Every
+EV, fuse, export-source, export-mode, and secondary-storage block is appended
+through that layout and receives its offset by name; consumers must not repeat
+a hand-calculated base offset. Immediately before solving, the declared
+`column_count` must equal the objective length, both constraint-matrix widths,
+and the bounds length. Incumbent validation uses the same declared blocks.
+Adding or reordering a base block must therefore either shift every downstream
+consumer coherently or fail before HiGHS is called.
+
+Solver diagnostics expose the declaration as `model_variable_blocks`; each
+entry carries `offset`, `width`, and `per_slot`. The contiguous cursor and
+the keys `model_column_count`, `model_objective_column_count`,
+`model_equality_column_count`, `model_inequality_column_count`, and
+`model_bounds_count` must all resolve to the same final width.
+`model_integral_blocks` lists each wholly integral named block and
+`model_integrality_count` reports the integral-column total. The three
+always-present source/action/grid blocks must appear in that list.
+`grid_import_export_overlap_max_kwh` is computed from the raw solution as
+`max_t(min(gi[t],ge[t]))` and must be zero within solver tolerance.
+
 ### EV co-optimization extension
 
 When one or more active EVs are provided, the variable vector expands to:
 
 $$
-\text{total variables} = 9n + n \cdot E + E
+\text{total variables after EVs} = B_{core} + n \cdot E + E, \qquad B_{core}=9n
 $$
 
 where `E` is the number of active EVs.
 
 | Offset | Variable | Name | Description | Bounds |
 |---|---|---|---|---|
-| `9n + i·n` | `evN_c[t]` | EV N DC-side charge per slot (kWh) | `[0, evN.max_charge_per_slot]` |
-| `9n + E·n + i` | `evN_pen` | EV N deadline target slack (kWh shortfall) | `[0, ∞)` |
+| after base + `i·n` | `evN_c[t]` | EV N DC-side charge per slot (kWh) | `[0, evN.max_charge_per_slot]` |
+| after all EV charge blocks + `i` | `evN_pen` | EV N deadline target slack (kWh shortfall) | `[0, ∞)` |
 
 The EV charger AC load entering the energy balance equation is `evN_c[t] / charger_efficiency`.
 
@@ -94,7 +114,7 @@ When an EV has a deadline and `charge_past_target=False` (normal mode):
 When `main_fuse_amps > 0`, the variable vector expands further:
 
 $$
-\text{total variables} = 9n + n \cdot E + E + n
+\text{total variables after fuse} = B_{core} + n \cdot E + E + n
 $$
 
 | Offset | Variable | Name | Description | Bounds |
@@ -127,11 +147,31 @@ the model remains feasible while forbidding controllable charge from worsening
 it. Huawei charge is balanced by construction; PowMr charge and Utility/SBU
 load switching affect only its configured phase.
 
+### Primary export-source, action-mode, and grid-flow extension
+
+After the core, active-EV, and optional-fuse blocks, the layout always appends
+five named per-slot blocks. Let `B` be the layout's current
+`column_count` at that point:
+
+| Allocated offset | Variable | Name | Description | Bounds |
+|---|---|---|---|---|
+| `B` | `bx[t]` | `primary_battery_export` | Battery-side DC discharge attributed to grid export (kWh) | `[0, max_discharge_per_slot]` |
+| next named block | `pv_export[t]` | `pv_export` | Non-primary-battery AC grid export, normally direct PV (kWh) | `[0, pv_avail[t] + PowMr_SBU_revealed_PV[t]]` |
+| next named block | `z_source[t]` | `export_source_mode` | Selects the exact causal branch for `bx=min(ed,ge/η_dis)` | binary |
+| next named block | `y_action[t]` | `primary_action_mode` | Selects primary charge or discharge eligibility | binary |
+| next named block | `y_grid[t]` | `grid_flow_mode` | Selects physical meter import or export direction | binary |
+
+If the conditional export reserve is enabled, its binary
+`battery_export_mode` block is appended next. Secondary storage follows all
+primary blocks. No consumer derives any of these offsets from `9n`, EV count,
+fuse state, or optional-block assumptions; it asks `MilpColumnLayout` for the
+named block.
+
 ### Secondary stationary-storage extension (PowMr fork, issue #1)
 
 When a valid `SecondaryStorageConfig` is present, six `n`-slot blocks are
-appended after the base, EV, and optional fuse variables. Let `B` be that prior
-vector length:
+appended after all previously declared core, EV, fuse, export-source, and
+optional export-mode variables. Let `B` be that prior vector length:
 
 | Offset | Variable | Description | Type / bounds |
 |---|---|---|---|
@@ -184,15 +224,20 @@ $$
     && \text{battery cycle cost (depreciation)} \\
     + & \epsilon_{\mathrm{chg}} \cdot p_{\mathrm{imp}}[t] \cdot ec[t]
     && \text{charge-side conversion loss cost} \\
-    + & \epsilon_{\mathrm{dis}} \cdot p_{\mathrm{imp}}[t] \cdot ed[t]
-    && \text{discharge-side conversion loss cost *} \\
+    + & \epsilon_{\mathrm{dis}} \cdot \bigl(
+          p_{\mathrm{imp}}[t](ed[t]-bx[t]) +
+          p^+_{\mathrm{exp}}[t]bx[t]\bigr)
+    && \text{destination-aware discharge loss cost} \\
     + & p_{\mathrm{soc}} \cdot \bigl( \mathrm{s\_max\_pen}[t] + \mathrm{s\_min\_pen}[t] \bigr)
     && \text{SoC soft-constraint penalties} \\
     + & p_{\mathrm{fuse}} \cdot \mathrm{gi\_pen}[t]
     && \text{Main fuse grid-import penalty}
 \bigg] \\
-+ \sum_{t} \gamma \cdot \bigl( ed[t] - ec[t] \bigr)
-    && \text{terminal-SoC valuation (undiscounted)} \\
++ & R \cdot \sum_t \bigl(ed[t]-ec[t]\bigr)
+    && \text{terminal inventory value (uniform, undiscounted)} \\
++ & \epsilon_a \sum_t\bigl(ec[t]+ed[t]\bigr)
+  - 1.5\epsilon_a\sum_t\bigl(ed[t]-bx[t]\bigr)
+    && \text{primary-action structural tiebreak (undiscounted)} \\
 \end{aligned}
 $$
 
@@ -207,16 +252,52 @@ Where:
 | Symbol | Description |
 |---|---|
 | $\delta_t$ | Time discount per slot: $\delta_t = r^{\Delta t}$ where $\Delta t$ is hours from now |
-| $p_{\mathrm{imp}}[t]$ | Grid import price (currency/kWh).  Sanitised to `max(p_imp_raw[t], 0)` (issue #655).  Also used as a **conservative approximation** for the LP's discharge-side conversion loss coefficient (see note below). |
+| $p_{\mathrm{imp}}[t]$ | Grid import price (currency/kWh), sanitised to `max(p_imp_raw[t], 0)` (issue #655). |
 | $p_{\mathrm{exp}}[t]$ | Grid export price (currency/kWh). Before solving, `p_exp` is sanitised: (1) clamped to 0 when below `min_export_price` (physically blocked export), and (2) clamped to `min(p_exp, p_imp)` to prevent an unbounded LP when `p_exp > p_imp` in any slot (issue #635). |
+| $p^+_{\mathrm{exp}}[t]$ | Non-negative sanitised export price used to value conversion loss on battery-origin export. |
 | $\alpha$ | Battery cycle cost per kWh: $\alpha = \frac{P \cdot L_{pct}/100}{2 \cdot N \cdot C_u}$ |
 | $\epsilon_{\mathrm{chg}}$ | Charge-side loss fraction: $\epsilon_{\mathrm{chg}} = 1 - \eta_{\mathrm{chg}}$ |
 | $\epsilon_{\mathrm{dis}}$ | Discharge-side loss fraction: $\epsilon_{\mathrm{dis}} = 1 - \eta_{\mathrm{dis}}$ |
-| $\gamma$ | Terminal-SoC replacement price (currency/kWh), from the engine |
+| $R$ | Non-negative terminal-inventory replacement price (currency/kWh), from the engine; missing/non-finite resolves to zero |
+| $\epsilon_a$ | Primary-action structural weight, exactly $0.00001$ currency per battery-side DC kWh |
 | $p_{\mathrm{soc}}$ | SoC penalty cost: $\max(p_{\mathrm{imp}}) \times 100$ |
 | $p_{\mathrm{fuse}}$ | Fuse penalty cost: $\max(p_{\mathrm{imp}}) \times 100$ (same magnitude as SoC) |
 | $p_{\mathrm{ev\_pen}}^{(v)}$ | EV deadline penalty for EV v: $\max(p_{\mathrm{imp}}) \cdot \max(\mathrm{energy\_needed}, 1.0) \cdot 10$ |
 | $\beta_{\mathrm{ev}}^{(v)}$ | EV charge-past-target benefit for EV v: `future_value_per_kwh` — avoided-future-import valuation (issue #630), or a $0.0001$ per kWh AC fallback tiebreaker when no future price data is available |
+
+The terminal term is a final-inventory valuation, not a collection of per-slot
+premiums. Because the same $R$ multiplies every battery-side discharge and
+charge, equal discharge and recharge cancel exactly. Slot prices, efficiencies,
+cycle wear, capacity, headroom, and power constraints then decide whether a
+refill cycle is worthwhile. This retains the issue #694 same-slot PV/export and
+issue #592 deferred-cheap-surplus behaviours without a path-dependent charge
+credit cap.
+
+The structural tiebreak uses the exact export-source split, so $ed[t]-bx[t]$
+is local battery discharge. Its per-DC-kWh perturbation is
+$+\epsilon_a$ for charge, $-0.5\epsilon_a$ for local discharge, and
+$+\epsilon_a$ for battery-origin export. Charge/local-discharge and
+export/refill cycles therefore add $0.5\epsilon_a$ and $2\epsilon_a$
+respectively. On a true lossless/economic tie, local discharge wins,
+preserving the intent of issues #638/#655. A 97%-efficient discharge at a
+flat tariff is not an economic tie and is deliberately no longer forced.
+
+This is a weighted structural tiebreak, not a mathematically lexicographic
+objective. It can alter economics below $\epsilon_a$, and the configured 0.5%
+MIP gap does not guarantee proof of an $\epsilon_a$-sized distinction. At
+ordinary 48-hour/10 kW primary-battery bounds its total perturbation remains
+below about 0.01 currency. It is part of selector `score` under
+`PlanCostBreakdown.primary_action_tiebreak`, but not auditable
+`total_cost`.
+
+The engine derives $R$ from the first contiguous published,
+price-actionable heuristic discharge block, using the mean of its `top_n`
+dearest import prices. With opt-in forecast valuation, the unpublished
+forecast tail is reduced by MAE plus the configured margin and the effective
+value is `max(published_value, forecast_haircut_value)`. This heuristic is
+horizon-end inventory context: it neither models future grid/PV refill nor
+acts as a per-slot export floor. Forecast points do not enter slot prices,
+actionability, bounds, export revenue, or any physical flow constraint.
 
 Plus EV pre-deadline benefit (undiscounted, per EV $v$ with deadline, slots $t \leq D_v$):
 
@@ -256,6 +337,86 @@ $$
 - `pv_avail[t]` = $\max(-\operatorname{net\_load}[t], 0)$ — PV surplus fixed to the `pv[t]` variable bounds
 - EV charger efficiency re-scales DC-side charge to AC grid/PV load
 
+Export origin is enforced by a second equality:
+
+$$
+ge[t] - \eta_{\mathrm{dis}}\,bx[t] - pv\_export[t] = 0
+$$
+
+with $0 \leq bx[t] \leq ed[t]$ and
+
+$$
+\eta_{\mathrm{dis}}(ed[t]-bx[t])
+\leq eligible\_local\_ac\_sinks[t].
+$$
+
+`eligible_local_ac_sinks` is the complete set of fixed loads the model permits
+the Huawei battery to serve: residual non-EV house demand and, where
+configured, eligible PowMr dedicated-load or primary-transfer demand, with a
+PowMr SBU site-load offset removed. Active co-optimised EV demand is
+deliberately excluded, as is pre-accounted fixed EV demand through its site
+cap. PV therefore serves flexible EV load before the battery can be credited
+with local discharge. Thus `bx[t]` is the battery-side discharge whose AC
+output reaches the grid, while `ed[t]-bx[t]` serves only allowed fixed sinks.
+`pv_export[t]` is a non-negative AC source block, not a post-hoc guess. The
+exact source-conservation invariant is:
+
+$$
+\eta_{\mathrm{dis}}\,bx[t] + pv\_export[t] = ge[t]
+$$
+
+The split is causal and independent of objective coefficients:
+
+$$
+bx[t] = \min\left(ed[t],\frac{ge[t]}{\eta_{\mathrm{dis}}}\right)
+$$
+
+Let $z_{source}[t]$ be the binary `export_source_mode`,
+$M_d[t]$ the finite discharge upper bound, and $M_{pv}[t]$ the finite
+non-battery export upper bound. The branch rows are:
+
+$$
+ed[t]-bx[t] \leq M_d[t](1-z_{source}[t])
+$$
+
+$$
+ge[t]-\eta_{\mathrm{dis}}bx[t] \leq M_{pv}[t]z_{source}[t]
+$$
+
+Together with source conservation and `bx<=ed`, `z_source=0` makes all
+aggregate export battery-origin until that export is exhausted, while
+`z_source=1` makes all concurrent battery discharge export-origin before a
+non-battery remainder is permitted. Consequently battery-caused export cannot
+be relabelled as PV export in a slot that also has PV and forced EV load.
+
+The physical non-battery upper bound is:
+
+$$
+0 \leq pv\_export[t]
+\leq pv\_avail[t] + PowMr\_SBU\_revealed\_PV[t].
+$$
+
+The PowMr term is non-zero only when switching a dedicated load already
+included in the site measurement to SBU can reveal PV that was hidden behind
+that load.
+
+Grid import and export are opposite directions through one meter. With finite
+physical bounds $M_i[t]$ and $M_e[t]$, binary `grid_flow_mode[t]` enforces:
+
+$$
+gi[t] \leq M_i[t]y_{grid}[t]
+$$
+
+$$
+ge[t] \leq M_e[t](1-y_{grid}[t])
+$$
+
+$M_i[t]$ covers reachable fixed site load, maximum primary/EV charge, and
+configured PowMr load/charge. $M_e[t]$ covers the finite non-battery export
+bound plus maximum delivered primary discharge. Both flows may be zero, but
+they cannot both be positive. This prevents a zero-net import/export wash from
+manufacturing source attribution that disappears during result reconciliation.
+
 ### Inequality constraints
 
 **SoC upper bound (soft):**
@@ -270,11 +431,18 @@ $$
 -\sum_{k=0}^{t} \bigl( ec[k] - ed[k] \bigr) - \mathrm{s\_min\_pen}[t] \leq soc_0
 $$
 
-**Mutual exclusion — no simultaneous charge + discharge:**
+**Exact primary action choice — no simultaneous charge + discharge:**
 
 $$
-\frac{ec[t]}{\mathrm{max\_charge}} + \frac{ed[t]}{\mathrm{max\_discharge}} \leq 1
+ec[t] \leq \mathrm{max\_charge}[t] \cdot y_{action}[t]
 $$
+
+$$
+ed[t] \leq \mathrm{max\_discharge}[t] \cdot (1-y_{action}[t])
+$$
+
+where binary $y_{action}[t]$ is the named `primary_action_mode` block. Both
+flows may be zero, but they cannot both be positive.
 
 **Cycle cost auxiliary — forcing $m[t] \geq ec[t]$ and $m[t] \geq ed[t]$:**
 
@@ -334,25 +502,32 @@ $$
 
 This is a **hard bound** on the `ge[t]` variable — unlike the fuse it needs no penalty variable because the cap is physically enforced by the inverter/DNO, so exceeding it is never required for feasibility.  Battery export and PV export compete for the same cap through the energy-balance equality, so the LP naturally front-loads battery export into low-PV slots and tapers it as PV ramps; PV that cannot be exported at the cap is handled by the free `curt[t]` variable.  When `max_grid_export_power_kw` is `None` or 0, `ge[t]` remains unbounded above (identical to previous behaviour).
 
+**Global battery no-export bound (issue #592):**
+
+When `excess_export_enabled = False`, the battery-origin block is fixed to
+zero for every slot:
+
+$$ bx[t] = 0 $$
+
+Normal battery self-consumption remains available through `ed[t]-bx[t]`, and
+direct PV export remains available through `pv_export[t]`.
+
 Where $D_v$ is the deadline slot index for EV v.
 
 **Battery export minimum price floor (issue #752):**
 
 For each slot $t$, when `battery_export_min_price > 0` and the slot's **raw** `p_exp[t] < battery_export_min_price` (evaluated before the `min_export_price` and export-≤-import clamps):
 
-$$
-ed[t] \leq \frac{\mathrm{base\_load}[t]}{\eta_{\mathrm{dis}}}
-$$
+$$ bx[t] = 0 $$
 
 This is the **per-slot, soft-switch companion to the global `no_export` cap**. Where `no_export` blocks battery export on every slot when `excess_export_enabled = False`, the floor blocks it only on slots where the user's explicit per-slot price guard is unsatisfied. The battery can still serve house load on the blocked slot — it just cannot intentionally export to the grid there. Above the floor the optimizer is free to decide whether exporting is worthwhile; reaching the threshold does **not** automatically trigger export.
 
-Scope: the floor applies only to intentional battery-to-grid export (`ForceBatteriesDischarge`). It does not affect normal battery self-consumption, battery discharge for house load, direct PV export (`ge` is not capped — only `ed` is), or PV charging of the battery.
+Scope: the floor applies only to intentional battery-to-grid export (`ForceBatteriesDischarge`). It does not affect normal battery self-consumption, battery discharge for house load, direct PV export (`pv_export` is not capped), or PV charging of the battery.
 
 Evaluation on the **raw** `p_exp` is essential: the user's `battery_export_min_price` floor must be honoured even when the `recommended_threshold` (auto-calculated cycle wear) or the inverter's `export_min_price` physical floor are lower.  Selecting the larger of the three floors would force every user to overwrite their own threshold when they want a stricter guard, defeating the purpose of the dedicated setting.
 
-The non-MILP `apply_excess_export` path enforces the same floor by requiring `export_price >= max(export_min_price, recommended_threshold, battery_export_min_price)` for any slot it would otherwise label `ForceBatteriesDischarge`.
-
-When `battery_export_min_price = 0` (default), no slot is ever blocked by the floor — the behavior is entirely backward compatible with the pre-#752 PLP.
+There is no non-MILP battery-export scheduling path. When
+`battery_export_min_price = 0` (default), no slot is blocked by this floor.
 
 ---
 
@@ -372,7 +547,7 @@ $$
 p_{\mathrm{exp}}[t] = \min\bigl(p_{\mathrm{exp}}[t],\; p_{\mathrm{imp}}[t]\bigr)
 $$
 
-Without this, slots where `p_exp > p_imp` create an **unbounded LP** (HiGHS status=3). `gi[t]` and `ge[t]` are both `[0, ∞)` and linked only through the per-slot energy-balance equality, so the LP can drive both to infinity (import cheap, export expensive) while the terms cancel. A single such slot causes `solve_milp()` to return `None` for the **entire horizon**, silently falling back to weaker heuristic candidates.
+Without this, slots where `p_exp > p_imp` create an **unbounded LP** (HiGHS status=3). `gi[t]` and `ge[t]` are both `[0, ∞)` and linked through the per-slot balances, so the LP can drive both to infinity (import cheap, export expensive) while the terms cancel. A single such slot causes `solve_milp()` to return `None` for the **entire horizon**, selecting the explicit passive fallback.
 
 This condition occurs in practice whenever negative import spot prices coincide with positive export tariffs (common in DK/DE/NL markets during high wind/solar hours), or when asymmetric import/export grid fees create an apparent export-price premium.
 
@@ -380,76 +555,47 @@ The clamp is economically correct and capping the achievable arbitrage spread re
 
 ### 3. Discharge-side loss pricing: destination-aware valuation (issue #641)
 
-The LP's pre-solve objective uses `p_imp[t]` (the sanitised import price)
-for the discharge-side conversion loss coefficient.  This is a
-**conservative approximation**: the LP cannot know before solving whether
-the discharged energy will go to house load (correctly valued at import
-price) or to export (correctly valued at export price), because the
-gi[t]/ge[t] split is itself an LP decision.
-
-Defaulting to the (typically higher) import price is the safe choice for
-the LP's own optimization — it never leads the LP to be overly optimistic
-about an export cycle's profitability.  After the LP solves and the
-per-slot grid_export_kwh / grid_import_kwh fields are written, the
-**destination-aware** cost is computed:
+The explicit `bx[t]` source split lets both the LP and scorer price
+discharge-side conversion loss by its actual destination:
 
 ```text
-For each slot:
-  if grid_export_kwh > 0 (net exporter):
-    p_loss = max(export_price, 0)  # after min-export-price clamp
-  else (net importer or idle):
-    p_loss = max(import_price, 0)
-  discharge_loss_cost = batteries_discharged * (1 - dis_eff) * p_loss
+local_discharge_dc = ed[t] - bx[t]
+battery_export_dc = bx[t]
+discharge_loss_cost =
+    local_discharge_dc * (1 - dis_eff) * max(import_price[t], 0)
+    + battery_export_dc * (1 - dis_eff) * max(export_price[t], 0)
 ```
 
-This destination-aware valuation is used by:
-- `cost_function.py::score_plan()` — the authoritative scorer (sees the
-  solved energy flows).
-- The `discharge_loss_cost_destination_aware` key in `solve_milp()`'s
-  returned diagnostics dict (post-hoc).
-
-The LP objective coefficient and the scored cost are allowed to differ
-because they answer different questions: the LP must decide before knowing
-the outcome (conservative approximation), while the scorer evaluates the
-finished plan with full information (accurate valuation).  This is not a
-violation of the LP/cost-function consistency rule — the rule requires
-that the LP's decisions are scoreable consistently, not that a
-necessarily-uninformed pre-solve coefficient matches a fully-informed
-post-solve number.
+The LP objective, `cost_function.py::score_plan()`, and diagnostics all use
+that same split. A slot may contain PV export and local battery discharge at
+the same time; aggregate `grid_export_kwh > 0` is therefore no longer used as
+a proxy for the destination of all battery discharge.
 
 ---
 
 ## Post-processing
 
-After solving, the solution is decoded into slot recommendations and energy flow fields:
+After solving, the exact-action solution is decoded into slot recommendations
+and reconciled energy-flow fields:
 
 ```mermaid
 flowchart TD
-    A[LP solution: ec, ed, gi, ge]
-    B{ec > threshold AND ed > threshold?}
-    C[Numerical tolerance conflict: resolve by net profit]
-    D{Round-trip profitable?}
-    E[Keep ec, zero ed]
-    F[Zero both]
+    A[MILP solution: exact ec XOR ed, gi, ge, bx, pv_export]
     G{ec > threshold?}
     H{PV surplus available?}
     I[BatteriesChargeSolar]
     J[BatteriesChargeGrid]
     K{ed > threshold?}
-    L{Grid export > 0 AND price >= min_export_price?}
+    L{Battery-origin export > tolerance?}
     M[ForceBatteriesDischarge]
     N[BatteriesDischargeMode]
-    N2[Write LP energy flow fields to ALL future slots:
-    batteries_discharged_kwh, grid_import_kwh, grid_export_kwh]
+    N2[Write rounded energy-balance flows to ALL future slots,
+    then reconcile exact battery/PV export attribution]
     O[Write EV charge decisions]
     P[Recompute estimated_net_consumption and estimated_cost per slot]
     Q[Compute penalty violation diagnostics]
 
-    A --> B
-    B -->|Yes| C --> D
-    D -->|Yes| E --> G
-    D -->|No| F --> G
-    B -->|No| G
+    A --> G
     G -->|Yes| H
     H -->|Yes| I --> N2
     H -->|No| J --> N2
@@ -463,14 +609,17 @@ flowchart TD
 
 ### Energy flow fields written to slots (issue #637)
 
-The MILP now writes **all** per-slot energy flow fields directly from the LP solution,
-making them the source of truth:
+The MILP writes **all** per-slot energy-flow fields from one reconciled
+solution path, making those published fields the source of truth:
 
 | Field | LP variable | Description |
 |---|---|---|
-| `batteries_discharged_kwh` | `ed[t]` | Energy discharged from battery (kWh) |
-| `grid_import_kwh` | `gi[t]` | Grid import (kWh) |
-| `grid_export_kwh` | `ge[t]` | Grid export (kWh) |
+| `batteries_charged_kwh` | rounded `ec[t]` | Energy stored in the battery (kWh) |
+| `batteries_discharged_kwh` | rounded `ed[t]` | Energy discharged from battery (kWh) |
+| `grid_import_kwh` | reconciled site balance | Grid import from the same rounded battery/EV flows (kWh) |
+| `grid_export_kwh` | reconciled site balance | Grid export from the same rounded battery/EV flows (kWh) |
+| `primary_battery_export_kwh` | reconciled $\eta_{dis}\,bx[t]$ | AC grid export originating in the primary battery (kWh) |
+| `pv_export_kwh` | aggregate minus primary source | AC grid export not originating in the primary battery (kWh) |
 | `secondary_storage_charged_kwh` | secondary charge | Energy stored in PowMr (kWh) |
 | `secondary_storage_discharged_kwh` | secondary discharge | Energy removed from PowMr (kWh) |
 | `secondary_storage_grid_import_kwh` | derived branch flow | PowMr utility load plus AC charging draw (kWh) |
@@ -484,6 +633,31 @@ SoC simulation (:func:`~soc_simulation.simulate_soc`) must be called with
 these values verbatim instead of re-deriving a different (greedy)
 allocation from the recommendation label and net demand.
 
+Post-processing labels `ForceBatteriesDischarge` only when
+`primary_battery_export_kwh` exceeds the numerical action tolerance. Aggregate grid export
+is insufficient evidence because a slot can export PV while the battery serves
+local load. For every solved slot and in aggregate, diagnostics must satisfy:
+
+```text
+primary_battery_export_kwh + pv_export_kwh == grid_export_kwh
+```
+
+The raw solution satisfies the identity within solver tolerance. Result writing
+rounds all three public fields to 0.001 kWh and derives one source from the
+other, so the published identity is exact at that precision. Both source fields
+must be non-negative. `export_source_balance_max_error_kwh` reports the
+maximum published per-slot residual. Passive fallback slots have
+`primary_battery_export_kwh = 0`; their natural PV export is reported in
+`pv_export_kwh`.
+
+The published `terminal_inventory_value` and `primary_action_tiebreak`
+diagnostics are recomputed from these final reconciled three-decimal
+slot/source fields. The compatibility alias
+`terminal_soc_credit` carries the same signed value as
+`terminal_inventory_value`. These diagnostics must match
+`score_plan()` even when rounding or a defensive writeback guard changes a
+raw solver flow.
+
 ### EV charging fields written to slots
 
 | Field | Source |
@@ -496,9 +670,9 @@ allocation from the recommendation label and net demand.
 
 ### Engine-level post-processing (after winner selection)
 
-After the MILP (or baseline) winner is selected, the engine runs a final pass over all slots to ensure consistency:
+After the MILP (or passive) winner is selected, the engine runs a final pass over all slots to ensure consistency:
 
-1. **Power recomputation**: `ev_charger_calculated_power` is recomputed from the actual per-slot EV AC load (`ev_planned_load_kwh + ev_accounted_load_kwh`).  For the current (partially elapsed) slot the remaining time is used as the divisor.  This ensures the power field always matches the load, even when the baseline candidate wins (bypassing the MILP's own power calculation).
+1. **Power recomputation**: `ev_charger_calculated_power` is recomputed from the actual per-slot EV AC load (`ev_planned_load_kwh + ev_accounted_load_kwh`).  For the current (partially elapsed) slot the remaining time is used as the divisor.  This ensures the power field always matches the load, including when the passive fallback wins.
 
 2. **Minimum power floor**: If the computed AC power is below `charger_min_power_w` (default 1380 W = 230 V × 6 A), the charger physically cannot start.  The slot's EV fields are zeroed out:
    - `ev_charger_calculated_power = 0`
@@ -512,12 +686,31 @@ After the MILP (or baseline) winner is selected, the engine runs a final pass ov
 
 ## Assumptions
 
-- **Conditional integrality**: Huawei/EV behavior retains its continuous formulation. When secondary storage is enabled, PowMr charge/SBU modes are binary and its current-step variable is integer, so HiGHS solves a mixed-integer model.
+- **Always mixed-integer**: `export_source_mode`, `primary_action_mode`, and
+  `grid_flow_mode` are binary in every solve. Conditional export reserve and
+  PowMr operation add further binary/integer blocks.
 - **Deterministic inputs**: All forecasts (prices, PV, load) are treated as known with certainty — no stochastic programming.
 - **Cycle cost proxy**: The `m[t] = max(ec[t], ed[t])` formulation counts the larger of charge or discharge per slot, matching the 2× denominator in the cycle cost formula.
 - **Time discount**: The objective uses exponential discounting with `time_discount_rate^hours_ahead` to match the selector's discounted score.
-- **Export price clamping**: Negative export prices and prices below `min_export_price` are clamped to 0 before solving, reflecting physical inverter behaviour.
-- **Terminal-SoC credit**: Undiscounted in the objective, matching the cost function's `terminal_soc_value`.
+- **Export price clamping**: When `min_export_price > 0`, prices below that
+  configured physical floor are clamped to 0 before solving. Genuine negative
+  export prices remain negative when the floor is disabled, so free
+  curtailment can beat costly export.
+- **Terminal inventory value**: Uniform and undiscounted in the objective,
+  matching the cost function's `terminal_soc_value`; equal discharge and
+  recharge cancel.
+- **Primary-action structural tiebreak**: Selector-only and kept separate from
+  terminal value. It is
+  `ε_aΣ(ec+ed)-1.5ε_aΣ(ed-bx)` with `ε_a=0.00001` currency/DC-kWh;
+  it prefers local discharge only on a true economic tie and penalises
+  charge/local-discharge and export/refill cycles.
+- **Export-source conservation**:
+  `primary_battery_export_kwh + pv_export_kwh == grid_export_kwh` within
+  solver tolerance for every solved slot and for horizon aggregates.
+- **Column-layout integrity**: objective, equality matrix, inequality matrix,
+  bounds, and incumbent block validation all consume one
+  `MilpColumnLayout` declaration and must agree on its final column count
+  before solving.
 
 ---
 
@@ -525,9 +718,9 @@ After the MILP (or baseline) winner is selected, the engine runs a final pass ov
 
 | Parameter | Value | Rationale |
 |---|---|---|
-| Method | `highs` | scipy's HiGHS is the only supported LP method |
-| Timeout | 2.0 s normally; 5.0 s with secondary storage | The PowMr extension adds binary modes and integer current steps across the horizon |
-| Relative MIP gap | 0.5% with secondary storage | Bounds solve time for the 192-slot mixed-integer horizon; not applied to the original continuous model |
+| Method | `highs` | SciPy `linprog(..., integrality=...)` delegates the MILP to HiGHS |
+| Timeout | Configured, default 15 s; valid range 1–60 s | One wall-clock budget applies with or without EV, fuse, export reserve, or PowMr |
+| Relative MIP gap | 0.5% | Applies to every solve because the three primary binary blocks are always present |
 | `pv[t]` bounds | `(pv_avail[t], pv_avail[t])` | Fixed — PV surplus is not chosen by the LP |
 
 ---

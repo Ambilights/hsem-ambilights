@@ -13,6 +13,8 @@ from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import resolve_cycle_cost
 from custom_components.hsem.utils.units import usable_kwh_from_rated
 
+PRIMARY_ACTION_TIEBREAK_COST = 1e-5
+
 # ---------------------------------------------------------------------------
 # Override detection helpers
 # ---------------------------------------------------------------------------

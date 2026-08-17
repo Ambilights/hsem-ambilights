@@ -22,6 +22,42 @@ from custom_components.hsem.utils.units import (
 )
 
 
+def _reconcile_export_sources(
+    out_slots: list[PlannedSlot],
+    *,
+    future_idx: list[int],
+    primary_export_dc: np.ndarray | None,
+    discharge_eff: float,
+) -> float:
+    """Publish AC source fields whose rounded sum is aggregate grid export."""
+    max_error = 0.0
+    for t, slot_i in enumerate(future_idx):
+        slot = out_slots[slot_i]
+        aggregate = round(max(slot.grid_export_kwh, 0.0), 3)
+        solved_dc = (
+            max(float(primary_export_dc[t]), 0.0)
+            if primary_export_dc is not None
+            else 0.0
+        )
+        battery_ac_limit = min(
+            solved_dc * discharge_eff,
+            max(slot.batteries_discharged_kwh, 0.0) * discharge_eff,
+        )
+        battery_ac = round(min(battery_ac_limit, aggregate), 3)
+        pv_ac = round(max(aggregate - battery_ac, 0.0), 3)
+        # Derive one source from the other after publication rounding so the
+        # invariant is exact, rather than merely within solver tolerance.
+        battery_ac = round(max(aggregate - pv_ac, 0.0), 3)
+        slot.grid_export_kwh = aggregate
+        slot.primary_battery_export_kwh = battery_ac
+        slot.pv_export_kwh = pv_ac
+        max_error = max(
+            max_error,
+            abs(aggregate - battery_ac - pv_ac),
+        )
+    return max_error
+
+
 def _redistribute_below_minimum_power(
     dc_by_slot: dict[int, float],
     *,
@@ -41,8 +77,12 @@ def _redistribute_below_minimum_power(
     is ever told to deliver it, and the schedule silently falls short of
     ``total_kwh_needed``.
 
-    Energy is carried from later slots into earlier ones, never the reverse,
-    so nothing is pushed past the deadline the MILP already respected.
+    Energy is first carried from later slots into earlier ones.  If the
+    earliest fragments still combine to less than the minimum, a bounded
+    recovery pass fills unused headroom in slots the solver already selected.
+    That keeps every recipient inside the deadline the MILP respected while
+    avoiding a plan/command mismatch when a commandable slot has room for the
+    otherwise-unplaceable residue.
 
     Args:
         dc_by_slot: Battery-side kWh per output-slot index, as solved.
@@ -84,6 +124,30 @@ def _redistribute_below_minimum_power(
             # slots; carry the whole amount further back rather than command
             # a power the charger would ignore.
             deficit += accepted
+
+    # A reverse-only pass can still strand energy when the earliest solved
+    # fragments add up to less than the charger minimum, even though a later
+    # commandable slot has spare nameplate/constraint headroom.  For example,
+    # [0.45, 0.45, 3.0, 2.1] kWh at a 1.242 kWh minimum used to publish only
+    # 5.1 of the 6.0 kWh the solver and diagnostics promised.  Fill only slots
+    # that the solver already selected, and reuse the same per-slot ceiling as
+    # the first pass, so this cannot push energy beyond the solved deadline or
+    # through a surplus-only constraint.
+    if deficit > 1e-12:
+        for slot_i in sorted(placed):
+            hours = slot_hours[slot_i]
+            solved = dc_by_slot[slot_i]
+            max_dc = rated_ac_power_w * hours * charger_efficiency / 1000.0
+            max_dc = min(
+                max_dc,
+                solved + max(ceilings.get(slot_i, math.inf), 0.0),
+            )
+            extra = min(max(max_dc - placed[slot_i], 0.0), deficit)
+            placed[slot_i] += extra
+            deficit -= extra
+            if deficit <= 1e-12:
+                deficit = 0.0
+                break
     return placed, deficit
 
 
@@ -160,6 +224,8 @@ def _write_milp_results_to_slots(
         out_slots[i].batteries_discharged_kwh = 0.0
         out_slots[i].grid_import_kwh = 0.0
         out_slots[i].grid_export_kwh = 0.0
+        out_slots[i].primary_battery_export_kwh = 0.0
+        out_slots[i].pv_export_kwh = 0.0
         out_slots[i].primary_battery_hold = False
         out_slots[i].ev_planned_load_kwh = 0.0
         out_slots[i].ev_accounted_load_kwh = 0.0

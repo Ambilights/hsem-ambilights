@@ -44,6 +44,7 @@ def _add_battery_export_reserve_constraints(
     residual_house_load: np.ndarray,
     checkpoints: np.ndarray,
     reserve_kwh: float,
+    primary_export_off: int | None = None,
 ) -> dict[str, Any]:
     """Append battery-export detection and conditional reserve constraints.
 
@@ -66,16 +67,23 @@ def _add_battery_export_reserve_constraints(
 
     # Big-M values are physical battery bounds, not arbitrary constants.
     max_delivered_kwh = max(max_discharge_kwh * discharge_eff, _EPSILON_KWH)
+    max_export_dc_kwh = max(max_discharge_kwh, _EPSILON_KWH)
     soc_big_m_kwh = max(usable_kwh, _EPSILON_KWH)
 
     for t in range(m):
-        # Battery discharge beyond the house load remaining after forecast PV
-        # is intentional battery-to-grid export (or displaces usable solar),
-        # so export_mode[t] must become one:
-        #   discharge_eff * ed[t] - M_export * z[t] <= residual_house_load[t]
-        a_ub[old_rows + t, ed_off + t] = discharge_eff
-        a_ub[old_rows + t, export_mode_off + t] = -max_delivered_kwh
-        b_ub[old_rows + t] = max(float(residual_house_load[t]), 0.0)
+        if primary_export_off is not None:
+            # Production models expose the destination directly: any positive
+            # battery-origin DC export forces export mode on.
+            a_ub[old_rows + t, primary_export_off + t] = 1.0
+            a_ub[old_rows + t, export_mode_off + t] = -max_export_dc_kwh
+        else:
+            # Backward-compatible row for direct helper callers.
+            a_ub[old_rows + t, ed_off + t] = discharge_eff
+            a_ub[old_rows + t, export_mode_off + t] = -max_delivered_kwh
+            b_ub[old_rows + t] = max(
+                float(residual_house_load[t]),
+                0.0,
+            )
 
         # If z[t] == 1, preserve the configured reserve at the checkpoint:
         #   current + sum(ec-ed)[0:checkpoint] >= reserve

@@ -10,12 +10,12 @@ and exposes two distinct aggregate numbers:
   cost.  Auditable; directly comparable to an electricity bill.
 - :attr:`PlanCostBreakdown.score` — the **selector objective**.  Equals
   ``total_cost`` plus every synthetic penalty (SoC guard, grid limit,
-  override) plus the terminal-SoC opportunity cost.  The candidate selector
-  picks the plan with the **lowest score**, not the lowest money cost.
+  override), terminal inventory value, and local self-consumption credit.
+  The candidate selector picks the **lowest score**, not lowest money cost.
 
 Cost components
 ---------------
-The cost function aggregates eight independently-tunable terms:
+The cost function aggregates nine independently-tunable terms:
 
 Money terms (sum to ``total_cost``):
 
@@ -26,8 +26,8 @@ Money terms (sum to ``total_cost``):
 2. **Export revenue** — energy exported to the grid × export price
    (negative contribution, i.e. revenue reduces total cost).
 3. **Battery conversion loss** — energy lost during a charge/discharge cycle,
-   priced at the sanitised (non-negative) import price of its own slot —
-   the price of the energy that was lost.  Same clamp as import cost.
+   priced at import for local delivery and at export for battery-origin
+   grid export.
 4. **Battery cycle cost** — depreciation per kWh cycled, derived from the
    battery's purchase price, rated capacity, and expected lifetime cycles.
 
@@ -41,19 +41,12 @@ Selector-only terms (added on top of ``total_cost`` to produce ``score``):
 7. **Override penalty** — per-slot cost added for any slot whose recommendation
    was forced by an override (e.g. read-only mode, manual schedule).  Penalises
    plans that deviate from the hardware's natural optimal state.
-8. **Terminal SoC value** — per-slot opportunity cost of charging/discharging,
-   capped by the differential between ``replacement_price_per_kwh`` and that
-   slot's own sanitised import price:
-   ``terminal_premium[t] = max(0, replacement_price_per_kwh - imp_price_obj[t])``.
-   Discharging a slot incurs ``+terminal_premium[t]`` per kWh; charging earns
-   ``-terminal_premium[t]`` per kWh.  Summed across all slots.  This mirrors
-   ``milp_optimizer.py``'s ``c_obj`` terminal-SoC term exactly, so the
-   selector's score always matches what the LP actually optimised for
-   (issue #655) — when ``replacement_price_per_kwh <= imp_price_obj[t]`` for
-   every slot, this reduces to the same net effect as the old flat
-   ``(initial_kwh − final_kwh) × replacement_price_per_kwh`` formula, but it
-   no longer *over-penalises* discharge in slots where the replacement price
-   does not exceed that slot's own import price.
+8. **Terminal inventory value** — uniform replacement value times net
+   battery discharge minus charge. Equal discharge/refill cancels regardless
+   of slot position, so the term depends only on final inventory.
+9. **Primary-action tiebreak** — a microscopic selector-only preference for
+   direct local self-consumption over an exact economic tie, while charging,
+   battery export, and a charge/discharge cycle remain slightly disfavoured.
 
 All monetary values are in the caller's local currency.
 
@@ -84,10 +77,9 @@ from datetime import datetime
 
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.planner.cost_helpers import (
+    PRIMARY_ACTION_TIEBREAK_COST,
     _is_override_slot,
     _resolve_cycle_cost,
-    compute_charge_premium,
-    deferred_export_price_by_slot,
 )
 from custom_components.hsem.planner.cost_types import (  # noqa: F401
     CostWeights,
@@ -239,23 +231,6 @@ def score_plan(
 
     cycle_cost_kwh = _resolve_cycle_cost(weights)
 
-    # Deferred-export correction (issue #592): mirror the MILP's objective
-    # so the selector's terminal-SoC charge credit matches what the LP
-    # actually optimised for.  Computed once for the whole slot list.
-    _deferred_prices: list[float | None] | None = None
-    if (
-        replacement_price_per_kwh is not None
-        and abs(replacement_price_per_kwh) > 1e-9
-        and weights.battery_usable_capacity_kwh > 1e-9
-        and weights.max_charge_per_slot_kwh > 1e-9
-    ):
-        _deferred_prices = deferred_export_price_by_slot(
-            slots,
-            usable_kwh=weights.battery_usable_capacity_kwh,
-            max_charge_per_slot=weights.max_charge_per_slot_kwh,
-            now=now,
-        )
-
     # Resolve the effective roundtrip loss fraction.
     # When separate charge/discharge efficiencies are provided (both non-default),
     # we compute the roundtrip loss from them:
@@ -272,6 +247,7 @@ def score_plan(
     grid_limit_penalty = 0.0
     override_penalty = 0.0
     terminal_soc_value = 0.0
+    primary_action_tiebreak = 0.0
     secondary_costs = SecondaryCostAccumulator()
 
     # Discounted versions for the selector score (total_cost stays raw).
@@ -287,7 +263,7 @@ def score_plan(
 
     _time_passed_value = Recommendations.TimePassed.value
 
-    for slot_idx, slot in enumerate(slots):
+    for slot in slots:
         # Skip past slots entirely.  The SoC simulation zeros
         # estimated_battery_soc_pct on past slots as a sentinel, which would
         # falsely trigger the SoC-low penalty on every past slot.
@@ -348,6 +324,33 @@ def score_plan(
         # clamping logic elsewhere and is unaffected by this sanitisation.
         imp_price_obj = max(imp_price, 0.0)
 
+        # Production plans carry an explicit source split. Keep a bounded
+        # fallback for older callers that construct aggregate-only slots.
+        grid_export = max(slot.grid_export_kwh, 0.0)
+        explicit_primary = max(slot.primary_battery_export_kwh, 0.0)
+        explicit_pv = max(slot.pv_export_kwh, 0.0)
+        if abs(explicit_primary + explicit_pv - grid_export) <= 0.002:
+            primary_export_ac = min(explicit_primary, grid_export)
+            pv_export_ac = max(grid_export - primary_export_ac, 0.0)
+        else:
+            primary_export_ac = min(
+                grid_export,
+                max(slot.batteries_discharged_kwh * discharge_eff, 0.0),
+            )
+            pv_export_ac = max(grid_export - primary_export_ac, 0.0)
+        primary_export_dc = min(
+            max(slot.batteries_discharged_kwh, 0.0),
+            primary_export_ac / discharge_eff,
+        )
+        local_discharge_dc = max(
+            slot.batteries_discharged_kwh - primary_export_dc,
+            0.0,
+        )
+        primary_action_tiebreak += PRIMARY_ACTION_TIEBREAK_COST * (
+            slot.batteries_charged_kwh
+            + slot.batteries_discharged_kwh
+            - 1.5 * local_discharge_dc
+        )
         # 1. Import cost — grid_import_kwh already reflects the extra grid draw
         #    needed to store energy through the charge efficiency (i.e. the
         #    simulation writes grid_import_kwh = charge_stored / charge_eff).
@@ -356,60 +359,30 @@ def score_plan(
             import_cost += cost
             import_cost_disc += cost * discount
 
-        # 2. Export revenue — clamp export prices below export_min_price
-        #    to 0 to match the applier's physical export block and the
-        #    MILP's clamping (milp_optimizer.py).  Additionally zero
-        #    battery-destined export revenue when the slot is below the
-        #    user's ``battery_export_min_price`` floor (issue #752): the
-        #    MILP forbids ``force_batteries_discharge`` there, so that
-        #    export can never be realised by the battery.
-        if slot.grid_export_kwh > 1e-9:
-            effective_exp_price = exp_price
-            if (
-                weights.export_min_price > 1e-9
-                and effective_exp_price < weights.export_min_price
-            ):
-                effective_exp_price = 0.0
-            if (
-                weights.battery_export_min_price > 1e-9
-                and effective_exp_price < weights.battery_export_min_price
-                and slot.batteries_discharged_kwh > 1e-9
-                and slot.solcast_pv_estimate_kwh <= 1e-9
-            ):
-                effective_exp_price = 0.0
-            rev = slot.grid_export_kwh * effective_exp_price
+        # 2. Export revenue. The site floor applies to both sources; the
+        # battery floor applies only to intentional primary-battery export.
+        effective_exp_price = exp_price
+        if (
+            weights.export_min_price > 1e-9
+            and effective_exp_price < weights.export_min_price
+        ):
+            effective_exp_price = 0.0
+        battery_exp_price = effective_exp_price
+        if (
+            weights.battery_export_min_price > 1e-9
+            and exp_price < weights.battery_export_min_price
+        ):
+            battery_exp_price = 0.0
+        if grid_export > 1e-9:
+            rev = (
+                pv_export_ac * effective_exp_price
+                + primary_export_ac * battery_exp_price
+            )
             export_revenue += rev
             export_revenue_disc += rev * discount
 
-        # 3. Conversion loss cost — opportunity cost of energy lost in the
-        #    round-trip.  The loss occurred at purchase time (charge slot) and
-        #    at delivery time (discharge slot).
-        #
-        #    Charge-side loss is priced at the sanitised (non-negative)
-        #    import price of the charge slot — the price of the energy that
-        #    was lost during input (issue #655).
-        #
-        #    Discharge-side loss is priced based on the slot's actual
-        #    resolved energy flow (destination-aware pricing, issue #641):
-        #
-        #    - If the slot is a net EXPORTER (grid_export_kwh > 0): the
-        #      discharge is destined for export, so the lost energy's true
-        #      marginal value is the export price (foregone export revenue).
-        #      Use the sanitised export price (after min-export-price clamp,
-        #      floored at 0).
-        #    - Otherwise (slot is importing or idle): the discharge serves
-        #      house load, so the lost energy's true marginal value is the
-        #      import price (avoided import cost).  Use imp_price_obj.
-        #
-        #    This differs from the LP's pre-solve objective coefficient,
-        #    which uses imp_price_obj unconditionally as a conservative
-        #    approximation (the LP cannot know the destination before
-        #    solving).  The scorer has access to the solved energy flows and
-        #    can make the correct destination-aware valuation.  This is not
-        #    a violation of the LP/cost-function consistency rule — the
-        #    rule requires that the LP's decisions are scoreable
-        #    consistently, not that a necessarily-uninformed pre-solve
-        #    coefficient matches a fully-informed post-solve number.
+        # 3. Conversion losses use the same source/destination split as MILP:
+        # local discharge loss is valued at import, exported loss at export.
         charge_loss_fraction = 1.0 - charge_eff
         discharge_loss_fraction = 1.0 - discharge_eff
         if slot.batteries_charged_kwh > 1e-9 and charge_loss_fraction > 1e-9:
@@ -418,31 +391,11 @@ def score_plan(
             conversion_loss_cost += conv
             conversion_loss_cost_disc += conv * discount
         if slot.batteries_discharged_kwh > 1e-9 and discharge_loss_fraction > 1e-9:
-            lost_kwh_discharge = slot.batteries_discharged_kwh * discharge_loss_fraction
-            # Destination-aware discharge loss pricing (issue #641):
-            # net-exporter → price loss at export price; otherwise import price.
-            if slot.grid_export_kwh > 1e-9:
-                p_loss = exp_price
-                if (
-                    weights.export_min_price > 1e-9
-                    and p_loss < weights.export_min_price
-                ):
-                    p_loss = 0.0
-                # Battery-destined export floored by battery_export_min_price
-                # (issue #752): when the slot's raw export price is below
-                # the user's floor and the discharge is battery-destined (no
-                # PV surplus), that export can never be realised, so the
-                # foregone-export valuation is 0.
-                if (
-                    weights.battery_export_min_price > 1e-9
-                    and p_loss < weights.battery_export_min_price
-                    and slot.solcast_pv_estimate_kwh <= 1e-9
-                ):
-                    p_loss = 0.0
-                p_loss = max(p_loss, 0.0)
-            else:
-                p_loss = imp_price_obj
-            conv = lost_kwh_discharge * p_loss
+            lost_local = local_discharge_dc * discharge_loss_fraction
+            lost_export = primary_export_dc * discharge_loss_fraction
+            conv = lost_local * imp_price_obj + lost_export * max(
+                battery_exp_price, 0.0
+            )
             conversion_loss_cost += conv
             conversion_loss_cost_disc += conv * discount
 
@@ -500,55 +453,20 @@ def score_plan(
         if _is_override_slot(slot) and abs(weights.override_penalty_per_slot) > 1e-9:
             override_penalty += weights.override_penalty_per_slot
 
-        # 8. Terminal-SoC opportunity cost (selector-only).
-        #
-        # Per-slot incentive capped by the opportunity-cost DIFFERENTIAL
-        # between the replacement price and this slot's own (sanitised)
-        # import price — mirrors milp_optimizer.py's terminal_premium term
-        # exactly, so the selector's score matches what the LP actually
-        # optimised for (issue #655).  When replacement_price <=
-        # imp_price_obj[t], the premium is zero: charging/discharging in
-        # that slot is not discouraged or encouraged by terminal-SoC alone.
-        # Charging (batteries_charged_kwh) earns a credit; discharging
-        # (batteries_discharged_kwh) incurs a penalty.  Undiscounted —
-        # matches milp_optimizer.py's treatment of this term.
-        #
-        # SECOND CAP (issue #694): the terminal premium must never make
-        # battery charging more attractive than grid export.  Mirrors the
-        # identical cap in milp_optimizer.py's _build_objective().
-        #
-        # Gated on initial_battery_kwh as well (even though this per-slot
-        # formula no longer needs its value) to preserve the documented
-        # enablement contract: terminal-SoC accounting requires BOTH
-        # initial_battery_kwh and replacement_price_per_kwh to be provided.
+        # 8. Path-independent terminal inventory value.
         if (
             initial_battery_kwh is not None
             and replacement_price_per_kwh is not None
-            and abs(replacement_price_per_kwh) > 1e-9
             and slot.price_actionable
         ):
-            terminal_premium = max(0.0, replacement_price_per_kwh - imp_price_obj)
-            # Cap the CHARGE credit only: the terminal premium for
-            # charging is reduced by the opportunity cost of not
-            # exporting the same PV surplus (issue #694), and corrected by
-            # the deferred-export spread when a future slot's PV surplus
-            # exceeds the battery's absorption capacity (issue #592).
-            # Mirrors milp/_objective.py exactly.  The discharge penalty
-            # is NOT capped.
-            _charge_premium = compute_charge_premium(
-                replacement_price_per_kwh=replacement_price_per_kwh,
-                imp_price_obj=imp_price_obj,
-                exp_price=exp_price,
-                charge_eff=charge_eff,
-                deferred_export_price=(
-                    _deferred_prices[slot_idx] if _deferred_prices else None
-                ),
+            replacement_value = (
+                max(replacement_price_per_kwh, 0.0)
+                if math.isfinite(replacement_price_per_kwh)
+                else 0.0
             )
-            # Charge earns the capped credit; discharge incurs the full penalty
             terminal_soc_value += (
-                -slot.batteries_charged_kwh * _charge_premium
-                + slot.batteries_discharged_kwh * terminal_premium
-            )
+                slot.batteries_discharged_kwh - slot.batteries_charged_kwh
+            ) * replacement_value
 
     # ``total_cost`` is money only — never includes synthetic penalties.
     total_cost = import_cost - export_revenue + conversion_loss_cost + cycle_cost_total
@@ -567,6 +485,7 @@ def score_plan(
             + grid_limit_penalty_disc
             + override_penalty
             + terminal_soc_value
+            + primary_action_tiebreak
         )
     else:
         score = (
@@ -575,6 +494,7 @@ def score_plan(
             + grid_limit_penalty
             + override_penalty
             + terminal_soc_value
+            + primary_action_tiebreak
         )
 
     score_rounded = round(score, 6)
@@ -588,6 +508,7 @@ def score_plan(
         grid_limit_penalty=round(grid_limit_penalty, 6),
         override_penalty=round(override_penalty, 6),
         terminal_soc_value=round(terminal_soc_value, 6),
+        primary_action_tiebreak=round(primary_action_tiebreak, 6),
         secondary_conversion_loss_cost=round(
             secondary_costs.conversion_loss_cost,
             6,
@@ -607,7 +528,7 @@ def score_plan(
         "debug",
         "[cost] score_plan DONE  total_cost=%.6f  score=%.6f  "
         "import=%.6f  export_rev=%.6f  conv_loss=%.6f  "
-        "cycle=%.6f  soc_pen=%.6f  grid=%.6f  override=%.6f  term_soc=%.6f",
+        "cycle=%.6f  soc_pen=%.6f  grid=%.6f  override=%.6f  term_soc=%.6f  tie=%.6f",
         result.total_cost,
         result.score,
         result.import_cost,
@@ -618,6 +539,7 @@ def score_plan(
         result.grid_limit_penalty,
         result.override_penalty,
         result.terminal_soc_value,
+        result.primary_action_tiebreak,
     )
 
     return result

@@ -30,7 +30,6 @@ Each slot must have:
 - expected PV production in kWh
 - import price per kWh
 - export price per kWh
-- optional tariff per kWh
 - recommendation
 - planned battery charge in kWh
 - planned battery discharge in kWh
@@ -96,14 +95,39 @@ in the same layer must not change it.
 1. The MILP is the only active-optimisation authority for primary-battery
    export. With excess export disabled, it may discharge only into house load;
    it cannot schedule battery-to-grid energy.
-2. With excess export enabled, any primary-battery discharge beyond house load
-   activates an export-mode binary. The battery SoC at the end of the following
+2. The MILP represents battery-origin export explicitly as battery-side DC
+   `bx[t]`. Its AC slot field is
+   `primary_battery_export_kwh = discharge_efficiency × bx[t]`; the separate
+   `pv_export_kwh` field carries non-primary-battery AC export (normally
+   direct PV). They obey
+   `primary_battery_export_kwh + pv_export_kwh = grid_export_kwh`.
+   The raw solution satisfies this within solver tolerance; public slot fields
+   are reconciled exactly at 0.001 kWh precision. Aggregate grid export alone
+   is never used to infer battery export.
+   Source attribution is causal rather than chosen by the objective:
+   `bx[t] = min(ed[t], grid_export_kwh[t] / discharge_efficiency)`. A per-slot
+   binary `export_source_mode` enforces that identity together with
+   `grid_export_kwh = discharge_efficiency × bx[t] + pv_export_kwh`. Thus any
+   concurrent battery discharge and grid export is attributed to the battery
+   first; PV supplies local and flexible loads before its residual is labelled
+   export. The non-battery export block also has a finite physical upper bound:
+   forecast PV surplus plus any PV exposed when PowMr SBU removes a dedicated
+   load already included in the site measurement. No objective tiebreak may
+   change source attribution.
+   A separate binary `grid_flow_mode[t]` makes meter direction exact:
+   `gi[t] <= M_import[t] * grid_flow_mode[t]` and
+   `ge[t] <= M_export[t] * (1-grid_flow_mode[t])`. The finite bounds are
+   derived from the largest physically reachable site load/charge and
+   PV-plus-battery export in that slot. Import and export may both be zero,
+   but can never both be positive or form a hidden wash flow.
+3. With excess export enabled, material `bx[t]` activates an export-mode
+   binary. The battery SoC at the end of the following
    demand window (immediately before the next forecast PV-surplus slot, or
    horizon end) must then retain
    `hsem_batteries_excess_export_discharge_buffer`. The reserve is conditional:
    normal self-consumption may use it, and a planned cheap grid charge before
    the checkpoint may restore it.
-3. `force_export` is separate PV routing: it holds the primary battery at zero
+4. `force_export` is separate PV routing: it holds the primary battery at zero
    charge and zero discharge while exporting available PV. It is never evidence
    of battery discharge.
 
@@ -319,7 +343,7 @@ pv_kwh
 = pv_used_for_house_kwh
 + pv_used_for_ev_kwh
 + pv_used_for_battery_kwh
-+ pv_exported_kwh
++ pv_export_kwh
 + pv_curtailed_kwh
 ```
 
@@ -343,6 +367,18 @@ Battery discharge must satisfy:
 usable_battery_discharge_kwh
 = battery_energy_removed_kwh * discharge_efficiency
 ```
+
+For MILP output the grid-export sources satisfy:
+
+```text
+primary_battery_export_kwh = battery_export_dc_kwh * discharge_efficiency
+grid_export_kwh = primary_battery_export_kwh + pv_export_kwh
+```
+
+`battery_energy_removed_kwh - battery_export_dc_kwh` is the battery-side
+discharge serving local load. Both export-source fields are non-negative. The
+raw equality holds within solver tolerance and public values are exact at
+0.001 kWh precision.
 
 Battery energy to remove in order to deliver a target house load:
 
@@ -603,36 +639,23 @@ Each side of the round-trip is priced independently at its own slot's price:
 - **Charge-side loss**: Priced at the sanitised import price of the charge
   slot (`max(import_price, 0)`).  The lost energy was purchased at that
   price.
-- **Discharge-side loss**: Priced based on the slot's resolved energy flow
-  (destination-aware).  After the MILP solves and the per-slot
-  `grid_export_kwh` / `grid_import_kwh` fields are populated:
-
-  - **If the slot is a net EXPORTER** (`grid_export_kwh > 0`): the
-    discharge is destined for export, so the lost energy's true marginal
-    value is the export price (foregone export revenue).  Use the
-    sanitised export price (`max(export_price, 0)` after min-export-price
-    clamp).
-  - **Otherwise** (net importer or idle): the discharge serves house load,
-    so the lost energy's marginal value is the import price (avoided
-    import cost).  Use `max(import_price, 0)`.
+- **Discharge-side loss**: Priced from the MILP's explicit export-source split.
+  Battery-side `bx[t]` is export-destined; `ed[t] - bx[t]` serves local
+  load. Export-destined loss uses sanitised export price (foregone revenue);
+  local-use loss uses sanitised import price (avoided import).
 
 ```text
-For each slot:
-  if grid_export_kwh > 0:
-    p_loss = max(export_price, 0)  # after min-export-price clamp
-  else:
-    p_loss = max(import_price, 0)
-  discharge_loss_cost[t] = batteries_discharged[t] * (1 - dis_eff) * p_loss
+local_discharge_dc = ed[t] - bx[t]
+battery_export_dc = bx[t]
+discharge_loss_cost[t] =
+    local_discharge_dc * (1 - dis_eff) * max(import_price, 0)
+    + battery_export_dc * (1 - dis_eff) * max(export_price, 0)
 ```
 
-The LP's pre-solve objective coefficient for `ed[t]` uses the import price
-unconditionally as a **conservative approximation** — the LP cannot know
-the discharge destination before solving.  The destination-aware
-valuation is applied post-hoc by `cost_function.py::score_plan()` (the
-authoritative scorer) and reported in `solve_milp()`'s diagnostics dict as
-`discharge_loss_cost_destination_aware`.  This asymmetry is intentional:
-the LP must decide before knowing the outcome, while the scorer evaluates
-the finished plan with full information.
+The LP objective, `cost_function.py::score_plan()`, and diagnostics use this
+same split. A slot can export PV while the battery serves local load, so
+`grid_export_kwh > 0` is not sufficient evidence that all discharge is
+export-destined.
 
 ### Invariants for tests
 
@@ -643,12 +666,12 @@ the finished plan with full information.
   1 - charge_eff * discharge_eff when explicit efficiencies are set.
 - When both efficiencies are 100 %, the legacy conversion_loss_pct field drives
   the conversion_loss_cost term (backwards compatibility).
-- Discharge-side conversion loss MUST be destination-aware: export slots use
-  the export price, house-load slots use the import price (issue #641).
-- An export-destined discharge slot (grid_export_kwh > 0) must have a LOWER
-  loss cost than the old import-only-priced value when export < import.
-- A house-load discharge slot (grid_export_kwh == 0) must have the SAME
-  loss cost as before the fix (import-price valuation, regression guard).
+- Discharge-side conversion loss MUST be destination-aware: `bx[t]` uses the
+  export price and `ed[t]-bx[t]` uses the import price (issue #641).
+- Battery-origin export has a lower loss cost than import-only pricing when
+  export price is lower than import price.
+- A slot with PV export and local battery discharge keeps import-price
+  valuation for the local discharge; net-export status cannot change it.
 
 ## Live data injection (current slot)
 
@@ -736,21 +759,16 @@ re-derive them from the recommendation label and net demand.
 This mode is used for MILP-sourced candidates.  `solve_milp()` populates
 these fields in a **single merged write-out pass** (issue #659) that:
 
-1. Resolves degenerate LP vertices (simultaneous charge+discharge) by
-   checking actual resolved SoC headroom at each slot in chronological
-   order (issue #662).  The net residual (ec − ed) is clamped against
-   the remaining ceiling headroom (``usable_kwh − running_soc``) or
-   floor headroom (``running_soc − 0``).  If the available headroom is
-   ≤ ``_MIN_ACTION_KWH`` the vertex is treated as solver noise and both
-   ec and ed are zeroed.  The structurally-dead ``net_charge_profit``
-   heuristic and the per-slot LP ``s_max_pen``/``s_min_pen`` variables
-   are **not** used for this resolution — they cannot distinguish
-   horizon-wide degeneracy from genuine economic signals.
+1. Consumes an exact charge-or-discharge solution: the binary
+   `primary_action_mode` prevents simultaneous material `ec` and `ed`. The
+   existing chronological headroom resolver remains as a defensive guard for
+   solver tolerance or legacy direct-helper inputs; a validated production
+   solution must not depend on that guard to remove a wash cycle.
 2. Writes `batteries_charged_kwh` and `batteries_discharged_kwh` from the
-   **resolved** ec/ed (not the raw LP arrays).
+   **resolved** ec/ed (not the raw solver arrays).
 3. Derives `grid_import_kwh` and `grid_export_kwh` from the slot's energy
    balance equation using the **same resolved** ec/ed values — they are
-   **not** read directly from the raw LP `gi[t]`/`ge[t]` arrays, because
+   **not** read directly from the raw solver `gi[t]`/`ge[t]` arrays, because
    the raw arrays assume the original (potentially now-invalid) ec/ed
    combination.
 
@@ -897,6 +915,13 @@ A time-limited incumbent must pass all of these checks against the final model:
 - one-dimensional, exact-length, finite decision vector;
 - future-slot count and indices align with the planning horizon;
 - every per-slot decision-variable block has exactly the active slot count;
+- the central `MilpColumnLayout` declares nine core per-slot blocks, appends
+  active EV and optional fuse blocks, then the named `primary_battery_export`,
+  `pv_export`, `export_source_mode`, `primary_action_mode`, and
+  `grid_flow_mode` blocks, followed by optional export-reserve and
+  secondary-storage blocks;
+- the objective length, equality-matrix width, inequality-matrix width, and
+  bounds length all equal that layout's final `column_count`;
 - variable bounds are satisfied;
 - all equality and inequality rows are satisfied within solver tolerance;
 - every integer/binary variable is integral within tolerance.
@@ -906,6 +931,28 @@ used.  The candidate name intentionally remains exactly ``milp`` for both
 optimal and accepted-incumbent results because that name is a control-flow
 key: it preserves pre-populated primary/PowMr flows and prevents the
 secondary-storage utility bypass from overwriting the solved PowMr schedule.
+Offsets are obtained by block name from the layout declaration rather than
+recomputed from a hard-coded base width or positional formula. Adding or
+reordering a block can therefore never silently overlap EV, fuse, export-mode,
+or PowMr variables: construction fails before HiGHS is called if any consumer
+has the old width.
+
+`export_source_mode`, `primary_action_mode`, and `grid_flow_mode` are
+per-slot binary blocks in every solve. They make the export-source split,
+primary charge/discharge direction, and meter import/export direction exact.
+Secondary-storage and conditional export-reserve modes may add further integer
+blocks, but the base primary model is already mixed-integer.
+
+Diagnostics publish the ordered block metadata under
+`model_variable_blocks` and the common width under `model_column_count`,
+`model_objective_column_count`, `model_equality_column_count`,
+`model_inequality_column_count`, and `model_bounds_count`. The block
+offset/width cursor and every count must agree.
+`model_integral_blocks` lists every wholly integral named block and
+`model_integrality_count` gives the total integral-column count; all three
+per-slot primary modes must appear there.
+`grid_import_export_overlap_max_kwh` reports the largest raw
+`min(gi[t], ge[t])` and must remain within solver tolerance.
 
 The plan explanation sensor surfaces the most recent solve outcome through:
 
@@ -969,6 +1016,19 @@ never uses penalties unless forced by an out-of-bounds initial SoC.
 
 ### Battery discharge upper bounds (hard)
 
+Before the destination-specific discharge bounds below, every active slot uses
+a binary `primary_action_mode[t]`:
+
+```text
+ec[t] <= max_charge_per_slot * primary_action_mode[t]
+ed[t] <= max_discharge_per_slot * (1 - primary_action_mode[t])
+```
+
+Both flows may be zero, but they can never both be positive. This exact
+charge-or-discharge choice prevents a physically meaningless continuous
+half-charge/half-discharge vertex and the plan-versus-writeback divergence it
+would create.
+
 In addition to the soft SoC penalties, the MILP applies **hard per-slot upper
 bounds** on the discharge variable `ed[t]` (implemented as variable bounds in
 `_build_constraints`):
@@ -982,9 +1042,11 @@ bounds** on the discharge variable `ed[t]` (implemented as variable bounds in
    ```
 
    The battery may only serve the non-EV portion of demand; the EV load is
-   served by grid import or PV.  When co-optimisation **is** active the guard
-   is skipped — `base_load` is rebuilt without EV load, so the battery can
-   never serve it.
+   served by grid import or PV.  When co-optimisation **is** active the legacy
+   bound is skipped, but `base_load` is rebuilt without flexible EV load and
+   the explicit local-sink/source row also excludes that EV load. The battery
+   therefore still cannot serve it or have that demand counted as local
+   battery discharge.
 
    **Exactness note**: although `base_load` is net of PV and
    `ev_accounted_load_kwh` is the gross EV load, the formula is exact —
@@ -1001,12 +1063,12 @@ bounds** on the discharge variable `ed[t]` (implemented as variable bounds in
    (`no_export=True`):
 
    ```text
-   ed[t] <= base_load[t] / discharge_eff
+   bx[t] = 0
    ```
 
-   The battery can never discharge more than the slot's house load, so it
-   cannot export energy to the grid.  When `base_load[t] = 0` (PV-surplus
-   slot) the cap is 0 and the battery sits idle.  PV export is unaffected.
+   The battery-origin export block is fixed to zero. The battery may still
+   discharge into house load through `ed[t] - bx[t]`; PV export through
+   `pv_export[t]` is unaffected.
    Note this also suppresses battery-driven grid arbitrage — intentional:
    "excess export disabled" means the battery never feeds the grid.
 
@@ -1017,7 +1079,7 @@ bounds** on the discharge variable `ed[t]` (implemented as variable bounds in
    export to the grid:
 
    ```text
-   ed[t] <= base_load[t] / discharge_eff  (only on blocked slots)
+   bx[t] = 0  (only on blocked slots)
    ```
 
    This is the per-slot, soft-switch companion to the global `no_export`
@@ -1032,8 +1094,8 @@ bounds** on the discharge variable `ed[t]` (implemented as variable bounds in
    intentional battery-to-grid export (`ForceBatteriesDischarge`); it
    does NOT restrict normal battery self-consumption, battery discharge
    for house load, direct PV export, or PV charging of the battery.  The
-   same floor remains part of candidate scoring, but there is no
-   non-MILP battery-export scheduling path.
+   scorer uses the solved `primary_battery_export_kwh` attribution directly;
+   there is no non-MILP battery-export scheduling path.
 
    Historical correction for `v6.2.2-powmr.23`: that release described the
    private `apply_excess_export()` helper as deciding force-discharge slots.
@@ -1049,10 +1111,10 @@ bounds** on the discharge variable `ed[t]` (implemented as variable bounds in
 
 4. **Conditional excess-export reserve** — when excess export is enabled and
    `excess_export_discharge_buffer_pct > 0`, each slot receives a binary
-   `z_export[t]`. Discharge above the AC house load forces that binary on:
+   `z_export[t]`. Material battery-origin export forces that binary on:
 
    ```text
-   discharge_eff * ed[t] - M_export * z_export[t] <= base_load[t]
+   bx[t] <= max_discharge_per_slot * z_export[t]
    ```
 
    Let `checkpoint[t]` be the final demand slot before the next forecast
@@ -1070,10 +1132,35 @@ bounds** on the discharge variable `ed[t]` (implemented as variable bounds in
    solved SoC trajectory at the checkpoint, future grid or PV charging may
    legitimately restore the buffer before it is measured.
 
-When any apply, the tighter cap wins.  When the battery cannot export on
-a slot (`no_export` or a blocked-by-floor slot), the MILP labels
-discharge slots `BatteriesDischargeMode` (self-consumption) rather than
-`ForceBatteriesDischarge` in post-processing.
+When either export block applies, `bx[t]` is zero. The local-discharge
+quantity `ed[t]-bx[t]` remains available within house load. Post-processing
+labels `ForceBatteriesDischarge` only when
+`primary_battery_export_kwh = discharge_eff * bx[t]` exceeds the numerical
+action tolerance; otherwise a discharge slot is `BatteriesDischargeMode`.
+
+For every solved slot:
+
+```text
+bx[t] = min(ed[t], grid_export_kwh / discharge_eff)
+primary_battery_export_kwh = discharge_eff * bx[t]
+pv_export_kwh = pv_export[t]
+primary_battery_export_kwh + pv_export_kwh = grid_export_kwh
+0 <= pv_export[t] <= pv_avail[t] + PowMr_SBU_revealed_PV[t]
+```
+
+The binary `export_source_mode[t]` makes the first identity exact: if aggregate
+export is smaller than delivered battery discharge, all export is
+battery-origin; otherwise all battery discharge is export-origin and only the
+remainder may be non-battery/PV export. The local-discharge row permits
+`ed[t]-bx[t]` only against fixed residual house demand and eligible PowMr
+transfer/dedicated-load sinks; active flexible EV demand is deliberately
+excluded. This prevents simultaneous PV, forced EV load, and battery discharge
+from disguising battery-caused export as PV export.
+
+The raw solution satisfies the source equalities within solver tolerance.
+Public fields are rounded/reconciled so the source sum is exact at 0.001 kWh
+precision, and both sources are non-negative. Passive fallback slots set
+`primary_battery_export_kwh = 0`.
 
 ### EV co-optimisation (MILP)
 
@@ -1172,8 +1259,11 @@ how that plays out per slot, from cheapest to most expensive action.
 
 ```text
 Σ_t [ p_imp[t]·gi[t] − p_exp[t]·ge[t] + α·m[t]
-      + (charge_loss·p_imp[t])·ec[t] + (discharge_loss·p_imp[t])·ed[t]
+      + (charge_loss·p_imp[t])·ec[t]
+      + discharge_loss·(p_imp[t]·(ed[t]−bx[t]) + p_exp_pos[t]·bx[t])
       + p_soc·(s_max_pen[t] + s_min_pen[t]) ]
++ R·Σ_t(ed[t] − ec[t])
++ ε·Σ_t(ec[t] + ed[t]) − 1.5ε·Σ_t(ed[t] − bx[t])
 + Σ_ev [ ev_penalty·ev_pen + tiebreaker·Σ_t ev_c[t] ]
 ```
 
@@ -1233,93 +1323,93 @@ After the deadline slot `D`:
     the higher genuine avoided-cost value wins the surplus for that slot.
   - Grid import is never used for post-deadline EV charging.
 
-#### 5. Terminal SoC (horizon-end valuation)
+#### 6. Terminal inventory value and primary-action structural tiebreak
 
-At horizon end, the battery's remaining energy is valued **inside the LP objective**
-as a linear term so the LP itself optimises for it:
+At horizon end, the battery's remaining energy is valued **inside the LP
+objective** with one uniform, undiscounted coefficient:
 
-- `terminal_soc_value = (Σed − Σec) × replacement_price`
-- Discharging (`ed[t]`) incurs a penalty in the objective
-- Charging (`ec[t]`) earns a credit in the objective
-- Ending with less energy → penalty (encourages recharging)
-- Ending with more energy → credit (discourages wasteful discharging)
-
-**Per-slot incentive cap (issue #655):** the per-slot terminal-SoC term is
-capped by the **opportunity-cost differential** between the replacement
-price and the slot's own import price:
-
-```
-terminal_premium[t] = max(0, replacement_price_per_kwh − p_imp[t])
+```text
+R = max(replacement_price_per_kwh or 0, 0)  # non-finite resolves to 0
+terminal_soc_value = R * (Σ_t ed[t] - Σ_t ec[t])
+                   = R * (initial_battery_kwh - final_battery_kwh)
 ```
 
-When `replacement_price ≤ p_imp[t]`, the premium is zero — the LP sees no
-terminal-SoC incentive and makes discharge decisions purely on per-slot
-price signals.  When `replacement_price > p_imp[t]`, the differential
-represents the genuine opportunity cost of using energy now vs. later.
+This is path-independent final-inventory accounting. The same $R$ applies to
+every battery-side charge and discharge, so an export discharge and equal
+later refill cancel exactly in `terminal_soc_value`. The cycle is then judged
+by actual import/export prices, charge and discharge efficiencies, cycle wear,
+available energy/headroom, and per-slot power limits. There is no per-slot
+`terminal_premium`, asymmetric charge credit, or deferred-export-price
+side channel.
 
-This prevents the regression where uniform +replacement_price penalties
-dominated per-slot import-saving benefits in flat/near-flat price scenarios,
-causing zero discharge even when a full battery could cover house load
-(issue #638 regression).
+Battery-origin export receives the full inventory opportunity cost because
+`bx[t]` remains part of `ed[t]`. There is no avoided-import cap on exported
+energy. This prevents aggregate battery export from being valued as though it
+displaced house import. If the optimizer can export and later refill
+economically, the equal battery movements cancel in the terminal term and the
+explicit refill cost/opportunity cost decides the result.
 
-**Charge-credit cap (issue #694):** the terminal premium is applied
-**asymmetrically**.  The charge credit is further reduced by the export
-opportunity cost — the revenue foregone by not exporting the same PV
-surplus:
+The uniform terminal term is paired with a tiny primary-action structural
+tiebreak:
 
-```
-charge_premium[t] = max(0, replacement_price_per_kwh − p_imp[t] − p_exp[t] / η_chg)
-
-c_obj[ec[t]] −= charge_premium[t]   (capped credit for charging)
-c_obj[ed[t]] += terminal_premium[t] (full penalty for discharging)
-```
-
-Without this cap, a high `replacement_price` can make the charge credit
-larger than the export benefit (`−p_exp[t]`), causing the LP to charge the
-battery from solar during expensive hours instead of exporting at peak
-prices and deferring charging to cheaper slots — a "tunnel-vision" effect.
-When `p_exp[t]` is high (expensive slots) the capped credit is small and
-the LP exports; when `p_exp[t]` is low (cheap slots) the credit is close
-to the full premium and the LP charges to store energy for future
-discharge windows.  The discharge penalty is deliberately **not** capped,
-preserving the issue #638 protection against unnecessary discharging.
-
-**Deferred-export correction (issue #592):** the #694 cap compares charging
-against exporting in the **same slot**.  When a *future* slot carries PV
-surplus that exceeds the battery's absorption capacity
-(`min(usable_kwh, max_charge_per_slot)`), that surplus is exported
-regardless of today's charge decision — so the economically correct refill
-price is the future slot's export price, not this slot's.  Letting
-`p_exp_deferred[t]` be the minimum export price across all later slots
-whose surplus exceeds that absorption capacity, the premium becomes:
-
-```
-charge_premium[t] = max(0, repl − p_imp[t] − p_exp[t] / η_chg
-                             + min(p_exp_deferred[t], p_exp[t]) / η_chg)
+```text
+ε = 0.00001 currency / DC kWh
+primary_action_tiebreak
+    = ε * Σ_t(ec[t] + ed[t])
+      - 1.5ε * Σ_t(ed[t] - bx[t])
 ```
 
-When `p_exp_deferred[t] ≥ p_exp[t]` (or no qualifying future slot exists),
-the correction is zero and the formula degrades to the #694 cap.  When a
-cheaper future slot has unabsorbable surplus, the credit is restored so
-the LP charges now at the high export price and lets the inevitable
-future surplus refill the battery at the low price.  Both the MILP
-(`milp/_objective.py`) and the selector (`cost_function.py`) compute the
-premium via the shared helper `cost_helpers.compute_charge_premium()` with
-the per-slot deferred price from `cost_helpers.deferred_export_price_by_slot()`
-so the LP's decisions and the selector's score never diverge.
+The exact export-source split makes `ed[t]-bx[t]` local battery discharge.
+The resulting per-DC-kWh perturbation is `+ε` for charge, `-0.5ε` for local
+discharge, and `+ε` for battery-origin export. A charge/local-discharge cycle
+therefore adds `0.5ε` and an export/refill cycle adds `2ε` instead of
+harvesting a tie benefit. On a true lossless/economic tie, the negative local
+coefficient preserves the self-consumption preference required by issues
+#638/#655; with real 97% discharge efficiency, a flat tariff is not an
+economic tie and discharge is deliberately no longer forced.
 
-- **Undiscounted** — terminal SoC is a single point-in-time valuation at
-  horizon end, matching `cost_function.py`'s `terminal_soc_value` treatment.
-- The differential uses the sanitised import price (`max(p_imp, 0)`) so
-  negative import prices cannot artificially inflate the terminal premium.
+This is a weighted structural tiebreak, not a mathematically lexicographic
+objective. It can decide economics smaller than ε, and the configured 0.5%
+MIP gap does not promise proof of an ε-sized distinction. At ordinary
+48-hour/10 kW primary-battery bounds its total perturbation remains below
+about 0.01 currency. The term is reported as
+`primary_action_tiebreak`, contributes to selector `score`, and is excluded
+from auditable `total_cost`.
+
+**Preserved PV timing behaviour (issues #694/#592):** charging from PV reduces
+the same slot's available `pv_export[t]`; a later refill consumes that later
+slot's PV/headroom. Because equal charge/discharge cancels in the terminal
+term, the optimizer compares the actual same-slot foregone export and future
+refill opportunity directly. High-price PV can still be exported instead of
+charged (#694), and an inevitable cheaper future surplus can still refill the
+battery after expensive PV is exported (#592), subject to real capacity and
+power constraints. These are solver outcomes, not terminal-premium caps.
+
+Required behavioural regressions make the distinction concrete:
+
+- With $R=3$, a 1.0 kWh battery may export 1.0 kWh at 2.0 when a later slot
+  can restore the full 1.0 kWh from otherwise-worthless PV. Initial and final
+  inventory match, so terminal value is zero; $R$ is not a hard export floor.
+- If the later PV energy or charge-power limit is only 0.4 kWh, only 0.4 kWh
+  may take that free export/refill cycle. The unrefillable 0.6 kWh still pays
+  terminal inventory value.
+- A free refill arriving after a 4.0-price local demand is too late to justify
+  selling the energy at 2.0 before that demand. Moving the same refill before
+  demand may make the export feasible without causing the dear import.
+- With grid refill, an export/refill cycle occurs only when export revenue
+  covers the actual refill import, both conversion losses, and cycle wear.
+  Forecast-derived $R$ changes none of those slot prices and cannot make a
+  non-actionable tail executable.
 
 ##### Where `replacement_price` comes from
 
 `replacement_price_from_next_discharge()` values stored energy from the first
-contiguous upcoming discharge block whose slots are `price_actionable`. On a
-day-ahead market the actionable prefix ends where publication does, so past
-that point there is nothing to compare against and the battery has no reason
-to fill today for an expensive tomorrow.
+contiguous upcoming **heuristic** discharge block whose slots are
+`price_actionable`. It takes the mean of that block's `top_n` dearest import
+prices; `top_n` is derived from usable battery capacity and maximum
+discharge energy per slot. The helper reads scheduling labels as horizon
+context. It does not simulate future PV/grid refill, charge headroom,
+efficiency, or the selected MILP flows.
 
 When `PlannerInput.price_forecast` is populated (opt-in, off by default), the
 predicted unpublished tail is valued by the same rule — the mean of its `top_n`
@@ -1334,17 +1424,19 @@ secondary storage, using its own mean-of-window aggregation rather than
 `top_n`, because a dedicated load spends stored energy across the window
 instead of concentrating it on the dearest hour.
 
-Two invariants hold, and both are covered by tests:
+Two authority invariants hold, and both are covered by tests:
 
-1. **Charge-only.** Taking the maximum means a cheap forecast collapses to the
-   published-only value. A prediction can raise the worth of stored energy —
-   encouraging charging — but can never lower it into justifying a discharge or
-   an export.
+1. **One-way valuation.** Taking the maximum means a cheap forecast collapses
+   to the published-only value. A prediction can raise the worth of terminal
+   inventory, encouraging charging or retention and potentially suppressing
+   discharge/export. It can never lower stored-energy value and thereby create
+   a discharge or export opportunity.
 2. **Never actionable.** Forecast points live only in
    `PlannerInput.price_forecast`. They never populate `PlannedSlot.price`, never
-   extend `price_actionable`, and are passed to no other function, so no
-   actuator, MILP bound, or export decision can observe one. The isolation is
-   structural rather than a flag each consumer must check.
+   extend `price_actionable`, and never become import cost, export revenue, a
+   physical bound, or actuator authority. Their only planner effect is through
+   the scalar horizon-end replacement value. The isolation is structural
+   rather than a flag each slot consumer must check.
 
 Every predicted price is reduced by `mae + margin` before use, where `mae` is
 the source's own published error for that horizon and `margin` is an operator
@@ -1362,8 +1454,17 @@ debounced refresh path and must trigger a new planner run rather than reusing a
 plan valued from stale forecast data. Parser-rejected points do not enter the
 signature.
 
-The post-hoc `terminal_soc_credit` calculation in the diagnostics dict is
-retained as a consistency check but no longer drives the LP's decisions.
+The effective replacement value is logged and passed unchanged into the MILP
+and scorer; its published/forecast composition follows the rule above rather
+than separate executable price channels. MILP diagnostics expose
+`terminal_inventory_value` and `primary_action_tiebreak`. The MILP and scorer
+use the same coefficients and export-source semantics. Published diagnostics
+are recomputed from the final reconciled slot fields, so they match the
+authoritative scorer even when solver writeback has removed a degenerate raw
+flow.
+`terminal_soc_credit` remains a legacy diagnostic key carrying the same
+signed value as `terminal_inventory_value`; despite its historical name, a
+positive value is a penalty for net inventory loss.
 
 #### Key constraint: EV surplus-only for charge-past-target
 
@@ -1513,8 +1614,8 @@ ge[t] <= max_grid_export_power_kw * slot_hours
 ```
 
 - Implemented as a variable bound on `ge[t]`, not a penalty.
-- Battery export and PV export compete for the same cap through the
-  energy-balance equality, so the optimal plan front-loads battery export
+- Battery export and PV export compete for the same cap through
+  `ge[t] = discharge_eff*bx[t] + pv_export[t]`, so the optimal plan front-loads battery export
   into low-PV slots and tapers it as PV ramps.
 - PV that cannot be exported at the cap is absorbed by the free `curt[t]`
   curtailment variable.
@@ -1536,6 +1637,18 @@ remains unbounded above — behaviour is identical to the pre-#726 code.
 - Every MILP candidate slot's `grid_export_kwh` is ≤
   `max_grid_export_power_kw × slot_hours` (within solver tolerance) when the
   cap is active.
+- `primary_battery_export_kwh + pv_export_kwh == grid_export_kwh` within
+  solver tolerance before publication and exactly at 0.001 kWh precision on
+  every published MILP slot.
+- The raw source split satisfies
+  `bx[t] == min(ed[t], ge[t]/discharge_efficiency)`; a battery discharge that
+  coincides with export cannot be relabelled as local use to receive the
+  local-discharge side of `primary_action_tiebreak`.
+- Primary `ec[t]` and `ed[t]` are never simultaneously positive because the
+  always-present `primary_action_mode[t]` is binary.
+- Grid `gi[t]` and `ge[t]` are never simultaneously positive because the
+  always-present `grid_flow_mode[t]` is binary and uses finite physical
+  per-slot import/export bounds.
 - The battery never discharges purely to displace PV export at a saturated
   cap (export-destined discharge gains nothing once `ge[t]` is at its
   bound).
@@ -1550,9 +1663,9 @@ The cost function returns **two distinct aggregates** for every plan
 - `total_cost` — the **money outcome** of the plan within the horizon.
   Pure monetary value.  Auditable; directly comparable to a real electricity bill.
 - `score` — the **selector objective**.  Equals `total_cost` plus every
-  synthetic penalty plus the terminal-SoC opportunity cost.  The candidate
-  selector picks the plan with the **lowest score** — not the lowest money
-  cost.
+  synthetic penalty, the terminal-inventory opportunity cost, and the
+  separately named primary-action structural tiebreak. The candidate selector
+  picks the plan with the **lowest score** — not the lowest money cost.
 
 ```text
 total_cost
@@ -1560,7 +1673,6 @@ total_cost
 - export_revenue
 + battery_cycle_cost
 + conversion_loss_cost
-+ tariff_cost
 ```
 
 ```text
@@ -1570,6 +1682,7 @@ score
 + grid_limit_penalty
 + override_penalty
 + terminal_soc_value
++ primary_action_tiebreak
 ```
 
 Where:
@@ -1582,6 +1695,9 @@ Where:
   (penalty) when the plan empties the battery.  It prevents the selector
   from preferring plans that look cheap only because they drained the
   battery to zero before end-of-horizon.
+- `primary_action_tiebreak` is **selector-only** and may have either sign. It
+  is the same ε-weighted primary charge/discharge/export expression used by
+  the MILP; it resolves structural ties without being real money.
 
 The implementation exposes both numbers on `PlanCostBreakdown` together with
 a deprecated `total` alias that equals `score` (kept so older code and tests
@@ -1606,6 +1722,30 @@ Export revenue is:
 ```text
 grid_export_kwh * export_price_per_kwh
 ```
+
+For MILP candidates, `grid_export_kwh` is source-conserved:
+
+```text
+primary_battery_export_kwh = discharge_eff * bx[t]
+pv_export_kwh = pv_export[t]
+grid_export_kwh = primary_battery_export_kwh + pv_export_kwh
+```
+
+The source fields are written to every future slot and serialised into planner
+diagnostics. They are non-negative and sum to aggregate export exactly at the
+published 0.001 kWh precision. `export_source_balance_max_error_kwh` reports
+the maximum published per-slot residual. Production cost and conversion-loss
+diagnostics use these fields directly; they do not reconstruct export origin
+from recommendation labels, net-export status, or Solcast availability.
+
+`score_plan()` retains a bounded compatibility path for older tests/callers
+that construct aggregate-only slots. If the supplied source sum differs from
+`grid_export_kwh` by more than 0.002 kWh, it caps the reconstructed primary
+share at
+`min(grid_export_kwh, batteries_discharged_kwh * discharge_efficiency)` and
+assigns the remainder to PV. It never consults recommendation labels or
+Solcast. No production MILP or passive candidate may rely on this fallback;
+both publish explicit source fields before scoring.
 
 When the export price is negative (curtailment penalty), ``export_revenue``
 is negative — exporting costs money rather than earning it.  The
@@ -1636,27 +1776,25 @@ revenue as 0 in both optimisation and scoring.
 **Battery export minimum price floor (``battery_export_min_price``, issue
 #752):** When ``battery_export_min_price > 0`` and a slot's raw
 ``export_price`` is strictly below this floor, the MILP forbids
-intentional battery-to-grid discharge in that slot by capping ``ed[t]`` to
-``base_load[t] / discharge_eff``. To keep cost-function scores consistent with
-the optimisation assumptions:
+intentional battery-to-grid discharge in that slot by fixing ``bx[t] = 0``.
+Normal discharge into eligible local load remains available through
+``ed[t] - bx[t]``. To keep cost-function scores consistent with the
+optimisation assumptions:
 
 - ``CostWeights.battery_export_min_price`` mirrors the floor in
   ``score_plan``.
-- When ``export_price < battery_export_min_price`` AND the slot is a net
-  exporter AND PV alone cannot account for the export (i.e. no material PV
-  surplus available on the slot), the export-destined portion is treated as
-  battery-destined and the export revenue (and discharge-loss
-  destination-aware pricing) is zeroed for that slot — that export can
-  never be realised by the battery.
-- Slots where PV would be exported (``solcast_pv_estimate_kwh > 0``)
-  still receive full export revenue.  The floor never restricts PV export.
+- When ``export_price < battery_export_min_price``, the solver fixes
+  ``bx[t] = 0``, so ``primary_battery_export_kwh = 0``. The scorer
+  uses that explicit attribution rather than inferring source from net flow
+  or forecast PV.
+- ``pv_export_kwh`` still receives full export revenue. The floor never
+  restricts PV export.
 - Above the floor the optimizer decides freely — reaching the threshold
   does NOT auto-trigger export.
 
 Invariant: ``battery_export_min_price > 0`` AND ``export_price <
-battery_export_min_price`` AND the slot's export is battery-destined (no
-PV surplus available) → the cost function scores that slot's
-export-destined revenue and discharge-loss valuation as 0.
+battery_export_min_price`` → ``primary_battery_export_kwh == 0`` while
+``pv_export_kwh`` remains eligible for normal export revenue.
 
 **Export-≤-import clamp (MILP unbounded-LP fix, issue #635):**
 Before solving, the MILP also clamps ``export_price[t]`` to never
@@ -1730,77 +1868,66 @@ score_plan(slots_with_past).soc_penalty
 == score_plan(future_only_slots).soc_penalty
 ```
 
-### Terminal SoC value
+### Terminal inventory value and primary-action structural tiebreak
 
 Plans must not look better merely because they empty the battery before the
-horizon ends.
-
-The cost function implements this via a `terminal_soc_value` term that
-contributes to `score` (not to `total_cost`).  It is computed **per slot**
-and summed across the horizon, mirroring `milp_optimizer.py`'s `c_obj`
-terminal-SoC term exactly (issue #655/#657) so the selector's score always
-matches what the LP actually optimised for:
+horizon ends. The scorer therefore uses the same uniform, undiscounted
+final-inventory term as the MILP:
 
 ```text
-imp_price_obj[t]     = max(slot.price.import_price, 0.0)
-terminal_premium[t]  = max(0, replacement_price_per_kwh - imp_price_obj[t])
-charge_premium[t]    = max(0, replacement_price_per_kwh - imp_price_obj[t]
-                             - slot.price.export_price / charge_eff
-                             + min(p_exp_deferred[t], slot.price.export_price)
-                               / charge_eff)
-
-terminal_soc_value = sum over all slots of:
-    batteries_discharged_kwh[t] * terminal_premium[t]
-    - batteries_charged_kwh[t] * charge_premium[t]
+terminal_soc_value =
+    replacement_price_per_kwh
+    * (sum(batteries_discharged_kwh) - sum(batteries_charged_kwh))
 ```
 
-The formula is **asymmetric** (issue #694): the charge credit is reduced
-by the export opportunity cost (`p_exp / η_chg`) so that charging never
-beats exporting in the same slot, while the discharge penalty uses the
-full `terminal_premium[t]`.  The **deferred-export correction** (issue
-#592) adds back the spread when a future slot has PV surplus beyond the
-battery's absorption capacity — see the MILP objective section above.
-Both sides use the shared helper
-`cost_helpers.compute_charge_premium()` so the selector's score always
-matches what the LP optimised for.
+Equivalently, it is
+`replacement_price_per_kwh * (initial_battery_kwh - final_battery_kwh)`.
+It contributes to `score`, never `total_cost`. Charging makes the term
+negative, discharging makes it positive, and equal charge/discharge cancels
+exactly regardless of path. The replacement-price source and
+published/forecast authority rules are defined in the MILP objective section
+above; it is not the minimum import price across the whole horizon and it does
+not model future refill.
 
-Sign convention (per slot):
+The scorer also mirrors the MILP's primary-action structural tiebreak:
 
-- Charging (`batteries_charged_kwh[t] > 0`) contributes a **negative**
-  (credit) term, reducing `score`.
-- Discharging (`batteries_discharged_kwh[t] > 0`) contributes a **positive**
-  (penalty) term, increasing `score`.
+```text
+epsilon = 0.00001
+battery_export_dc[t] =
+    primary_battery_export_kwh[t] / discharge_efficiency
+local_discharge_dc[t] =
+    batteries_discharged_kwh[t] - battery_export_dc[t]
+primary_action_tiebreak =
+    epsilon * sum(
+        batteries_charged_kwh[t] + batteries_discharged_kwh[t]
+    )
+    - 1.5 * epsilon * sum(local_discharge_dc[t])
+```
 
-The per-slot premium is capped by the differential between
-`replacement_price_per_kwh` and that slot's own sanitised import price.  When
-`replacement_price_per_kwh <= imp_price_obj[t]`, the premium is zero for that
-slot - charging/discharging then has no terminal-SoC effect, because the LP
-saw no genuine opportunity cost either.  This prevents the selector from
-over-penalising discharge in cheap-import slots, matching the MILP exactly.
-
-The recommended `replacement_price_per_kwh` is the **minimum future import
-price across the planning horizon**.  This represents the marginal cost of
-re-purchasing one stored kWh at the cheapest available opportunity - the
-economically correct proxy for the opportunity cost of consuming stored energy
-now rather than later.  Using the average over all future slots (including
-expensive peak prices) systematically over-values stored energy during
-high-price periods and biases the selector against discharging.
+The field reproduces the MILP expression from final reconciled, three-decimal
+slot/source fields. It contributes to `score`, never `total_cost`, and is
+exposed separately from `terminal_soc_value`. A 1.0 kWh local discharge
+contributes `-0.000005`; six-decimal public scoring therefore retains the
+intended tie direction.
+Production plans must use explicit `primary_battery_export_kwh`. Only the
+bounded aggregate-only compatibility path described above may reconstruct a
+source share, and it never consults recommendation labels or PV forecast.
 
 Import prices are sanitised the same way as the MILP's own objective
 (`imp_price_obj = max(imp_price, 0.0)`) before being used anywhere in
 `score_plan` - including the import-cost term itself.  The charge-side
 conversion loss term also uses `imp_price_obj`.  For the discharge-side
 conversion loss, destination-aware pricing applies (issue #641):
-export-destined discharge is priced at the sanitised export price, while
-house-load discharge uses `imp_price_obj` — see Battery efficiency /
-Conversion loss pricing above.  The LP's pre-solve objective uses
-`imp_price_obj` unconditionally as a conservative approximation.
+`battery_export_dc` is priced at the sanitised export price, while
+`local_discharge_dc` uses `imp_price_obj` — see Battery efficiency /
+Conversion loss pricing above. The LP and scorer use the same explicit split.
 
 Terminal-SoC accounting is **only active** when both `initial_battery_kwh`
 and `replacement_price_per_kwh` are supplied to `score_plan`.  Unit tests
 that call `score_plan` without horizon context (e.g. simple per-slot
 arithmetic checks) do not need the term and may omit both inputs; in that
-case `terminal_soc_value = 0.0` and `score == total_cost + penalties`.
+case `terminal_soc_value` is `0.0`. The flow-based
+`primary_action_tiebreak` remains independently defined.
 
 ### Invariants for tests
 
@@ -1808,9 +1935,10 @@ case `terminal_soc_value = 0.0` and `score == total_cost + penalties`.
   `import_cost - export_revenue + cycle_cost + conversion_loss_cost`
   exactly.  No synthetic penalty may enter `total_cost`.
 - `score` must equal
-  `total_cost + soc_penalty + grid_limit_penalty + override_penalty + terminal_soc_value`
+  `total_cost + soc_penalty + grid_limit_penalty + override_penalty + terminal_soc_value + primary_action_tiebreak`
   exactly.
-- When all penalties are zero and terminal-SoC is disabled, `score == total_cost`.
+- When all penalties and selector-only inventory/tiebreak terms are zero,
+  `score == total_cost`.
 - The candidate selector must pick the candidate with the lowest `score`,
   not the lowest `total_cost`.
 - `winner.score == output.plan_cost.score` for every planner run.
@@ -1818,10 +1946,19 @@ case `terminal_soc_value = 0.0` and `score == total_cost + penalties`.
 - Given two otherwise-identical plans, the one that ends with more stored
   battery energy must have the lower `terminal_soc_value` and therefore the
   lower `score` (all else equal).
+- Equal battery-side discharge and recharge must contribute exactly zero net
+  `terminal_soc_value`, regardless of their slot positions.
+- `primary_action_tiebreak` must equal
+  `εΣ(ec+ed)-1.5εΣ(ed-bx)` using the same reconciled source split as the
+  scorer and published diagnostics.
+- Every MILP slot must satisfy
+  `primary_battery_export_kwh + pv_export_kwh == grid_export_kwh` within
+  solver tolerance before publication and exactly at 0.001 kWh published
+  precision, with both source fields non-negative.
 - (issue #752) When `battery_export_min_price > 0` and a slot's raw
   `export_price` is strictly below this floor, the MILP never schedules
-  intentional battery-to-grid export on that slot — `grid_export_kwh` may
-  be > 0 there only when PV surplus alone would have been exported.
+  intentional battery-to-grid export on that slot —
+  `primary_battery_export_kwh == 0`; `pv_export_kwh` may remain positive.
 - (issue #752) A solver failure cannot reintroduce intentional battery
   export through a non-MILP heuristic path.
 - (issue #752) With `battery_export_min_price = 0` (default) the
@@ -1926,7 +2063,8 @@ Every candidate plan must be fully simulated and scored.
 
 Rejected-plan diagnostics keep the two cost aggregates distinct:
 ``estimated_cost`` is the auditable monetary ``total_cost``, while ``score``
-is the selector objective including synthetic penalties and terminal-SoC value.
+is the selector objective including synthetic penalties, terminal inventory
+value, and the primary-action structural tiebreak.
 
 Required candidates on every run:
 
@@ -2259,13 +2397,20 @@ Beyond that boundary:
 
 - Huawei primary storage is held: charge and discharge are both zero. Grid
   import and PV export/curtailment remain physical site-flow outputs, not
-  price-driven storage actions.
+  price-driven storage actions. Therefore `bx[t] = 0`,
+  `primary_battery_export_kwh = 0`, and any `grid_export_kwh` is carried
+  by `pv_export_kwh`.
 - PowMr charge and SBU modes are forbidden (Utility only).
 - Optional EV arbitrage/deadline allocation is forbidden. A fixed live EV
   session remains a mandatory physical load, and unmet target energy is
   surfaced rather than priced as free.
-- Primary and secondary terminal/replacement valuation and deferred-export
-  look-ahead use only actionable prices.
+- Primary and secondary terminal/replacement valuation uses only actionable
+  prices.
+
+An opt-in forecast-derived replacement value does not relax this boundary.
+It can value terminal inventory for actionable decisions, but it cannot make a
+non-actionable slot charge, discharge, export battery energy, or change
+inverter mode.
 
 Heuristic fallback candidates enforce the same price-neutral hold contract, so a
 solver timeout cannot reintroduce actions selected from placeholder zeros.

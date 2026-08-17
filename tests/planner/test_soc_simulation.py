@@ -50,6 +50,8 @@ def _make_minimal_input(
     battery_max_soc_pct: float = 100.0,
     battery_max_charge_power_w: float = 5000.0,
     battery_max_discharge_power_w: float | None = None,
+    battery_charge_efficiency_pct: float = 97.0,
+    battery_discharge_efficiency_pct: float = 97.0,
     battery_purchase_price: float = 0.0,
     pv_kwh_per_hour: float = 0.0,
     load_kwh_per_hour: float = 0.5,
@@ -86,6 +88,8 @@ def _make_minimal_input(
         battery_max_soc_pct=battery_max_soc_pct,
         battery_max_charge_power_w=battery_max_charge_power_w,
         battery_max_discharge_power_w=battery_max_discharge_power_w,
+        battery_charge_efficiency_pct=battery_charge_efficiency_pct,
+        battery_discharge_efficiency_pct=battery_discharge_efficiency_pct,
         battery_purchase_price=battery_purchase_price,
         battery_expected_cycles=6000,
         weight_1d=25,
@@ -624,6 +628,8 @@ class TestPowerLimits:
         inp = _make_minimal_input(
             battery_soc_pct=100.0,
             battery_max_discharge_power_w=None,
+            battery_charge_efficiency_pct=100.0,
+            battery_discharge_efficiency_pct=100.0,
             load_kwh_per_hour=4.0,  # heavy load
             pv_kwh_per_hour=0.0,
             schedules=[],

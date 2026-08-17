@@ -319,6 +319,8 @@ def _slot_to_dict(slot: Any) -> dict[str, Any]:
         "batteries_discharged_kwh": round(slot.batteries_discharged_kwh, 3),
         "grid_import_kwh": round(slot.grid_import_kwh, 3),
         "grid_export_kwh": round(slot.grid_export_kwh, 3),
+        "primary_battery_export_kwh": round(slot.primary_battery_export_kwh, 3),
+        "pv_export_kwh": round(slot.pv_export_kwh, 3),
         "recommendation": slot.recommendation,
         "primary_battery_hold": slot.primary_battery_hold,
         # EV load semantics (issue #404):

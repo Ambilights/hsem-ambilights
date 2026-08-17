@@ -50,6 +50,11 @@ def _build_constraints(
     max_grid_export_per_slot_kwh: float = 0.0,
     export_limit_active: bool = False,
     battery_export_blocked: np.ndarray | None = None,  # type: ignore[name-defined]
+    primary_action_mode_off: int | None = None,
+    pv_export_ub_per_slot: np.ndarray | None = None,
+    grid_flow_mode_off: int | None = None,
+    grid_import_ub_per_slot: np.ndarray | None = None,
+    grid_export_ub_per_slot: np.ndarray | None = None,
 ) -> dict:
     """Build all LP constraint matrices and variable bounds.
 
@@ -101,13 +106,13 @@ def _build_constraints(
     #   upper: cumsum(ec−ed)[t] − s_max_pen[t] ≤ (usable_kwh − current_kwh)
     #   lower: −cumsum(ec−ed)[t] − s_min_pen[t] ≤ current_kwh
     soc_rows = 2 * m
-    # Mutual exclusion rows: ec[t]/max_charge + ed[t]/max_dis <= 1
-    mutex_rows = m
+    exact_action_mode = primary_action_mode_off is not None
+    action_rows = 2 * m if exact_action_mode else m
     # Cycle cost auxiliary rows: m[t] >= ec[t] and m[t] >= ed[t]
     #   → -m[t] + ec[t] <= 0  and  -m[t] + ed[t] <= 0
     cycle_rows = 2 * m
-    A_ub = np.zeros((soc_rows + mutex_rows + cycle_rows, n_vars))  # NOSONAR
-    b_ub = np.zeros(soc_rows + mutex_rows + cycle_rows)
+    A_ub = np.zeros((soc_rows + action_rows + cycle_rows, n_vars))  # NOSONAR
+    b_ub = np.zeros(soc_rows + action_rows + cycle_rows)
 
     for t in range(m):
         for k in range(t + 1):
@@ -124,14 +129,23 @@ def _build_constraints(
         b_ub[t] = usable_kwh - current_kwh  # upper SoC headroom
         b_ub[m + t] = current_kwh  # lower SoC headroom
 
-        # Mutual exclusion: ec[t]/max_charge + ed[t]/max_dis <= 1
-        A_ub[2 * m + t, ec_off + t] = 1.0 / max_charge_per_slot
-        A_ub[2 * m + t, ed_off + t] = 1.0 / max_dis
-        b_ub[2 * m + t] = 1.0
+        if exact_action_mode:
+            assert primary_action_mode_off is not None
+            charge_row = 2 * m + t
+            discharge_row = 3 * m + t
+            A_ub[charge_row, ec_off + t] = 1.0
+            A_ub[charge_row, primary_action_mode_off + t] = -max_charge_per_slot
+            A_ub[discharge_row, ed_off + t] = 1.0
+            A_ub[discharge_row, primary_action_mode_off + t] = max_dis
+            b_ub[discharge_row] = max_dis
+        else:
+            A_ub[2 * m + t, ec_off + t] = 1.0 / max_charge_per_slot
+            A_ub[2 * m + t, ed_off + t] = 1.0 / max_dis
+            b_ub[2 * m + t] = 1.0
 
     # Cycle cost auxiliary: m[t] >= ec[t]  →  -m[t] + ec[t] <= 0
     #                     m[t] >= ed[t]  →  -m[t] + ed[t] <= 0
-    cycle_row_start = soc_rows + mutex_rows  # = 3m
+    cycle_row_start = soc_rows + action_rows
     for t in range(m):
         A_ub[cycle_row_start + t, ec_off + t] = 1.0
         A_ub[cycle_row_start + t, m_off + t] = -1.0
@@ -169,41 +183,25 @@ def _build_constraints(
     # base_load = 0 (PV surplus): H − P ≤ 0 so both sides are 0.  Hence
     # max(base_load − ev, 0) == max(H − ev − P, 0) in all cases.
     #
-    # When no_export=True, the per-slot cap is extended to ALL slots:
-    # ed[t] ≤ base_load[t] / η_dis.  This prevents the battery from
-    # exporting to the grid — it only serves house load.  Used when the
-    # user has disabled excess export in the config flow.
+    # no_export and battery_export_blocked constrain the explicit battery-
+    # export source block below, not total discharge. Local discharge may
+    # still serve every eligible sink represented by the model without being
+    # misclassified as export.
     #
-    # battery_export_blocked[t] (issue #752) is a per-slot mask that
-    # selectively applies the SAME cap (ed[t] ≤ base_load[t] / η_dis) only
-    # to slots where the RAW export_price is strictly below the user's
-    # ``battery_export_min_price``.  The battery may still serve house
-    # load on those slots; only intentional battery-to-grid export (i.e.
-    # discharge above what house load needs) is blocked.  The mask is
-    # evaluated against the raw export price upstream of the
-    # ``min_export_price`` and export-≤-import clamps so the user's
-    # explicit floor is honoured even when other guards are lower.
     # ------------------------------------------------------------------
     ev_discharge_guard_active = (not active_evs) and bool(np.any(ev_accounted > 1e-9))
     if battery_export_blocked is None:
         battery_export_blocked = np.zeros(len(base_load), dtype=bool)
     ed_ub_per_slot: list[float] = []
     for t in range(m):
-        # Per-slot cap: battery must not discharge more than what's needed
-        # to cover house load (minus EV-accounted load when applicable).
-        # When no_export=True, all slots get this cap.  Otherwise, only
-        # EV-accounted slots and battery_export_blocked slots get it.
-        cap_house_load = base_load[t] / discharge_eff
-        if ev_discharge_guard_active and ev_accounted[t] > 1e-9:
-            cap_house_load = max(base_load[t] - ev_accounted[t], 0.0) / discharge_eff
         if not bool(price_actionable[t]):
             ed_ub_per_slot.append(0.0)
-        elif (
-            no_export
-            or bool(battery_export_blocked[t])
-            or (ev_discharge_guard_active and ev_accounted[t] > 1e-9)
-        ):
-            ed_ub_per_slot.append(min(cap_house_load, max_dis))
+        elif ev_discharge_guard_active and ev_accounted[t] > 1e-9:
+            house_only_ac = max(
+                float(base_load[t]) - float(ev_accounted[t]),
+                0.0,
+            )
+            ed_ub_per_slot.append(min(house_only_ac / discharge_eff, max_dis))
         else:
             ed_ub_per_slot.append(max_dis)
 
@@ -250,7 +248,7 @@ def _build_constraints(
 
     if ev_total_rows > 0:
         # Extend A_ub and b_ub to accommodate EV rows
-        existing_rows = soc_rows + mutex_rows + cycle_rows
+        existing_rows = soc_rows + action_rows + cycle_rows
         A_ub_old = A_ub
         b_ub_old = b_ub
         A_ub = np.zeros((existing_rows + ev_total_rows, n_vars))
@@ -360,7 +358,7 @@ def _build_constraints(
                 session_ac_by_slot[t] = session_ac_by_slot.get(t, 0.0) + session_ac
 
         session_t_list = sorted(session_slots_set)
-        existing_rows = soc_rows + mutex_rows + cycle_rows + ev_total_rows
+        existing_rows = soc_rows + action_rows + cycle_rows + ev_total_rows
         A_ub_old = A_ub
         b_ub_old = b_ub
         A_ub = np.zeros((existing_rows + session_rows, n_vars))
@@ -381,7 +379,7 @@ def _build_constraints(
     # ------------------------------------------------------------------
     fuse_rows = m if fuse_active else 0
     if fuse_active:
-        existing_rows = soc_rows + mutex_rows + cycle_rows + ev_total_rows
+        existing_rows = soc_rows + action_rows + cycle_rows + ev_total_rows
         A_ub_old = A_ub
         b_ub_old = b_ub
         A_ub = np.zeros((existing_rows + fuse_rows, n_vars))
@@ -399,17 +397,38 @@ def _build_constraints(
     # violations) and non-negative (violations cannot be negative).
     # ------------------------------------------------------------------
     unbounded: tuple[float, float | None] = (0.0, None)
+    if grid_import_ub_per_slot is None:
+        grid_import_bounds = [unbounded] * m
+    else:
+        grid_import_bounds = [
+            (0.0, max(float(grid_import_ub_per_slot[t]), 0.0)) for t in range(m)
+        ]
+    if grid_export_ub_per_slot is None:
+        grid_export_bounds = [
+            ((0.0, max_grid_export_per_slot_kwh) if export_limit_active else unbounded)
+            for _t in range(m)
+        ]
+    else:
+        grid_export_bounds = [
+            (
+                0.0,
+                min(
+                    max(float(grid_export_ub_per_slot[t]), 0.0),
+                    max_grid_export_per_slot_kwh,
+                )
+                if export_limit_active
+                else max(float(grid_export_ub_per_slot[t]), 0.0),
+            )
+            for t in range(m)
+        ]
     bounds: list[tuple[float, float | None]] = list(
         [
             ((0.0, max_charge_per_slot) if bool(price_actionable[t]) else (0.0, 0.0))
             for t in range(m)
         ]  # ec[t]: no primary storage action beyond published price authority
         + [(0.0, float(ed_ub_per_slot[t])) for t in range(m)]  # ed[t]
-        + [unbounded] * m  # gi[t] (unbounded above)
-        + [
-            ((0.0, max_grid_export_per_slot_kwh) if export_limit_active else unbounded)
-            for _t in range(m)
-        ]  # ge[t] (hard export cap when active, else unbounded above)
+        + grid_import_bounds
+        + grid_export_bounds
         + [
             (pv_avail[t], pv_avail[t]) for t in range(m)
         ]  # pv[t] fixed to actual surplus
@@ -440,6 +459,27 @@ def _build_constraints(
     # --- Fuse penalty bounds ---
     if fuse_active:
         bounds += [unbounded] * m  # gi_pen[t] (penalty, ≥ 0)
+    if pv_export_ub_per_slot is not None:
+        if (
+            len(pv_export_ub_per_slot) != m
+            or primary_action_mode_off is None
+            or grid_flow_mode_off is None
+            or grid_import_ub_per_slot is None
+            or grid_export_ub_per_slot is None
+        ):
+            raise ValueError("incomplete explicit export-source layout")
+        # Explicit source and binary-mode blocks follow primary/EV/fuse blocks.
+        for t in range(m):
+            export_blocked = (
+                no_export
+                or bool(battery_export_blocked[t])
+                or not bool(price_actionable[t])
+            )
+            bounds.append(
+                (0.0, 0.0) if export_blocked else (0.0, float(ed_ub_per_slot[t]))
+            )
+        bounds += [(0.0, max(float(pv_export_ub_per_slot[t]), 0.0)) for t in range(m)]
+        bounds += [(0.0, 1.0)] * (3 * m)
 
     return {
         "A_eq": A_eq,

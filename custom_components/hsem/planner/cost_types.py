@@ -172,14 +172,15 @@ class PlanCostBreakdown:
         override_penalty:
             Penalty for forced-override slots.  Selector-only.
         terminal_soc_value:
-            Per-slot opportunity cost of charging/discharging, summed across
-            the horizon.  Each slot's contribution is capped by the
-            differential between ``replacement_price_per_kwh`` and that
-            slot's own sanitised import price (mirrors
-            ``milp_optimizer.py``'s terminal-SoC objective term exactly,
-            issue #655).  Negative (credit) when the plan nets more
-            charging than discharging in slots where the differential is
-            positive; positive (penalty) when it nets more discharging.
+            Path-independent value of the primary and secondary batteries'
+            net inventory change across the actionable horizon.  Negative is
+            a credit for ending with more stored energy; positive is a penalty
+            for ending with less.
+            Selector-only — does not enter :attr:`total_cost`.
+        primary_action_tiebreak:
+            Microscopic selector-only preference that resolves exact economic
+            ties toward direct local self-consumption without subsidising a
+            charge/discharge cycle or battery-origin export.
             Selector-only — does not enter :attr:`total_cost`.
         total_cost:
             Money outcome of the plan in the horizon.  Equal to
@@ -188,7 +189,8 @@ class PlanCostBreakdown:
         score:
             Selector objective.  Equal to
             ``total_cost + soc_penalty + grid_limit_penalty
-            + override_penalty + terminal_soc_value``.
+            + override_penalty + terminal_soc_value
+            + primary_action_tiebreak``.
             **Lower is better.**  The candidate selector picks the plan
             with the lowest score.
         total:
@@ -206,6 +208,7 @@ class PlanCostBreakdown:
     grid_limit_penalty: float = 0.0
     override_penalty: float = 0.0
     terminal_soc_value: float = 0.0
+    primary_action_tiebreak: float = 0.0
     secondary_conversion_loss_cost: float = 0.0
     secondary_cycle_cost: float = 0.0
     secondary_terminal_soc_value: float = 0.0

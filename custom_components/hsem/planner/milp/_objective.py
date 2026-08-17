@@ -5,15 +5,13 @@ Extracted from ``solve_milp`` so the orchestrator remains under 30 KB.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import TYPE_CHECKING
 
 import numpy as np
 
-from custom_components.hsem.planner.cost_helpers import (
-    compute_charge_premium,
-    deferred_export_price_by_slot,
-)
+from custom_components.hsem.planner.cost_helpers import PRIMARY_ACTION_TIEBREAK_COST
 from custom_components.hsem.utils.datetime_utils import utc_key
 from custom_components.hsem.utils.units import hours_ahead
 
@@ -33,6 +31,7 @@ def _build_objective(
     gi_off: int,
     ge_off: int,
     m_off: int,
+    primary_export_off: int,
     s_max_off: int,
     s_min_off: int,
     gi_pen_off: int,
@@ -61,24 +60,9 @@ def _build_objective(
 
     c_obj = np.zeros(n_vars)
 
-    # Deferred-export correction (issue #592): for each LP slot, the
-    # minimum export price among later slots whose PV surplus exceeds the
-    # battery's per-slot absorption capacity.  Indexed parallel to
-    # ``future_idx`` (LP-local index t → deferred price or None).
-    _deferred_by_lp_idx: list[float | None] | None = None
-    if (
-        usable_kwh > 1e-9
-        and max_charge_per_slot > 1e-9
-        and replacement_price_per_kwh is not None
-        and abs(replacement_price_per_kwh) > 1e-9
-    ):
-        _by_slot_idx = deferred_export_price_by_slot(
-            slots,
-            usable_kwh=usable_kwh,
-            max_charge_per_slot=max_charge_per_slot,
-            now=now,
-        )
-        _deferred_by_lp_idx = [_by_slot_idx[i] for i in future_idx]
+    replacement_price = max(replacement_price_per_kwh or 0.0, 0.0)
+    if not math.isfinite(replacement_price):
+        replacement_price = 0.0
 
     p_imp_max = float(np.max(p_imp)) if m > 0 else 0.1
     use_discount = time_discount_rate < 1.0 - 1e-9
@@ -96,21 +80,19 @@ def _build_objective(
         # Charge-side conversion loss: energy lost during charge, priced at
         # this slot's import price (where the charge occurs).
         c_obj[ec_off + t] = (charge_loss * p_imp_obj[t]) * discount
-        # Discharge-side conversion loss: energy lost during discharge.
-        # Priced at the sanitised import price of the discharge slot.
-        #
-        # NOTE (issue #641): This is a CONSERVATIVE APPROXIMATION.  The
-        # LP cannot know the destination of discharged energy (house load
-        # vs. export) before solving, because the gi[t]/ge[t] split is
-        # itself an LP decision.  Defaulting to the (typically higher)
-        # import price is the safe choice — it never leads the LP to be
-        # overly optimistic about an export cycle's profitability.
-        #
-        # The accurate destination-aware cost is computed post-hoc in
-        # cost_function.py::score_plan() (which sees the solved
-        # grid_export_kwh/grid_import_kwh fields) and reported in the
-        # diagnostics dict as "discharge_loss_cost_destination_aware".
+        # Price local discharge losses at avoided import. The explicit
+        # battery-export block corrects just its DC share to foregone export
+        # revenue, making the objective destination-aware before solving.
         c_obj[ed_off + t] = (discharge_loss * p_imp_obj[t]) * discount
+        c_obj[primary_export_off + t] = (
+            discharge_loss * (max(p_exp[t], 0.0) - p_imp_obj[t]) * discount
+        )
+        # A weighted structural tiebreak resolves exact economic ties.
+        # eps*(ec+ed)-1.5eps*(ed-bx) favours direct local discharge by
+        # 0.5eps/kWh, while charge, export, and cycling remain positive.
+        c_obj[ec_off + t] += PRIMARY_ACTION_TIEBREAK_COST
+        c_obj[ed_off + t] -= 0.5 * PRIMARY_ACTION_TIEBREAK_COST
+        c_obj[primary_export_off + t] += 1.5 * PRIMARY_ACTION_TIEBREAK_COST
         # Cycle cost through auxiliary variable m[t] (= max(ec, ed))
         c_obj[m_off + t] = cycle_cost_per_kwh * discount
         c_obj[gi_off + t] = p_imp_obj[t] * discount  # grid import cost
@@ -118,90 +100,12 @@ def _build_objective(
         # pv[t] has zero objective cost
         # curt[t] has zero objective cost (curtailment is free)
 
-        # Terminal-SoC term in the objective (undiscounted).
-        # Values the opportunity cost of ending the horizon with more or
-        # less stored battery energy.  Every unit of charge/discharge
-        # anywhere in the horizon contributes to the final cumulative SoC:
-        #   terminal_soc_value = (Σed - Σec) * replacement_price_per_kwh
-        # Charging (ec) earns a credit, discharging (ed) incurs a penalty.
-        #
-        # IMPORTANT: the per-slot incentive is capped by the
-        # opportunity-cost DIFFERENTIAL between the replacement price and
-        # this slot's import price.  When replacement_price ≤ p_imp[t],
-        # energy is worth the same or less later than now, so the
-        # terminal-SoC term must not discourage a genuine discharge
-        # decision (covering house load with an otherwise-idle battery).
-        # This prevents the regression identified in issue #638 where
-        # flat-price scenarios saw zero discharge because the uniform
-        # +replacement_price penalty dominated the per-slot import-saving
-        # benefit.
-        #
-        # The differential is computed against the sanitised import price
-        # (p_imp_obj, non-negative) so that negative import prices cannot
-        # artificially inflate the terminal premium.
-        #
-        # SECOND CAP (issue #694): the terminal premium must never make
-        # battery charging more attractive than grid export for the same
-        # slot.  Without this cap, a high replacement_price can cause the
-        # LP to charge from solar during expensive hours instead of
-        # exporting at peak prices — a "tunnel-vision" effect where the
-        # LP rushes to satisfy the terminal-SoC target immediately rather
-        # than deferring charging to cheaper slots with ample solar.
-        #
-        #   Export benefit:  -p_exp[t]
-        #   Charge cost:     (charge_loss·p_imp[t] - premium + cycle_cost) · η_chg
-        #
-        # Requiring export ≤ charge (both negative = both beneficial):
-        #   -p_exp[t] ≤ (charge_loss·p_imp[t] - premium + cycle_cost) · η_chg
-        #   → premium ≤ charge_loss·p_imp[t] + cycle_cost + p_exp[t] / η_chg
-        #
-        # The cap only reduces the terminal premium — it can never increase
-        # it.  When p_exp[t] is high the cap is large and rarely binds;
-        # when p_exp[t] is low (cheap slots) the cap is small, but the LP
-        # still charges in those slots because the global optimum values
-        # stored energy for future discharge windows.
-        #
-        # Deferred-export correction (issue #592): the #694 cap compares
-        # charging against exporting in the SAME slot.  When a future slot
-        # has PV surplus beyond what the battery can absorb, that surplus
-        # is exported regardless — so the true opportunity cost of charging
-        # now is the spread between this slot's (high) export price and the
-        # future slot's (low) export price.  ``compute_charge_premium``
-        # restores that spread so the LP charges now at high prices and
-        # lets the inevitable future surplus refill at low prices.
-        if (
-            replacement_price_per_kwh is not None
-            and abs(replacement_price_per_kwh) > 1e-9
-            and slots[future_idx[t]].price_actionable
-        ):
-            terminal_premium = max(0.0, replacement_price_per_kwh - p_imp_obj[t])
-            # Cap the CHARGE credit only: the terminal premium for
-            # charging is reduced by the opportunity cost of not
-            # exporting the same PV surplus (issue #694).
-            #
-            #   charge_premium = repl - p_imp - p_exp / η_chg
-            #
-            # This ensures that when export prices are high (expensive
-            # slots), the charge credit is small and the LP exports.
-            # When export prices are low (cheap slots), the charge
-            # credit is close to the full terminal premium and the
-            # LP charges to store energy for future discharge windows.
-            #
-            # The discharge penalty is NOT capped — it remains at the
-            # full terminal_premium to prevent unnecessary discharging
-            # (issue #638).
-            _charge_eff = 1.0 - charge_loss
-            _charge_premium = compute_charge_premium(
-                replacement_price_per_kwh=replacement_price_per_kwh,
-                imp_price_obj=p_imp_obj[t],
-                exp_price=p_exp[t],
-                charge_eff=_charge_eff,
-                deferred_export_price=(
-                    _deferred_by_lp_idx[t] if _deferred_by_lp_idx else None
-                ),
-            )
-            c_obj[ec_off + t] -= _charge_premium  # capped credit for charging
-            c_obj[ed_off + t] += terminal_premium  # full penalty for discharging
+        # Uniform final-inventory value. Every DC kWh charged earns -R and
+        # every DC kWh discharged pays +R, so an equal discharge/refill cycle
+        # cancels exactly regardless of where it occurs in the horizon.
+        if replacement_price > 1e-9 and slots[future_idx[t]].price_actionable:
+            c_obj[ec_off + t] -= replacement_price
+            c_obj[ed_off + t] += replacement_price
 
         # Penalty costs: high enough that penalties are zero when SoC is
         # within bounds, but absorb violations when the initial SoC is

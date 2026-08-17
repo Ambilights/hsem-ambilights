@@ -28,7 +28,7 @@ We split the cost function into **two distinct aggregates** returned for every c
 ### 1. `total_cost` — real-money terms only
 
 ```
-total_cost = grid_import_cost − export_revenue + cycle_cost + conversion_loss_cost + tariff_cost
+total_cost = grid_import_cost − export_revenue + cycle_cost + conversion_loss_cost
 ```
 
 - Every term in `total_cost` corresponds to a real monetary flow.
@@ -39,12 +39,16 @@ total_cost = grid_import_cost − export_revenue + cycle_cost + conversion_loss_
 ### 2. `score` — selector objective
 
 ```
-score = total_cost + soc_penalties + grid_limit_penalty + override_penalty + terminal_soc_value
+score = total_cost + soc_penalties + grid_limit_penalty + override_penalty
+        + terminal_soc_value + primary_action_tiebreak
 ```
 
 - Starts from `total_cost` (always includes real money).
 - Adds **synthetic penalties** (quadratic SoC guard, grid power limit, override cost).
 - Adds the **terminal SoC opportunity cost** — a value representing the lost future benefit of stored energy consumed during the horizon.
+- Adds a separately named **primary-action structural tiebreak** so a true
+  economic tie prefers battery-to-house discharge without rewarding
+  charge/discharge or export/refill cycles.
 - The selector always picks the candidate with the **lowest** `score`, not the lowest `total_cost`.
 
 ### Why two aggregates instead of a single weighted sum
@@ -66,9 +70,65 @@ Terminal SoC value uses:
 terminal_soc_value = (E_initial − E_final) × p_replacement
 ```
 
-Where `p_replacement` = **minimum** future import price across the horizon.
+The equivalent battery-flow form is:
 
-Using the minimum price (not the average) prevents over-valuing stored energy during peak-price periods, which would bias the selector against discharging at the most profitable time.
+```
+terminal_soc_value = p_replacement × (Σ discharge − Σ charge)
+```
+
+The replacement coefficient is sanitised non-negative (missing/non-finite
+resolves to zero), uniform, and undiscounted, so the value is path-independent:
+equal discharge and recharge cancel regardless of which slots contain them.
+`p_replacement` is horizon context from the first contiguous published,
+price-actionable heuristic discharge block (mean of its top-N import prices).
+When opt-in forecast valuation is available, the MAE-and-margin-haircut
+forecast value may raise, but never lower, that published value. Forecast
+points do not become slot prices or extend price authority.
+
+The replacement-price heuristic does not model future grid/PV refill. Refill
+economics remain in the explicit import/export prices, efficiencies, cycle
+wear, capacity, headroom, and power constraints. In particular, an export
+discharge followed by equal recharge has zero net terminal value rather than
+receiving a path-dependent reward or penalty.
+
+### Primary-action structural tiebreak
+
+The selector-only term is:
+
+```
+epsilon = 0.00001 currency / DC kWh
+battery_export_DC[t] =
+    primary_battery_export_kwh[t] / discharge_efficiency
+local_discharge_DC[t] = discharge[t] − battery_export_DC[t]
+primary_action_tiebreak
+    = epsilon × Σ(charge[t] + discharge[t])
+      − 1.5 × epsilon × Σ(local_discharge_DC[t])
+```
+
+The per-kWh perturbation is `+epsilon` for charge, `-0.5*epsilon` for local
+discharge, and `+epsilon` for battery-origin export. A charge/local-discharge
+cycle costs `0.5*epsilon` and an export/refill cycle costs `2*epsilon`. On a
+true lossless/economic tie, local discharge wins, preserving the intent of
+issues #638/#655. A 97%-efficient discharge at a flat tariff is not an
+economic tie and is deliberately no longer forced.
+
+This is a weighted structural tiebreak, not a mathematically lexicographic
+objective. It may affect economics below epsilon, and the configured 0.5% MIP
+gap does not guarantee proof of an epsilon-sized distinction. Under ordinary
+48-hour/10 kW primary-battery bounds the total perturbation remains below
+about 0.01 currency.
+The MILP identifies
+`battery_export_DC[t]` explicitly; its AC counterpart is
+`discharge_efficiency × battery_export_DC[t]`, and the remaining aggregate
+grid export is attributed to PV. A binary source branch enforces
+`battery_export_DC[t] = min(discharge[t], grid_export[t]/discharge_efficiency)`;
+this causal attribution cannot be changed by the objective. The non-battery
+source is physically capped by available PV (plus only PowMr SBU-revealed PV),
+and flexible EV load is not a battery-eligible local sink. A separate binary
+primary action mode prevents simultaneous charge and discharge. A third binary
+grid-flow mode, using finite physical import/export bounds, prevents a
+simultaneous meter wash from manufacturing an export source that disappears
+when final net flow is written.
 
 ### Quadratic SoC guard
 
@@ -97,7 +157,9 @@ Slots marked `time_passed` are excluded from SoC penalty calculation because the
 
 - Callers must be aware of which aggregate to use. The wrong choice (using `total_cost` for selection, or `score` for billing) produces incorrect results.
 - Slightly more complex API surface: every evaluation returns two floats instead of one.
-- The terminal-SoC opportunity cost is a synthetic value — it is not money the user will actually pay or receive, but represents a lower-bound estimate of future import cost.
+- Terminal inventory value and the primary-action structural tiebreak
+  are synthetic selector terms — neither is money the user will actually pay
+  or receive.
 
 ### Trade-offs considered
 
@@ -111,5 +173,8 @@ For every planner run:
 
 - `winner.score == final_output.score` (no post-selection mutation)
 - `winner.total_cost == final_output.total_cost`
-- `score >= total_cost` always (penalties are non-negative, terminal value can be positive or negative)
-- When all penalties are zero and terminal-SoC value is zero: `score == total_cost`
+- `score == total_cost + penalties + terminal_soc_value + primary_action_tiebreak`
+- `score` may be above or below `total_cost`: penalties are non-negative,
+  while terminal inventory and the structural tiebreak may have either sign
+- When all penalties and selector-only inventory/tiebreak terms are zero:
+  `score == total_cost`

@@ -189,37 +189,28 @@ def _compute_milp_diagnostics(
         total_curtailment_kwh,
     )
 
-    # ------------------------------------------------------------------
-    # Post-hoc destination-aware discharge loss cost (issue #641).
-    #
-    # The LP's pre-solve objective uses p_imp_obj for ed[t] as a
-    # conservative approximation (the LP cannot know the discharge
-    # destination before solving).  Once the LP has solved and the
-    # per-slot grid_export_kwh / grid_import_kwh fields are written,
-    # we can compute the economically accurate cost using the actual
-    # destination of each discharged kWh.
-    #
-    # This value should match cost_function.py::score_plan()'s
-    # conversion_loss_cost for the discharge-side portion.
-    # ------------------------------------------------------------------
+    # Destination-aware discharge loss, using the explicit AC export source
+    # rather than inferring that every discharge in a net-exporting slot went
+    # to the grid.
     discharge_loss_dest_aware = 0.0
+    discharge_eff = max(1.0 - discharge_loss, 0.01)
     for t in range(m):
         slot_i = future_idx[t]
-        s = out_slots[slot_i]
-        if s.batteries_discharged_kwh <= 1e-9:
+        slot = out_slots[slot_i]
+        discharge_dc = max(slot.batteries_discharged_kwh, 0.0)
+        if discharge_dc <= 1e-9:
             continue
-        lost_kwh = s.batteries_discharged_kwh * discharge_loss
-        if s.grid_export_kwh > 1e-9:
-            # Export-destined discharge: price at export price.
-            exp_p = slots[slot_i].price.export_price
-            # Apply same sanitisation as cost_function.py
-            if min_export_price > 1e-9 and exp_p < min_export_price:
-                exp_p = 0.0
-            p_loss = max(exp_p, 0.0)
-        else:
-            # House-load-covering discharge: price at import price.
-            p_loss = p_imp_obj[t]
-        discharge_loss_dest_aware += lost_kwh * p_loss
+        battery_export_dc = min(
+            max(slot.primary_battery_export_kwh, 0.0) / discharge_eff,
+            discharge_dc,
+        )
+        local_discharge_dc = max(discharge_dc - battery_export_dc, 0.0)
+        exp_price = slots[slot_i].price.export_price
+        if min_export_price > 1e-9 and exp_price < min_export_price:
+            exp_price = 0.0
+        discharge_loss_dest_aware += discharge_loss * (
+            local_discharge_dc * p_imp_obj[t] + battery_export_dc * max(exp_price, 0.0)
+        )
 
     diagnostics: dict = {
         "s_max_pen": s_max_pen_list,

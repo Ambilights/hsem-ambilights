@@ -25,6 +25,8 @@ Design principles
   discharge-loss).  The house actually receives
   ``batteries_discharged × discharge_efficiency``.
 - ``grid_import_kwh`` and ``grid_export_kwh`` are written by this function.
+- ``primary_battery_export_kwh`` and ``pv_export_kwh`` split aggregate
+  grid export by physical source for scoring and diagnostics.
 """
 
 from __future__ import annotations
@@ -76,6 +78,10 @@ def simulate_soc(
       ``batteries_discharged × (discharge_efficiency_pct / 100)``.
     - ``grid_import_kwh`` — energy imported from the grid this slot.
     - ``grid_export_kwh`` — energy exported to the grid this slot.
+    - ``primary_battery_export_kwh`` — AC energy exported from the primary
+      battery.
+    - ``pv_export_kwh`` — exported AC energy not sourced from the primary
+      battery (normally direct PV).
 
     Efficiency model
     ----------------
@@ -124,8 +130,8 @@ def simulate_soc(
             wait-mode self-consumption must preserve. Ignored for strict wait
             and MILP-prepopulated candidates.
         milp_prepopulated: When ``True``, the slot's ``batteries_discharged_kwh``,
-            ``grid_import_kwh``, and ``grid_export_kwh`` fields are already
-            populated by the MILP LP solution and must be used verbatim.
+            ``grid_import_kwh``, ``grid_export_kwh``, and export-source
+            fields are already populated by the MILP and used verbatim.
             The simulation skips the greedy derivation and tracks SoC from
             the pre-populated values.  Defaults to ``False`` (unchanged
             behaviour for non-MILP candidates).
@@ -443,6 +449,15 @@ def simulate_soc(
             slot.batteries_discharged_kwh = round(discharge, 3)
             slot.grid_import_kwh = round(grid_import, 3)
             slot.grid_export_kwh = round(grid_export, 3)
+            # Non-MILP flows still publish the same AC source split as MILP.
+            # In a deficit slot only battery delivery beyond net demand can
+            # export; in a PV-surplus slot every delivered battery kWh exports.
+            primary_export = min(slot.grid_export_kwh, discharge * discharge_eff)
+            slot.primary_battery_export_kwh = round(max(primary_export, 0.0), 3)
+            slot.pv_export_kwh = round(
+                max(slot.grid_export_kwh - slot.primary_battery_export_kwh, 0.0),
+                3,
+            )
 
         # If the slot has a FORCE discharge/export recommendation but
         # no discharge actually happened (battery empty or PV surplus),

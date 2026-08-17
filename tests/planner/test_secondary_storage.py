@@ -133,6 +133,7 @@ def test_secondary_charges_cheap_and_serves_nas_when_expensive() -> None:
     result, diagnostics = _solve(
         _slots([0.05, 0.05, 1.00, 1.00, 1.00, 1.00]),
         _powmr(),
+        primary_max_discharge_per_slot=0.0,
     )
 
     charge_hours = {

@@ -446,28 +446,34 @@ def solve_milp(
     #   + [evN_c(0..m-1) for each active EV]      ← EV DC charge per slot
     #   + [evN_target_pen for each active EV]      ← deadline target slack
     # ------------------------------------------------------------------
-    ec_off, ed_off, gi_off, ge_off, pv_off, m_off = 0, m, 2 * m, 3 * m, 4 * m, 5 * m
-    s_max_off = 6 * m
-    s_min_off = 7 * m
-    curt_off = 8 * m
-    n_vars = 9 * m
+    from custom_components.hsem.planner.milp._layout import MilpColumnLayout
+
+    column_layout = MilpColumnLayout(m)
+    ec_off = column_layout.add("primary_charge", m)
+    ed_off = column_layout.add("primary_discharge", m)
+    gi_off = column_layout.add("grid_import", m)
+    ge_off = column_layout.add("grid_export", m)
+    pv_off = column_layout.add("pv", m)
+    m_off = column_layout.add("primary_throughput", m)
+    s_max_off = column_layout.add("soc_max_penalty", m)
+    s_min_off = column_layout.add("soc_min_penalty", m)
+    curt_off = column_layout.add("curtailment", m)
 
     # --- EV variable layout ---
     ev_var_offsets: list[int] = []  # start of ev_c[t] block per EV
     ev_pen_offsets: list[int] = []  # index of deadline penalty per EV
-    for _ev_idx, _ev in enumerate(active_evs):
-        ev_var_offsets.append(n_vars)
-        n_vars += m  # ev_c[0..m-1] per EV
-        ev_pen_offsets.append(n_vars)
-        n_vars += 1  # single penalty per EV
+    for ev_idx, _ev in enumerate(active_evs):
+        ev_var_offsets.append(column_layout.add(f"ev_{ev_idx}_charge", m))
+        ev_pen_offsets.append(
+            column_layout.add(f"ev_{ev_idx}_target_penalty", 1, per_slot=False)
+        )
 
     # --- Fuse constraint variables ---
     # When main_fuse_amps is provided and > 0, add gi_pen[t] penalty
     # variables that absorb grid import exceeding the fuse rating.
     fuse_active = main_fuse_amps is not None and main_fuse_amps > 1e-9
     if fuse_active:
-        gi_pen_off = n_vars
-        n_vars += m  # gi_pen[0..m-1] per slot
+        gi_pen_off = column_layout.add("grid_import_penalty", m)
         # Calculate max grid import per slot in kWh (single source of truth
         # shared with the post-hoc EV/battery throttle in engine_core).
         # We derive interval_minutes from the first slot's duration.
@@ -506,6 +512,53 @@ def solve_milp(
     discharge_eff = clamp_efficiency(discharge_efficiency_pct)
     charge_loss = 1.0 - charge_eff
     discharge_loss = 1.0 - discharge_eff
+    # A non-battery export can use forecast PV plus PV hidden behind a
+    # dedicated load that PowMr SBU removes from the metered site load.
+    pv_export_ub_per_slot = pv_avail.copy()
+    if secondary_active:
+        assert secondary_storage is not None
+        if secondary_storage.base_load_includes_dedicated_load:
+            from custom_components.hsem.planner.secondary_storage import (
+                secondary_site_load_offset_kwh,
+            )
+
+            pv_export_ub_per_slot += np.array(
+                [
+                    secondary_site_load_offset_kwh(slots[i], secondary_storage)
+                    for i in future_idx
+                ]
+            )
+
+    # Finite physical bounds make exact grid import/export direction possible.
+    grid_import_ub_per_slot = base_load + max_charge_per_slot / charge_eff
+    for ev in active_evs:
+        grid_import_ub_per_slot += ev.max_charge_per_slot / max(
+            ev.charger_efficiency, 0.01
+        )
+    if secondary_active:
+        assert secondary_storage is not None
+        secondary_charge_eff = clamp_efficiency(secondary_storage.charge_efficiency_pct)
+        secondary_charge_ac_max = (
+            secondary_storage.nominal_voltage_v
+            * secondary_storage.max_charge_current_a
+            * slot_hours
+            / 1000.0
+            / secondary_charge_eff
+        )
+        grid_import_ub_per_slot += secondary_charge_ac_max
+        grid_import_ub_per_slot += np.array(
+            [slots[i].secondary_storage_load_kwh for i in future_idx]
+        )
+    grid_export_ub_per_slot = pv_export_ub_per_slot + discharge_eff * max_dis
+
+    # Explicit export-source blocks. Primary battery export is battery-side
+    # DC kWh; PV/non-battery export is AC kWh. The source constraints convert
+    # the former using discharge_eff and reconcile both with aggregate ge[t].
+    primary_export_off = column_layout.add("primary_battery_export", m)
+    pv_export_off = column_layout.add("pv_export", m)
+    export_source_mode_off = column_layout.add("export_source_mode", m)
+    primary_action_mode_off = column_layout.add("primary_action_mode", m)
+    grid_flow_mode_off = column_layout.add("grid_flow_mode", m)
 
     # A user-configured excess-export buffer is a conditional reserve, not a
     # global minimum SoC. Binary variables distinguish intentional battery
@@ -522,18 +575,23 @@ def solve_milp(
             _next_solar_refill_checkpoints,
         )
 
-        export_mode_off = n_vars
-        n_vars += m
+        export_mode_off = column_layout.add("battery_export_mode", m)
         export_reserve_checkpoints = _next_solar_refill_checkpoints(pv_avail)
 
-    base_n_vars = n_vars
+    base_n_vars = column_layout.column_count
     secondary_layout = None
     if secondary_active:
         from custom_components.hsem.planner.milp._secondary_storage import (
             _allocate_secondary_variables,
         )
 
-        secondary_layout, n_vars = _allocate_secondary_variables(base_n_vars, m)
+        secondary_layout, n_vars = _allocate_secondary_variables(
+            base_n_vars,
+            m,
+            column_layout=column_layout,
+        )
+    else:
+        n_vars = column_layout.column_count
 
     from custom_components.hsem.planner.milp._solver_execution import (
         _build_solve_and_finalize,

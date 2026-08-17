@@ -79,6 +79,41 @@ class TestEnergyIsConserved:
         for dc in placed.values():
             assert dc >= MIN_DC - 1e-9
 
+    def test_bounded_recovery_fills_existing_commandable_headroom(self) -> None:
+        """Recover a sub-minimum residue into selected slots with spare capacity.
+
+        Four 60-minute solved allocations total 6.000 DC kWh.  At 90%
+        efficiency, the 1380 W operating minimum is 1.242 DC kWh and the
+        approximately 3333 W rating is 3.000 DC kWh.  Backward concentration
+        leaves the two 0.450 kWh fragments below the minimum, so the bounded
+        recovery pass must fill the already-commandable 2.100 kWh slot to
+        3.000 rather than silently dropping 0.900 kWh.
+        """
+        solved = {0: 0.45, 2: 0.45, 3: 3.0, 4: 2.1}
+        slot_hours = dict.fromkeys(solved, 1.0)
+        efficiency = 0.9
+        minimum_power_w = 1380.0
+        rated_power_w = 10_000.0 / 3.0
+        minimum_dc_kwh = minimum_power_w * efficiency / 1000.0
+        maximum_dc_kwh = rated_power_w * efficiency / 1000.0
+
+        placed, unplaceable = _redistribute_below_minimum_power(
+            solved,
+            slot_hours=slot_hours,
+            charger_efficiency=efficiency,
+            charger_min_power_w=minimum_power_w,
+            rated_ac_power_w=rated_power_w,
+        )
+
+        assert unplaceable == pytest.approx(0.0, abs=1e-9)
+        assert sum(placed.values()) == pytest.approx(6.0, abs=1e-9)
+        assert placed == {3: pytest.approx(3.0), 4: pytest.approx(3.0)}
+        assert set(placed).issubset(solved)
+        assert max(placed) <= max(solved)
+        for dc_kwh in placed.values():
+            assert dc_kwh >= minimum_dc_kwh - 1e-9
+            assert dc_kwh <= maximum_dc_kwh + 1e-9
+
     def test_energy_moves_earlier_never_later(self) -> None:
         """Moving energy later could push it past the deadline."""
         solved = {10: 0.601, 11: 0.577, 12: 0.577, 13: 0.577, 14: 2.078}

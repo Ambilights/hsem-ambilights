@@ -576,8 +576,9 @@ class TestForceExport:
         # 2.0 kWh × 0.15/kWh = 0.30 revenue
         assert bd.export_revenue == pytest.approx(0.30, abs=1e-6)
         assert bd.import_cost == pytest.approx(0.0, abs=1e-6)
-        # total = 0 - 0.30 = -0.30 (net revenue)
-        assert bd.total == pytest.approx(-0.30, abs=1e-6)
+        # Exported battery energy carries the microscopic action tiebreak.
+        assert bd.primary_action_tiebreak == pytest.approx(0.00002, abs=1e-9)
+        assert bd.total == pytest.approx(-0.30 + 0.00002, abs=1e-9)
 
 
 # ===========================================================================
@@ -751,6 +752,7 @@ class TestWinnerCostIdentity:
             total_cost = import - export_revenue + cycle + conversion_loss
             score      = total_cost + soc_penalty + grid_limit_penalty
                          + override_penalty + terminal_soc_value
+                         + primary_action_tiebreak
         """
         result = run_planner(make_winter_day_input())
         assert result.plan_cost is not None
@@ -764,6 +766,7 @@ class TestWinnerCostIdentity:
             + bd.grid_limit_penalty
             + bd.override_penalty
             + bd.terminal_soc_value
+            + bd.primary_action_tiebreak
         )
         assert bd.total_cost == pytest.approx(expected_total_cost, abs=1e-5)
         assert bd.score == pytest.approx(expected_score, abs=1e-5)
