@@ -156,6 +156,9 @@ _V2_NEW_KEY_DEFAULTS: dict[str, Any] = {
     # Energy price forecast sensors (optional — None = not configured)
     "hsem_import_electricity_price_forecast_sensor": None,
     "hsem_export_electricity_price_forecast_sensor": None,
+    # ENTSO-E published-price backup sensors (optional paired configuration)
+    "hsem_import_electricity_price_entsoe_sensor": None,
+    "hsem_export_electricity_price_entsoe_sensor": None,
     # EV smart charging flags
     "hsem_ev_target_soc": 80,
     "hsem_ev_deadline_time": "07:00",

@@ -893,6 +893,8 @@ async def _register_listeners(
     forecast_candidates = [
         cfg.import_electricity_price_sensor,
         cfg.export_electricity_price_sensor,
+        cfg.import_electricity_price_entsoe_sensor,
+        cfg.export_electricity_price_entsoe_sensor,
         cfg.import_electricity_price_forecast_sensor,
         cfg.export_electricity_price_forecast_sensor,
         cfg.price_forecast_valuation_sensor,
@@ -1053,6 +1055,8 @@ async def async_collect_all_states(
     for entity_id in (
         cfg.import_electricity_price_sensor,
         cfg.export_electricity_price_sensor,
+        cfg.import_electricity_price_entsoe_sensor,
+        cfg.export_electricity_price_entsoe_sensor,
         cfg.import_electricity_price_forecast_sensor,
         cfg.export_electricity_price_forecast_sensor,
         cfg.price_forecast_valuation_sensor,

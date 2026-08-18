@@ -258,6 +258,38 @@ class TestPriceForecastAuthority:
         assert current.secondary_storage_charged_kwh == 0.0
         assert current.secondary_storage_discharged_kwh == 0.0
 
+    def test_primary_current_outage_holds_entsoe_labelled_current_slot(self) -> None:
+        now = datetime(2026, 8, 14, 12, 5, tzinfo=UTC)
+        with patch(
+            "custom_components.hsem.coordinator_builder.hsem_now", return_value=now
+        ):
+            recommendations = generate_recommendation_intervals(15, 24)
+        current = recommendations[48]
+        current.recommendation = Recommendations.ForceBatteriesDischarge.value
+        current.batteries_discharged_kwh = 2.0
+        current.import_price = 1.0
+        current.export_price = 0.5
+        current.import_price_available = True
+        current.export_price_available = True
+        current.import_price_source = "entsoe"
+        current.export_price_source = "entsoe"
+        current.price_actionable = True
+        live = LiveState()
+        live.force_working_mode_state = "auto"
+        live.import_electricity_price_available = False
+        live.export_electricity_price_available = False
+
+        _apply_live_current_price_availability(recommendations, live, now)
+        held = _apply_current_price_outage_hold(recommendations, live, now)
+
+        assert current.import_price_source == "entsoe"
+        assert current.export_price_source == "entsoe"
+        assert current.price_actionable is False
+        assert held is current
+        assert current.recommendation == Recommendations.BatteriesWaitMode.value
+        assert current.primary_battery_hold is True
+        assert current.batteries_discharged_kwh == 0.0
+
     def test_explicit_user_force_is_higher_authority_than_price_outage(self) -> None:
         now = datetime(2026, 8, 14, 12, 5, tzinfo=UTC)
         with patch(

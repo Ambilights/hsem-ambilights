@@ -44,7 +44,7 @@ every step in order so individual entities can be customised.
 ### Step: `prices`
 
 Generic electricity price sensor configuration. Provider-agnostic — supports
-Energi Data Service, Nordpool, Amber Electric, and any other price source.
+Energi Data Service, Nord Pool, Amber Electric, and any other price source.
 
 | Field | Key | Default | Description |
 |---|---|---|---|
@@ -52,8 +52,28 @@ Energi Data Service, Nordpool, Amber Electric, and any other price source.
 | Export price sensor | `hsem_export_electricity_price_sensor` | `sensor.energi_data_service_produktion` | HA entity for export price |
 | Import price forecast sensor | `hsem_import_electricity_price_forecast_sensor` | — | Optional dedicated import forecast sensor |
 | Export price forecast sensor | `hsem_export_electricity_price_forecast_sensor` | — | Optional dedicated export forecast sensor |
+| ENTSO-E import backup sensor | `hsem_import_electricity_price_entsoe_sensor` | — | Optional published-price backup; must contain the final import price |
+| ENTSO-E export backup sensor | `hsem_export_electricity_price_entsoe_sensor` | — | Optional published-price backup; must contain the final export price |
 | Export min price | `hsem_export_electricity_min_price` | 0.0 | Below this, inverter throttles export to zero |
 | Price update interval | `hsem_electricity_price_update_interval` | 15 minutes | How often the price source publishes (15, 30, or 60) |
+
+The ENTSO-E backup is optional, but its import and export sensors are a pair:
+configure both or neither. Select the ENTSO-E **Average electricity price**
+entities, not the scalar current-price entities. Each selected sensor must
+expose at least one non-empty `prices`, `prices_today`, or
+`prices_tomorrow` list. Every record needs a finite `price` and a
+timezone-aware `time` or `start`. The two series must have identical
+timestamps, their cadence must match the configured price update interval, and
+each unit must exactly match its corresponding primary sensor after whitespace
+is trimmed.
+
+HSEM performs no currency conversion and adds no VAT, tariff, markup, or grid
+fee. Configure those adjustments in the source integrations before selecting
+the entities here. The two ENTSO-E sensors therefore normally come from
+separate import and export ENTSO-E config entries. Nord Pool remains primary;
+the pair is available only as a backup for published slots Nord Pool has not
+provided. See [ENTSO-E Price Backup](entsoe-price-backup.md) for source-side
+currency, VAT, tariff, and validation setup.
 
 ### Step: `months`
 
@@ -232,7 +252,6 @@ Excess battery export configuration.
 | Discharge buffer | `hsem_batteries_excess_export_discharge_buffer` | 10 % | Safety SoC buffer before forced export |
 | Battery export min price | `hsem_batteries_export_min_price` | `0.0` | Per-slot hard floor for intentional battery-to-grid export (issue #752). When > 0, the MILP forbids marking a slot as `force_batteries_discharge` when the export price is strictly below this floor — the battery can still serve house load in those slots. Reaching the threshold does NOT automatically trigger export; the optimizer still decides whether selling is worthwhile. Applies only to intentional battery-to-grid export, not to normal self-consumption, PV export, or PV charging. Set to 0 to disable. |
 | Price threshold | — | Auto-calculated | Computed from battery depreciation settings at runtime |
-
 
 ### Step: `weighted_values`
 

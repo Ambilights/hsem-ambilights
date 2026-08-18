@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from custom_components.hsem.models.price_source import PriceSource
 from custom_components.hsem.utils.prices import SlotPrice
 
 
@@ -32,6 +33,9 @@ class PlannedSlot:
         import_price_available / export_price_available:
             ``True`` only when the corresponding numeric price was supplied
             by the source. Zero and negative prices remain available.
+        import_price_source / export_price_source:
+            Optional provenance for the corresponding price channel
+            (``primary``, ``entsoe``, or ``forecast``).
         price_actionable:
             ``True`` only inside the contiguous future prefix for which both
             price channels are published.
@@ -165,3 +169,5 @@ class PlannedSlot:
     pv_export_kwh: float = 0.0
     recommendation: str | None = None
     primary_battery_hold: bool = False
+    import_price_source: PriceSource | None = None
+    export_price_source: PriceSource | None = None

@@ -195,6 +195,16 @@ def populate_prices(
                 )
                 slot.import_price_available = imp_available
                 slot.export_price_available = exp_available
+                slot.import_price_source = (
+                    point.import_price_source
+                    if point is not None and imp_available
+                    else None
+                )
+                slot.export_price_source = (
+                    point.export_price_source
+                    if point is not None and exp_available
+                    else None
+                )
                 slot.price_actionable = imp_available and exp_available
                 if not slot.price_actionable:
                     tsi.missing_slots.add(meta.key)
@@ -203,9 +213,10 @@ def populate_prices(
 
         # Use (day_offset, hour) keys when any entry carries a non-zero
         # day_offset so that tomorrow's prices are not overwritten by today's.
+        use_day_key = any(pp.day_offset != 0 for pp in price_points)
         imp_prices: dict[int, float] | dict[tuple[int, int], float]
         exp_prices: dict[int, float] | dict[tuple[int, int], float]
-        if any(pp.day_offset != 0 for pp in price_points):
+        if use_day_key:
             imp_prices = {
                 (pp.day_offset, pp.hour): pp.import_price
                 for pp in price_points
@@ -216,6 +227,10 @@ def populate_prices(
                 for pp in price_points
                 if _price_channel_available(pp.export_price, pp.export_price_available)
             }
+            points_by_key = {(pp.day_offset, pp.hour): pp for pp in price_points}
+            aligned_points = [
+                points_by_key.get((meta.key.day_offset, meta.hour)) for meta in tsi
+            ]
         else:
             imp_prices = {
                 pp.hour: pp.import_price
@@ -227,10 +242,24 @@ def populate_prices(
                 for pp in price_points
                 if _price_channel_available(pp.export_price, pp.export_price_available)
             }
+            points_by_hour = {pp.hour: pp for pp in price_points}
+            aligned_points = [points_by_hour.get(meta.hour) for meta in tsi]
         aligned_imp, aligned_exp = tsi.align_hourly_prices(imp_prices, exp_prices)
-        for slot, imp, exp in zip(slots, aligned_imp, aligned_exp):
+        for slot, point, imp, exp in zip(
+            slots, aligned_points, aligned_imp, aligned_exp
+        ):
             slot.import_price_available = math.isfinite(imp)
             slot.export_price_available = math.isfinite(exp)
+            slot.import_price_source = (
+                point.import_price_source
+                if point is not None and slot.import_price_available
+                else None
+            )
+            slot.export_price_source = (
+                point.export_price_source
+                if point is not None and slot.export_price_available
+                else None
+            )
             slot.price_actionable = (
                 slot.import_price_available and slot.export_price_available
             )
@@ -255,6 +284,12 @@ def populate_prices(
         )
         slot.import_price_available = imp_available
         slot.export_price_available = exp_available
+        slot.import_price_source = (
+            pt.import_price_source if pt is not None and imp_available else None
+        )
+        slot.export_price_source = (
+            pt.export_price_source if pt is not None and exp_available else None
+        )
         slot.price_actionable = imp_available and exp_available
 
 

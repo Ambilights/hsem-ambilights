@@ -53,6 +53,8 @@ DEFAULT_CONFIG_VALUES = {
     "hsem_import_electricity_price_sensor": "sensor.energi_data_service",
     "hsem_import_electricity_price_forecast_sensor": vol.UNDEFINED,
     "hsem_export_electricity_price_forecast_sensor": vol.UNDEFINED,
+    "hsem_import_electricity_price_entsoe_sensor": vol.UNDEFINED,
+    "hsem_export_electricity_price_entsoe_sensor": vol.UNDEFINED,
     # Predicted prices for the unpublished horizon (valuation only).
     "hsem_price_forecast_valuation_enabled": False,
     "hsem_price_forecast_valuation_sensor": vol.UNDEFINED,

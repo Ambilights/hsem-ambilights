@@ -27,6 +27,7 @@ from homeassistant.core import HomeAssistant
 
 from custom_components.hsem import HSEMConfigEntry
 from custom_components.hsem.coordinator import HSEMDataUpdateCoordinator
+from custom_components.hsem.models.price_source import PriceBackupStatus
 from custom_components.hsem.utils.diagnostics import build_diagnostics_dump
 from custom_components.hsem.utils.logger import HSEM_LOGGER as _LOGGER
 
@@ -90,9 +91,15 @@ async def async_get_config_entry_diagnostics(  # NOSONAR -- HA diagnostics hook,
             str(entry.version) if hasattr(entry, "version") else STATE_UNKNOWN
         )
 
-    return build_diagnostics_dump(
+    diagnostics = build_diagnostics_dump(
         planner_input,
         planner_output,
         apply_summary,
         integration_version=str(integration_version),
     )
+    diagnostics["entsoe_price_backup_status"] = (
+        coordinator.data.entsoe_price_backup_status.as_dict()
+        if coordinator.data is not None
+        else PriceBackupStatus().as_dict()
+    )
+    return diagnostics

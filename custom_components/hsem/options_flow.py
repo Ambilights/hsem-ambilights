@@ -49,6 +49,7 @@ from custom_components.hsem.flows.power import (
     validate_power_step_input,
 )
 from custom_components.hsem.flows.prices import (
+    ENTSOE_SENSOR_FIELDS,
     get_prices_step_schema,
     validate_prices_input,
 )
@@ -116,9 +117,12 @@ class HSEMOptionsFlow(config_entries.OptionsFlow):
         errors = {}
 
         if user_input is not None:
-            errors = await validate_prices_input(self.hass, user_input)
+            normalized_input = dict(user_input)
+            for field in ENTSOE_SENSOR_FIELDS:
+                normalized_input.setdefault(field, None)
+            errors = await validate_prices_input(self.hass, normalized_input)
             if not errors:
-                self._user_input.update(user_input)
+                self._user_input.update(normalized_input)
                 return await self.async_step_months()
 
         data_schema = await get_prices_step_schema(self._config_entry)

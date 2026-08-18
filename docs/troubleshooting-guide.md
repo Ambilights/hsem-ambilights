@@ -57,16 +57,23 @@ inverter entities will be found.
   the Huawei Solar integration's device list.
 - **Fix:** Correct the device IDs in the config flow and save.
 
-**1c. Price feed (Energi Data Service) not installed or broken**
+**1c. Primary price feed missing or stale**
 
-HSEM reads electricity prices from the `energidataservice` integration. If it's
-missing, not configured, or its entities are unavailable, prices default to
-`0.0`.
+HSEM reads electricity prices from the primary import/export entities selected
+in the **Electricity Prices** step. Missing published prices display as `0.0`
+only as a fallback; they remain unavailable and non-actionable to the planner.
+An optional ENTSO-E pair can supply published slots the primary source has not
+provided.
 
-- **Check:** Look at the `data_quality` attribute on `sensor.hsem_plan_explanation`.
-  Are `today_price_missing_hours` or `tomorrow_price_missing_hours` high?
-- **Fix:** Verify the EDS integration is installed, configured for your
-  price area, and its entities show valid data in HA Developer Tools → States.
+- **Check:** Look at the `data_quality` attribute on
+  `sensor.hsem_plan_explanation`. Are `today_price_missing_hours` or
+  `tomorrow_price_missing_hours` high? In Developer Tools → States, inspect
+  the primary source's timestamped price attributes.
+- **Fix:** Restore the primary integration. If you configure ENTSO-E backup
+  sensors, verify both average-price entities contain aligned data in the same
+  final price basis as the primary sensors. Follow
+  [ENTSO-E Price Backup](entsoe-price-backup.md) for the complete setup and
+  validation sequence.
 
 **1d. Critical sensors missing → Error mode**
 
@@ -107,39 +114,69 @@ can restore.
 
 ### Checks & likely causes
 
-**2a. EDS update interval mismatch**
+**2a. Price source update interval mismatch**
 
-The planner uses an `eds_share` conversion factor that depends on whether EDS
-publishes data every 15 minutes or every 60 minutes. If the HSEM config says
-one interval but EDS actually publishes at the other, all prices are silently
-scaled wrong.
+The planner's `price_share` conversion depends on whether the configured
+source publishes every 15, 30, or 60 minutes. A wrong interval scales prices
+incorrectly. ENTSO-E backup validation rejects a mismatched cadence, but the
+primary source still needs the correct setting.
 
-- **Check:** HSEM → **Configure** → **Energi Data Service** step. Verify
-  the _EDS Update Interval_ (15 or 60) matches what your EDS integration
-  actually uses. Check the EDS integration documentation for your price area.
-- **Fix:** Change the interval to match reality.
+- **Check:** HSEM → **Configure** → **Electricity Prices**. Verify
+  _Electricity Price Update Interval_ matches both primary and ENTSO-E
+  timestamp spacing and that every timestamp lies exactly on an interval
+  boundary.
+- **Fix:** Set the interval to the real source cadence. Both source pairs must
+  use the same cadence.
 
-**2b. Grid fee or tax configuration**
+**2b. VAT, tariff, or currency mismatch**
 
-HSEM adds grid fees and taxes to spot prices. Wrong values here distort the
-cost function.
+HSEM does not transform price values. It performs no currency conversion and
+adds no VAT, tariff, markup, or grid fee. If a primary or backup source reports
+raw spot prices instead of the final amount paid or received, the planner
+compares unlike values even when their unit labels match.
 
-- **Check:** HSEM → **Configure** → **Energi Data Service** step. Review
-  _Grid Fee_ (net-tariff), _Grid Tariff_ (transmissions-net), _El-afgift_,
-  and _Reduktion_. Verify against your electricity bill.
-- **Fix:** Correct any mismatched values.
+- **Check:** Compare several overlapping primary and ENTSO-E import/export
+  records in Developer Tools → States after all source-side adjustments.
+- **Fix:** Apply every adjustment on the source sensors. Use separate ENTSO-E
+  import and export entries when their rules differ. With
+  `JaccoR/hass-entso-e` v0.7.5, the currency setting labels the unit but does
+  not convert EUR, VAT uses a fraction (`0.25` for 25%), and VAT is applied
+  after the price modifier.
 
-**2c. Export minimum price blocks all export**
+**2c. ENTSO-E backup rejected during configuration**
+
+HSEM accepts the ENTSO-E backup only when it can fail over both price channels
+without changing the price basis or timeline.
+
+- **Check:** Configure both ENTSO-E fields or leave both empty. Select the
+  **Average electricity price** entities and inspect `prices`,
+  `prices_today`, or `prices_tomorrow`.
+- **Check:** Every record needs a finite `price` and timezone-aware `time`
+  or `start`; import/export timestamps must align; spacing and interval
+  boundaries must match HSEM's configured cadence.
+- **Check:** Each ENTSO-E unit must be non-empty and exactly equal to its
+  corresponding primary unit after leading/trailing whitespace is removed.
+- **Check:** Inspect `entsoe_price_backup_status` on the working mode sensor.
+  `configured` confirms the pair is enabled, `matched_slots` reports how many
+  slots used it this cycle, and `rejection_reason` explains why at least one
+  delivery day that needed backup did not qualify. A different complete day
+  may still have contributed to `matched_slots` in the same cycle.
+- **Fix:** Correct the ENTSO-E integration entries, wait for their next update,
+  then reopen HSEM's **Electricity Prices** step. The
+  [ENTSO-E Price Backup](entsoe-price-backup.md) guide includes the supported
+  source contract and version-specific checks.
+
+**2d. Export minimum price blocks all export**
 
 The `export_min_price` setting prevents grid export when the export price
 is below that threshold. If set too high, HSEM never exports — the battery
 stays full and the inverter physically blocks export.
 
-- **Check:** HSEM → **Configure** → **Energi Data Service** step.
-  _Export Minimum Price_. Compare against current export spot prices.
+- **Check:** HSEM → **Configure** → **Electricity Prices**.
+  _Export Minimum Price_. Compare against current export prices.
 - **Fix:** Lower or set to 0 if you want to export at all positive prices.
 
-**2d. Negative prices trigger force-export**
+**2e. Negative prices trigger force-export**
 
 If the current slot has published prices and the available live import price
 is negative, the runtime recommendation resolver gives PV-only `force_export`
@@ -147,7 +184,8 @@ priority over the planner output. An unavailable/stale price or a slot beyond
 the actionable published-price horizon cannot trigger this override.
 
 - **Check:** `sensor.hsem_working_mode` shows `force_export` during a
-  slot with negative prices. This is normal — verify the spot price in EDS.
+  slot with negative prices. This is normal — verify the published import
+  price at the active source.
 - **Fix:** If the action is unexpected, correct the price sensor or tariff
   transformation. Keep HSEM in Read-Only mode while validating the input.
 
@@ -469,7 +507,7 @@ end-of-discharge threshold, no discharge is scheduled.
 
 **7c. Export minimum price blocks all export**
 
-See [Section 2c](#2c-export-minimum-price-blocks-all-export). If
+See [Section 2d](#2d-export-minimum-price-blocks-all-export). If
 `export_min_price` is set above current export prices, the inverter blocks
 grid export. The battery may still discharge to serve house load, but won't
 export.

@@ -291,6 +291,8 @@ def build_planner_input(
                 slot_in_day=slot_in_day,
                 import_price_available=rec.import_price_available,
                 export_price_available=rec.export_price_available,
+                import_price_source=rec.import_price_source,
+                export_price_source=rec.export_price_source,
             )
         )
 
