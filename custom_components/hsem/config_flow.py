@@ -16,10 +16,6 @@ from custom_components.hsem.flows.batteries_excess_export import (
     get_batteries_excess_export_step_schema,
     validate_batteries_excess_export_input,
 )
-from custom_components.hsem.flows.batteries_schedules import (
-    get_batteries_schedules_step_schema,
-    validate_batteries_schedules_input,
-)
 from custom_components.hsem.flows.batteries_wait_mode import (
     get_batteries_wait_mode_step_schema,
     validate_batteries_wait_mode_input,
@@ -54,10 +50,6 @@ from custom_components.hsem.flows.init import (
     validate_init_step_input,
 )
 from custom_components.hsem.flows.months import get_months_schema, validate_months_input
-from custom_components.hsem.flows.ocpp import (
-    get_ocpp_step_schema,
-    validate_ocpp_step_input,
-)
 from custom_components.hsem.flows.power import (
     get_power_step_schema,
     validate_power_step_input,
@@ -106,6 +98,43 @@ _V1_DEPRECATED_KEYS: frozenset[str] = frozenset(
         "hsem_batteries_enable_batteries_schedule_3_min_price_difference",
         "hsem_batteries_conversion_loss",
     }
+)
+
+_CHARGE_RATE_BUCKETS: tuple[str, ...] = (
+    "below_0",
+    "0_to_5",
+    "6_to_15",
+    "16_to_21",
+    "21_to_35",
+    "35_to_50",
+    "above_50",
+)
+
+# Configuration retired in v3. These values must be removed from both data
+# and options because the options flow deliberately preserves entity-managed
+# options that are not present in its schemas.
+_V3_DEPRECATED_KEYS: frozenset[str] = frozenset(
+    {
+        "hsem_charge_rate_learned_rates",
+        "hsem_batteries_enable_batteries_schedule_1",
+        "hsem_batteries_enable_batteries_schedule_1_start",
+        "hsem_batteries_enable_batteries_schedule_1_end",
+        "hsem_batteries_enable_batteries_schedule_1_min_price_difference",
+        "hsem_batteries_enable_batteries_schedule_2",
+        "hsem_batteries_enable_batteries_schedule_2_start",
+        "hsem_batteries_enable_batteries_schedule_2_end",
+        "hsem_batteries_enable_batteries_schedule_2_min_price_difference",
+        "hsem_batteries_enable_batteries_schedule_3",
+        "hsem_batteries_enable_batteries_schedule_3_start",
+        "hsem_batteries_enable_batteries_schedule_3_end",
+        "hsem_batteries_enable_batteries_schedule_3_min_price_difference",
+        "hsem_ocpp_enabled",
+        "hsem_ocpp_port",
+        "hsem_ocpp_cpid",
+        "hsem_ocpp_start_window_s",
+        "hsem_ocpp_stop_window_s",
+    }
+    | {f"hsem_charge_rate_override_{bucket}" for bucket in _CHARGE_RATE_BUCKETS}
 )
 
 # New keys introduced in v2 that did not exist in v1.  When
@@ -163,7 +192,7 @@ _V2_NEW_KEY_DEFAULTS: dict[str, Any] = {
 class HSEMConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):  # pyright: ignore[reportGeneralTypeIssues]  # HA ConfigFlow class hierarchy triggers false-positive on MRO
     """Config flow for HSEM."""
 
-    VERSION = 2
+    VERSION = 3
 
     async def async_migrate_entry(
         self, hass: HomeAssistant, config_entry: ConfigEntry
@@ -185,9 +214,13 @@ class HSEMConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):  # pyright: igno
             )
             return False
 
-        if config_entry.version == 1:
-            data = _migrate_v1_to_v2(dict(config_entry.data))
-            hass.config_entries.async_update_entry(config_entry, data=data, version=2)
+        original_version = config_entry.version
+        migrated_version = original_version
+        data = dict(config_entry.data)
+        options = dict(config_entry.options)
+
+        if migrated_version == 1:
+            data = _migrate_v1_to_v2(data)
             # v6.0.0 (#523) prefixed every entity unique_id with the config
             # entry id, but shipped no entity-registry migration -- so existing
             # v5 entities were orphaned and re-created with a "_2" suffix (losing
@@ -208,9 +241,26 @@ class HSEMConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):  # pyright: igno
                 hass, config_entry.entry_id, _migrate_unique_id
             )
 
+            migrated_version = 2
+
+        if migrated_version == 2:
+            data = _migrate_v2_to_v3(data)
+            options = _migrate_v2_to_v3(options)
+            _remove_v3_entity_registry_entries(hass, config_entry.entry_id)
+            migrated_version = 3
+
+        if migrated_version != original_version:
+            hass.config_entries.async_update_entry(
+                config_entry,
+                data=data,
+                options=options,
+                version=migrated_version,
+            )
             _LOGGER.info(
-                "Config entry %s migrated from v1 to v2",
+                "Config entry %s migrated from v%s to v%s",
                 config_entry.entry_id,
+                original_version,
+                migrated_version,
             )
 
         return True
@@ -594,7 +644,7 @@ class HSEMConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):  # pyright: igno
                 self._user_input.update(user_input)
                 if bool(self._user_input.get("hsem_ev_second_enabled")):
                     return await self.async_step_ev_second_planned_load()
-                return await self.async_step_ocpp()
+                return await self.async_step_batteries_wait_mode()
 
         data_schema = await get_ev_planned_load_step_schema(None)
 
@@ -618,62 +668,12 @@ class HSEMConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):  # pyright: igno
             errors = await validate_ev_second_planned_load_input(self.hass, user_input)
             if not errors:
                 self._user_input.update(user_input)
-                return await self.async_step_ocpp()
+                return await self.async_step_batteries_wait_mode()
 
         data_schema = await get_ev_second_planned_load_step_schema(None)
 
         return self.async_show_form(
             step_id="ev_second_planned_load",
-            data_schema=data_schema,
-            errors=errors,
-            last_step=False,
-        )
-
-    async def async_step_ocpp(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Handle the ocpp config flow step.
-
-        Validates user input and advances to the next step in the config flow.
-        """
-        errors = {}
-
-        if user_input is not None:
-            errors = await validate_ocpp_step_input(self.hass, user_input)
-            if not errors:
-                self._user_input.update(user_input)
-                return await self.async_step_batteries_schedules()
-
-        data_schema = await get_ocpp_step_schema(None)
-
-        return self.async_show_form(
-            step_id="ocpp",
-            data_schema=data_schema,
-            errors=errors,
-            last_step=False,
-        )
-
-    async def async_step_batteries_schedules(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Handle the batteries_schedules config flow step.
-
-        Validates user input and advances to the next step in the config flow.
-        """
-        errors = {}
-
-        if user_input is not None:
-            errors = await validate_batteries_schedules_input(user_input)
-            if not errors:
-                self._user_input.update(user_input)
-                return await self.async_step_batteries_wait_mode()
-
-        data_schema = await get_batteries_schedules_step_schema(
-            None, hass=self.hass, user_input=self._user_input
-        )
-
-        return self.async_show_form(
-            step_id="batteries_schedules",
             data_schema=data_schema,
             errors=errors,
             last_step=False,
@@ -861,3 +861,70 @@ def _migrate_v1_to_v2(data: dict[str, Any]) -> dict[str, Any]:
             migrated[month_key] = convert_months_to_int(raw)
 
     return migrated
+
+
+def _migrate_v2_to_v3(values: dict[str, Any]) -> dict[str, Any]:
+    """Remove configuration for controls retired in config-entry version 3."""
+    return {
+        key: value for key, value in values.items() if key not in _V3_DEPRECATED_KEYS
+    }
+
+
+def _v3_retired_entity_registry_keys(entry_id: str) -> set[tuple[str, str]]:
+    """Return exact (domain, unique_id) pairs retired in version 3."""
+    keys: set[tuple[str, str]] = set()
+
+    for bucket in _CHARGE_RATE_BUCKETS:
+        suffix = f"charge_rate_{bucket}"
+        keys.update(
+            {
+                ("number", f"{DOMAIN}_{entry_id}_{suffix}"),
+                ("number", f"{DOMAIN}_{suffix}"),
+            }
+        )
+
+    for number in (1, 2, 3):
+        schedule = f"batteries_enable_batteries_schedule_{number}"
+        entity_suffixes = (
+            ("switch", f"{schedule}_switch"),
+            ("time", f"{schedule}_start_time"),
+            ("time", f"{schedule}_end_time"),
+        )
+        for domain, suffix in entity_suffixes:
+            keys.update(
+                {
+                    # Current format (the config key already includes hsem_).
+                    (domain, f"{DOMAIN}_{entry_id}_{DOMAIN}_{suffix}"),
+                    # Possible intermediate from an early single-prefix ID.
+                    (domain, f"{DOMAIN}_{entry_id}_{suffix}"),
+                    # Actual pre-v2 helper format (DOMAIN appeared in both the
+                    # unique-ID template and the config-key-derived suffix).
+                    (domain, f"{DOMAIN}_{DOMAIN}_{suffix}"),
+                    # Earliest single-prefix format.
+                    (domain, f"{DOMAIN}_{suffix}"),
+                }
+            )
+
+    for sensor_name in ("status", "power", "info", "sessions"):
+        suffix = f"ocpp_charger_{sensor_name}_sensor"
+        keys.update(
+            {
+                ("sensor", f"{DOMAIN}_{entry_id}_{suffix}"),
+                ("sensor", f"{DOMAIN}_{suffix}"),
+            }
+        )
+
+    return keys
+
+
+@callback
+def _remove_v3_entity_registry_entries(hass: HomeAssistant, entry_id: str) -> None:
+    """Remove registry rows for entities that version 3 no longer provides."""
+    registry = er.async_get(hass)
+    retired = _v3_retired_entity_registry_keys(entry_id)
+    for entity_entry in list(er.async_entries_for_config_entry(registry, entry_id)):
+        if (
+            entity_entry.platform == DOMAIN
+            and (entity_entry.domain, entity_entry.unique_id) in retired
+        ):
+            registry.async_remove(entity_entry.entity_id)

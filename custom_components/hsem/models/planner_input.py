@@ -11,7 +11,6 @@ from custom_components.hsem.const import (
     MILP_SOLVER_TIMEOUT_DEFAULT_SECONDS,
     SEASONAL_FILL_MODE_FORECAST,
 )
-from custom_components.hsem.models.battery_schedule_input import BatteryScheduleInput
 from custom_components.hsem.models.hourly_consumption_average import (
     HourlyConsumptionAverage,
 )
@@ -88,8 +87,6 @@ class PlannerInput:
         solcast_slots:
             PV production forecast.  Should cover every planned slot; missing
             slots default to zero.
-        battery_schedules:
-            Up to three charge/discharge schedule windows.
         excess_export_enabled:
             Whether the excess-export feature is active.
         excess_export_discharge_buffer_pct:
@@ -178,9 +175,6 @@ class PlannerInput:
     consumption_averages: list[HourlyConsumptionAverage] = field(default_factory=list)
     price_points: list[PricePoint] = field(default_factory=list)
     solcast_slots: list[SolcastSlot] = field(default_factory=list)
-
-    # --- discharge / charge schedules ---
-    battery_schedules: list[BatteryScheduleInput] = field(default_factory=list)
 
     # --- excess export ---
     excess_export_enabled: bool = False

@@ -170,7 +170,6 @@ def _established_terminal_export_input() -> PlannerInput:
         solcast_slots=[
             SolcastSlot(hour=hour, pv_estimate=pvs.get(hour, 0)) for hour in range(24)
         ],
-        battery_schedules=[],
         excess_export_enabled=True,
         months_winter=[1, 2, 3, 4, 10, 11, 12],
         is_read_only=True,

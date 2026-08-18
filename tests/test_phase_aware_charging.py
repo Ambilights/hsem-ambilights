@@ -245,7 +245,6 @@ def test_live_phase_imbalance_reaches_planner_input() -> None:
             cfg=cfg,
             live=live,
             hourly_recommendations=[_rec()],
-            batteries_schedules=[],
             previous_winner_name=None,
             previous_winner_score=0.0,
         )

@@ -8,9 +8,6 @@ Each section maps to one P0 issue and contains:
 Covered bugs
 ------------
 P0-01  Month matching (issue #265) — string-containment false positive
-P0-02  Midnight rollover (issue #266) — cross-midnight windows not handled
-P0-03  Next-day charging (issue #267) — 07:00 window not found from 22:00
-P0-04  Schedule_3 default (issue #268) — 00:00→00:00 zero-length window
 P0-05  Invalid sensor values (issue #269) — "unknown"/"unavailable" → 0
 P0-06  Concurrent updates (issue #270) — parallel update cycles not locked
 P0-07  Version comparison (issue #271) — "1.10" < "1.9" (lexicographic)
@@ -26,7 +23,6 @@ Async tests use ``pytest-asyncio`` with the ``asyncio`` mark.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, time, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -37,23 +33,6 @@ from homeassistant.exceptions import HomeAssistantError, ServiceNotFound
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
-
-_UTC = UTC
-
-
-def _dt(
-    hour: int,
-    minute: int = 0,
-    *,
-    day: int = 15,
-    month: int = 1,
-    year: int = 2026,
-    day_offset: int = 0,
-) -> datetime:
-    """Return a UTC-aware datetime. ``day_offset`` shifts by whole days."""
-    base = datetime(year, month, day, hour, minute, tzinfo=_UTC)
-    return base + timedelta(days=day_offset)
-
 
 # ===========================================================================
 # P0-01  Month matching  (issue #265)
@@ -139,259 +118,6 @@ class TestP001MonthMatching:
 
         with pytest.raises(ValueError, match="Month must be between 1 and 12"):
             convert_months_to_int(["13"])
-
-
-# ===========================================================================
-# P0-02  Midnight rollover  (issue #266)
-# ===========================================================================
-
-
-class TestP002MidnightRollover:
-    """OLD BUG: ``is_time_in_window`` and ``interval_ends_before_window_start``
-    only handled same-day windows (start < end).  A cross-midnight window such
-    as 23:00–02:00 was silently treated as always-false, causing HSEM to skip
-    valid overnight charge/discharge windows entirely.
-
-    FIX: Both helpers now detect when ``start > end`` (cross-midnight) and
-    use the corresponding logic branch.
-    """
-
-    def test_inside_cross_midnight_window(self) -> None:
-        """01:00 is inside the 23:00-02:00 window."""
-        from custom_components.hsem.utils.time_windows import is_time_in_window
-
-        assert is_time_in_window(time(1, 0), time(23, 0), time(2, 0)) is True
-
-    def test_at_start_of_cross_midnight_window(self) -> None:
-        """23:00 is the inclusive start of the 23:00-02:00 window."""
-        from custom_components.hsem.utils.time_windows import is_time_in_window
-
-        assert is_time_in_window(time(23, 0), time(23, 0), time(2, 0)) is True
-
-    def test_at_end_of_cross_midnight_window_is_exclusive(self) -> None:
-        """02:00 is the exclusive end — must be False."""
-        from custom_components.hsem.utils.time_windows import is_time_in_window
-
-        assert is_time_in_window(time(2, 0), time(23, 0), time(2, 0)) is False
-
-    def test_before_cross_midnight_window(self) -> None:
-        """21:00 is before the 23:00 start — must be False."""
-        from custom_components.hsem.utils.time_windows import is_time_in_window
-
-        assert is_time_in_window(time(21, 0), time(23, 0), time(2, 0)) is False
-
-    def test_after_cross_midnight_window(self) -> None:
-        """03:00 is after the 02:00 end of the cross-midnight window."""
-        from custom_components.hsem.utils.time_windows import is_time_in_window
-
-        assert is_time_in_window(time(3, 0), time(23, 0), time(2, 0)) is False
-
-    def test_interval_ending_before_cross_midnight_window_start(self) -> None:
-        """An interval ending at 22:00 is before a 23:00 cross-midnight window."""
-        from custom_components.hsem.utils.time_windows import (
-            interval_ends_before_window_start,
-        )
-
-        now = _dt(21, 0)
-        interval_end = _dt(22, 0)
-        assert interval_ends_before_window_start(interval_end, time(23, 0), now) is True
-
-    def test_interval_ending_inside_cross_midnight_window_is_not_before(self) -> None:
-        """An interval ending at 23:30 is NOT before the 23:00 window start."""
-        from custom_components.hsem.utils.time_windows import (
-            interval_ends_before_window_start,
-        )
-
-        now = _dt(21, 0)
-        interval_end = _dt(23, 30)
-        assert (
-            interval_ends_before_window_start(interval_end, time(23, 0), now) is False
-        )
-
-    def test_same_day_window_still_works(self) -> None:
-        """Ordinary same-day windows continue to work after the fix."""
-        from custom_components.hsem.utils.time_windows import is_time_in_window
-
-        assert is_time_in_window(time(8, 0), time(7, 0), time(9, 0)) is True
-        assert is_time_in_window(time(6, 59), time(7, 0), time(9, 0)) is False
-
-
-# ===========================================================================
-# P0-03  Next-day charging  (issue #267)
-# ===========================================================================
-
-
-class TestP003NextDayCharging:
-    """OLD BUG: ``next_window_start_dt`` did not exist; the sensor used a naive
-    ``now.replace(hour=..., minute=...)`` call which always returned a time on
-    the *current* calendar day.  At 22:00, the 07:00 morning discharge window
-    was computed as *already in the past* — so the cheap 02:00–05:00 overnight
-    grid-charge opportunity was never selected.
-
-    FIX: ``next_window_start_dt`` always returns the *next* future occurrence of
-    the requested wall-clock time (today if still upcoming, tomorrow if past).
-    """
-
-    def test_evening_planning_resolves_morning_window_to_tomorrow(self) -> None:
-        """At 22:00 a 07:00 window must resolve to the next calendar day."""
-        from custom_components.hsem.utils.time_windows import next_window_start_dt
-
-        now = _dt(22, 0)
-        result = next_window_start_dt(now, time(7, 0))
-        expected = _dt(7, 0, day_offset=1)
-        assert result == expected, (
-            f"At 22:00, 07:00 window should be tomorrow — got {result}"
-        )
-
-    def test_result_is_always_strictly_after_now(self) -> None:
-        """``next_window_start_dt`` must never return a past datetime."""
-        from custom_components.hsem.utils.time_windows import next_window_start_dt
-
-        for hour in (0, 6, 12, 18, 22, 23):
-            now = _dt(hour, 0)
-            result = next_window_start_dt(now, time(7, 0))
-            assert result > now, (
-                f"next_window_start_dt from {now.time()} returned {result.time()}, "
-                "which is not strictly after now"
-            )
-
-    def test_pre_morning_time_still_returns_today(self) -> None:
-        """At 06:00 the 07:00 window is still today — must not advance to tomorrow."""
-        from custom_components.hsem.utils.time_windows import next_window_start_dt
-
-        now = _dt(6, 0)
-        result = next_window_start_dt(now, time(7, 0))
-        assert result == _dt(7, 0), (
-            "At 06:00, the 07:00 window has not yet passed — should be today"
-        )
-
-    def test_cheap_night_slot_flagged_before_next_day_discharge_window(self) -> None:
-        """A 02:00-03:00 charge slot tonight is before the 07:00 window tomorrow.
-
-        This is the P0-03 key scenario: planning a 02:00 grid charge at 22:00
-        to cover morning peak use the following day.
-        """
-        from custom_components.hsem.utils.time_windows import (
-            interval_ends_before_window_start,
-        )
-
-        now = _dt(22, 0)
-        charge_slot_end = _dt(3, 0, day_offset=1)  # 03:00 next day
-        assert (
-            interval_ends_before_window_start(charge_slot_end, time(7, 0), now) is True
-        ), (
-            "02:00-03:00 charge slot must be flagged as 'before' the 07:00 discharge window"
-        )
-
-    def test_slot_after_discharge_window_excluded(self) -> None:
-        """A slot ending at 08:00 is NOT before the 07:00 window."""
-        from custom_components.hsem.utils.time_windows import (
-            interval_ends_before_window_start,
-        )
-
-        now = _dt(22, 0)
-        charge_slot_end = _dt(8, 0, day_offset=1)
-        assert (
-            interval_ends_before_window_start(charge_slot_end, time(7, 0), now) is False
-        )
-
-
-# ===========================================================================
-# P0-04  Schedule_3 default  (issue #268)
-# ===========================================================================
-
-
-class TestP004Schedule3Default:
-    """OLD BUG: ``schedule_3`` defaulted to ``enabled=True`` with a
-    ``00:00:00 → 00:00:00`` window, which is a zero-length window that cannot
-    be distinguished from midnight-to-midnight (a 24-hour window).  This caused
-    spurious grid-charge commands on any night where schedule_3 fired.
-
-    FIX: ``schedule_3`` is now ``enabled=False`` by default and uses explicit
-    non-midnight placeholder times so the window is unambiguously non-zero
-    when re-enabled by the user.
-    """
-
-    def test_schedule_3_disabled_by_default(self) -> None:
-        """schedule_3 must ship disabled so it never fires unintentionally."""
-        from custom_components.hsem.const import DEFAULT_CONFIG_VALUES
-
-        assert (
-            DEFAULT_CONFIG_VALUES["hsem_batteries_enable_batteries_schedule_3"] is False
-        ), "schedule_3 must default to disabled"
-
-    def test_schedule_3_default_start_is_not_midnight(self) -> None:
-        """Default start must not be '00:00:00' to avoid ambiguous zero-length window."""
-        from custom_components.hsem.const import DEFAULT_CONFIG_VALUES
-
-        start = DEFAULT_CONFIG_VALUES[
-            "hsem_batteries_enable_batteries_schedule_3_start"
-        ]
-        assert start != "00:00:00", (
-            "schedule_3 default start '00:00:00' + end '00:00:00' is ambiguous"
-        )
-
-    def test_schedule_3_default_end_is_not_midnight(self) -> None:
-        """Default end must not be '00:00:00'."""
-        from custom_components.hsem.const import DEFAULT_CONFIG_VALUES
-
-        end = DEFAULT_CONFIG_VALUES["hsem_batteries_enable_batteries_schedule_3_end"]
-        assert end != "00:00:00"
-
-    def test_schedule_3_default_start_and_end_differ(self) -> None:
-        """Default start ≠ default end — window is non-zero when enabled."""
-        from custom_components.hsem.const import DEFAULT_CONFIG_VALUES
-
-        start = DEFAULT_CONFIG_VALUES[
-            "hsem_batteries_enable_batteries_schedule_3_start"
-        ]
-        end = DEFAULT_CONFIG_VALUES["hsem_batteries_enable_batteries_schedule_3_end"]
-        assert start != end, "Default schedule_3 must not be a zero-length window"
-
-    def test_schedules_1_and_2_remain_enabled(self) -> None:
-        """Schedules 1 and 2 should remain enabled by default."""
-        from custom_components.hsem.const import DEFAULT_CONFIG_VALUES
-
-        assert (
-            DEFAULT_CONFIG_VALUES["hsem_batteries_enable_batteries_schedule_1"] is True
-        )
-        assert (
-            DEFAULT_CONFIG_VALUES["hsem_batteries_enable_batteries_schedule_2"] is True
-        )
-
-    @pytest.mark.asyncio
-    async def test_zero_length_window_rejected_by_validator(self) -> None:
-        """The schedule validator must reject a 00:00:00 → 00:00:00 window when enabled."""
-        from custom_components.hsem.flows.batteries_schedule_3 import (
-            validate_batteries_schedule_3_input,
-        )
-
-        user_input = {
-            "hsem_batteries_enable_batteries_schedule_3": True,
-            "hsem_batteries_enable_batteries_schedule_3_start": "00:00:00",
-            "hsem_batteries_enable_batteries_schedule_3_end": "00:00:00",
-            "hsem_batteries_enable_batteries_schedule_3_min_price_difference": 0.0,
-        }
-        errors = await validate_batteries_schedule_3_input(user_input)
-        assert "base" in errors, (
-            "00:00→00:00 with enabled=True must produce a validation error"
-        )
-
-    @pytest.mark.asyncio
-    async def test_disabled_schedule_3_accepts_any_times(self) -> None:
-        """A disabled schedule_3 must never fail validation (times are irrelevant)."""
-        from custom_components.hsem.flows.batteries_schedule_3 import (
-            validate_batteries_schedule_3_input,
-        )
-
-        user_input = {
-            "hsem_batteries_enable_batteries_schedule_3": False,
-            "hsem_batteries_enable_batteries_schedule_3_start": "00:00:00",
-            "hsem_batteries_enable_batteries_schedule_3_end": "00:00:00",
-            "hsem_batteries_enable_batteries_schedule_3_min_price_difference": 0.0,
-        }
-        errors = await validate_batteries_schedule_3_input(user_input)
-        assert errors == {}, "Disabled schedule must not fail validation"
 
 
 # ===========================================================================
@@ -676,86 +402,12 @@ class TestP007VersionComparison:
 
 
 # ===========================================================================
-# P0-08  Magic thresholds  (issue #272)
+# P0-08  Solar-charge classification  (issue #720)
 # ===========================================================================
 
 
-class TestP008MagicThresholds:
-    """OLD BUG: The planner used hard-coded ``0.1`` and ``0.2`` literals in
-    multiple places with no explanation of their meaning or units.  A change
-    in one location did not propagate to others, leading to the solar-charge
-    threshold regression in v5.1.0 (one site used ``-0.1``, another ``-0.2``).
-
-    FIX: Named constants ``SOLAR_SURPLUS_CHARGE_THRESHOLD_KWH`` and
-    ``NEAR_ZERO_CONSUMPTION_THRESHOLD_KWH`` are defined in ``const.py`` and
-    imported everywhere the threshold is used.
-    """
-
-    def test_solar_surplus_constant_exists_and_is_negative(self) -> None:
-        """SOLAR_SURPLUS_CHARGE_THRESHOLD_KWH must be defined and negative."""
-        from custom_components.hsem.const import SOLAR_SURPLUS_CHARGE_THRESHOLD_KWH
-
-        assert SOLAR_SURPLUS_CHARGE_THRESHOLD_KWH < 0
-
-    def test_near_zero_constant_exists_and_is_non_negative(self) -> None:
-        """NEAR_ZERO_CONSUMPTION_THRESHOLD_KWH must be defined and >= 0."""
-        from custom_components.hsem.const import NEAR_ZERO_CONSUMPTION_THRESHOLD_KWH
-
-        assert NEAR_ZERO_CONSUMPTION_THRESHOLD_KWH >= 0
-
-    def test_solar_surplus_default_matches_v510(self) -> None:
-        """Default value must match v5.1.0 behaviour: -0.2 kWh."""
-        from custom_components.hsem.const import SOLAR_SURPLUS_CHARGE_THRESHOLD_KWH
-
-        assert pytest.approx(-0.2) == SOLAR_SURPLUS_CHARGE_THRESHOLD_KWH
-
-    def test_near_zero_default_matches_v510(self) -> None:
-        """Default value must match v5.1.0 behaviour: 0.1 kWh."""
-        from custom_components.hsem.const import NEAR_ZERO_CONSUMPTION_THRESHOLD_KWH
-
-        assert pytest.approx(0.1) == NEAR_ZERO_CONSUMPTION_THRESHOLD_KWH
-
-    def test_scheduler_modules_import_constants_not_literals(self) -> None:
-        """charge_scheduler.py and discharge_scheduler.py must import and reference
-        the named constants instead of bare literals."""
-        import ast
-        import pathlib
-
-        # charge_scheduler.py is now a thin re-export; the actual import lives
-        # in the implementation module under planner/charging/.
-        source = pathlib.Path(
-            "custom_components/hsem/planner/charging/pre_charge.py"
-        ).read_text(encoding="utf-8")
-        tree = ast.parse(source)
-
-        imported_names: set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom):
-                for alias in node.names:
-                    imported_names.add(alias.asname or alias.name)
-
-        assert "SOLAR_SURPLUS_CHARGE_THRESHOLD_KWH" in imported_names, (
-            "charging/pre_charge.py must import SOLAR_SURPLUS_CHARGE_THRESHOLD_KWH"
-        )
-
-        # Also verify discharge_scheduler.py does not import the removed
-        # near-zero constant (issue #720 removed the misapplied threshold).
-        source = pathlib.Path(
-            "custom_components/hsem/planner/discharge_scheduler.py"
-        ).read_text(encoding="utf-8")
-        tree = ast.parse(source)
-
-        imported_names = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom):
-                for alias in node.names:
-                    imported_names.add(alias.asname or alias.name)
-
-        assert "NEAR_ZERO_CONSUMPTION_THRESHOLD_KWH" not in imported_names, (
-            "discharge_scheduler.py must not import "
-            "NEAR_ZERO_CONSUMPTION_THRESHOLD_KWH — the threshold was "
-            "misapplied to positive-consumption slots (issue #720)"
-        )
+class TestP008SolarChargeClassification:
+    """Only genuine PV surplus may be classified as solar charging."""
 
     def test_near_zero_threshold_used_in_optimization_strategy(self) -> None:
         """A slot at exactly zero net consumption has no PV surplus and must get

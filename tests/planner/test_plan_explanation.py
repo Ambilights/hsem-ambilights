@@ -276,7 +276,7 @@ class TestStrategyDetection:
 
     def test_winter_day_strategy(self):
         """Winter fixture without schedules should select a winter/wait strategy."""
-        inp = make_winter_day_input(schedules=[])
+        inp = make_winter_day_input()
         output = run_planner(inp)
         valid_winter_strategies = {
             "winter_wait",

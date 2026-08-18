@@ -513,8 +513,6 @@ def _make_bare_coordinator() -> HSEMDataUpdateCoordinator:
     coord._last_plan_price_forecast_signature = None
     coord._last_apply_summary = None
     coord._live = None
-    coord._batteries_schedules = []
-    coord._batteries_schedules_remaining_capacity_needed = 0.0
     coord._force_discharge_excess_since = None
     coord._force_discharge_excess_slot_start = None
     coord._force_discharge_replanned_slot_start = None
@@ -549,7 +547,6 @@ class TestCoordinatorData:
     def test_numeric_fields_default_to_zero(self) -> None:
         """Numeric accumulator fields must default to 0.0."""
         data = CoordinatorData()
-        assert data.batteries_schedules_remaining_capacity_needed == pytest.approx(0.0)
         assert data.current_required_battery == pytest.approx(0.0)
 
 

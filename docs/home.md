@@ -19,7 +19,7 @@ HSEM is a modular, secure, and highly configurable Home Assistant integration th
 1. **Remove any previous Huawei Solar Battery Optimization Project integrations.**
 2. **Install HSEM** via HACS or manually.
 3. **Configure your sensors** for solar battery, inverter, grid, and EV charger (if present).
-4. **Set up battery schedules** in HSEM (do not use Fusion Solar app for scheduling).
+4. **Review battery economics and safety settings**; the MILP builds the battery plan dynamically.
 5. **Let HSEM run for at least 14 days** to collect historical data for optimal performance.
 6. **Monitor the Working Mode Sensor** for system status and recommendations.
 
@@ -31,7 +31,7 @@ HSEM is a modular, secure, and highly configurable Home Assistant integration th
 
 - **Dynamic Grid Export/Import Management** — avoids export at negative prices, forces charging at negative import prices.
 - **EV Charging Optimization** — smart TOU mode during EV charging, prevents battery drain into EV unless configured.
-- **Battery Scheduling** — up to three configurable discharge schedules with price-difference thresholds and depreciation-aware economics.
+- **Dynamic Battery Optimisation** — the MILP chooses charge, discharge, hold, and optional export slots from prices, forecasts, losses, wear, and hardware limits.
 - **Excess Battery Export** — automatically exports excess battery capacity when profitable, differentiating solar-charged vs grid-charged energy.
 - **Consumption Forecasting** — legacy weighted-average (1d/3d/7d/14d with IQR outlier detection) or ML ridge regression.
 - **Solar Forecast Integration** — Solcast PV forecasts for today and tomorrow.
@@ -64,7 +64,9 @@ Yes. Enable `hsem_ev_charger_force_max_discharge_power` and set `hsem_ev_charger
 
 ### Should I configure time-of-use (TOU) settings in the Fusion Solar app?
 
-**No.** HSEM calculates and manages all battery schedules automatically. Any time slots in the Fusion Solar app will be overwritten.
+**No.** HSEM derives the required inverter commands from its current dynamic
+plan. Manually configured time slots can conflict with HSEM and may be
+overwritten.
 
 ### How does HSEM interact with Fusion Solar time slots?
 
@@ -103,7 +105,7 @@ HSEM enters a "Missing Entities Input" state with a clear error description. No 
 | **Force Batteries Discharge** | Discharges battery during high-cost periods. |
 | **Batteries Charge Solar** | Charges battery from solar surplus. |
 | **Batteries Charge Grid** | Charges from grid during low/negative import prices. |
-| **Batteries Discharge Mode** | Scheduled battery discharge to minimize grid import. |
+| **Batteries Discharge Mode** | Economical battery discharge to minimize grid import. |
 | **Batteries Wait Mode** | Battery idle, waiting for optimal conditions. |
 | **Missing Entities Input** | Missing or misconfigured input sensors. |
 | **Read Only** | Dry run mode — no commands sent to devices. |
@@ -115,30 +117,18 @@ HSEM enters a "Missing Entities Input" state with a clear error description. No 
 Every update cycle, the sensor:
 
 1. **Fetches configuration & sensor states** — battery, inverter, grid prices, solar production, EV charger.
-2. **Performs pre-calculations** — net consumption, battery capacity, weighted consumption forecasts, solar forecast, hourly net consumption, battery schedules.
-3. **Applies optimization strategy** — determines the best action per hour (Force Export, Charge Solar/Grid, EV Smart Charging, Discharge, Wait).
+2. **Performs pre-calculations** — net consumption, battery capacity, weighted consumption forecasts, solar forecast, and per-slot net load.
+3. **Solves the dynamic plan** — the MILP determines the best action per slot (Force Export, Charge Solar/Grid, EV Smart Charging, Discharge, Wait).
 4. **Applies working mode & TOU periods** — sets battery mode and updates TOU periods if not in read-only mode.
-5. **Updates state & attributes** — exposes hourly calculations, recommendations, and schedule status.
+5. **Updates state & attributes** — exposes per-slot calculations, recommendations, and plan status.
 
 ---
 
 ## Best Practices
 
-- **Do not configure schedules in the Fusion Solar app.** HSEM overwrites them.
+- **Do not configure fixed time slots in the Fusion Solar app.** They can conflict with HSEM's dynamic plan.
 - **Ensure all required sensors are available and correctly configured.**
 - **Allow HSEM to collect 14 days of data** before expecting optimal results.
-
----
-
-## Battery Schedules
-
-Define up to three discharge schedules with time windows and minimum price differences. HSEM automatically calculates required battery capacity and finds optimal charging times before each discharge.
-
-**Example:** Discharge 17:00–21:00 if the price difference exceeds your configured threshold.
-
-> See the upstream HSEM guide,
-> [How to Calculate the Minimum Charging Price](https://github.com/woopstar/hsem/wiki/How-to-Calculate-the-Minimum-Charging-Price-for-a-Battery-Schedule),
-> for battery depreciation economics.
 
 ---
 

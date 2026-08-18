@@ -97,7 +97,7 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
     Attributes
     ----------
     ``extra_state_attributes`` returns the full planning snapshot including
-    battery schedules, price data, EV state, and Solcast estimates.
+    price data, EV state, Solcast estimates, and planner diagnostics.
     """
 
     _attr_icon = "mdi:chart-timeline-variant"
@@ -224,8 +224,8 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
             }
 
         # Only a *critical* absence empties the payload.  When a non-critical
-        # sensor is unavailable the planner still ran, so the schedule must
-        # stay published — dashboards and automations read
+        # sensor is unavailable the planner still ran, so the plan must stay
+        # published — dashboards and automations read
         # ``hourly_recommendations`` from here and would otherwise go blind
         # for the duration of an unrelated integration's outage.
         if live.degraded_mode is DegradedMode.Error:
@@ -322,8 +322,6 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
             "house_consumption_energy_weight_7d": cfg.house_consumption_energy_weight_7d,
             "house_consumption_power_state": live.house_consumption_power_w,
             "house_power_includes_ev_charger_power": cfg.house_power_includes_ev_charger_power,
-            "batteries_schedules_remaining_capacity_needed": data.batteries_schedules_remaining_capacity_needed,
-            "batteries_schedules": data.batteries_schedules,
             "huawei_solar_batteries_charging_cutoff_capacity_state": live.huawei_batteries_charging_cutoff_capacity_pct,
             "huawei_solar_batteries_grid_charge_cutoff_soc_state": live.huawei_batteries_grid_charge_cutoff_soc_pct,
             "huawei_solar_batteries_maximum_charging_power_state": live.huawei_batteries_max_charge_power_w,
@@ -489,7 +487,6 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         resolve_current_recommendation(
             resolved_rec,
             live,
-            data.batteries_schedules_remaining_capacity_needed,
         )
         resolved_state = resolved_rec.recommendation
         if resolved_state == hourly_rec.recommendation and data.state == resolved_state:

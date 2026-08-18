@@ -39,12 +39,12 @@ total_cost = grid_import_cost − export_revenue + cycle_cost + conversion_loss_
 ### 2. `score` — selector objective
 
 ```
-score = total_cost + soc_penalties + grid_limit_penalty + override_penalty
-        + terminal_soc_value + primary_action_tiebreak
+score = total_cost + soc_penalties + grid_limit_penalty + terminal_soc_value
+        + primary_action_tiebreak
 ```
 
 - Starts from `total_cost` (always includes real money).
-- Adds **synthetic penalties** (quadratic SoC guard, grid power limit, override cost).
+- Adds **synthetic penalties** (quadratic SoC guard and grid power limit).
 - Adds the **terminal inventory value** — a path-independent value of the
   battery inventory change across the actionable horizon.
 - Adds a separately named **primary-action structural tiebreak** so a true

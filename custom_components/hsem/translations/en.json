@@ -17,7 +17,6 @@
       "invalid_price_value": "Invalid price value — please enter a number.",
       "invalid_seasonal_fill_mode": "Invalid seasonal fill mode. Choose Forecast-driven or Calendar months.",
       "invalid_sensor": "Invalid input sensor. Please choose a valid sensor.",
-      "invalid_time_format": "Invalid time format — expected HH:MM:SS.",
       "months_winter_empty": "Winter season must have at least one month.",
       "only_one_entry_allowed": "Only one configuration of HSEM is allowed.",
       "power_out_of_range": "Power value is outside the allowed range.",
@@ -26,8 +25,6 @@
       "secondary_storage_invalid_charge_range": "Charge current must use 10 A steps between 10 A and 80 A, with minimum not exceeding maximum.",
       "secondary_storage_invalid_grid_phase": "Secondary storage grid phase must be 1, 2, or 3.",
       "secondary_storage_invalid_soc_range": "Secondary storage SoC limits must satisfy 0 ≤ minimum < maximum ≤ 100.",
-      "start_time_after_end_time": "Start time must be before end time.",
-      "start_time_equals_end_time": "Start time and end time cannot be the same — this creates a zero-length window. Disable the schedule instead.",
       "invalid_wait_mode_behavior": "Invalid wait mode behaviour. Choose Strict wait or Self-consumption with reserve."
     },
     "step": {
@@ -130,66 +127,6 @@
         },
         "description": "Configure optional planned charging load integration for the second EV. Only shown when a second EV charger is enabled.",
         "title": "EV 2 Planned Load Integration"
-      },
-      "ocpp": {
-        "data": {
-          "hsem_ocpp_enabled": "Enable OCPP Server",
-          "hsem_ocpp_port": "OCPP Port",
-          "hsem_ocpp_cpid": "Charge Point ID",
-          "hsem_ocpp_start_window_s": "Start Window (s)",
-          "hsem_ocpp_stop_window_s": "Stop Window (s)"
-        },
-        "data_description": {
-          "hsem_ocpp_enabled": "Enable the embedded OCPP 1.6 WebSocket server for direct EV charger control. LAN-only — do not expose the port to the internet.",
-          "hsem_ocpp_port": "TCP port for the OCPP WebSocket server. Default: 9000. Must be above 1024.",
-          "hsem_ocpp_cpid": "Expected charge-point identifier of the EV charger. Leave empty to accept any charger.",
-          "hsem_ocpp_start_window_s": "Seconds of sustained surplus required before starting a charge. Prevents rapid start-stop cycling. Default: 60.",
-          "hsem_ocpp_stop_window_s": "Seconds of sustained shortage required before stopping a charge. Prevents rapid stop-start cycling. Default: 180."
-        },
-        "description": "Configure the embedded OCPP 1.6 server for LAN-only EV charger control. When enabled, HSEM sends SetChargingProfile commands directly to your EV charger based on the charging plan.",
-        "title": "OCPP Server"
-      },
-      "batteries_schedule_1": {
-        "data": {
-          "hsem_batteries_enable_batteries_schedule_1": "Enable Battery Schedule 1",
-          "hsem_batteries_enable_batteries_schedule_1_end": "Battery Schedule 1 End Time",
-          "hsem_batteries_enable_batteries_schedule_1_start": "Battery Schedule 1 Start Time"
-        },
-        "data_description": {
-          "hsem_batteries_enable_batteries_schedule_1": "Enable or disable the first battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_1_end": "Specify the end time for the first battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_1_start": "Specify the start time for the first battery discharge schedule."
-        },
-        "description": "Configure battery discharge schedule 1, including its activation time.",
-        "title": "Battery Discharge Schedule 1"
-      },
-      "batteries_schedule_2": {
-        "data": {
-          "hsem_batteries_enable_batteries_schedule_2": "Enable Battery Schedule 2",
-          "hsem_batteries_enable_batteries_schedule_2_end": "Battery Schedule 2 End Time",
-          "hsem_batteries_enable_batteries_schedule_2_start": "Battery Schedule 2 Start Time"
-        },
-        "data_description": {
-          "hsem_batteries_enable_batteries_schedule_2": "Enable or disable the second battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_2_end": "Specify the end time for the second battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_2_start": "Specify the start time for the second battery discharge schedule."
-        },
-        "description": "Configure battery discharge schedule 2, including its activation time.",
-        "title": "Battery Discharge Schedule 2"
-      },
-      "batteries_schedule_3": {
-        "data": {
-          "hsem_batteries_enable_batteries_schedule_3": "Enable Battery Schedule 3",
-          "hsem_batteries_enable_batteries_schedule_3_end": "Battery Schedule 3 End Time",
-          "hsem_batteries_enable_batteries_schedule_3_start": "Battery Schedule 3 Start Time"
-        },
-        "data_description": {
-          "hsem_batteries_enable_batteries_schedule_3": "Enable or disable the third battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_3_end": "Specify the end time for the third battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_3_start": "Specify the start time for the third battery discharge schedule."
-        },
-        "description": "Configure battery discharge schedule 3, including its activation time.",
-        "title": "Battery Discharge Schedule 3"
       },
       "prices": {
         "data": {
@@ -380,32 +317,6 @@
         },
         "description": "Update the settings for HSEM",
         "title": "Update Huawei Solar Energy Management"
-      },
-      "batteries_schedules": {
-        "data": {
-          "hsem_batteries_enable_batteries_schedule_1": "Enable Battery Schedule 1",
-          "hsem_batteries_enable_batteries_schedule_1_end": "Battery Schedule 1 End Time",
-          "hsem_batteries_enable_batteries_schedule_1_start": "Battery Schedule 1 Start Time",
-          "hsem_batteries_enable_batteries_schedule_2": "Enable Battery Schedule 2",
-          "hsem_batteries_enable_batteries_schedule_2_end": "Battery Schedule 2 End Time",
-          "hsem_batteries_enable_batteries_schedule_2_start": "Battery Schedule 2 Start Time",
-          "hsem_batteries_enable_batteries_schedule_3": "Enable Battery Schedule 3",
-          "hsem_batteries_enable_batteries_schedule_3_end": "Battery Schedule 3 End Time",
-          "hsem_batteries_enable_batteries_schedule_3_start": "Battery Schedule 3 Start Time"
-        },
-        "data_description": {
-          "hsem_batteries_enable_batteries_schedule_1": "Enable or disable the first battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_1_end": "Specify the end time for the first battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_1_start": "Specify the start time for the first battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_2": "Enable or disable the second battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_2_end": "Specify the end time for the second battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_2_start": "Specify the start time for the second battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_3": "Enable or disable the third battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_3_end": "Specify the end time for the third battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_3_start": "Specify the start time for the third battery discharge schedule."
-        },
-        "description": "Configure up to three battery discharge schedule windows, each with enable/disable toggle, start time, and end time. Schedules define when the battery may discharge to cover peak consumption or export to the grid.",
-        "title": "Battery Discharge Schedules"
       },
       "months": {
         "data": {
@@ -583,7 +494,6 @@
       "invalid_price_value": "Invalid price value — please enter a number.",
       "invalid_seasonal_fill_mode": "Invalid seasonal fill mode. Choose Forecast-driven or Calendar months.",
       "invalid_sensor": "Invalid input sensor. Please choose a valid sensor.",
-      "invalid_time_format": "Invalid time format — expected HH:MM:SS.",
       "months_winter_empty": "Winter season must have at least one month.",
       "only_one_entry_allowed": "Only one configuration of HSEM is allowed.",
       "power_out_of_range": "Power value is outside the allowed range.",
@@ -592,8 +502,6 @@
       "secondary_storage_invalid_charge_range": "Charge current must use 10 A steps between 10 A and 80 A, with minimum not exceeding maximum.",
       "secondary_storage_invalid_grid_phase": "Secondary storage grid phase must be 1, 2, or 3.",
       "secondary_storage_invalid_soc_range": "Secondary storage SoC limits must satisfy 0 ≤ minimum < maximum ≤ 100.",
-      "start_time_after_end_time": "Start time must be before end time.",
-      "start_time_equals_end_time": "Start time and end time cannot be the same — this creates a zero-length window. Disable the schedule instead.",
       "invalid_wait_mode_behavior": "Invalid wait mode behaviour. Choose Strict wait or Self-consumption with reserve."
     },
     "step": {
@@ -696,66 +604,6 @@
         },
         "description": "Configure optional planned charging load integration for the second EV. Only shown when a second EV charger is enabled.",
         "title": "EV 2 Planned Load Integration"
-      },
-      "ocpp": {
-        "data": {
-          "hsem_ocpp_enabled": "Enable OCPP Server",
-          "hsem_ocpp_port": "OCPP Port",
-          "hsem_ocpp_cpid": "Charge Point ID",
-          "hsem_ocpp_start_window_s": "Start Window (s)",
-          "hsem_ocpp_stop_window_s": "Stop Window (s)"
-        },
-        "data_description": {
-          "hsem_ocpp_enabled": "Enable the embedded OCPP 1.6 WebSocket server for direct EV charger control. LAN-only — do not expose the port to the internet.",
-          "hsem_ocpp_port": "TCP port for the OCPP WebSocket server. Default: 9000. Must be above 1024.",
-          "hsem_ocpp_cpid": "Expected charge-point identifier of the EV charger. Leave empty to accept any charger.",
-          "hsem_ocpp_start_window_s": "Seconds of sustained surplus required before starting a charge. Prevents rapid start-stop cycling. Default: 60.",
-          "hsem_ocpp_stop_window_s": "Seconds of sustained shortage required before stopping a charge. Prevents rapid stop-start cycling. Default: 180."
-        },
-        "description": "Configure the embedded OCPP 1.6 server for LAN-only EV charger control. When enabled, HSEM sends SetChargingProfile commands directly to your EV charger based on the charging plan.",
-        "title": "OCPP Server"
-      },
-      "batteries_schedule_1": {
-        "data": {
-          "hsem_batteries_enable_batteries_schedule_1": "Enable Battery Schedule 1",
-          "hsem_batteries_enable_batteries_schedule_1_end": "Battery Schedule 1 End Time",
-          "hsem_batteries_enable_batteries_schedule_1_start": "Battery Schedule 1 Start Time"
-        },
-        "data_description": {
-          "hsem_batteries_enable_batteries_schedule_1": "Enable or disable the first battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_1_end": "Specify the end time for the first battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_1_start": "Specify the start time for the first battery discharge schedule."
-        },
-        "description": "Configure battery discharge schedule 1, including its activation time.",
-        "title": "Battery Discharge Schedule 1"
-      },
-      "batteries_schedule_2": {
-        "data": {
-          "hsem_batteries_enable_batteries_schedule_2": "Enable Battery Schedule 2",
-          "hsem_batteries_enable_batteries_schedule_2_end": "Battery Schedule 2 End Time",
-          "hsem_batteries_enable_batteries_schedule_2_start": "Battery Schedule 2 Start Time"
-        },
-        "data_description": {
-          "hsem_batteries_enable_batteries_schedule_2": "Enable or disable the second battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_2_end": "Specify the end time for the second battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_2_start": "Specify the start time for the second battery discharge schedule."
-        },
-        "description": "Configure battery discharge schedule 2, including its activation time.",
-        "title": "Battery Discharge Schedule 2"
-      },
-      "batteries_schedule_3": {
-        "data": {
-          "hsem_batteries_enable_batteries_schedule_3": "Enable Battery Schedule 3",
-          "hsem_batteries_enable_batteries_schedule_3_end": "Battery Schedule 3 End Time",
-          "hsem_batteries_enable_batteries_schedule_3_start": "Battery Schedule 3 Start Time"
-        },
-        "data_description": {
-          "hsem_batteries_enable_batteries_schedule_3": "Enable or disable the third battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_3_end": "Specify the end time for the third battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_3_start": "Specify the start time for the third battery discharge schedule."
-        },
-        "description": "Configure battery discharge schedule 3, including its activation time.",
-        "title": "Battery Discharge Schedule 3"
       },
       "prices": {
         "data": {
@@ -946,32 +794,6 @@
         },
         "description": "Update the settings for HSEM",
         "title": "Update Huawei Solar Energy Management"
-      },
-      "batteries_schedules": {
-        "data": {
-          "hsem_batteries_enable_batteries_schedule_1": "Enable Battery Schedule 1",
-          "hsem_batteries_enable_batteries_schedule_1_end": "Battery Schedule 1 End Time",
-          "hsem_batteries_enable_batteries_schedule_1_start": "Battery Schedule 1 Start Time",
-          "hsem_batteries_enable_batteries_schedule_2": "Enable Battery Schedule 2",
-          "hsem_batteries_enable_batteries_schedule_2_end": "Battery Schedule 2 End Time",
-          "hsem_batteries_enable_batteries_schedule_2_start": "Battery Schedule 2 Start Time",
-          "hsem_batteries_enable_batteries_schedule_3": "Enable Battery Schedule 3",
-          "hsem_batteries_enable_batteries_schedule_3_end": "Battery Schedule 3 End Time",
-          "hsem_batteries_enable_batteries_schedule_3_start": "Battery Schedule 3 Start Time"
-        },
-        "data_description": {
-          "hsem_batteries_enable_batteries_schedule_1": "Enable or disable the first battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_1_end": "Specify the end time for the first battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_1_start": "Specify the start time for the first battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_2": "Enable or disable the second battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_2_end": "Specify the end time for the second battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_2_start": "Specify the start time for the second battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_3": "Enable or disable the third battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_3_end": "Specify the end time for the third battery discharge schedule.",
-          "hsem_batteries_enable_batteries_schedule_3_start": "Specify the start time for the third battery discharge schedule."
-        },
-        "description": "Configure up to three battery discharge schedule windows, each with enable/disable toggle, start time, and end time. Schedules define when the battery may discharge to cover peak consumption or export to the grid.",
-        "title": "Battery Discharge Schedules"
       },
       "months": {
         "data": {
@@ -1262,18 +1084,6 @@
       },
       "effective_discharge_floor": {
         "name": "Effective Discharge Floor"
-      },
-      "ocpp_charger_status": {
-        "name": "OCPP Charger Status"
-      },
-      "ocpp_charger_power": {
-        "name": "OCPP Charger Power"
-      },
-      "ocpp_charger_info": {
-        "name": "OCPP Charger Info"
-      },
-      "ocpp_charger_sessions": {
-        "name": "OCPP Charger Sessions"
       }
     },
     "switch": {
@@ -1285,15 +1095,6 @@
       },
       "verbose_logging": {
         "name": "Verbose Logging"
-      },
-      "batteries_schedule_1": {
-        "name": "Batteries Schedule 1"
-      },
-      "batteries_schedule_2": {
-        "name": "Batteries Schedule 2"
-      },
-      "batteries_schedule_3": {
-        "name": "Batteries Schedule 3"
       },
       "ev_force_discharge": {
         "name": "EV Force Max Discharge Power"
@@ -1343,48 +1144,9 @@
       },
       "ev_second_target_soc": {
         "name": "EV 2 Target SoC"
-      },
-      "charge_rate_below_0": {
-        "name": "Max Charge Rate (<0°C)"
-      },
-      "charge_rate_0_to_5": {
-        "name": "Max Charge Rate (0-5°C)"
-      },
-      "charge_rate_6_to_15": {
-        "name": "Max Charge Rate (6-15°C)"
-      },
-      "charge_rate_16_to_21": {
-        "name": "Max Charge Rate (16-21°C)"
-      },
-      "charge_rate_21_to_35": {
-        "name": "Max Charge Rate (21-35°C)"
-      },
-      "charge_rate_35_to_50": {
-        "name": "Max Charge Rate (35-50°C)"
-      },
-      "charge_rate_above_50": {
-        "name": "Max Charge Rate (>50°C)"
       }
     },
     "time": {
-      "schedule_1_start": {
-        "name": "Batteries Discharge Schedule 1 Start"
-      },
-      "schedule_1_end": {
-        "name": "Batteries Discharge Schedule 1 End"
-      },
-      "schedule_2_start": {
-        "name": "Batteries Discharge Schedule 2 Start"
-      },
-      "schedule_2_end": {
-        "name": "Batteries Discharge Schedule 2 End"
-      },
-      "schedule_3_start": {
-        "name": "Batteries Discharge Schedule 3 Start"
-      },
-      "schedule_3_end": {
-        "name": "Batteries Discharge Schedule 3 End"
-      },
       "ev_deadline": {
         "name": "EV Charge Deadline"
       },

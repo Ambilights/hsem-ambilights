@@ -42,9 +42,6 @@ class CostWeights:
             for every kWh of excess energy.  ``None`` disables the check.
         grid_limit_penalty_per_kwh:
             Currency/kWh applied to each kWh that exceeds ``grid_limit_kw``.
-        override_penalty_per_slot:
-            Flat cost added for every slot flagged as a forced override.
-            Penalises plans that bypass normal optimisation.
         cycle_cost_per_kwh:
             Depreciation cost in local currency per kWh cycled through the
             battery.  When ``None`` it is auto-calculated from
@@ -89,9 +86,6 @@ class CostWeights:
     # Grid limit
     grid_limit_kw: float | None = None
     grid_limit_penalty_per_kwh: float = 0.5
-
-    # Override penalty
-    override_penalty_per_slot: float = 0.0
 
     # Battery cycle depreciation
     cycle_cost_per_kwh: float | None = None
@@ -170,8 +164,6 @@ class PlanCostBreakdown:
         grid_limit_penalty:
             Penalty for exceeding the configured grid power limit.
             Selector-only — does not enter :attr:`total_cost`.
-        override_penalty:
-            Penalty for forced-override slots.  Selector-only.
         terminal_soc_value:
             Path-independent value of the primary and secondary batteries'
             net inventory change across the actionable horizon.  Negative is
@@ -190,8 +182,7 @@ class PlanCostBreakdown:
         score:
             Selector objective.  Equal to
             ``total_cost + soc_penalty + grid_limit_penalty
-            + override_penalty + terminal_soc_value
-            + primary_action_tiebreak``.
+            + terminal_soc_value + primary_action_tiebreak``.
             **Lower is better.**  The candidate selector picks the plan
             with the lowest score.
         total:
@@ -207,7 +198,6 @@ class PlanCostBreakdown:
     cycle_cost: float = 0.0
     soc_penalty: float = 0.0
     grid_limit_penalty: float = 0.0
-    override_penalty: float = 0.0
     terminal_soc_value: float = 0.0
     primary_action_tiebreak: float = 0.0
     secondary_conversion_loss_cost: float = 0.0

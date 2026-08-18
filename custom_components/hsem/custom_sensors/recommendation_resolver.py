@@ -2,8 +2,7 @@
 
 Single responsibility: apply post-planner adjustments to the **current**
 time-slot recommendation based on real-time state that the planner engine
-cannot observe (e.g. live EV charging status, remaining battery versus
-upcoming scheduled discharge windows).
+cannot observe (for example, live EV charging status).
 
 This module is purely decisional — no I/O, no hardware writes.
 """
@@ -27,7 +26,6 @@ def _fmt_live_w(power_w: float | None) -> str:
 def resolve_current_recommendation(
     rec: HourlyRecommendation,
     live: LiveState,
-    batteries_schedules_remaining_capacity_needed: float,
 ) -> None:
     """Adjust the current-interval recommendation based on live runtime state.
 
@@ -38,16 +36,12 @@ def resolve_current_recommendation(
     1. **Published negative import price** → force export available PV.
     2. **Grid charge active** → grid charging takes priority over EV smart charge.
     3. **EV actively charging** → switch to EV smart charging mode.
-    4. **Battery above remaining schedule need** → switch to discharge mode,
-       unless the optimiser explicitly allocated a primary-battery hold.
 
     The recommendation is modified **in-place** on ``rec``.
 
     Args:
         rec: The :class:`HourlyRecommendation` for the current time slot.
         live: Live state snapshot at call time.
-        batteries_schedules_remaining_capacity_needed: Total kWh still needed
-            by all upcoming discharge-window schedules.
     """
     if rec is None:
         return
@@ -126,21 +120,5 @@ def resolve_current_recommendation(
             rec.ev_total_planned_load_kwh,
             _fmt_live_w(live.ev.power_w),
             _fmt_live_w(live.ev_second.power_w),
-            original_recommendation,
-        )
-
-    # 4. Battery has enough energy to cover remaining scheduled discharge needs
-    if (
-        not rec.primary_battery_hold
-        and batteries_schedules_remaining_capacity_needed > 0
-        and live.battery_current_capacity_kwh
-        > batteries_schedules_remaining_capacity_needed
-    ):
-        rec.recommendation = Recommendations.BatteriesDischargeMode.value
-        HSEM_LOGGER.debug(
-            "[resolver] battery above schedule need (%.2f > %.2f kWh) "
-            "→ overriding %s to batteries_discharge_mode",
-            live.battery_current_capacity_kwh,
-            batteries_schedules_remaining_capacity_needed,
             original_recommendation,
         )

@@ -148,8 +148,8 @@ the actionable published-price horizon cannot trigger this override.
 
 - **Check:** `sensor.hsem_working_mode` shows `force_export` during a
   slot with negative prices. This is normal — verify the spot price in EDS.
-- **Fix:** If you don't want force-export, disable it in your battery
-  schedule configuration (set _Allow Forced Export_ to off).
+- **Fix:** If the action is unexpected, correct the price sensor or tariff
+  transformation. Keep HSEM in Read-Only mode while validating the input.
 
 ---
 
@@ -267,8 +267,8 @@ not accept the value.
   2. Check that the working mode or settings being written are valid for
      your inverter model.
   3. Restart the Huawei Solar integration.
-  4. If the failure is on `set_tou_periods`, check your battery schedule
-     configuration for invalid values.
+  4. If the failure is on `set_tou_periods`, verify the Huawei TOU entity,
+     service availability, and current dynamically planned recommendation.
 
 **4e. Force working mode override active**
 
@@ -316,15 +316,16 @@ Hardware-mode, EV-command, and partial-discharge-cap changes remain immediate.
 - **Fix:** Set to 0 to disable window hysteresis, or lower it if slots are
   staying locked too long.
 
-**5c. Only one schedule active**
+**5c. No materially better plan**
 
-If you only have one battery schedule configured and it covers only part of
-the day, the battery will be in `batteries_wait_mode` outside that window.
+The MILP changes battery actions only when prices, PV, load, losses, wear, and
+available SoC make another feasible plan better. Flat prices or a small spread
+can correctly produce a long hold or passive period.
 
-- **Check:** HSEM → **Configure** → **Batteries Schedule** steps (1, 2, 3).
-  Are schedules enabled? Do they cover the hours you expect?
-- **Fix:** Enable additional schedules or widen the hours. Each schedule
-  defines when a specific working mode is permitted.
+- **Check:** `sensor.hsem_plan_explanation` → `price_spread`, `constraints`,
+  and `rejected_plans` for the current run.
+- **Fix:** Correct inaccurate price, PV, load, efficiency, or battery-economics
+  inputs. If the inputs are accurate, an unchanged plan is expected.
 
 **5d. Planner in winter wait mode**
 
@@ -361,16 +362,17 @@ warning and may produce suboptimal plans.
 
 ### Checks & likely causes
 
-**6a. No charge schedule configured or active**
+**6a. No economical or feasible charge opportunity**
 
-HSEM only commands charging when a schedule permits it and the planner
-assigns charge recommendations to slots.
+The MILP schedules charging only when PV surplus or full-horizon grid-price
+economics justify it and all SoC, power, fuse, and price-authority constraints
+allow it.
 
-- **Check:** `sensor.hsem_plan_explanation` → `selected_strategy`. Does it
-  include "charge"? Look at the `planned_slots` attribute — are any marked
-  with a charge recommendation?
-- **Fix:** Enable a battery schedule in the config flow and ensure it
-  covers the hours when you want charging to happen.
+- **Check:** `sensor.hsem_plan_explanation` → `selected_strategy`,
+  `constraints`, `rejected_plans`, and the planned slots for charge flows.
+- **Fix:** Verify import prices, PV forecast, charge cutoff, charge power,
+  efficiency, cycle cost, and main-fuse settings. Do not force a time window;
+  correct the input that is making charge infeasible or uneconomical.
 
 **6b. SoC already at or above charge cutoff**
 
@@ -442,15 +444,18 @@ the planner may determine there's no surplus to charge the battery.
 
 ### Checks & likely causes
 
-**7a. No discharge schedule configured or active**
+**7a. No economical or feasible discharge opportunity**
 
-Discharge requires a battery schedule with a discharge-compatible mode
-enabled.
+The MILP schedules local discharge when avoided import cost justifies using
+stored energy and the battery remains within its SoC and power limits.
+Intentional export additionally requires excess export to be enabled and its
+per-slot price floor to be met.
 
-- **Check:** `sensor.hsem_plan_explanation` → `selected_strategy`. Does it
-  include "discharge"?
-- **Fix:** Enable a battery schedule that permits discharge during the hours
-  when you want to discharge.
+- **Check:** `sensor.hsem_plan_explanation` → `selected_strategy`,
+  `constraints`, `rejected_plans`, and planned battery flows.
+- **Fix:** Verify import/export prices, SoC floor, discharge power, cycle cost,
+  terminal inventory valuation, and excess-export settings. Accurate inputs
+  can legitimately produce no discharge.
 
 **7b. SoC at or below end-of-discharge floor**
 

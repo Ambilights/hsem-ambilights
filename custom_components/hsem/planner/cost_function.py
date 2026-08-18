@@ -9,13 +9,13 @@ and exposes two distinct aggregate numbers:
   plus battery cycle (depreciation) cost plus round-trip conversion loss
   cost.  Auditable; directly comparable to an electricity bill.
 - :attr:`PlanCostBreakdown.score` — the **selector objective**.  Equals
-  ``total_cost`` plus every synthetic penalty (SoC guard, grid limit,
-  override), terminal inventory value, and local self-consumption credit.
-  The candidate selector picks the **lowest score**, not lowest money cost.
+  ``total_cost`` plus every synthetic penalty (SoC guard and grid limit),
+  terminal inventory value, and primary-action tiebreak. The candidate
+  selector picks the **lowest score**, not lowest money cost.
 
 Cost components
 ---------------
-The cost function aggregates nine independently-tunable terms:
+The cost function aggregates eight independently-tunable terms:
 
 Money terms (sum to ``total_cost``):
 
@@ -38,13 +38,10 @@ Selector-only terms (added on top of ``total_cost`` to produce ``score``):
    configured ``max_soc_pct`` guard), multiplied by a configurable weight.
 6. **Grid limit penalty** — penalty when grid import or export in any slot
    exceeds the configured grid power limit, proportional to the excess energy.
-7. **Override penalty** — per-slot cost added for any slot whose recommendation
-   was forced by an override (e.g. read-only mode, manual schedule).  Penalises
-   plans that deviate from the hardware's natural optimal state.
-8. **Terminal inventory value** — uniform replacement value times net
+7. **Terminal inventory value** — uniform replacement value times net
    battery discharge minus charge. Equal discharge/refill cancels regardless
    of slot position, so the term depends only on final inventory.
-9. **Primary-action tiebreak** — a microscopic selector-only preference for
+8. **Primary-action tiebreak** — a microscopic selector-only preference for
    direct local self-consumption over an exact economic tie, while charging,
    battery export, and a charge/discharge cycle remain slightly disfavoured.
 
@@ -78,7 +75,6 @@ from datetime import datetime
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.planner.cost_helpers import (
     PRIMARY_ACTION_TIEBREAK_COST,
-    _is_override_slot,
     _resolve_cycle_cost,
 )
 from custom_components.hsem.planner.cost_types import (  # noqa: F401
@@ -134,9 +130,9 @@ def score_plan(
     - ``total_cost`` — money outcome only.  Equals
       ``import_cost − export_revenue + cycle_cost + conversion_loss_cost``.
     - ``score`` — selector objective.  Equals ``total_cost`` plus all
-      synthetic penalties (SoC guard, grid limit, override), the terminal
-      inventory value, and ``primary_action_tiebreak``.  The candidate
-      selector minimises this value.
+      synthetic penalties (SoC guard and grid limit), the terminal inventory
+      value, and ``primary_action_tiebreak``. The candidate selector
+      minimises this value.
 
     Terminal inventory accounting (the spec-mandated ``terminal_soc_value``
     term) is enabled when both
@@ -246,7 +242,6 @@ def score_plan(
     cycle_cost_total = 0.0
     soc_penalty = 0.0
     grid_limit_penalty = 0.0
-    override_penalty = 0.0
     terminal_soc_value = 0.0
     primary_action_tiebreak = 0.0
     secondary_costs = SecondaryCostAccumulator()
@@ -309,7 +304,7 @@ def score_plan(
 
         # A numeric value outside the contiguous published-price prefix is
         # diagnostic data, not economic authority.  Neutralise every monetary
-        # use while leaving physical cycle/SoC/grid/override penalties intact.
+        # use while leaving physical cycle, SoC, and grid penalties intact.
         if not slot.price_actionable:
             imp_price = 0.0
             exp_price = 0.0
@@ -450,11 +445,7 @@ def score_plan(
                     grid_limit_penalty += pen
                     grid_limit_penalty_disc += pen * discount
 
-        # 7. Override penalty
-        if _is_override_slot(slot) and abs(weights.override_penalty_per_slot) > 1e-9:
-            override_penalty += weights.override_penalty_per_slot
-
-        # 8. Path-independent terminal inventory value.
+        # 7. Path-independent terminal inventory value.
         if (
             initial_battery_kwh is not None
             and replacement_price_per_kwh is not None
@@ -484,7 +475,6 @@ def score_plan(
             + cycle_cost_total_disc
             + soc_penalty_disc
             + grid_limit_penalty_disc
-            + override_penalty
             + terminal_soc_value
             + primary_action_tiebreak
         )
@@ -493,7 +483,6 @@ def score_plan(
             total_cost
             + soc_penalty
             + grid_limit_penalty
-            + override_penalty
             + terminal_soc_value
             + primary_action_tiebreak
         )
@@ -507,7 +496,6 @@ def score_plan(
         cycle_cost=round(cycle_cost_total, 6),
         soc_penalty=round(soc_penalty, 6),
         grid_limit_penalty=round(grid_limit_penalty, 6),
-        override_penalty=round(override_penalty, 6),
         terminal_soc_value=round(terminal_soc_value, 6),
         primary_action_tiebreak=round(primary_action_tiebreak, 6),
         secondary_conversion_loss_cost=round(
@@ -529,7 +517,7 @@ def score_plan(
         "debug",
         "[cost] score_plan DONE  total_cost=%.6f  score=%.6f  "
         "import=%.6f  export_rev=%.6f  conv_loss=%.6f  "
-        "cycle=%.6f  soc_pen=%.6f  grid=%.6f  override=%.6f  term_soc=%.6f  tie=%.6f",
+        "cycle=%.6f  soc_pen=%.6f  grid=%.6f  term_soc=%.6f  tie=%.6f",
         result.total_cost,
         result.score,
         result.import_cost,
@@ -538,7 +526,6 @@ def score_plan(
         result.cycle_cost,
         result.soc_penalty,
         result.grid_limit_penalty,
-        result.override_penalty,
         result.terminal_soc_value,
         result.primary_action_tiebreak,
     )

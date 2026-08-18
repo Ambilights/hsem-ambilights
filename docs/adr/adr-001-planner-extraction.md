@@ -62,8 +62,8 @@ flowchart TD
 |---|---|---|
 | `planner/engine_core.py` | Pipeline orchestration | None |
 | `planner/slot_population.py` | Build time horizon | None |
-| `planner/charge_scheduler.py` | Charge schedule logic (planner/charging/ sub-package) | None |
-| `planner/discharge_scheduler.py` | Discharge schedule logic | None |
+| `planner/charge_scheduler.py` | Opportunistic charge and recommendation hysteresis facade | None |
+| `planner/discharge_scheduler.py` | Reserve, export, seasonal, and discharge-context helpers | None |
 | `planner/candidate_generator.py` | Candidate plan generation | None |
 | `planner/candidate_selector.py` | Candidate scoring + selection | None |
 | `planner/cost_function.py` | Cost/score calculation | None |

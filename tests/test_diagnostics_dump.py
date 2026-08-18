@@ -144,19 +144,19 @@ class TestPlannerInputRoundTrip:
         assert len(reconstructed.consumption_averages) == len(
             original.consumption_averages
         )
-        assert len(reconstructed.battery_schedules) == len(original.battery_schedules)
 
-    def test_battery_schedule_times_preserved(self) -> None:
+    def test_legacy_battery_schedules_key_is_ignored(self) -> None:
+        """Diagnostics produced before schedule removal remain replayable."""
         original = make_summer_day_input()
         dump = build_diagnostics_dump(original, run_planner(original))
+        dump["planner_input"]["battery_schedules"] = [
+            {"enabled": True, "start": "07:00:00", "end": "09:00:00"}
+        ]
+
         reconstructed = load_planner_input_from_dump(dump)
 
-        for orig_sched, recon_sched in zip(
-            original.battery_schedules, reconstructed.battery_schedules
-        ):
-            assert recon_sched.start == orig_sched.start
-            assert recon_sched.end == orig_sched.end
-            assert recon_sched.enabled == orig_sched.enabled
+        assert reconstructed.now_iso == original.now_iso
+        assert not hasattr(reconstructed, "battery_schedules")
 
     def test_null_battery_max_discharge_preserved(self) -> None:
         original = make_summer_day_input()

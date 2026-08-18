@@ -1,30 +1,11 @@
-"""Regression tests for 48-hour planning horizon — second-day slot correctness.
+"""Regression tests for second-day correctness in a 48-hour plan.
 
-Verifies that slots in the second 24 hours of a 48-hour planning window receive
-correct recommendations instead of defaulting entirely to ``BatteriesDischargeMode``.
-
-Root causes fixed:
-1. ``apply_discharge_schedules`` only applied each battery schedule once (for the
-   next single occurrence) rather than once per calendar day in the horizon.
-   Over a 48-hour window the second day's discharge window was never set, so the
-   seasonal fill fell through to ``BatteriesDischargeMode`` for all summer slots.
-
-2. ``apply_optimization_strategy`` filtered the solar-charging pass with
-   ``slot.start.date() == now.date()``, preventing solar charging from being
-   assigned on day 2.
-
-Acceptance criteria:
-- Second-day discharge windows are assigned ``BatteriesDischargeMode``.
-- Second-day non-discharge summer slots are NOT all ``BatteriesDischargeMode``.
-- Solar PV surplus slots on day 2 receive ``BatteriesChargeSolar``.
-- Both day-1 and day-2 discharge windows are reflected in ``discharge_windows``.
+Verifies that the full horizon is populated, second-day recommendations remain
+well-formed and diverse, and day-two PV surplus can still charge the battery.
 """
 
 from __future__ import annotations
 
-from datetime import time
-
-from custom_components.hsem.models.battery_schedule_input import BatteryScheduleInput
 from custom_components.hsem.models.hourly_consumption_average import (
     HourlyConsumptionAverage,
 )
@@ -52,7 +33,6 @@ def _make_48h_input(
     *,
     now_iso: str = "2024-06-15T00:00:00+02:00",
     battery_soc_pct: float = 50.0,
-    schedules: list[BatteryScheduleInput] | None = None,
     pv_kwh_per_hour: float = 0.0,
     load_kwh_per_hour: float = 0.5,
     months_winter: list[int] | None = None,
@@ -106,19 +86,6 @@ def _make_48h_input(
         for h in range(24)
     ]
 
-    default_schedules = [
-        BatteryScheduleInput(
-            enabled=True,
-            start=time(7, 0),
-            end=time(9, 0),
-        ),
-        BatteryScheduleInput(
-            enabled=True,
-            start=time(17, 0),
-            end=time(21, 0),
-        ),
-    ]
-
     return PlannerInput(
         now_iso=now_iso,
         interval_minutes=60,
@@ -136,7 +103,6 @@ def _make_48h_input(
         consumption_averages=consumption,
         price_points=prices,
         solcast_slots=solar,
-        battery_schedules=schedules if schedules is not None else default_schedules,
         excess_export_enabled=False,
         excess_export_discharge_buffer_pct=10.0,
         excess_export_price_threshold=0.10,
@@ -171,60 +137,6 @@ class TestBasic48hContract:
         result = run_planner(_make_48h_input())
         dates = {s.start.date() for s in result.slots}
         assert len(dates) == 2, f"Expected slots on exactly 2 dates, got {dates}"
-
-
-# ===========================================================================
-# Discharge windows on day 2
-# ===========================================================================
-
-
-class TestDay2DischargeWindows:
-    """Second-day discharge schedule windows must be applied."""
-
-    def test_day2_discharge_window_present(self):
-        """The 07:00-09:00 discharge window must appear on BOTH calendar days."""
-        result = run_planner(_make_48h_input())
-        day1 = result.slots[0].start.date()
-        day2 = day1.replace(day=day1.day + 1)  # next calendar day
-
-        day2_discharge = [
-            s
-            for s in result.slots
-            if s.start.date() == day2
-            and s.recommendation in _DISCHARGE_VALUES
-            and s.start.hour in (7, 8)
-        ]
-        assert len(day2_discharge) >= 1, (
-            f"Expected discharge slots at 07:00-09:00 on day 2 ({day2}), "
-            f"found none. Day-2 recommendations: "
-            f"{[(s.start.hour, s.recommendation) for s in result.slots if s.start.date() == day2]}"
-        )
-
-    def test_day2_evening_discharge_window_present(self):
-        """The 17:00-21:00 evening discharge window must appear on BOTH days."""
-        result = run_planner(_make_48h_input())
-        day1 = result.slots[0].start.date()
-        day2 = day1.replace(day=day1.day + 1)
-
-        day2_eve_discharge = [
-            s
-            for s in result.slots
-            if s.start.date() == day2
-            and s.recommendation in _DISCHARGE_VALUES
-            and 17 <= s.start.hour < 21
-        ]
-        assert len(day2_eve_discharge) >= 1, (
-            "Expected discharge slots at 17:00-21:00 on day 2, found none."
-        )
-
-    def test_discharge_windows_list_covers_both_days(self):
-        """PlannerOutput.discharge_windows must include windows from both days."""
-        result = run_planner(_make_48h_input())
-        assert len(result.discharge_windows) >= 2, (
-            f"Expected at least 2 discharge windows (one per day), "
-            f"got {len(result.discharge_windows)}: "
-            f"{[(w.start.isoformat(), w.end.isoformat()) for w in result.discharge_windows]}"
-        )
 
 
 # ===========================================================================
@@ -283,43 +195,34 @@ class TestDay2NotAllDischarge:
 
 
 class TestDay2SolarCharging:
-    """With PV surplus on day 2, BatteriesChargeSolar must be assigned."""
+    """Day-two daytime PV can charge the battery for later local demand."""
 
     def test_day2_pv_surplus_gets_charge_solar(self):
-        """High PV production on day 2 should yield BatteriesChargeSolar slots.
+        """A daytime-only PV surplus should charge before evening demand.
 
-        The battery may already be full from day 1's solar, in which case
-        charge recs are correctly cleared by the SoC simulation.  The test
-        verifies at least some charging occurs across the 48-hour horizon.
+        An all-day PV surplus has no future battery use and is correctly
+        exported directly by the MILP. This profile instead creates a real
+        daytime-to-evening storage opportunity on both delivery days.
         """
-        result = run_planner(
-            _make_48h_input(
-                pv_kwh_per_hour=5.0,
-                load_kwh_per_hour=0.3,
-                battery_soc_pct=10.0,
-                schedules=[
-                    BatteryScheduleInput(
-                        enabled=True,
-                        start=time(17, 0),
-                        end=time(21, 0),
-                    )
-                ],
-            )
+        inp = _make_48h_input(
+            pv_kwh_per_hour=0.0,
+            load_kwh_per_hour=0.8,
+            battery_soc_pct=10.0,
         )
+        inp.solcast_slots = [
+            SolcastSlot(hour=hour, pv_estimate=5.0 if 10 <= hour < 15 else 0.0)
+            for hour in range(24)
+        ]
+        result = run_planner(inp)
+        day2 = result.slots[0].start.date().replace(day=result.slots[0].start.day + 1)
 
-        # Solar charge may appear on either day depending on when the
-        # battery has room.  At minimum, day 1 should have charge slots.
-        all_solar_charge = [
+        day2_solar_charge = [
             s
             for s in result.slots
-            if s.recommendation == Recommendations.BatteriesChargeSolar.value
+            if s.start.date() == day2
+            and s.recommendation == Recommendations.BatteriesChargeSolar.value
         ]
-        assert len(all_solar_charge) > 0, (
-            "No BatteriesChargeSolar slots anywhere in 48h plan despite high"
-            " PV surplus and low battery SoC."
+        assert day2_solar_charge, (
+            "No day-two BatteriesChargeSolar slot despite daytime PV surplus "
+            "and later local demand."
         )
-
-
-# ===========================================================================
-# Pre-charge for day-2 discharge windows
-# ===========================================================================

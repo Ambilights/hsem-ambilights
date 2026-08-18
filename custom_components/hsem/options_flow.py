@@ -10,10 +10,6 @@ from custom_components.hsem.flows.batteries_excess_export import (
     get_batteries_excess_export_step_schema,
     validate_batteries_excess_export_input,
 )
-from custom_components.hsem.flows.batteries_schedules import (
-    get_batteries_schedules_step_schema,
-    validate_batteries_schedules_input,
-)
 from custom_components.hsem.flows.batteries_wait_mode import (
     get_batteries_wait_mode_step_schema,
     validate_batteries_wait_mode_input,
@@ -48,10 +44,6 @@ from custom_components.hsem.flows.init import (
     validate_init_step_input,
 )
 from custom_components.hsem.flows.months import get_months_schema, validate_months_input
-from custom_components.hsem.flows.ocpp import (
-    get_ocpp_step_schema,
-    validate_ocpp_step_input,
-)
 from custom_components.hsem.flows.power import (
     get_power_step_schema,
     validate_power_step_input,
@@ -356,7 +348,7 @@ class HSEMOptionsFlow(config_entries.OptionsFlow):
                 self._user_input.update(user_input)
                 if bool(self._user_input.get("hsem_ev_second_enabled")):
                     return await self.async_step_ev_second_planned_load()
-                return await self.async_step_ocpp()
+                return await self.async_step_batteries_wait_mode()
 
         data_schema = await get_ev_planned_load_step_schema(self._config_entry)
 
@@ -380,62 +372,12 @@ class HSEMOptionsFlow(config_entries.OptionsFlow):
             errors = await validate_ev_second_planned_load_input(self.hass, user_input)
             if not errors:
                 self._user_input.update(user_input)
-                return await self.async_step_ocpp()
+                return await self.async_step_batteries_wait_mode()
 
         data_schema = await get_ev_second_planned_load_step_schema(self._config_entry)
 
         return self.async_show_form(
             step_id="ev_second_planned_load",
-            data_schema=data_schema,
-            errors=errors,
-            last_step=False,
-        )
-
-    async def async_step_ocpp(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Handle the ocpp options step.
-
-        Validates user input and advances to the next step in the options flow.
-        """
-        errors = {}
-
-        if user_input is not None:
-            errors = await validate_ocpp_step_input(self.hass, user_input)
-            if not errors:
-                self._user_input.update(user_input)
-                return await self.async_step_batteries_schedules()
-
-        data_schema = await get_ocpp_step_schema(self._config_entry)
-
-        return self.async_show_form(
-            step_id="ocpp",
-            data_schema=data_schema,
-            errors=errors,
-            last_step=False,
-        )
-
-    async def async_step_batteries_schedules(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Handle the batteries_schedules options step.
-
-        Validates user input and advances to the next step in the options flow.
-        """
-        errors = {}
-
-        if user_input is not None:
-            errors = await validate_batteries_schedules_input(user_input)
-            if not errors:
-                self._user_input.update(user_input)
-                return await self.async_step_batteries_wait_mode()
-
-        data_schema = await get_batteries_schedules_step_schema(
-            self._config_entry, hass=self.hass
-        )
-
-        return self.async_show_form(
-            step_id="batteries_schedules",
             data_schema=data_schema,
             errors=errors,
             last_step=False,
@@ -535,9 +477,9 @@ class HSEMOptionsFlow(config_entries.OptionsFlow):
 
                 # Preserve entity-managed options that the options-flow schemas
                 # do not collect — switches (force-charge-now, smart charging,
-                # read-only, verbose logging, battery schedules, …), numbers
-                # (target SoC, charge-rate overrides), times (deadlines), and
-                # selector values (solcast likelihood).  Without this merge,
+                # read-only, verbose logging, …), numbers (target SoC and battery
+                # efficiency), EV deadline times, and selector values (solcast
+                # likelihood). Without this merge,
                 # ``async_create_entry`` would rewrite the options dict with
                 # only the schema fields, silently resetting every switch to
                 # its default (issue: force-charge switch turns itself off

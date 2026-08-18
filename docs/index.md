@@ -12,8 +12,8 @@ request numbers in these inherited documents refer to upstream
 
 | Document | Description |
 |---|---|
-| [Home](home.md) | User-facing overview: features, FAQ, working modes, battery schedules, excess export, consumption sensors |
-| [Battery Charging Economics](battery-charging-economics.md) | How to calculate the minimum charging price for a battery schedule |
+| [Home](home.md) | User-facing overview: features, FAQ, working modes, dynamic battery optimisation, excess export, consumption sensors |
+| [Battery Charging Economics](battery-charging-economics.md) | Battery wear, efficiency, and profitable charging/export economics |
 | [Architecture Overview](architecture-overview.md) | System context, layered architecture, module map, planning pipeline |
 | [Planner Specification](planner-spec.md) | **Normative** — all planner invariants, rules, and constraints |
 | [Planner Technical Guide](planner-guide.md) | How the planner works with worked examples |

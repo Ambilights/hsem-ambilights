@@ -127,8 +127,8 @@ The applier verifies these hardware writes:
    appropriate TOU mode for the current recommendation
 2. **Grid export power** — `set_maximum_feed_grid_power_percent` adjusted
    to zero when export should be blocked, or restored to 100 % when allowed
-3. **TOU periods** — `set_tou_periods` applied according to the current
-   battery schedule
+3. **TOU periods** — `set_tou_periods` applied from the current dynamically
+   planned recommendation
 
 ---
 
@@ -142,8 +142,7 @@ planner output with live sensor readings:
 | 1 (highest) | Current slot actionable and available live import price < 0 | → `force_export` (overrides lower priorities) |
 | 2 | Current recommendation = `batteries_charge_grid` | Kept (never overridden) |
 | 3 | Any EV actively charging | → `ev_smart_charging` |
-| 4 | Battery energy > remaining schedule need | → `batteries_discharge_mode` |
-| — | None of the above | Planner recommendation kept |
+| — | None of the above | Accepted planner recommendation kept |
 
 ### Protection rules
 

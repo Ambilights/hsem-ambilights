@@ -215,7 +215,7 @@ class TestRecommendationResolverNullSafety:
         live = LiveState()
         live.import_electricity_price = 0.0  # explicitly zero — not negative
 
-        resolve_current_recommendation(rec, live, 0.0)
+        resolve_current_recommendation(rec, live)
         # Should NOT override to ForceExport with a zero (non-negative) price
         assert rec.recommendation != Recommendations.ForceExport.value
 
@@ -231,7 +231,7 @@ class TestRecommendationResolverNullSafety:
         live = LiveState()
         live.import_electricity_price = -0.05
 
-        resolve_current_recommendation(rec, live, 0.0)
+        resolve_current_recommendation(rec, live)
         assert rec.recommendation == Recommendations.ForceExport.value
 
 
@@ -473,13 +473,13 @@ class TestThresholdCalculationWithNoneInputs:
 
 
 # ---------------------------------------------------------------------------
-# Flow None-safety regression — batteries_schedule_1/2/3 and excess_export
+# Flow None-safety regression — excess_export
 # ---------------------------------------------------------------------------
 
 
 class TestFlowExpectedCyclesNullSafety:
-    """Regression: batteries_schedule and excess_export flows must not pass None
-    expected_cycles into calculate_recommended_threshold.
+    """Regression: the excess_export flow must not pass None expected_cycles
+    into calculate_recommended_threshold.
 
     The pre-fix pattern ``convert_to_int(get_config_value(...) or 6000)`` fails when
     get_config_value returns a non-numeric string such as ``"unknown"``:
@@ -493,7 +493,7 @@ class TestFlowExpectedCyclesNullSafety:
 
     @staticmethod
     def _flow_expected_cycles(raw_config_value: str | int | None) -> int:
-        """Mirror the fixed flow pattern used in all four flow files."""
+        """Mirror the fixed fallback pattern used by the excess-export flow."""
         _v = convert_to_int(raw_config_value)
         return _v if _v is not None else 6000
 

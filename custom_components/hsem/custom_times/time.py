@@ -23,7 +23,7 @@ from custom_components.hsem.utils.misc import get_config_value
 
 
 class HSEMTimeEntity(HSEMEntity, TimeEntity):
-    """Time entity for an HSEM schedule slot (start or end time).
+    """Time entity for an HSEM EV charging deadline.
 
     Inherits from :class:`TimeEntity` so Home Assistant's platform dispatcher
     routes it correctly to the ``time`` domain.

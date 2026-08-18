@@ -1,4 +1,4 @@
-"""Cost function helpers — override detection and cycle cost resolution."""
+"""Cost-function helpers for cycle cost and terminal inventory valuation."""
 
 from __future__ import annotations
 
@@ -14,37 +14,6 @@ from custom_components.hsem.utils.misc import resolve_cycle_cost
 from custom_components.hsem.utils.units import usable_kwh_from_rated
 
 PRIMARY_ACTION_TIEBREAK_COST = 1e-5
-
-# ---------------------------------------------------------------------------
-# Override detection helpers
-# ---------------------------------------------------------------------------
-
-#: Recommendation values that represent schedule-forced modes rather than
-#: the optimiser's free choice.  Used to detect override slots.
-_OVERRIDE_RECOMMENDATIONS: frozenset[str] = frozenset(
-    {
-        "batteries_charge_grid",  # schedule-driven grid charge
-    }
-)
-
-
-def _is_override_slot(slot: PlannedSlot) -> bool:
-    """Return ``True`` if *slot* was set by a forced override.
-
-    Currently an override is defined as a slot whose recommendation is
-    ``"batteries_charge_grid"`` (a schedule-driven hard constraint).  Extend
-    this set as HSEM gains more override modes.
-
-    Args:
-        slot: The slot to inspect.
-
-    Returns:
-        ``True`` when the slot represents a forced override.
-    """
-    return bool(
-        slot.recommendation and slot.recommendation in _OVERRIDE_RECOMMENDATIONS
-    )
-
 
 # ---------------------------------------------------------------------------
 # Cycle cost helper

@@ -232,8 +232,6 @@ def make_bare_coordinator(
     coord._avg_house_consumption_entity_id_cache = {}
     coord._hourly_recommendations = []
     coord._hourly_recommendation = None
-    coord._batteries_schedules = []
-    coord._batteries_schedules_remaining_capacity_needed = 0.0
     coord._current_required_battery = 0.0
     coord._live = None
     coord._snapshot = None
@@ -328,13 +326,10 @@ def make_bare_coordinator(
     coord._financial_tracker_initialized = False
     coord._midnight_unsub = None
     coord._daily_plan_last_accumulated = None
-    coord._last_soc_pct = None
     coord._dynamic_floor = DynamicDischargeFloor()
     coord._effective_discharge_floor_pct = None
     coord._effective_discharge_floor_diag = None
     coord._capacity_learner = CapacityLearner()
-    coord._ocpp_server = None
-    coord._ocpp_sessions = []
     coord._ml_predictor = None
     coord._options_update_task = None
     coord._options_update_debounce_task = None
@@ -2144,7 +2139,6 @@ class TestApplyPlannerOutputEvLoad:
     ) -> Any:
         """Return a bare coordinator whose _hourly_recommendations are pre-generated."""
         coord = make_bare_coordinator()
-        coord._batteries_schedules = []
         coord._hourly_recommendations = generate_recommendation_intervals(
             interval_minutes, total_hours
         )
@@ -2368,7 +2362,6 @@ class TestApplyPlannerOutputEvLoad:
             )
 
         coord = make_bare_coordinator()
-        coord._batteries_schedules = []
         coord._hourly_recommendations = recs
 
         coord._apply_planner_output(PlannerOutput(slots=slots))
@@ -2447,7 +2440,6 @@ class TestApplyPlannerOutputEvLoad:
             )
 
         coord = make_bare_coordinator()
-        coord._batteries_schedules = []
         coord._hourly_recommendations = recs
 
         coord._apply_planner_output(PlannerOutput(slots=slots))
@@ -2513,7 +2505,6 @@ class TestApplyPlannerOutputEvLoad:
         ]
 
         coord = make_bare_coordinator()
-        coord._batteries_schedules = []
         coord._hourly_recommendations = [orphan_rec]
 
         # Capture WARNING from HSEM_LOGGER directly (propagation is False)
@@ -2581,7 +2572,6 @@ class TestApplyPlannerOutputEvLoad:
         ]
 
         coord = make_bare_coordinator()
-        coord._batteries_schedules = []
         coord._hourly_recommendations = [orphan]
 
         coord._apply_planner_output(PlannerOutput(slots=slots))
@@ -2812,7 +2802,6 @@ class TestEvFieldsEndToEnd:
 
         # Build coordinator with matching hourly_recommendations
         coord = make_bare_coordinator()
-        coord._batteries_schedules = []
         # Generate recs aligned to planner slot starts
         coord._hourly_recommendations = [
             HourlyRecommendation(

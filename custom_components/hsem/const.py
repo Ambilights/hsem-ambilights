@@ -43,15 +43,6 @@ DEFAULT_CONFIG_VALUES = {
     "hsem_batteries_expected_cycles": 6000,
     "hsem_batteries_cycle_cost": 0.0,
     "hsem_batteries_capacity_loss_pct": 30,
-    "hsem_batteries_enable_batteries_schedule_1_end": "09:00:00",
-    "hsem_batteries_enable_batteries_schedule_1_start": "07:00:00",
-    "hsem_batteries_enable_batteries_schedule_1": True,
-    "hsem_batteries_enable_batteries_schedule_2_end": "21:00:00",
-    "hsem_batteries_enable_batteries_schedule_2_start": "17:00:00",
-    "hsem_batteries_enable_batteries_schedule_2": True,
-    "hsem_batteries_enable_batteries_schedule_3_end": "02:00:00",
-    "hsem_batteries_enable_batteries_schedule_3_start": "23:00:00",
-    "hsem_batteries_enable_batteries_schedule_3": False,
     "hsem_ev_target_soc": 80,
     "hsem_ev_second_target_soc": 80,
     "hsem_ev_deadline_time": "07:00",
@@ -181,12 +172,6 @@ DEFAULT_CONFIG_VALUES = {
     "hsem_update_interval": 5,
     "hsem_verbose_logging": False,
     "hsem_dynamic_discharge_floor": False,
-    # Embedded OCPP 1.6 server for EV charger control (issue #603).
-    "hsem_ocpp_enabled": False,
-    "hsem_ocpp_port": 9000,
-    "hsem_ocpp_cpid": "",
-    "hsem_ocpp_start_window_s": 60,
-    "hsem_ocpp_stop_window_s": 180,
     # Daily plan-vs-actual tracking — optional energy meter entities.
     # When not configured, the sensor falls back to Riemann-sum estimates
     # from instantaneous power sensors.
@@ -245,21 +230,6 @@ RELIABILITY_SCALE_STRENGTH = 1.00  # 1.0 = full effect; lower to soften
 # Setting 0% export via the percentage-based service is not well handled by
 # the inverter; a 100 W floor is used instead.
 GRID_EXPORT_LIMIT_WATT = 100
-
-# ---------------------------------------------------------------------------
-# Planner power thresholds (kWh per slot)
-# ---------------------------------------------------------------------------
-
-# Minimum solar surplus (negative net consumption) required to classify a
-# slot as having usable solar generation when scheduling battery charge.
-# A slot must export at least this much excess before it is considered a
-# "solar surplus" charging opportunity.  Default matches v5.1.0 behaviour.
-SOLAR_SURPLUS_CHARGE_THRESHOLD_KWH = -0.2
-
-# Maximum net consumption for a slot to be treated as "near-zero" or solar-
-# charged during seasonal optimisation.  Slots at or below this level are
-# charged from solar rather than from the grid.  Default matches v5.1.0.
-NEAR_ZERO_CONSUMPTION_THRESHOLD_KWH = 0.1
 
 # EMA smoothing factor for live net consumption used in EV charger power
 # smoothing.  Alpha=0.3 means each new reading contributes 30 % to the

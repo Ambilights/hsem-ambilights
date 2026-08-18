@@ -17,14 +17,11 @@ the candidate set, and the mathematical models behind each strategy.
 
 ## Why multiple candidates?
 
-Battery scheduling is a sequential decision problem under uncertainty (prices,
-PV, and load are forecasts, not certainties). A single heuristic strategy may
-miss the global optimum under certain market conditions. By evaluating multiple
-independent strategies and picking the cheapest valid one, the planner:
-
-- Captures more of the available arbitrage value
-- Degrades gracefully when forecasts are wrong
-- Provides explainable alternative plans for debugging
+Battery scheduling is a sequential decision problem under uncertainty because
+prices, PV, and load are forecasts. HSEM uses one dynamic MILP for active
+optimisation, a passive executable fallback for solver failure, and a
+`no_action` diagnostic comparator. This structure captures full-horizon value,
+degrades safely, and keeps plan comparisons auditable.
 
 ---
 
@@ -41,23 +38,6 @@ alongside the MILP:
 | 2 | `passive` | Solar charging only where PV surplus exists; no grid charge or forced discharge |
 | 3 | `milp` | Globally-optimal LP solution (when scipy is available) |
 
-### Historical candidates (disabled)
-
-The following candidates were previously generated but are now commented out
-in MILP-only mode. They remain documented for reference and may be re-enabled
-as diagnostic tools:
-
-| Name | Strategy |
-|---|---|
-| `baseline` | Current HSEM scheduling output (discharge → charge → excess export → optimisation) |
-| `grid_charge` | Grid-charge slots kept; solar charging removed |
-| `solar_only` | Only solar-charge slots kept; grid charging cleared |
-| `discharge_only` | Discharge slots kept; all charge slots cleared |
-| `aggressive` | Cheapest N slots forced to grid-charge; most expensive M slots forced to discharge |
-| `soc_plan_25/50/75/100/125/full` | Partial-SoC candidates charging different fractions of discharge-window need |
-
----
-
 ## Assumptions behind each candidate
 
 ### `no_action` (diagnostic floor)
@@ -66,8 +46,8 @@ as diagnostic tools:
 (no external scheduling). PV surplus is exported; battery only moves according
 to its native operating logic.
 
-**Purpose:** Provides a baseline cost that all other candidates must beat.
-If no candidate beats `no_action`, the planner falls back to doing nothing.
+**Purpose:** Provides an auditable diagnostic comparator. It is never eligible
+to win; the passive candidate is the executable fallback.
 
 **Mathematical model:**
 - All recommendations cleared to `None`
@@ -103,14 +83,14 @@ variable layout, constraints, solver pipeline, and post-processing flow.
 ### EV co-optimisation
 
 When one or more active EVs are provided, the MILP co-optimises EV charging
-alongside the battery schedule. EV charging variables are added to the LP
-variable vector and the energy balance equation includes EV charger load.
+alongside primary- and optional secondary-battery flows. EV variables are part
+of the same LP vector and energy-balance constraints.
 
 ### Fallback
 
-If `scipy` is unavailable or the solver fails (infeasible / numerical issue),
-the MILP candidate is silently dropped and the remaining candidates
-(`no_action`, `passive`) compete as normal.
+If `scipy` is unavailable or the solver fails without a validated incumbent,
+the MILP candidate is dropped and `passive` is used. `no_action` remains
+available only for diagnostics.
 
 ---
 

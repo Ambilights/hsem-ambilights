@@ -48,8 +48,6 @@ def _make_bare_coordinator():
 
     coord = HSEMDataUpdateCoordinator.__new__(HSEMDataUpdateCoordinator)
     coord._config_entry = config_entry
-    coord._batteries_schedules = []
-    coord._batteries_schedules_remaining_capacity_needed = 0.0
     coord._plan_explanation = MagicMock()
     coord._data_quality = MagicMock()
     coord.logger = logging.getLogger("test")
@@ -790,9 +788,7 @@ class TestResolverDoesNotEraseEVFields:
         # EV is actively charging — resolver will relabel to ev_smart_charging
         live = self._make_live_state(ev=MagicMock(is_charging=True))
 
-        resolve_current_recommendation(
-            rec, live, batteries_schedules_remaining_capacity_needed=0.0
-        )
+        resolve_current_recommendation(rec, live)
 
         # Label changes but energy fields must be preserved
         assert rec.recommendation == "ev_smart_charging"
@@ -827,47 +823,11 @@ class TestResolverDoesNotEraseEVFields:
             ev=MagicMock(is_charging=False),
         )
 
-        resolve_current_recommendation(
-            rec, live, batteries_schedules_remaining_capacity_needed=0.0
-        )
+        resolve_current_recommendation(rec, live)
 
         assert rec.recommendation == "force_export"
         assert rec.ev_planned_load_kwh == pytest.approx(2.1, abs=1e-9)
         assert rec.estimated_net_consumption_kwh == pytest.approx(2.8, abs=1e-9)
-
-    def test_resolver_preserves_ev_load_on_discharge_override(self):
-        """BatteriesDischargeMode override must not clear ev_planned_load_kwh."""
-        from custom_components.hsem.custom_sensors.recommendation_resolver import (
-            resolve_current_recommendation,
-        )
-
-        midnight = datetime(2026, 5, 14, 0, 0, 0, tzinfo=_FIXED_LOCAL_TZ)
-        t_start = midnight + timedelta(hours=17)
-        t_end = t_start + timedelta(hours=1)
-
-        rec = _make_hourly_recommendation(
-            t_start,
-            t_end,
-            ev_planned_load_kwh=1.5,
-            estimated_net_consumption_kwh=2.0,
-            recommendation="batteries_wait_mode",
-        )
-
-        # Battery above schedule need → discharge override
-        live = self._make_live_state(
-            import_electricity_price="0.30",
-            ev=MagicMock(is_charging=False),
-            ev_second=MagicMock(is_charging=False),
-            battery_current_capacity_kwh=8.0,
-        )
-
-        resolve_current_recommendation(
-            rec, live, batteries_schedules_remaining_capacity_needed=5.0
-        )
-
-        assert rec.recommendation == "batteries_discharge_mode"
-        assert rec.ev_planned_load_kwh == pytest.approx(1.5, abs=1e-9)
-        assert rec.estimated_net_consumption_kwh == pytest.approx(2.0, abs=1e-9)
 
 
 # ===========================================================================

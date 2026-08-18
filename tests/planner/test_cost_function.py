@@ -122,7 +122,6 @@ class TestReturnTypeContract:
         assert bd.cycle_cost == pytest.approx(0.0)
         assert bd.soc_penalty == pytest.approx(0.0)
         assert bd.grid_limit_penalty == pytest.approx(0.0)
-        assert bd.override_penalty == pytest.approx(0.0)
 
     def test_total_equals_sum_of_components(self):
         """total must equal the arithmetic sum of all components."""
@@ -147,7 +146,6 @@ class TestReturnTypeContract:
             + bd.cycle_cost
             + bd.soc_penalty
             + bd.grid_limit_penalty
-            + bd.override_penalty
             + bd.primary_action_tiebreak
         )
         assert bd.total == pytest.approx(expected, abs=1e-9)
@@ -583,42 +581,7 @@ class TestGridLimitPenalty:
 
 
 # ===========================================================================
-# 8. Override penalty component
-# ===========================================================================
-
-
-class TestOverridePenalty:
-    """Verify forced-override slots accrue the override penalty."""
-
-    def test_no_override_recommendation_no_penalty(self):
-        """Normal recommendation (not override) → override_penalty = 0."""
-        slot = _make_slot(recommendation="batteries_discharge_mode")
-        bd = score_plan([slot], CostWeights(override_penalty_per_slot=0.05))
-        assert bd.override_penalty == pytest.approx(0.0)
-
-    def test_charge_grid_recommendation_is_override(self):
-        """'batteries_charge_grid' is a forced schedule → override_penalty applied."""
-        slot = _make_slot(recommendation="batteries_charge_grid")
-        bd = score_plan([slot], CostWeights(override_penalty_per_slot=0.10))
-        assert bd.override_penalty == pytest.approx(0.10)
-
-    def test_override_penalty_accumulates_per_slot(self):
-        """Three override slots → penalty × 3."""
-        slots = [
-            _make_slot(hour=h, recommendation="batteries_charge_grid") for h in range(3)
-        ]
-        bd = score_plan(slots, CostWeights(override_penalty_per_slot=0.05))
-        assert bd.override_penalty == pytest.approx(0.15, rel=1e-5)
-
-    def test_zero_override_weight_disables_term(self):
-        """override_penalty_per_slot=0 disables the term."""
-        slot = _make_slot(recommendation="batteries_charge_grid")
-        bd = score_plan([slot], CostWeights(override_penalty_per_slot=0.0))
-        assert bd.override_penalty == pytest.approx(0.0)
-
-
-# ===========================================================================
-# 9. NaN price safety
+# 8. NaN price safety
 # ===========================================================================
 
 
@@ -645,7 +608,7 @@ class TestNanSafety:
 
 
 # ===========================================================================
-# 10. compare_plans helper — known winner tests
+# 9. compare_plans helper — known winner tests
 # ===========================================================================
 
 
@@ -882,7 +845,7 @@ class TestComparePlansKnownWinner:
 
 
 # ===========================================================================
-# 11. Integration with run_planner
+# 10. Integration with run_planner
 # ===========================================================================
 
 
@@ -925,7 +888,6 @@ class TestRunPlannerIntegration:
         assert bd.cycle_cost >= 0.0
         assert bd.soc_penalty >= 0.0
         assert bd.grid_limit_penalty >= 0.0
-        assert bd.override_penalty >= 0.0
 
     def test_summer_plan_total_equals_sum_of_components(self):
         """plan_cost.score must be consistent with all its components (issue #413).
@@ -944,7 +906,6 @@ class TestRunPlannerIntegration:
             expected_total_cost
             + bd.soc_penalty
             + bd.grid_limit_penalty
-            + bd.override_penalty
             + bd.terminal_soc_value
             + bd.primary_action_tiebreak
         )

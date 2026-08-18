@@ -133,7 +133,6 @@ async def _apply_top_level(
             live=live,
             hourly_recommendation=rec,
             current_required_battery=0.0,
-            batteries_schedules_remaining_capacity_needed=0.0,
             apply_summary=None,
             state=None,
         ),
