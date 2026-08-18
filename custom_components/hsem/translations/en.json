@@ -55,7 +55,7 @@
           "hsem_secondary_storage_inverter_standby_power_w": "SBU Inverter Overhead (W)",
           "hsem_secondary_storage_cycle_cost_per_kwh": "Cycle Cost per kWh",
           "hsem_secondary_storage_base_load_includes_dedicated_load": "House History Includes Dedicated Load",
-          "hsem_secondary_storage_allow_primary_battery_transfer": "Allow Huawei-to-PowMr Energy Transfer"
+          "hsem_secondary_storage_allow_primary_battery_transfer": "Allow Cross-Battery Energy Transfer"
         },
         "data_description": {
           "hsem_secondary_storage_enabled": "Add a non-exporting second battery to the MILP. It may charge from utility and power only its dedicated AC load.",
@@ -78,7 +78,7 @@
           "hsem_secondary_storage_inverter_standby_power_w": "Additional DC draw while SBU powers the dedicated load.",
           "hsem_secondary_storage_cycle_cost_per_kwh": "Optional wear cost added for each kWh charged or discharged.",
           "hsem_secondary_storage_base_load_includes_dedicated_load": "Enable when the house-consumption history normally includes the PowMr/NAS utility load. Mixed Utility/SBU history remains an approximation.",
-          "hsem_secondary_storage_allow_primary_battery_transfer": "Advanced: permit Huawei discharge while PowMr charges. Disabled by default to prevent battery-to-battery conversion losses."
+          "hsem_secondary_storage_allow_primary_battery_transfer": "Advanced: permit Huawei discharge while PowMr charges and PowMr SBU while Huawei charges. Disabled by default to prevent battery-to-battery conversion losses."
         },
         "description": "Configure a topology-aware, non-exporting PowMr battery for coordinated optimisation. Hardware control is a separate opt-in and remains subject to HSEM read-only mode.",
         "title": "Secondary Storage (PowMr)"
@@ -541,7 +541,7 @@
           "hsem_secondary_storage_inverter_standby_power_w": "SBU Inverter Overhead (W)",
           "hsem_secondary_storage_cycle_cost_per_kwh": "Cycle Cost per kWh",
           "hsem_secondary_storage_base_load_includes_dedicated_load": "House History Includes Dedicated Load",
-          "hsem_secondary_storage_allow_primary_battery_transfer": "Allow Huawei-to-PowMr Energy Transfer"
+          "hsem_secondary_storage_allow_primary_battery_transfer": "Allow Cross-Battery Energy Transfer"
         },
         "data_description": {
           "hsem_secondary_storage_enabled": "Add a non-exporting second battery to the MILP. It may charge from utility and power only its dedicated AC load.",
@@ -564,7 +564,7 @@
           "hsem_secondary_storage_inverter_standby_power_w": "Additional DC draw while SBU powers the dedicated load.",
           "hsem_secondary_storage_cycle_cost_per_kwh": "Optional wear cost added for each kWh charged or discharged.",
           "hsem_secondary_storage_base_load_includes_dedicated_load": "Enable when the house-consumption history normally includes the PowMr/NAS utility load. Mixed Utility/SBU history remains an approximation.",
-          "hsem_secondary_storage_allow_primary_battery_transfer": "Advanced: permit Huawei discharge while PowMr charges. Disabled by default to prevent battery-to-battery conversion losses."
+          "hsem_secondary_storage_allow_primary_battery_transfer": "Advanced: permit Huawei discharge while PowMr charges and PowMr SBU while Huawei charges. Disabled by default to prevent battery-to-battery conversion losses."
         },
         "description": "Configure a topology-aware, non-exporting PowMr battery for coordinated optimisation. Hardware control is a separate opt-in and remains subject to HSEM read-only mode.",
         "title": "Secondary Storage (PowMr)"

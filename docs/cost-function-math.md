@@ -105,36 +105,48 @@ $$ P_{grid} = \sum_{t \in slots} \max(0, \frac{|gi[t] - ge[t]|}{\Delta t} - L_{g
 Where $\Delta t$ is slot duration in hours, $L_{grid}$ is the configured grid
 power limit in kW, and $w_{grid}$ is the penalty weight per excess kWh.
 
-### Terminal SoC value (opportunity cost)
+### Terminal inventory value (opportunity cost)
 
-$$ V_{terminal} = (E_{initial} - E_{final}) \cdot p_{replacement} $$
+$$ V_p = (E_{p,initial} - E_{p,final}) \cdot p_{p,replacement} $$
+
+$$ V_s = (E_{s,initial} - E_{s,final}) \cdot p_{s,replacement} $$
+
+$$ V_{terminal} = V_p + V_s $$
 
 Equivalently, because battery charge and discharge are measured on the battery
 side,
 
-$$ V_{terminal} = p_{replacement} \cdot
-   \left(\sum_t discharge[t] - \sum_t charge[t]\right) $$
+$$ V_p = p_{p,replacement} \cdot
+   \left(\sum_t discharge_p[t] - \sum_t charge_p[t]\right) $$
+
+$$ V_s = p_{s,replacement} \cdot
+   \left(\sum_t discharge_s[t] - \sum_t charge_s[t]\right) $$
 
 Where:
 
-- $E_{initial}$ = stored battery energy above the discharge floor at the start of the horizon (kWh)
-- $E_{final}$ = stored battery energy above the discharge floor at the end of the horizon (kWh)
-- $p_{replacement}$ = non-negative replacement price per kWh from the engine's
-  published and optional forecast horizon context; missing/non-finite resolves
-  to zero
+- $E_{p,initial}$ and $E_{p,final}$ = primary stored energy above the discharge
+  floor at the start and end of the horizon (kWh)
+- $E_{s,initial}$ and $E_{s,final}$ = secondary stored energy above its reserve
+  at the start and end of the horizon (kWh)
+- $p_{p,replacement}$ and $p_{s,replacement}$ = independent non-negative
+  replacement prices from the engine's published and optional forecast horizon
+  context; missing or non-finite values resolve to zero
 
 **Sign convention:**
 
 $$\begin{aligned}
-\Delta E &< 0 \mathrm{ (more energy at end)} \rightarrow V_{terminal} < 0 \mathrm{ (credit)} \\
-\Delta E &> 0 \mathrm{ (less energy at end)} \rightarrow V_{terminal} > 0 \mathrm{ (penalty)}
+\Delta E_i &< 0 \mathrm{ (more energy at end)} \rightarrow V_i < 0 \mathrm{ (credit)} \\
+\Delta E_i &> 0 \mathrm{ (less energy at end)} \rightarrow V_i > 0 \mathrm{ (penalty)}
 \end{aligned}$$
 
-The term is uniform and undiscounted. It depends only on the initial and final
-inventory, not on the path used to reach the final inventory. A discharge and
-an equal later recharge therefore cancel in $V_{terminal}$; their actual import
-and export prices, conversion efficiencies, cycle wear, power limits, and
-available headroom decide whether the cycle is worthwhile.
+where $i \in \{p,s\}$.
+
+Each component uses one uniform, undiscounted coefficient and depends only on
+that battery's initial and final inventory. Equal discharge and recharge of
+either battery therefore cancel exactly in $V_{terminal}$ regardless of slot
+positions. Actual import and export prices, conversion efficiencies, cycle
+wear, power limits, and available headroom decide whether a cycle is
+worthwhile.
 
 `replacement_price_from_next_discharge()` obtains the published value from the
 first contiguous future, price-actionable heuristic discharge block. It averages
@@ -147,11 +159,17 @@ When forecast valuation is enabled, the unpublished forecast tail is reduced by
 its MAE plus the configured margin and valued with the same top-N rule. The
 effective replacement price is:
 
-$$ p_{replacement} = \max(p_{published}, p_{forecast\_haircut}) $$
+$$ p_{p,replacement} = \max(p_{published}, p_{forecast\_haircut}) $$
 
 Forecast points never become slot prices or make a slot price-actionable. They
 can only raise the value of retained terminal inventory; they cannot create a
 discharge or export opportunity.
+
+`resolve_secondary_terminal_price()` applies the same published/forecast
+`max()` authority rule using the secondary battery's mean-of-window aggregation
+rather than the primary battery's top-N aggregation. The result is passed
+unchanged as $p_{s,replacement}$ and never becomes a per-slot charge or
+discharge premium.
 
 ### Primary-action structural tiebreak (selector only)
 
@@ -242,9 +260,9 @@ For every planner run:
 4. When all penalties and selector-only inventory/tiebreak terms are zero: $S = C_{total}$
 5. Selector picks minimum $S$, not minimum $C_{total}$
 6. $score_{winner} = score_{final\_output}$ (no post-selection mutation)
-7. Two identical plans, one ending with more stored energy → lower $V_{terminal}$ → lower $S$
-8. Equal battery discharge and recharge contribute zero net terminal value,
-   regardless of which slots contain those actions
+7. Two identical plans, one ending with more stored energy in either battery → lower $V_{terminal}$ → lower $S$
+8. Equal primary or secondary battery discharge and recharge contribute zero
+   net terminal value, regardless of which slots contain those actions
 9. $battery\_export_{AC}[t] + pv\_export[t] = grid\_export[t]$ within solver
    tolerance before publication and exactly at 0.001 kWh published precision
 10. $T_{action}$ exactly matches

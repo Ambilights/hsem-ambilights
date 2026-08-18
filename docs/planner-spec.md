@@ -425,9 +425,13 @@ $$
 d_t = z^s_t \left(\frac{L_t}{\eta_d} + \frac{P_o h_t}{1000}\right)
 $$
 
-This equality is the no-export invariant: secondary discharge can serve exactly
-the dedicated load plus its DC-side overhead and no more. It can never enter the
-Huawei/grid export path.
+This equality is the dedicated-load-node invariant: secondary discharge serves
+exactly the dedicated load plus its DC-side overhead and never directly
+backfeeds. SBU still changes the aggregate site balance: if PV already serves
+part of that dedicated load, moving it to battery may both avoid residual grid
+import and reveal PV for export. That export remains non-battery/PV-origin; the
+secondary discharge pays its full terminal-inventory, conversion-loss, and wear
+terms.
 
 Let $E_0$ be energy above the reserve and $E_{usable}$ the energy between the
 minimum and maximum SoC. The secondary state equation is hard-constrained:
@@ -460,10 +464,21 @@ explicit load sensor remains the source of truth for battery draw.
 Secondary charge participates in the same site grid balance and main-fuse limit
 as Huawei and EV charging. With phase-aware charging enabled, its entire site
 delta is assigned to the configured physical phase instead of being treated as a
-balanced three-phase load. By default, Huawei discharge is forbidden while
-PowMr grid charging is active, preventing an inefficient Huawei DC→AC→PowMr DC
-transfer. The advanced transfer option must be explicitly enabled to relax this
-guard.
+balanced three-phase load. By default, cross-battery transfer is forbidden in
+both directions. With $M^c_t$ and $M^d_t$ denoting the primary charge and
+discharge bounds, respectively:
+
+$$
+ec_t + M^c_t z^s_t \le M^c_t
+$$
+
+$$
+ed_t + M^d_t z^c_t \le M^d_t
+$$
+
+The first row prevents PowMr SBU from funding Huawei charging; the second
+prevents Huawei discharge from funding PowMr charging. The advanced transfer
+option must be explicitly enabled to relax both guards.
 
 The live primary house/PV frame remains the established full-slot projection,
 including energy already elapsed in the current slot. When that forecast
@@ -476,11 +491,13 @@ equivalent, and assigns that equivalent only to the configured phase. Thus a
 while the secondary battery receives only the remaining-duration energy.
 
 Huawei recommendation labels are reconciled after the PowMr site-bus adjustment
-without changing either battery's solved energy. If SBU removes the remaining
-site import from a primary charge slot, that charge is labelled solar and runs
-in Maximize Self Consumption rather than forced grid-charge mode. If SBU makes a
-positive primary-discharge slot export, it is labelled forced battery discharge
-only when the final export price clears both the economic and user-configured
+without changing either battery's solved energy. With cross-battery transfer
+enabled, SBU may remove the remaining site import from a primary charge slot;
+that charge is then labelled solar and runs in Maximize Self Consumption rather
+than forced grid-charge mode. With transfer disabled, the hard mutual-exclusion
+row makes that combination impossible. If SBU makes a positive
+primary-discharge slot export, it is labelled forced battery discharge only
+when the final export price clears both the economic and user-configured
 battery-export floors; otherwise it remains self-consumption discharge. EV,
 session, and explicit battery-hold intents are not rewritten by this pass.
 
@@ -489,7 +506,10 @@ publication contract. Final grid import or export of exactly 0.001 kWh or less
 is numerical/publication residue: it keeps solar charge or normal
 self-consumption respectively. Only a flow greater than 0.001 kWh enables
 forced grid-charge or forced battery-export hardware modes. This boundary is
-identical for the primary MILP write-out and the post-SBU adjustment.
+identical for the primary MILP write-out and the post-SBU adjustment. The
+secondary writer rejects material SBU and primary charge in the same slot when
+cross-battery transfer is disabled; it never repairs the solved energy by
+post-hoc mutation.
 
 For no-export slots and slots below either export-price floor, the primary
 discharge cap is coupled to the SBU binary before solving. When the house
@@ -500,6 +520,22 @@ export when PowMr changes from utility to SBU.
 
 The MILP and authoritative candidate scorer both include secondary conversion
 loss, cycle wear, time discount, and a horizon-tail value for stored energy.
+The secondary terminal term is uniform and undiscounted across every actionable
+slot:
+
+```text
+secondary_terminal_soc_value
+    = R_secondary * sum(
+          secondary_storage_discharged_kwh
+          - secondary_storage_charged_kwh
+      )
+    = R_secondary * (initial_secondary_kwh - final_secondary_kwh)
+```
+
+Equal secondary discharge and refill therefore cancel exactly regardless of
+their slot positions or prices. There is no per-slot secondary charge premium
+or discharge premium. Actual grid import/export, conversion loss, cycle wear,
+headroom, and power constraints decide whether the cycle is worthwhile.
 Non-MILP candidates receive a physically valid utility-bypass plan so candidate
 comparison never leaves the dedicated load unaccounted.
 
@@ -569,18 +605,23 @@ installation, which has no PowMr PV input, it stops PowMr charging completely.
   nominal duration
 - SBU discharge equals dedicated load divided by discharge efficiency plus
   inverter overhead
-- secondary discharge is tied to the dedicated load and never directly backfeeds;
-  it may only free Huawei PV that is independently eligible for export
+- secondary discharge is tied to the dedicated load and never directly
+  backfeeds; it may free Huawei PV that is independently eligible for export
+- SBU may both avoid genuine residual grid import and reveal PV export through
+  the aggregate site balance
 - charge current is always a supported 10 A increment
 - PowMr charge and utility/SBU load transitions affect only its configured phase
 - a current-slot PowMr command is checked against its full power on that phase,
   not diluted by the fraction of the slot remaining
 - Huawei discharge is zero during PowMr charging unless transfer is enabled
+- Huawei charge is zero during PowMr SBU unless transfer is enabled
+- enabling cross-battery transfer relaxes both battery-to-battery guards but
+  does not change export-source attribution or inventory valuation
 - post-SBU Huawei charge/discharge labels match the final executable site flow
   and respect the configured battery-export price floor
 - no-export and below-floor slots couple Huawei discharge to SBU load removal,
   so Huawei cannot create grid export without post-hoc energy mutation;
-  independent PV export remains valid
+  independently eligible PV export remains valid
 - disabled secondary storage is numerically identical to the upstream planner
 - missing required PowMr telemetry produces no secondary plan and blocks control
 - global read-only and the feature control switch each independently block writes
@@ -596,6 +637,8 @@ installation, which has no PowMr PV input, it stops PowMr charging completely.
 - disabled or invalid secondary storage emits no ``secondary_result`` line
 - logged secondary conversion, cycle, and terminal terms equal the authoritative
   candidate scorer's terms for the same solved slots
+- equal secondary charge and discharge contribute exactly zero net
+  ``secondary_terminal_soc_value`` regardless of slot prices or positions
 - building or logging the summary leaves the solved slot list unchanged
 
 ## Battery efficiency
@@ -1259,8 +1302,17 @@ how that plays out per slot, from cheapest to most expensive action.
       + p_soc·(s_max_pen[t] + s_min_pen[t]) ]
 + R·Σ_t(ed[t] − ec[t])
 + ε·Σ_t(ec[t] + ed[t]) − 1.5ε·Σ_t(ed[t] − bx[t])
++ Σ_t δ_t·[(1−η_secondary_charge)·p_imp[t]·c_secondary[t]
+           + (1−η_secondary_discharge)·p_imp[t]·d_secondary[t]
+           + α_secondary·m_secondary[t]]
++ R_secondary·Σ_t(d_secondary[t] − c_secondary[t])
 + Σ_ev [ ev_penalty·ev_pen + tiebreaker·Σ_t ev_c[t] ]
 ```
+
+The aggregate grid terms already contain the secondary branch's actual import
+cost or avoided import. Secondary conversion loss and wear are discounted with
+the other within-horizon money terms. Its terminal inventory coefficient is
+uniform and undiscounted, matching the authoritative scorer.
 
 #### 1. Serve house load from PV (free)
 
@@ -1417,7 +1469,9 @@ replacement_price = max(published_only, forecast_derived)
 `resolve_secondary_terminal_price()` applies the identical `max()` rule for the
 secondary storage, using its own mean-of-window aggregation rather than
 `top_n`, because a dedicated load spends stored energy across the window
-instead of concentrating it on the dearest hour.
+instead of concentrating it on the dearest hour. The resolved scalar is passed
+unchanged as $R_{secondary}$ to the uniform final-inventory term; it never
+becomes a per-slot secondary charge or discharge premium.
 
 Two authority invariants hold, and both are covered by tests:
 
@@ -1684,11 +1738,12 @@ Where:
 - `soc_guard_penalty` and `grid_limit_penalty` are **selector-only**
   synthetic terms. They must **never** appear in `total_cost`, because they
   do not represent real money paid or earned.
-- `terminal_soc_value` is **selector-only**.  It is negative (credit) when
-  the plan ends with more stored energy than it started with, and positive
-  (penalty) when the plan empties the battery.  It prevents the selector
-  from preferring plans that look cheap only because they drained the
-  battery to zero before end-of-horizon.
+- `terminal_soc_value` is **selector-only** and is the sum of independent
+  primary and secondary final-inventory terms. It is negative (credit) when
+  the plan ends with more valued stored energy than it started with, and
+  positive (penalty) when it ends with less. It prevents the selector from
+  preferring plans that look cheap only because they drained either battery
+  before end-of-horizon.
 - `primary_action_tiebreak` is **selector-only** and may have either sign. It
   is the same ε-weighted primary charge/discharge/export expression used by
   the MILP; it resolves structural ties without being real money.
@@ -1864,24 +1919,34 @@ score_plan(slots_with_past).soc_penalty
 
 ### Terminal inventory value and primary-action structural tiebreak
 
-Plans must not look better merely because they empty the battery before the
+Plans must not look better merely because they empty either battery before the
 horizon ends. The scorer therefore uses the same uniform, undiscounted
-final-inventory term as the MILP:
+final-inventory terms as the MILP:
 
 ```text
-terminal_soc_value =
+primary_terminal_soc_value =
     replacement_price_per_kwh
     * (sum(batteries_discharged_kwh) - sum(batteries_charged_kwh))
+
+secondary_terminal_soc_value =
+    secondary_storage_replacement_price_per_kwh
+    * (
+        sum(secondary_storage_discharged_kwh)
+        - sum(secondary_storage_charged_kwh)
+      )
+
+terminal_soc_value =
+    primary_terminal_soc_value + secondary_terminal_soc_value
 ```
 
-Equivalently, it is
-`replacement_price_per_kwh * (initial_battery_kwh - final_battery_kwh)`.
-It contributes to `score`, never `total_cost`. Charging makes the term
-negative, discharging makes it positive, and equal charge/discharge cancels
-exactly regardless of path. The replacement-price source and
-published/forecast authority rules are defined in the MILP objective section
-above; it is not the minimum import price across the whole horizon and it does
-not model future refill.
+Each component is equivalently its replacement price multiplied by
+`initial_battery_kwh - final_battery_kwh` for that battery. The aggregate
+contributes to `score`, never `total_cost`. Charging makes a component
+negative, discharging makes it positive, and equal charge/discharge for either
+battery cancels exactly regardless of path. The replacement-price sources and
+published/forecast authority rules are defined in the MILP objective section;
+neither coefficient is the minimum import price across the whole horizon or a
+model of future refill.
 
 The scorer also mirrors the MILP's primary-action structural tiebreak:
 
@@ -1916,11 +1981,13 @@ conversion loss, destination-aware pricing applies (issue #641):
 `local_discharge_dc` uses `imp_price_obj` — see Battery efficiency /
 Conversion loss pricing above. The LP and scorer use the same explicit split.
 
-Terminal-SoC accounting is **only active** when both `initial_battery_kwh`
-and `replacement_price_per_kwh` are supplied to `score_plan`.  Unit tests
-that call `score_plan` without horizon context (e.g. simple per-slot
-arithmetic checks) do not need the term and may omit both inputs; in that
-case `terminal_soc_value` is `0.0`. The flow-based
+Primary terminal accounting is active only when both `initial_battery_kwh`
+and `replacement_price_per_kwh` are supplied to `score_plan`. Secondary
+terminal accounting is independently active when secondary scoring is enabled
+and `secondary_storage_replacement_price_per_kwh` is supplied in `CostWeights`.
+Unit tests without either horizon context may omit those inputs, in which case
+the corresponding component, and therefore possibly `terminal_soc_value`, is
+`0.0`. The flow-based
 `primary_action_tiebreak` remains independently defined.
 
 ### Invariants for tests
@@ -1940,8 +2007,10 @@ case `terminal_soc_value` is `0.0`. The flow-based
 - Given two otherwise-identical plans, the one that ends with more stored
   battery energy must have the lower `terminal_soc_value` and therefore the
   lower `score` (all else equal).
-- Equal battery-side discharge and recharge must contribute exactly zero net
-  `terminal_soc_value`, regardless of their slot positions.
+- Equal primary battery-side discharge and recharge must contribute exactly
+  zero net `terminal_soc_value`, regardless of their slot positions.
+- Equal secondary battery-side discharge and recharge must contribute exactly
+  zero net `terminal_soc_value`, regardless of their slot positions.
 - `primary_action_tiebreak` must equal
   `εΣ(ec+ed)-1.5εΣ(ed-bx)` using the same reconciled source split as the
   scorer and published diagnostics.

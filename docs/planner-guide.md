@@ -305,6 +305,10 @@ source branch. `pv_export[t]` is capped by available forecast PV plus only PV
 revealed when PowMr SBU removes a dedicated load already present in the site
 measurement. Active flexible EV demand is excluded from battery-eligible local
 sinks, so PV serves it before residual PV can be classified as export.
+An SBU slot may therefore both avoid residual import and reveal PV export. The
+PowMr discharge still pays its full terminal-inventory value, conversion loss,
+and wear, so Utility wins when the incremental meter value does not cover those
+costs.
 
 The corresponding slot diagnostics are
 `primary_battery_export_kwh = discharge_efficiency × bx[t]` and
@@ -939,25 +943,34 @@ if slot_power_kw > grid_limit_kw:
     grid_limit_penalty += excess_kwh × grid_limit_penalty_per_kwh
 ```
 
-### Terminal SoC accounting
+### Terminal inventory accounting
 
-Plans that empty the battery before the horizon ends look artificially cheap
-because they avoid future discharge costs. The cost function accounts for this
-by pricing the battery's remaining energy at the end of the horizon.
+Plans that empty either battery before the horizon ends look artificially cheap.
+The cost function accounts for this by pricing both batteries' remaining energy
+at the end of the horizon.
 
 The terminal term is uniform and undiscounted:
 
 ```text
-terminal_soc_value =
+primary_terminal_soc_value =
     replacement_price_per_kwh
     × (Σ batteries_discharged_kwh − Σ batteries_charged_kwh)
-  = replacement_price_per_kwh
-    × (initial_battery_kwh − final_battery_kwh)
+
+secondary_terminal_soc_value =
+    secondary_storage_replacement_price_per_kwh
+    × (
+        Σ secondary_storage_discharged_kwh
+        − Σ secondary_storage_charged_kwh
+      )
+
+terminal_soc_value =
+    primary_terminal_soc_value + secondary_terminal_soc_value
 ```
 
-It depends only on final inventory, not on the route taken. Equal discharge and
-later recharge cancel exactly, so their real slot prices, efficiencies, wear,
-headroom, and power limits decide whether the cycle is economic.
+Each component depends only on final inventory, not on the route taken. Equal
+discharge and recharge of either battery cancel exactly, so real slot prices,
+efficiencies, wear, headroom, and power limits decide whether a cycle is
+economic.
 
 `replacement_price_from_next_discharge()` uses the first contiguous
 published, price-actionable heuristic discharge block and averages its
@@ -970,6 +983,11 @@ plus the configured margin and the effective value is the higher of published
 and forecast-derived values. Forecast points never become slot prices, extend
 price actionability, or create an export opportunity; they can only raise the
 value of retained terminal inventory.
+
+`resolve_secondary_terminal_price()` uses the same published/forecast authority
+rule with a mean-of-window aggregation suited to the dedicated load. Its result
+is one uniform, undiscounted coefficient, never a per-slot secondary charge or
+discharge premium.
 
 **Primary-action structural tiebreak (issues #638/#655).** A tiny weighted
 selector-only term resolves true economic ties without subsidising

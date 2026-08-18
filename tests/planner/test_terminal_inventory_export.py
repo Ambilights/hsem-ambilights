@@ -418,9 +418,9 @@ def test_powmr_sbu_is_removed_from_primary_local_load_before_attribution() -> No
     """Attribute exactly 1.600 AC kWh to Huawei export during PowMr SBU.
 
     In one 60-minute slot the house sensor contains 0.500 kWh, including the
-    PowMr's dedicated 0.100 kWh load.  SBU supplies that 0.100 itself, leaving
-    0.400 kWh eligible for Huawei self-consumption.  A 2.000 DC/AC kWh Huawei
-    discharge therefore exports 2.000 - 0.400 = 1.600 kWh.  PowMr is never an
+    PowMr's dedicated 0.100 kWh load. SBU supplies that 0.100 itself, leaving
+    0.400 kWh eligible for Huawei self-consumption. A 2.000 DC/AC kWh Huawei
+    discharge therefore exports 2.000 - 0.400 = 1.600 kWh. PowMr is never an
     export source and PV export is exactly zero.
     """
     secondary = SecondaryStorageConfig(

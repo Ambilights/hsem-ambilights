@@ -171,7 +171,7 @@ separately disabled by default.
 | SBU overhead | `hsem_secondary_storage_inverter_standby_power_w` | 55 W | Additional DC draw while battery supplies the load |
 | Cycle cost | `hsem_secondary_storage_cycle_cost_per_kwh` | 0 | Optional wear cost per throughput kWh |
 | History includes load | `hsem_secondary_storage_base_load_includes_dedicated_load` | `True` | House history normally contains the NAS utility load |
-| Allow battery transfer | `hsem_secondary_storage_allow_primary_battery_transfer` | `False` | Allow Huawei discharge while PowMr charges |
+| Allow battery transfer | `hsem_secondary_storage_allow_primary_battery_transfer` | `False` | Allow cross-battery transfer in either direction: Huawei discharge while PowMr charges, or PowMr SBU while Huawei charges |
 
 Safe commissioning order:
 
