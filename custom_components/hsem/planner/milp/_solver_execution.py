@@ -235,7 +235,6 @@ def _build_solve_and_finalize(
             slots=slots,
             future_idx=future_idx,
             p_imp_obj=p_imp_obj,
-            p_exp=p_exp,
             time_discount_rate=time_discount_rate,
             now=now,
         )
@@ -339,8 +338,10 @@ def _build_solve_and_finalize(
             slots=slots,
             future_idx=future_idx,
             primary_discharge_off=ed_off,
+            primary_charge_off=ec_off,
             primary_max_discharge_kwh=max_dis,
             primary_discharge_efficiency_fraction=discharge_eff,
+            primary_max_charge_kwh=max_charge_per_slot,
             primary_site_discharge_limited=primary_site_discharge_limited,
             primary_site_discharge_cap_kwh=primary_site_discharge_cap_kwh,
             price_actionable=price_actionable,

@@ -20,6 +20,7 @@ from custom_components.hsem.planner.milp._secondary_diagnostics import (
     SecondaryResultSummary,
 )
 from custom_components.hsem.planner.milp._secondary_storage import (
+    _add_secondary_objective,
     _allocate_secondary_variables,
     _write_secondary_results,
 )
@@ -103,6 +104,7 @@ def _solve(
     secondary: SecondaryStorageConfig,
     *,
     primary_current_kwh: float = 0.0,
+    primary_replacement_price_per_kwh: float | None = None,
     no_export: bool = True,
     min_export_price: float = 0.0,
     battery_export_min_price: float = 0.0,
@@ -119,6 +121,7 @@ def _solve(
         charge_efficiency_pct=97.0,
         discharge_efficiency_pct=97.0,
         time_discount_rate=1.0,
+        replacement_price_per_kwh=primary_replacement_price_per_kwh,
         no_export=no_export,
         min_export_price=min_export_price,
         battery_export_min_price=battery_export_min_price,
@@ -224,16 +227,47 @@ def test_secondary_sbu_removes_included_load_from_site_import() -> None:
     assert result[0].grid_export_kwh == pytest.approx(0.0)
 
 
+def test_secondary_sbu_avoids_residual_import_with_partial_pv() -> None:
+    """SBU may eliminate residual import and expose the remaining PV."""
+    slot = _slots([10.0], house_load_kwh=0.100)[0]
+    slot.solcast_pv_estimate_kwh = 0.050
+
+    planned, _diagnostics = _solve(
+        [slot],
+        _powmr(
+            current_soc_pct=80.0,
+            base_load_includes_dedicated_load=True,
+            replacement_price_per_kwh=0.0,
+            inverter_standby_power_w=0.0,
+            discharge_efficiency_pct=100.0,
+        ),
+        primary_current_kwh=0.0,
+        no_export=True,
+    )
+
+    solved = planned[0]
+    assert solved.secondary_storage_mode == SECONDARY_MODE_SBU
+    assert solved.secondary_storage_discharged_kwh == pytest.approx(0.100)
+    assert solved.secondary_storage_grid_import_kwh == pytest.approx(0.0)
+    assert solved.batteries_charged_kwh == pytest.approx(0.0)
+    assert solved.batteries_discharged_kwh == pytest.approx(0.0)
+    assert solved.grid_import_kwh == pytest.approx(0.0)
+    assert solved.grid_export_kwh == pytest.approx(0.050)
+    assert solved.pv_export_kwh == pytest.approx(0.050)
+
+
 def _apply_sbu_to_primary_slot(
     slot: PlannedSlot,
     *,
     battery_export_min_price: float,
+    allow_primary_battery_transfer: bool = False,
     primary_site_discharge_limited: bool = False,
 ) -> dict[str, float | int] | None:
     """Apply one deterministic SBU write-out to an existing primary slot."""
     config = _powmr(
         current_soc_pct=80.0,
         base_load_includes_dedicated_load=True,
+        allow_primary_battery_transfer=allow_primary_battery_transfer,
     )
     slot.secondary_storage_load_kwh = 0.100
     layout, n_vars = _allocate_secondary_variables(0, 1)
@@ -256,7 +290,19 @@ def _apply_sbu_to_primary_slot(
     )
 
 
-def test_sbu_relabels_zero_import_primary_charge_as_solar() -> None:
+def test_sbu_rejects_primary_charge_when_transfer_disabled() -> None:
+    """A direct write-out must fail closed on PowMr-to-Huawei transfer."""
+    slot = _slots([1.0], house_load_kwh=0.100)[0]
+    slot.recommendation = Recommendations.BatteriesChargeGrid.value
+    slot.batteries_charged_kwh = 0.400
+    slot.grid_import_kwh = 0.100
+
+    result = _apply_sbu_to_primary_slot(slot, battery_export_min_price=0.50)
+
+    assert result is None
+
+
+def test_sbu_relabels_primary_charge_as_solar_when_transfer_enabled() -> None:
     """SBU load removal must not leave a zero-import forced-grid label."""
     slot = _slots([1.0], house_load_kwh=0.100)[0]
     slot.recommendation = Recommendations.BatteriesChargeGrid.value
@@ -264,8 +310,13 @@ def test_sbu_relabels_zero_import_primary_charge_as_solar() -> None:
     slot.grid_import_kwh = 0.100
     original_charge = slot.batteries_charged_kwh
 
-    _apply_sbu_to_primary_slot(slot, battery_export_min_price=0.50)
+    result = _apply_sbu_to_primary_slot(
+        slot,
+        battery_export_min_price=0.50,
+        allow_primary_battery_transfer=True,
+    )
 
+    assert result is not None
     assert slot.grid_import_kwh == pytest.approx(0.0)
     assert slot.grid_export_kwh == pytest.approx(0.0)
     assert slot.recommendation == Recommendations.BatteriesChargeSolar.value
@@ -279,8 +330,13 @@ def test_sbu_one_wh_import_residue_relabels_primary_charge_as_solar() -> None:
     slot.batteries_charged_kwh = 0.400
     slot.grid_import_kwh = 0.101
 
-    _apply_sbu_to_primary_slot(slot, battery_export_min_price=0.50)
+    result = _apply_sbu_to_primary_slot(
+        slot,
+        battery_export_min_price=0.50,
+        allow_primary_battery_transfer=True,
+    )
 
+    assert result is not None
     assert slot.grid_import_kwh == pytest.approx(0.001)
     assert slot.recommendation == Recommendations.BatteriesChargeSolar.value
 
@@ -292,14 +348,19 @@ def test_sbu_two_wh_import_keeps_primary_grid_charge() -> None:
     slot.batteries_charged_kwh = 0.400
     slot.grid_import_kwh = 0.102
 
-    _apply_sbu_to_primary_slot(slot, battery_export_min_price=0.50)
+    result = _apply_sbu_to_primary_slot(
+        slot,
+        battery_export_min_price=0.50,
+        allow_primary_battery_transfer=True,
+    )
 
+    assert result is not None
     assert slot.grid_import_kwh == pytest.approx(0.002)
     assert slot.recommendation == Recommendations.BatteriesChargeGrid.value
 
 
 def test_sbu_relabels_primary_discharge_export_as_force() -> None:
-    """Allowed SBU-created export must use an executable Huawei mode."""
+    """SBU-created material export must use an executable Huawei mode."""
     slot = _slots([1.0], house_load_kwh=0.100)[0]
     slot.price = SlotPrice(import_price=1.0, export_price=1.00)
     slot.recommendation = Recommendations.BatteriesDischargeMode.value
@@ -442,11 +503,38 @@ def test_site_limited_pv_export_with_utility_mode_is_not_rejected() -> None:
     assert solved.grid_export_kwh == pytest.approx(0.200)
 
 
-def test_profitable_sbu_can_reveal_pv_export_without_primary_discharge() -> None:
-    """SBU may remove only the demand present and reveal surplus PV."""
+def test_secondary_inventory_value_blocks_uneconomic_pv_export() -> None:
+    """PowMr stays in Utility when exposed PV is worth less than inventory."""
     slot = _slots([10.0], house_load_kwh=0.100)[0]
-    slot.solcast_pv_estimate_kwh = 0.050
+    slot.solcast_pv_estimate_kwh = 0.300
     slot.price = SlotPrice(import_price=10.0, export_price=0.40)
+
+    planned, _diagnostics = _solve(
+        [slot],
+        _powmr(
+            current_soc_pct=80.0,
+            base_load_includes_dedicated_load=True,
+            replacement_price_per_kwh=0.50,
+            inverter_standby_power_w=0.0,
+            discharge_efficiency_pct=100.0,
+        ),
+        primary_current_kwh=9.0,
+        primary_max_discharge_per_slot=0.0,
+        no_export=True,
+    )
+
+    solved = planned[0]
+    assert solved.secondary_storage_mode == SECONDARY_MODE_UTILITY
+    assert solved.batteries_discharged_kwh == pytest.approx(0.0)
+    assert solved.secondary_storage_discharged_kwh == pytest.approx(0.0)
+    assert solved.grid_import_kwh == pytest.approx(0.0)
+    assert solved.grid_export_kwh == pytest.approx(0.200)
+
+
+def test_secondary_sbu_cannot_fund_primary_charge_when_transfer_disabled() -> None:
+    """PowMr may not move stored energy into Huawei through the shared bus."""
+    slot = _slots([20.0], house_load_kwh=0.100)[0]
+    slot.solcast_pv_estimate_kwh = 0.100
 
     planned, _diagnostics = _solve(
         [slot],
@@ -456,16 +544,45 @@ def test_profitable_sbu_can_reveal_pv_export_without_primary_discharge() -> None
             replacement_price_per_kwh=0.0,
             inverter_standby_power_w=0.0,
             discharge_efficiency_pct=100.0,
+            allow_primary_battery_transfer=False,
         ),
         primary_current_kwh=0.0,
-        no_export=True,
+        primary_replacement_price_per_kwh=10.0,
+    )
+
+    solved = planned[0]
+    assert solved.secondary_storage_mode == SECONDARY_MODE_UTILITY
+    assert solved.secondary_storage_discharged_kwh == pytest.approx(0.0)
+    assert solved.batteries_charged_kwh == pytest.approx(0.0)
+    assert solved.grid_import_kwh == pytest.approx(0.0)
+    assert solved.grid_export_kwh == pytest.approx(0.0)
+
+
+def test_secondary_sbu_can_fund_primary_charge_when_transfer_enabled() -> None:
+    """The advanced transfer opt-in permits the inverse battery transfer."""
+    slot = _slots([20.0], house_load_kwh=0.100)[0]
+    slot.solcast_pv_estimate_kwh = 0.100
+
+    planned, _diagnostics = _solve(
+        [slot],
+        _powmr(
+            current_soc_pct=80.0,
+            base_load_includes_dedicated_load=True,
+            replacement_price_per_kwh=0.0,
+            inverter_standby_power_w=0.0,
+            discharge_efficiency_pct=100.0,
+            allow_primary_battery_transfer=True,
+        ),
+        primary_current_kwh=0.0,
+        primary_replacement_price_per_kwh=10.0,
     )
 
     solved = planned[0]
     assert solved.secondary_storage_mode == SECONDARY_MODE_SBU
-    assert solved.batteries_discharged_kwh == pytest.approx(0.0)
+    assert solved.secondary_storage_discharged_kwh == pytest.approx(0.100)
+    assert solved.batteries_charged_kwh == pytest.approx(0.097)
     assert solved.grid_import_kwh == pytest.approx(0.0)
-    assert solved.grid_export_kwh == pytest.approx(0.050)
+    assert solved.grid_export_kwh == pytest.approx(0.0)
 
 
 def test_mixed_history_cannot_model_powmr_backfeed() -> None:
@@ -475,6 +592,9 @@ def test_mixed_history_cannot_model_powmr_backfeed() -> None:
         _powmr(
             current_soc_pct=80.0,
             base_load_includes_dedicated_load=True,
+            replacement_price_per_kwh=0.0,
+            inverter_standby_power_w=0.0,
+            discharge_efficiency_pct=100.0,
         ),
     )
 
@@ -506,6 +626,7 @@ def test_secondary_solves_full_192_slot_horizon() -> None:
     result, diagnostics = _solve(
         _quarter_hour_slots(prices),
         _powmr(base_load_includes_dedicated_load=True),
+        primary_max_discharge_per_slot=0.0,
     )
 
     assert len(result) == 192
@@ -659,6 +780,59 @@ def test_secondary_result_log_absent_when_secondary_disabled(
     assert result_lines == []
 
 
+def test_secondary_terminal_value_is_uniform_final_inventory_accounting() -> None:
+    """Equal PowMr charge/discharge cancels regardless of slot prices."""
+    charge_slot, discharge_slot = _slots([0.05, 5.00])
+    charge_slot.secondary_storage_charged_kwh = 0.500
+    charge_slot.secondary_storage_mode = SECONDARY_MODE_CHARGE
+    discharge_slot.secondary_storage_discharged_kwh = 0.500
+    discharge_slot.secondary_storage_mode = SECONDARY_MODE_SBU
+
+    breakdown = score_plan(
+        [charge_slot, discharge_slot],
+        CostWeights(
+            secondary_storage_enabled=True,
+            secondary_storage_charge_efficiency_pct=100.0,
+            secondary_storage_discharge_efficiency_pct=100.0,
+            secondary_storage_cycle_cost_per_kwh=0.0,
+            secondary_storage_replacement_price_per_kwh=2.0,
+        ),
+        now=_NOW,
+    )
+
+    assert breakdown.secondary_terminal_soc_value == pytest.approx(0.0)
+
+
+def test_secondary_milp_terminal_coefficients_are_uniform_and_undiscounted() -> None:
+    """MILP uses the same replacement value for every charge/discharge slot."""
+    slots = _slots([0.05, 5.00])
+    layout, n_vars = _allocate_secondary_variables(0, len(slots))
+    objective = np.zeros(n_vars)
+
+    _add_secondary_objective(
+        objective,
+        layout=layout,
+        config=_powmr(
+            charge_efficiency_pct=100.0,
+            discharge_efficiency_pct=100.0,
+            cycle_cost_per_kwh=0.0,
+            replacement_price_per_kwh=2.0,
+        ),
+        slots=slots,
+        future_idx=[0, 1],
+        p_imp_obj=np.asarray([0.05, 5.00]),
+        time_discount_rate=0.5,
+        now=_NOW,
+    )
+
+    assert objective[layout["charge"] : layout["charge"] + 2] == pytest.approx(
+        [-2.0, -2.0]
+    )
+    assert objective[layout["discharge"] : layout["discharge"] + 2] == pytest.approx(
+        [2.0, 2.0]
+    )
+
+
 def test_secondary_result_costs_match_authoritative_scorer() -> None:
     """Logged loss, wear, and terminal terms must equal ``score_plan``."""
     config = _powmr(cycle_cost_per_kwh=0.05)
@@ -693,6 +867,16 @@ def test_secondary_result_costs_match_authoritative_scorer() -> None:
     )
     assert summary["terminal_credit"] == pytest.approx(
         -breakdown.secondary_terminal_soc_value,
+        abs=1e-6,
+    )
+    replacement_price = config.replacement_price_per_kwh
+    assert replacement_price is not None
+    assert breakdown.secondary_terminal_soc_value == pytest.approx(
+        replacement_price
+        * (
+            sum(slot.secondary_storage_discharged_kwh for slot in planned)
+            - sum(slot.secondary_storage_charged_kwh for slot in planned)
+        ),
         abs=1e-6,
     )
     assert summary["net"] == pytest.approx(
@@ -750,7 +934,7 @@ def test_parked_secondary_identifies_terminal_value_as_dominant() -> None:
     planned, diagnostics = _solve(
         _slots([1.00, 1.00, 1.00], house_load_kwh=0.10),
         _powmr(
-            current_soc_pct=80.0,
+            current_soc_pct=100.0,
             cycle_cost_per_kwh=0.05,
             replacement_price_per_kwh=2.0,
             base_load_includes_dedicated_load=True,

@@ -63,18 +63,22 @@ score = total_cost + soc_penalties + grid_limit_penalty + terminal_soc_value
 
 A single number cannot serve both purposes without one of them being wrong.
 
-### Terminal SoC value formulation
+### Terminal inventory value formulation
 
-Terminal SoC value uses:
+Terminal inventory value is the sum of independent battery terms:
 
 ```
-terminal_soc_value = (E_initial − E_final) × p_replacement
+primary_terminal = (E_primary_initial − E_primary_final) × p_primary
+secondary_terminal = (E_secondary_initial − E_secondary_final) × p_secondary
+terminal_soc_value = primary_terminal + secondary_terminal
 ```
 
 The equivalent battery-flow form is:
 
 ```
-terminal_soc_value = p_replacement × (Σ discharge − Σ charge)
+primary_terminal = p_primary × (Σ primary_discharge − Σ primary_charge)
+secondary_terminal = p_secondary × (Σ secondary_discharge − Σ secondary_charge)
+terminal_soc_value = primary_terminal + secondary_terminal
 ```
 
 The replacement coefficient is sanitised non-negative (missing/non-finite

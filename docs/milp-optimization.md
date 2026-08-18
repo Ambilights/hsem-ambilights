@@ -193,8 +193,12 @@ $$
 For the PowMr reference hardware, $\Delta I=10$ A. Charge and SBU mode are
 mutually exclusive. The secondary state recurrence uses hard 20–100 % bounds,
 and SBU discharge is fixed to dedicated AC load divided by discharge efficiency
-plus configured inverter overhead. Because discharge is tied to that isolated
-load, it cannot backfeed or export.
+plus configured inverter overhead. That dedicated-load equality fixes the exact
+battery draw and prevents direct PowMr backfeed. Because SBU removes the load
+from the aggregate site balance, it may both avoid residual grid import and
+reveal PV for export when PV already served part of the dedicated load. The
+secondary discharge pays its full terminal-inventory, conversion-loss, and wear
+terms, so export is an economic outcome rather than a free SBU credit.
 
 When house history is configured to include the dedicated load, the site-bus
 credit is conservatively capped at `min(dedicated_load, gross_house_load)`.
@@ -204,9 +208,20 @@ Utility/SBU history can never turn that draw into modeled PowMr backfeed.
 The secondary AC branch is included in `gi[t]`, so the existing aggregate
 main-fuse row covers its bypass load and charging. The optional phase rows move
 that branch delta from the balanced share onto its configured physical phase.
-Unless explicitly allowed, an extra constraint enforces zero Huawei discharge
-whenever secondary charge mode is on. This prevents battery-to-battery transfer
-through two conversion stages.
+By default, cross-battery transfer is forbidden in both directions. Let
+$M_c[t]$ and $M_d[t]$ be the primary charge and discharge bounds:
+
+$$
+ec[t] + M_c[t] \cdot secondary\_sbu\_mode[t] \leq M_c[t]
+$$
+
+$$
+ed[t] + M_d[t] \cdot secondary\_charge\_mode[t] \leq M_d[t]
+$$
+
+The first row prevents PowMr SBU from funding Huawei charging; the second
+prevents Huawei discharge from funding PowMr charging. The advanced transfer
+option relaxes both guards.
 
 ---
 
@@ -231,10 +246,18 @@ $$
     + & p_{\mathrm{soc}} \cdot \bigl( \mathrm{s\_max\_pen}[t] + \mathrm{s\_min\_pen}[t] \bigr)
     && \text{SoC soft-constraint penalties} \\
     + & p_{\mathrm{fuse}} \cdot \mathrm{gi\_pen}[t]
-    && \text{Main fuse grid-import penalty}
+    && \text{Main fuse grid-import penalty} \\
+    + & (1-\eta_{\mathrm{s,chg}})p_{\mathrm{imp}}[t]c_s[t]
+    && \text{secondary charge conversion loss} \\
+    + & (1-\eta_{\mathrm{s,dis}})p_{\mathrm{imp}}[t]d_s[t]
+    && \text{secondary discharge conversion loss} \\
+    + & \alpha_s m_s[t]
+    && \text{secondary cycle wear} \\
 \bigg] \\
 + & R \cdot \sum_t \bigl(ed[t]-ec[t]\bigr)
     && \text{terminal inventory value (uniform, undiscounted)} \\
++ & R_s \cdot \sum_t \bigl(d_s[t]-c_s[t]\bigr)
+    && \text{secondary terminal inventory value (uniform, undiscounted)} \\
 + & \epsilon_a \sum_t\bigl(ec[t]+ed[t]\bigr)
   - 1.5\epsilon_a\sum_t\bigl(ed[t]-bx[t]\bigr)
     && \text{primary-action structural tiebreak (undiscounted)} \\
@@ -259,19 +282,29 @@ Where:
 | $\epsilon_{\mathrm{chg}}$ | Charge-side loss fraction: $\epsilon_{\mathrm{chg}} = 1 - \eta_{\mathrm{chg}}$ |
 | $\epsilon_{\mathrm{dis}}$ | Discharge-side loss fraction: $\epsilon_{\mathrm{dis}} = 1 - \eta_{\mathrm{dis}}$ |
 | $R$ | Non-negative terminal-inventory replacement price (currency/kWh), from the engine; missing/non-finite resolves to zero |
+| $c_s[t], d_s[t], m_s[t]$ | Secondary stored charge, stored discharge, and wear auxiliary (kWh) |
+| $\eta_{\mathrm{s,chg}}, \eta_{\mathrm{s,dis}}$ | Secondary charge and discharge efficiencies |
+| $\alpha_s$ | Secondary cycle-wear cost per throughput kWh |
+| $R_s$ | Non-negative secondary terminal-inventory replacement price; one uniform scalar for the horizon |
 | $\epsilon_a$ | Primary-action structural weight, exactly $0.00001$ currency per battery-side DC kWh |
 | $p_{\mathrm{soc}}$ | SoC penalty cost: $\max(p_{\mathrm{imp}}) \times 100$ |
 | $p_{\mathrm{fuse}}$ | Fuse penalty cost: $\max(p_{\mathrm{imp}}) \times 100$ (same magnitude as SoC) |
 | $p_{\mathrm{ev\_pen}}^{(v)}$ | EV deadline penalty for EV v: $\max(p_{\mathrm{imp}}) \cdot \max(\mathrm{energy\_needed}, 1.0) \cdot 10$ |
 | $\beta_{\mathrm{ev}}^{(v)}$ | EV charge-past-target benefit for EV v: `future_value_per_kwh` — avoided-future-import valuation (issue #630), or a $0.0001$ per kWh AC fallback tiebreaker when no future price data is available |
 
-The terminal term is a final-inventory valuation, not a collection of per-slot
-premiums. Because the same $R$ multiplies every battery-side discharge and
-charge, equal discharge and recharge cancel exactly. Slot prices, efficiencies,
-cycle wear, capacity, headroom, and power constraints then decide whether a
-refill cycle is worthwhile. This retains the issue #694 same-slot PV/export and
-issue #592 deferred-cheap-surplus behaviours without a path-dependent charge
-credit cap.
+The terminal terms are final-inventory valuations, not collections of per-slot
+premiums. For each battery, the same $R$ or $R_s$ multiplies every battery-side
+discharge and charge, so equal movements cancel exactly regardless of their
+slot positions. Slot prices, efficiencies, cycle wear, capacity, headroom, and
+power constraints then decide whether a refill cycle is worthwhile. This keeps
+secondary inventory valuation path-independent and retains the issue #694
+same-slot PV/export and issue #592 deferred-cheap-surplus behaviours without a
+path-dependent charge credit cap.
+
+Aggregate `gi[t]` and `ge[t]` already contain the secondary branch's actual
+import avoidance and any PV export revealed by SBU. Utility therefore wins when
+that incremental value does not cover the secondary inventory, conversion-loss,
+and wear terms; a mixed slot may validly avoid import and reveal export.
 
 The structural tiebreak uses the exact export-source split, so $ed[t]-bx[t]$
 is local battery discharge. Its per-DC-kWh perturbation is
@@ -298,6 +331,11 @@ value is `max(published_value, forecast_haircut_value)`. This heuristic is
 horizon-end inventory context: it neither models future grid/PV refill nor
 acts as a per-slot export floor. Forecast points do not enter slot prices,
 actionability, bounds, export revenue, or any physical flow constraint.
+
+`resolve_secondary_terminal_price()` uses the same published/forecast `max()`
+authority rule with the secondary battery's mean-of-window aggregation. The
+result is passed unchanged as $R_s$; it never becomes a per-slot secondary
+charge or discharge premium.
 
 Plus EV pre-deadline benefit (undiscounted, per EV $v$ with deadline, slots $t \leq D_v$):
 
@@ -696,9 +734,10 @@ After the MILP (or passive) winner is selected, the engine runs a final pass ove
   configured physical floor are clamped to 0 before solving. Genuine negative
   export prices remain negative when the floor is disabled, so free
   curtailment can beat costly export.
-- **Terminal inventory value**: Uniform and undiscounted in the objective,
-  matching the cost function's `terminal_soc_value`; equal discharge and
-  recharge cancel.
+- **Terminal inventory value**: Primary and secondary terms are independently
+  uniform and undiscounted in the objective, matching the cost function's
+  `terminal_soc_value`; equal discharge and recharge of either battery cancel
+  exactly.
 - **Primary-action structural tiebreak**: Selector-only and kept separate from
   terminal value. It is
   `ε_aΣ(ec+ed)-1.5ε_aΣ(ed-bx)` with `ε_a=0.00001` currency/DC-kWh;

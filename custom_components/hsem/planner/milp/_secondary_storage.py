@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -11,7 +12,6 @@ from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.secondary_storage_config import (
     SecondaryStorageConfig,
 )
-from custom_components.hsem.planner.cost_helpers import compute_charge_premium
 from custom_components.hsem.planner.secondary_storage import (
     SECONDARY_MODE_CHARGE,
     SECONDARY_MODE_SBU,
@@ -78,7 +78,9 @@ def _extend_secondary_constraints(
     config: SecondaryStorageConfig,
     slots: list[PlannedSlot],
     future_idx: list[int],
+    primary_charge_off: int,
     primary_discharge_off: int,
+    primary_max_charge_kwh: float,
     primary_max_discharge_kwh: float,
     primary_discharge_efficiency_fraction: float,
     primary_site_discharge_limited: np.ndarray,  # type: ignore[name-defined]
@@ -134,7 +136,7 @@ def _extend_secondary_constraints(
     old_a_ub = constraints["A_ub"]
     old_b_ub = constraints["b_ub"]
     old_ub_rows = old_a_ub.shape[0]
-    transfer_rows = 0 if config.allow_primary_battery_transfer else m
+    transfer_rows = 0 if config.allow_primary_battery_transfer else 2 * m
     site_discharge_rows = int(np.count_nonzero(primary_site_discharge_limited))
     added_rows = 7 * m + transfer_rows + site_discharge_rows
     a_ub = np.zeros((old_ub_rows + added_rows, n_vars))
@@ -154,7 +156,6 @@ def _extend_secondary_constraints(
     maximum_steps = int(
         max(config.max_charge_current_a, 0.0) // max(config.charge_current_step_a, 1e-9)
     )
-
     row = old_ub_rows
     for t in range(m):
         for k in range(t + 1):
@@ -193,7 +194,14 @@ def _extend_secondary_constraints(
             a_ub[row + t, primary_discharge_off + t] = 1.0
             a_ub[row + t, charge_mode_off + t] = primary_max_discharge_kwh
             b_ub[row + t] = primary_max_discharge_kwh
-        row += m
+
+            # Symmetric destination guard: PowMr SBU must not free site-bus
+            # energy for Huawei charging unless cross-battery transfer is an
+            # explicit opt-in. With z_sbu=1 this fixes primary charge to zero.
+            a_ub[row + m + t, primary_charge_off + t] = 1.0
+            a_ub[row + m + t, sbu_mode_off + t] = primary_max_charge_kwh
+            b_ub[row + m + t] = primary_max_charge_kwh
+        row += 2 * m
 
     # The base primary cap is computed before PowMr mode variables exist. In a
     # site-limited slot, SBU removes the included dedicated load from the same
@@ -250,7 +258,6 @@ def _add_secondary_objective(
     slots: list[PlannedSlot],
     future_idx: list[int],
     p_imp_obj: np.ndarray,  # type: ignore[name-defined]
-    p_exp: np.ndarray,  # type: ignore[name-defined]
     time_discount_rate: float,
     now: datetime,
 ) -> None:
@@ -258,6 +265,9 @@ def _add_secondary_objective(
     charge_eff = clamp_efficiency(config.charge_efficiency_pct)
     discharge_eff = clamp_efficiency(config.discharge_efficiency_pct)
     use_discount = time_discount_rate < 1.0 - 1e-9
+    replacement = max(config.replacement_price_per_kwh or 0.0, 0.0)
+    if not math.isfinite(replacement):
+        replacement = 0.0
 
     for t, slot_i in enumerate(future_idx):
         if not slots[slot_i].price_actionable:
@@ -277,19 +287,11 @@ def _add_secondary_objective(
             max(config.cycle_cost_per_kwh, 0.0) * discount
         )
 
-        replacement = config.replacement_price_per_kwh
-        if replacement is None or replacement <= 1e-9:
-            continue
-        charge_premium = compute_charge_premium(
-            replacement_price_per_kwh=replacement,
-            imp_price_obj=p_imp_obj[t],
-            exp_price=p_exp[t],
-            charge_eff=charge_eff,
-            deferred_export_price=None,
-        )
-        discharge_premium = max(0.0, replacement - p_imp_obj[t])
-        objective[layout["charge"] + t] -= charge_premium
-        objective[layout["discharge"] + t] += discharge_premium
+        # Uniform, undiscounted final-inventory value makes an equal secondary
+        # discharge and refill cancel exactly; physical slot economics decide.
+        if replacement > 1e-9:
+            objective[layout["charge"] + t] -= replacement
+            objective[layout["discharge"] + t] += replacement
 
 
 def _secondary_integrality(
@@ -399,6 +401,20 @@ def _write_secondary_results(
             if slot.price_actionable
             else 0.0
         )
+
+        if (
+            sbu_mode
+            and not config.allow_primary_battery_transfer
+            and is_material_planned_energy_kwh(slot.batteries_charged_kwh)
+        ):
+            log_planner(
+                "warning",
+                "[milp] secondary SBU transfer invariant failed  slot=%s  "
+                "primary_charge=%.3f",
+                slot.start.isoformat(),
+                slot.batteries_charged_kwh,
+            )
+            return None
 
         # Huawei is physically constrained to self-consumption in these slots:
         # export is disabled, its price is below a configured floor, or the
