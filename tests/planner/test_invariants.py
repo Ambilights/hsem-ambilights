@@ -35,7 +35,6 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from custom_components.hsem.models.battery_schedule_input import BatteryScheduleInput
 from custom_components.hsem.models.hourly_consumption_average import (
     HourlyConsumptionAverage,
 )
@@ -82,7 +81,6 @@ def _make_uniform_input(
     battery_max_charge_power_w: float = 5000.0,
     battery_purchase_price: float = 0.0,
     battery_expected_cycles: int = 6000,
-    schedules: list[BatteryScheduleInput] | None = None,
     excess_export_enabled: bool = False,
     house_power_includes_ev: bool = True,
     now_iso: str = "2024-06-15T00:00:00+02:00",
@@ -122,7 +120,6 @@ def _make_uniform_input(
         consumption_averages=consumption,
         price_points=prices,
         solcast_slots=solar,
-        battery_schedules=schedules if schedules is not None else [],
         excess_export_enabled=excess_export_enabled,
         months_winter=[1, 2, 3, 4, 10, 11, 12],
         house_power_includes_ev=house_power_includes_ev,
@@ -290,8 +287,8 @@ class TestEnergyBalance:
         assert slot.grid_import_kwh == pytest.approx(0.0, abs=1e-6)
         assert slot.grid_export_kwh == pytest.approx(2.5, abs=1e-3)
 
-    def test_grid_import_plus_battery_plus_pv_ge_load_no_schedule(self):
-        """Without schedules: PV + battery + grid must cover house load every slot.
+    def test_grid_import_plus_battery_plus_pv_ge_load_without_fixed_schedule(self):
+        """Without fixed controls: PV + battery + grid must cover house load every slot.
 
         Tests the full planner output across 24 slots to verify the energy
         balance identity holds everywhere, not just in isolated simulation.
@@ -598,52 +595,29 @@ class TestGridChargeAccounting:
     """
 
     def test_grid_import_exceeds_stored_with_conversion_loss(self):
-        """With 20% conversion loss, grid import for 1 kWh stored = 1.25 kWh.
-
-        Hand calculation:
-          charge_efficiency = 1 - 0.20 = 0.80
-          To store 1 kWh: grid_import = 1.0 / 0.80 = 1.25 kWh
-        """
-        # Build a minimal scenario: battery empty, one cheap slot, schedule forces charge
-        inp = _make_uniform_input(
-            battery_soc_pct=10.0,
-            battery_rated_capacity_kwh=10.0,
-            battery_end_of_discharge_soc_pct=10.0,
-            import_price=0.10,
-            load_kwh=0.0,
+        """A scheduled grid charge accounts for charge-side losses."""
+        now = datetime(2024, 6, 15, 1, 0, tzinfo=_TZ)
+        slot = _single_slot(
+            now=now,
+            load=0.0,
+            pv=0.0,
+            recommendation=Recommendations.BatteriesChargeGrid.value,
         )
-        # Use a schedule that forces grid charge in hour 0
-        from datetime import time as dtime
-
-        inp.battery_schedules = [
-            BatteryScheduleInput(
-                enabled=True,
-                start=dtime(0, 0),
-                end=dtime(2, 0),
-            )
-        ]
-        # We need a discharge schedule later so the charge schedule fires
-        inp.battery_schedules.append(
-            BatteryScheduleInput(
-                enabled=True,
-                start=dtime(18, 0),
-                end=dtime(20, 0),
-            )
+        slot.batteries_charged_kwh = 0.8
+        simulate_soc(
+            [slot],
+            now,
+            current_kwh=0.0,
+            usable_kwh=9.0,
+            max_capacity_kwh=9.0,
+            max_charge_per_slot=1.25,
+            max_discharge_per_slot=None,
+            rated_kwh=10.0,
+            end_of_discharge_soc_pct=10.0,
+            charge_efficiency_pct=80.0,
         )
-        result = run_planner(inp)
-        charge_slots = [
-            s
-            for s in result.slots
-            if s.recommendation == Recommendations.BatteriesChargeGrid.value
-            and s.batteries_charged_kwh > 1e-9
-        ]
-        for slot in charge_slots:
-            stored = slot.batteries_charged_kwh
-            # With 20% conversion loss, grid pull must exceed stored energy
-            assert slot.grid_import_kwh > stored - 1e-6, (
-                f"Grid import {slot.grid_import_kwh:.4f} should exceed "
-                f"stored {stored:.4f} when conversion loss = 20%"
-            )
+        assert slot.batteries_charged_kwh == pytest.approx(0.8, abs=1e-6)
+        assert slot.grid_import_kwh == pytest.approx(1.0, abs=1e-6)
 
     def test_cost_uses_grid_import_not_stored(self):
         """Import cost must be computed from grid_import_kwh, not batteries_charged.
@@ -753,8 +727,7 @@ class TestWinnerCostIdentity:
         Spec (issue #413) requires:
             total_cost = import - export_revenue + cycle + conversion_loss
             score      = total_cost + soc_penalty + grid_limit_penalty
-                         + override_penalty + terminal_soc_value
-                         + primary_action_tiebreak
+                         + terminal_soc_value + primary_action_tiebreak
         """
         result = run_planner(make_winter_day_input())
         assert result.plan_cost is not None
@@ -766,7 +739,6 @@ class TestWinnerCostIdentity:
             expected_total_cost
             + bd.soc_penalty
             + bd.grid_limit_penalty
-            + bd.override_penalty
             + bd.terminal_soc_value
             + bd.primary_action_tiebreak
         )
@@ -1259,7 +1231,6 @@ class TestMissingDataSentinel:
             consumption_averages=consumption,
             price_points=partial_prices,
             solcast_slots=solar,
-            battery_schedules=[],
             months_winter=[1, 2, 3, 4, 10, 11, 12],
             is_read_only=True,
         )
@@ -1331,7 +1302,6 @@ class TestSeasonalDeterminism:
         # January is always winter
         inp = make_winter_day_input(
             now_iso="2024-01-15T00:00:00+01:00",
-            schedules=[],  # no schedules so no schedule-driven discharge
         )
         result = run_planner(inp)
         # Check the baseline candidate's slots (the pre-candidate plan)

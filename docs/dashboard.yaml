@@ -1211,119 +1211,7 @@ views:
         column_span: 2
 
       # ═══════════════════════════════════════════════════════════
-      # SECTION 6 — BATTERY SCHEDULES
-      # ═══════════════════════════════════════════════════════════
-      - type: grid
-        cards:
-          - type: heading
-            heading: Batteries Discharge Schedules
-            heading_style: title
-            grid_options:
-              columns: full
-              rows: 1
-          - type: tile
-            entity: switch.hsem_batteries_enable_batteries_schedule_1
-            name: Schedule 1
-            icon: mdi:calendar-clock
-            vertical: false
-            hide_state: false
-            grid_options:
-              columns: 4
-              rows: 1
-            tap_action:
-              action: more-info
-          - type: tile
-            entity: time.hsem_batteries_enable_batteries_schedule_1_start
-            name: S1 Start
-            icon: mdi:clock-start
-            vertical: false
-            hide_state: false
-            grid_options:
-              columns: 4
-              rows: 1
-            tap_action:
-              action: more-info
-          - type: tile
-            entity: time.hsem_batteries_enable_batteries_schedule_1_end
-            name: S1 End
-            icon: mdi:clock-end
-            vertical: false
-            hide_state: false
-            grid_options:
-              columns: 4
-              rows: 1
-            tap_action:
-              action: more-info
-          - type: tile
-            entity: switch.hsem_batteries_enable_batteries_schedule_2
-            name: Schedule 2
-            icon: mdi:calendar-clock
-            vertical: false
-            hide_state: false
-            grid_options:
-              columns: 4
-              rows: 1
-            tap_action:
-              action: more-info
-          - type: tile
-            entity: time.hsem_batteries_enable_batteries_schedule_2_start
-            name: S2 Start
-            icon: mdi:clock-start
-            vertical: false
-            hide_state: false
-            grid_options:
-              columns: 4
-              rows: 1
-            tap_action:
-              action: more-info
-          - type: tile
-            entity: time.hsem_batteries_enable_batteries_schedule_2_end
-            name: S2 End
-            icon: mdi:clock-end
-            vertical: false
-            hide_state: false
-            grid_options:
-              columns: 4
-              rows: 1
-            tap_action:
-              action: more-info
-          - type: tile
-            entity: switch.hsem_batteries_enable_batteries_schedule_3
-            name: Schedule 3
-            icon: mdi:calendar-clock
-            vertical: false
-            hide_state: false
-            grid_options:
-              columns: 4
-              rows: 1
-            tap_action:
-              action: more-info
-          - type: tile
-            entity: time.hsem_batteries_enable_batteries_schedule_3_start
-            name: S3 Start
-            icon: mdi:clock-start
-            vertical: false
-            hide_state: false
-            grid_options:
-              columns: 4
-              rows: 1
-            tap_action:
-              action: more-info
-          - type: tile
-            entity: time.hsem_batteries_enable_batteries_schedule_3_end
-            name: S3 End
-            icon: mdi:clock-end
-            vertical: false
-            hide_state: false
-            grid_options:
-              columns: 4
-              rows: 1
-            tap_action:
-              action: more-info
-        column_span: 2
-
-      # ═══════════════════════════════════════════════════════════
-      # SECTION 7 — ENERGY ECONOMICS
+      # SECTION 6 — ENERGY ECONOMICS
       # ═══════════════════════════════════════════════════════════
       - type: grid
         cards:
@@ -1501,7 +1389,7 @@ views:
         column_span: 2
 
       # ═══════════════════════════════════════════════════════════
-      # SECTION 8 — CONSUMPTION & SOLAR
+      # SECTION 7 — CONSUMPTION & SOLAR
       # ═══════════════════════════════════════════════════════════
       - type: grid
         cards:
@@ -1771,7 +1659,7 @@ views:
         column_span: 2
 
       # ═══════════════════════════════════════════════════════════
-      # SECTION 9 — EV 1 (PRIMARY)
+      # SECTION 8 — EV 1 (PRIMARY)
       # ═══════════════════════════════════════════════════════════
       - type: grid
         cards:
@@ -2040,7 +1928,7 @@ views:
         column_span: 2
 
       # ═══════════════════════════════════════════════════════════
-      # SECTION 10 — EV 2 (SECOND)
+      # SECTION 9 — EV 2 (SECOND)
       # ═══════════════════════════════════════════════════════════
       - type: grid
         cards:

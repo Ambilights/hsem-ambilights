@@ -9,11 +9,10 @@ Pipeline stages owned by the coordinator:
 1. Reload config from the config entry.
 2. Collect live HA entity states (:mod:`state_collector`).
 3. Reset and generate recommendation time-slots.
-4. Build battery-schedule objects from config.
-5. Populate weighted house-consumption averages.
-6. Populate electricity prices and Solcast PV estimates.
-7. Run the pure-Python planner engine.
-8. Resolve the current time-slot recommendation.
+4. Populate weighted house-consumption averages.
+5. Populate electricity prices and Solcast PV estimates.
+6. Run the pure-Python planner engine.
+7. Resolve the current time-slot recommendation.
 
 Hardware writes (inverter + battery commands) are **not** performed here; they
 remain in :class:`~custom_components.hsem.custom_sensors.working_mode_sensor.HSEMWorkingModeSensor`
@@ -49,7 +48,6 @@ from homeassistant.helpers.event import (
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from custom_components.hsem.const import (
-    DOMAIN,
     EMA_ALPHA_NET_CONSUMPTION,
 )
 from custom_components.hsem.coordinator_builder import (
@@ -62,11 +60,9 @@ from custom_components.hsem.custom_sensors.hourly_data_populator.consumption imp
 from custom_components.hsem.custom_sensors.hourly_data_populator.prices_solcast import (
     populate_price_and_solcast_from_snapshot,
 )
-from custom_components.hsem.custom_sensors.ocpp_server import OCPPServer
 from custom_components.hsem.custom_sensors.state_collector import (  # noqa: F401 — kept for backward compat
     async_collect_all_states,
     async_collect_live_state,
-    build_battery_schedules,
     build_sensor_config,
 )
 from custom_components.hsem.models.daily_metrics import DailyMetrics
@@ -92,7 +88,6 @@ from custom_components.hsem.planner.secondary_storage import (
     SECONDARY_MODE_UTILITY,
 )
 from custom_components.hsem.utils.capacity_learner import CapacityLearner
-from custom_components.hsem.utils.charge_rate_learner import CHARGE_RATE_LEARNER
 from custom_components.hsem.utils.datetime_utils import (
     as_tz,
     now as hsem_now,
@@ -620,9 +615,6 @@ class CoordinatorData:
         hourly_recommendations: Full list of planner recommendation slots.
         hourly_recommendation: The recommendation slot active *right now*, or
             ``None`` when no matching slot exists.
-        batteries_schedules: Parsed battery charge/discharge schedule windows.
-        batteries_schedules_remaining_capacity_needed: Total remaining capacity
-            needed across all enabled battery schedules (kWh).
         current_required_battery: Required battery capacity from the planner (kWh).
         state: Working-mode recommendation string for the current slot, or one
             of the :class:`~utils.recommendations.Recommendations` sentinel values.
@@ -634,8 +626,6 @@ class CoordinatorData:
     live: LiveState | None = None
     hourly_recommendations: list[HourlyRecommendation] = field(default_factory=list)
     hourly_recommendation: HourlyRecommendation | None = None
-    batteries_schedules: list = field(default_factory=list)
-    batteries_schedules_remaining_capacity_needed: float = 0.0
     current_required_battery: float = 0.0
     state: str | None = None
     last_updated: str | None = None
@@ -672,10 +662,6 @@ class CoordinatorData:
     effective_discharge_floor_diag: dict | None = None
     #: Financial tracker with cumulative import cost and export income.
     financial_tracker: FinancialTracker | None = None
-    #: OCPP charger session dict (CPID → ChargerSession) for sensor entities.
-    ocpp_chargers: dict | None = None
-    #: OCPP completed session log for the sessions sensor.
-    ocpp_sessions: list | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -740,8 +726,6 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._snapshot: StateSnapshot | None = None
         self._hourly_recommendations: list[HourlyRecommendation] = []
         self._hourly_recommendation: HourlyRecommendation | None = None
-        self._batteries_schedules: list = []
-        self._batteries_schedules_remaining_capacity_needed: float = 0.0
         self._current_required_battery: float = 0.0
         self._next_update: str | None = None
         # Most recent completed hardware apply.  Hardware writes finish after
@@ -863,8 +847,6 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._daily_plan_last_accumulated: datetime | None = None
         # Timestamp of the last actual-energy accumulation cycle.
         self._last_accumulation_ts: datetime | None = None
-        #: Previous battery SoC reading for charge-rate learner delta detection.
-        self._last_soc_pct: float | None = None
         # Override expiry timestamp for timed manual overrides (issue #317).
         # Set by set_temporary_override when duration_minutes is provided.
         # Checked on every update cycle; when expired, the override is cleared
@@ -878,10 +860,6 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
         # Battery capacity learner (issue #605).
         self._capacity_learner: CapacityLearner = CapacityLearner()
-
-        # Embedded OCPP 1.6 server for EV charger control (issue #603).
-        self._ocpp_server: OCPPServer | None = None
-        self._ocpp_sessions: list = []
 
         # ML consumption predictor — cached across cycles so the retrain
         # gate can skip re-fitting when no new history has arrived.
@@ -930,23 +908,6 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             await self._init_financial_tracker()
         except Exception as e:
             async_log("error", "Failed to initialise financial tracker: %s", e)
-
-        # Start the embedded OCPP 1.6 server if enabled (issue #603).
-        cfg = build_sensor_config(self._config_entry)
-        if cfg.ocpp_enabled:
-            try:
-                self._ocpp_server = OCPPServer(
-                    hass=self.hass,
-                    host="0.0.0.0",
-                    port=cfg.ocpp_port,
-                    start_window_s=cfg.ocpp_start_window_s,
-                    stop_window_s=cfg.ocpp_stop_window_s,
-                )
-                await self._ocpp_server.start()
-                async_log("info", "OCPP server started on port %d", cfg.ocpp_port)
-            except Exception as e:
-                async_log("error", "Failed to start OCPP server: %s", e)
-                self._ocpp_server = None
 
         # Run an immediate first cycle so entities have data before first render.
         await self._async_handle_update(None)
@@ -1003,12 +964,6 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         if midnight is not None:
             midnight()
             self._midnight_unsub = None
-
-        # Stop the OCPP server if it was started.
-        ocpp = getattr(self, "_ocpp_server", None)
-        if ocpp is not None:
-            await ocpp.stop()
-            self._ocpp_server = None
 
         # Cancel any pending options-update background task and debounce timer.
         task = getattr(self, "_options_update_task", None)
@@ -1371,37 +1326,6 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                     live.bms_kwh_remaining, live.huawei_batteries_soc_pct
                 )
 
-            # Feed the charge rate learner when battery is actively charging
-            # (issue #608).  Detects charging by SoC increase between cycles
-            # and records the configured max charge power at the estimated
-            # cell temperature (default 25 °C until BMS temp is wired).
-            soc_now = live.huawei_batteries_soc_pct
-            if (
-                soc_now is not None
-                and getattr(self, "_last_soc_pct", None) is not None
-                and soc_now > getattr(self, "_last_soc_pct", 0.0) + 0.5
-                and live.huawei_batteries_max_charge_power_w
-            ):
-                CHARGE_RATE_LEARNER.update(
-                    25.0, live.huawei_batteries_max_charge_power_w
-                )
-                # Persist newly learned rates so they survive HA restarts.
-                from custom_components.hsem.custom_sensors.charge_rate_numbers import (
-                    persist_learned_rates_to_entry,
-                )
-
-                persist_learned_rates_to_entry(self.hass, self._config_entry)
-            if soc_now is not None:
-                self._last_soc_pct = soc_now
-
-            # Refresh charge rate number entities so they reflect the
-            # latest learned rates (issue #608).
-            charge_entities = self.hass.data.get(DOMAIN, {}).get(
-                "charge_rate_entities", []
-            )
-            for entity in charge_entities:
-                entity.async_write_ha_state()
-
             # Update the weekday/weekend consumption profile (issue #612).
             house_w = live.house_consumption_power_w
             if house_w is not None and house_w > 0:
@@ -1466,11 +1390,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 cfg.recommendation_interval_length,
             )
 
-            # 4. Build battery-schedule objects from config.
-            self._batteries_schedules = build_battery_schedules(cfg)
-            self._batteries_schedules.sort(key=lambda x: x.start)
-
-            # 5. Populate weighted house-consumption averages.
+            # 4. Populate weighted house-consumption averages.
             #
             # Two paths are available:
             #   a) ML prediction — queries the HA recorder for historical
@@ -1748,7 +1668,6 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                         cfg=cfg,
                         live=self._live,
                         hourly_recommendations=self._hourly_recommendations,
-                        batteries_schedules=self._batteries_schedules,
                         previous_winner_name=(
                             None
                             if corrective_live_replan
@@ -2086,39 +2005,6 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                         e,
                     )
 
-            # -----------------------------------------------------------------------
-            # OCPP charge target updates — push planner EV plan to OCPP server
-            # -----------------------------------------------------------------------
-            ocpp_server = getattr(self, "_ocpp_server", None)
-            if ocpp_server is not None and self._cfg.ocpp_enabled:
-                cfg = self._cfg
-                cpid = cfg.ocpp_cpid or "default"
-                if self._ev_charging_plan is not None:
-                    target_kw = self._ev_charging_plan.current_slot_planned_load_kwh
-                    # Convert per-slot kWh to kW by accounting for slot duration
-                    slot_minutes = cfg.recommendation_interval_minutes
-                    if slot_minutes > 0 and target_kw > 0:
-                        target_kw = (target_kw / slot_minutes) * 60.0
-                    # Force-charge-now overrides the planner target when the
-                    # plan is disabled (smart charging off) — the OCPP charger
-                    # must still receive the max-power command.
-                    force_primary = bool(
-                        get_config_value(self._config_entry, "hsem_ev_force_charge_now")
-                    )
-                    if force_primary:
-                        pwr_kw = float(
-                            get_config_value(
-                                self._config_entry,
-                                "hsem_ev_planned_load_charger_power_kw",
-                            )
-                            or 0.0
-                        )
-                        if pwr_kw > 0:
-                            target_kw = pwr_kw
-                    await ocpp_server.update_charge_target(cpid, target_kw, now=now)
-                else:
-                    await ocpp_server.update_charge_target(cpid, 0.0, now=now)
-
         except Exception as exc:
             raise UpdateFailed(f"HSEM update cycle failed: {exc}") from exc
 
@@ -2126,23 +2012,11 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._hourly_recommendations.sort(key=lambda x: utc_key(x.start))
         last_updated = utc_now_iso()
 
-        # Package OCPP charger state for sensor entities.
-        ocpp_chargers: dict | None = None
-        ocpp_sessions: list | None = None
-        ocpp = getattr(self, "_ocpp_server", None)
-        if ocpp is not None:
-            ocpp_chargers = ocpp.charger_sessions
-            ocpp_sessions = list(self._ocpp_sessions)
-
         data = CoordinatorData(
             cfg=self._cfg,
             live=self._live,
             hourly_recommendations=list(self._hourly_recommendations),
             hourly_recommendation=self._hourly_recommendation,
-            batteries_schedules=list(self._batteries_schedules),
-            batteries_schedules_remaining_capacity_needed=(
-                self._batteries_schedules_remaining_capacity_needed
-            ),
             current_required_battery=self._current_required_battery,
             state=state,
             last_updated=last_updated,
@@ -2157,8 +2031,6 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 if self._override_expiry is not None
                 else None
             ),
-            ocpp_chargers=ocpp_chargers,
-            ocpp_sessions=ocpp_sessions,
             capacity_learner=getattr(self, "_capacity_learner", CapacityLearner()),
             solar_hour_factors=dict(
                 getattr(self, "_solar_corrector", SolarForecastCorrector()).hour_factors
@@ -2985,9 +2857,6 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 unmatched[0],
             )
 
-        self._batteries_schedules_remaining_capacity_needed = sum(
-            s.needed_batteries_capacity for s in self._batteries_schedules if s.enabled
-        )
         # Preserve the plan explanation and data quality for the next CoordinatorData snapshot.
         self._plan_explanation = output.explanation
         self._data_quality = output.data_quality

@@ -11,11 +11,11 @@ HSEM exposes these entity types:
 
 | Type | Count | Description |
 |---|---|---|
-| **Sensor** | ~41 | Read-only state, plan, diagnostic, financial, and EV entities |
+| **Sensor** | ~37 | Read-only state, plan, diagnostic, financial, and EV entities |
 | **Select** | 2 | Force working mode override and Solcast likelihood selector |
-| **Switch** | ~15 | Toggle entities for schedules, EV settings, features, and ML options |
-| **Time** | 8 | Start/end time inputs for battery schedules and EV deadlines |
-| **Number** | ~12 | Charge/discharge efficiency, EV target SoC, temperature charge rates |
+| **Switch** | ~12 | Toggle entities for EV settings, features, and ML options |
+| **Time** | 2 | Primary and second-EV charge deadlines |
+| **Number** | 4 | Charge/discharge efficiency and EV target SoC controls |
 
 ---
 
@@ -28,7 +28,7 @@ all planner output as attributes.
 
 | State | Meaning |
 |---|---|
-| `batteries_charge_grid` | Battery charging from grid (forced by schedule or price) |
+| `batteries_charge_grid` | Battery charging from grid when selected by dynamic optimisation |
 | `batteries_charge_solar` | Battery charging from PV surplus |
 | `batteries_discharge_mode` | Battery discharging to cover house load |
 | `force_batteries_discharge` | Forced discharge to grid (excess export) |
@@ -78,8 +78,6 @@ all planner output as attributes.
 |---|---|---|
 | `hourly_recommendation` | dict \| null | The recommendation slot active **right now** |
 | `hourly_recommendations` | list[dict] | Full list of planner slots for the horizon |
-| `batteries_schedules` | list | Active battery discharge schedule definitions |
-| `batteries_schedules_remaining_capacity_needed` | float (kWh) | Remaining discharge budget across schedules |
 
 ### `hourly_recommendations` slot structure
 
@@ -452,61 +450,6 @@ Controls and reports the effective discharge floor SoC, which the planner uses a
 
 ---
 
-## OCPP charger sensors
-
-Sensors providing live status and diagnostics for an OCPP-compliant EV charger connected via the integrated OCPP server.
-
-**Configuration keys** (set in config flow):
-
-| Key | Description |
-|---|---|
-| `hsem_ocpp_enabled` | Enable the OCPP server |
-| `hsem_ocpp_port` | TCP port for OCPP WebSocket connections |
-| `hsem_ocpp_cpid` | OCPP charge point identifier |
-| `hsem_ocpp_start_window_s` | Seconds before charge deadline to start charging |
-| `hsem_ocpp_stop_window_s` | Seconds after charge deadline to stop charging |
-
-### `sensor.hsem_ocpp_charger_status`
-
-| Property | Value |
-|---|---|
-| **Type** | `sensor` |
-| **State** | Connection/charging state: `connected`, `charging`, `disconnected`, etc. |
-
-### `sensor.hsem_ocpp_charger_power`
-
-| Property | Value |
-|---|---|
-| **Type** | `sensor` |
-| **State** | Live charging power (kW) |
-| **Device class** | `power` |
-| **Unit** | kW |
-
-### `sensor.hsem_ocpp_charger_info`
-
-| Property | Value |
-|---|---|
-| **Type** | `sensor` |
-| **State** | Charger summary string |
-| **Attributes** | `vendor`, `model`, `firmware_version`, `serial_number` |
-
-### `sensor.hsem_ocpp_charger_sessions`
-
-| Property | Value |
-|---|---|
-| **Type** | `sensor` |
-| **State** | Number of completed sessions |
-| **Attributes** | `sessions` — list of completed session logs (start time, energy, duration) |
-
-**Template example:**
-
-```jinja2
-{{ states('sensor.hsem_ocpp_charger_status') }}
-{{ states('sensor.hsem_ocpp_charger_power') | float | round(2) }} kW
-```
-
----
-
 ## Savings tracker sensor
 
 Tracks actual vs missed savings over a rolling 90-day window.
@@ -579,10 +522,6 @@ Detects when the inverter is actively curtailing PV production.
 | `sensor.hsem_import_cost` | Import Cost | Cumulative import cost | Monetary (total_increasing) |
 | `sensor.hsem_net_grid_balance` | Net Grid Balance | Export income minus import cost | Monetary (measurement) |
 | `sensor.hsem_effective_discharge_floor` | Effective Discharge Floor | Current effective floor SoC | Percentage |
-| `sensor.hsem_ocpp_charger_status` | OCPP Charger Status | Charger connection/charging state | String |
-| `sensor.hsem_ocpp_charger_power` | OCPP Charger Power | Live charging power | kW |
-| `sensor.hsem_ocpp_charger_info` | OCPP Charger Info | Vendor, model, firmware, serial | String |
-| `sensor.hsem_ocpp_charger_sessions` | OCPP Charger Sessions | Completed session log | Integer |
 | `sensor.hsem_savings_tracker` | Savings Tracker | Actual vs missed savings (90-day) | Monetary |
 | `sensor.hsem_pv_curtailment_sensor` | PV Curtailment | PV curtailment detection | `curtailed` / `normal` |
 
@@ -621,9 +560,6 @@ This setting is also configurable in the options flow.
 | `switch.hsem_read_only` | Block all hardware writes |
 | `switch.hsem_extended_attributes` | Enable extended diagnostic attributes |
 | `switch.hsem_verbose_logging` | Enable verbose logging |
-| `switch.hsem_batteries_enable_batteries_schedule_1` | Toggle battery schedule 1 |
-| `switch.hsem_batteries_enable_batteries_schedule_2` | Toggle battery schedule 2 |
-| `switch.hsem_batteries_enable_batteries_schedule_3` | Toggle battery schedule 3 |
 | `switch.hsem_ev_force_discharge` | Force EV maximum discharge power |
 | `switch.hsem_ev_smart_charging` | Enable smart EV charging scheduling |
 | `switch.hsem_ev_force_charge_now` | Force immediate EV charging |
@@ -645,33 +581,10 @@ This setting is also configurable in the options flow.
 | `number.hsem_ev_target_soc` | Primary EV target SoC | 0–100 % |
 | `number.hsem_ev_second_target_soc` | Second EV target SoC | 0–100 % |
 
-### Temperature-based charge rates
-
-Charge rate limits based on ambient temperature ranges. Each adjusts the maximum
-charge power the planner may request within the corresponding temperature band.
-
-| Entity | Temperature range |
-|---|---|
-| `number.hsem_charge_rate_below_0` | Below 0 °C |
-| `number.hsem_charge_rate_0_to_5` | 0–5 °C |
-| `number.hsem_charge_rate_6_to_15` | 6–15 °C |
-| `number.hsem_charge_rate_16_to_21` | 16–21 °C |
-| `number.hsem_charge_rate_21_to_35` | 21–35 °C |
-| `number.hsem_charge_rate_35_to_50` | 35–50 °C |
-| `number.hsem_charge_rate_above_50` | Above 50 °C |
-
----
-
 ## Time entities
 
 | Entity | Purpose |
 |---|---|
-| `time.hsem_batteries_schedule_1_start` | Schedule 1 start time |
-| `time.hsem_batteries_schedule_1_end` | Schedule 1 end time |
-| `time.hsem_batteries_schedule_2_start` | Schedule 2 start time |
-| `time.hsem_batteries_schedule_2_end` | Schedule 2 end time |
-| `time.hsem_batteries_schedule_3_start` | Schedule 3 start time |
-| `time.hsem_batteries_schedule_3_end` | Schedule 3 end time |
 | `time.hsem_ev_deadline` | Primary EV charge deadline |
 | `time.hsem_ev_second_deadline` | Second EV charge deadline |
 
@@ -684,15 +597,6 @@ charge power the planner may request within the corresponding temperature band.
 The config flow includes a `quick_setup` step that auto-detects HA entities
 (Huawei inverter, EV charger, Solcast forecasts, price sensors) to reduce
 manual configuration.
-
-### OCPP server
-
-OCPP configuration is exposed through the config flow with these keys:
-`hsem_ocpp_enabled`, `hsem_ocpp_port`, `hsem_ocpp_cpid`,
-`hsem_ocpp_start_window_s`, `hsem_ocpp_stop_window_s`. See
-[OCPP charger sensors](#ocpp-charger-sensors) above.
-
----
 
 ## Services
 

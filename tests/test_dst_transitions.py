@@ -4,7 +4,6 @@ Acceptance criteria:
 - No pytz usage anywhere in HSEM.
 - All planner datetimes remain timezone-aware across DST transitions.
 - Planner intervals stay correct on DST forward (spring) and backward (autumn) days.
-- ``next_window_start_dt`` resolves charge/discharge windows correctly across DST gaps and folds.
 - ``_parse_now`` accepts valid timezone-aware ISO-8601 strings with DST offsets.
 
 Timezone under test: ``Europe/Copenhagen``
@@ -14,7 +13,7 @@ Timezone under test: ``Europe/Copenhagen``
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -23,10 +22,6 @@ import pytest
 from custom_components.hsem.models.planner_input import PlannerInput
 from custom_components.hsem.planner.engine_core import _parse_now
 from custom_components.hsem.planner.slot_population import build_slots
-from custom_components.hsem.utils.time_windows import (
-    interval_ends_before_window_start,
-    next_window_start_dt,
-)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -41,21 +36,6 @@ _SPRING_FORWARD_DATE = "2024-03-31"
 # Autumn fallback: 2024-10-27, clocks fall 03:00 → 02:00 (UTC+2 → UTC+1)
 # The local wall-clock hour 02:xx exists *twice* this day (25-hour day).
 _AUTUMN_FALLBACK_DATE = "2024-10-27"
-
-
-def _cph(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
-    """Return a Copenhagen-local timezone-aware datetime (fold=0, first occurrence)."""
-    return datetime(year, month, day, hour, minute, tzinfo=_TZ_CPH)
-
-
-def _cph_fold(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
-    """Return a Copenhagen-local timezone-aware datetime with fold=1 (second occurrence)."""
-    return datetime(year, month, day, hour, minute, fold=1, tzinfo=_TZ_CPH)
-
-
-def _parse_cph(value: str) -> datetime:
-    """Parse an ISO instant and restore Copenhagen's transition rules."""
-    return _parse_now(value, _TZ_CPH.key)
 
 
 # ---------------------------------------------------------------------------
@@ -211,126 +191,7 @@ class TestBuildSlotsDst:
 
 
 # ---------------------------------------------------------------------------
-# 3. next_window_start_dt: correct resolution across DST transitions
-# ---------------------------------------------------------------------------
-
-
-class TestNextWindowStartDstForward:
-    """next_window_start_dt across a spring-forward DST gap."""
-
-    def test_window_before_gap_is_in_future(self):
-        """A 01:00 window resolved from 00:30 on spring-forward day is in the future."""
-        # It is currently 00:30 UTC+1 on spring-forward day
-        now = _parse_cph("2024-03-31T00:30:00+01:00")
-        result = next_window_start_dt(now, time(1, 0))
-        assert result.astimezone(UTC) > now.astimezone(UTC)
-
-    def test_window_in_dst_gap_resolves_to_next_day(self):
-        """A window at 02:30 on spring-forward day (non-existent wall time) is skipped.
-
-        The gap hour (02:00–03:00) does not exist.  When now is already at 03:30 UTC+2,
-        the 02:30 target is in the past, so next_window_start_dt must return tomorrow.
-        """
-        # It is 03:30 UTC+2 (after the spring-forward)
-        now = _parse_cph("2024-03-31T03:30:00+02:00")
-        result = next_window_start_dt(now, time(2, 30))
-        # The result must be strictly in the future relative to now
-        assert result.astimezone(UTC) > now.astimezone(UTC)
-
-    def test_window_after_gap_is_same_day(self):
-        """A 04:00 window resolved from 00:30 on spring-forward day is later today."""
-        now = _parse_cph("2024-03-31T00:30:00+01:00")
-        result = next_window_start_dt(now, time(4, 0))
-        assert result.astimezone(UTC) > now.astimezone(UTC)
-        # Must be on the same calendar date (still 2024-03-31)
-        assert result.date() == now.date()
-
-
-class TestNextWindowStartDstFallback:
-    """next_window_start_dt across an autumn-fallback DST fold."""
-
-    def test_window_before_fold_is_in_future(self):
-        """A 01:00 window resolved from 00:30 on autumn-fallback day is in the future."""
-        now = _parse_cph("2024-10-27T00:30:00+02:00")
-        result = next_window_start_dt(now, time(1, 0))
-        assert result.astimezone(UTC) > now.astimezone(UTC)
-
-    def test_window_in_folded_hour_resolved_after_now(self):
-        """A window at 02:30 on autumn-fallback day is resolved correctly.
-
-        When it is currently 01:00 UTC+2 (before the fold), 02:30 is in the future.
-        """
-        now = _parse_cph("2024-10-27T01:00:00+02:00")
-        result = next_window_start_dt(now, time(2, 30))
-        assert result.astimezone(UTC) > now.astimezone(UTC)
-
-    def test_window_after_fold_is_future(self):
-        """A 04:00 window resolved from 00:30 UTC+2 on autumn-fallback day is in future."""
-        now = _parse_cph("2024-10-27T00:30:00+02:00")
-        result = next_window_start_dt(now, time(4, 0))
-        assert result.astimezone(UTC) > now.astimezone(UTC)
-        assert result.date() == now.date()
-
-    def test_window_already_passed_goes_to_next_day(self):
-        """A 01:00 window resolved when it is already 02:00 (post-fold) advances by 1 day."""
-        # After the fold at 03:00 → 02:00, it is now 02:30 UTC+1 (fold=1)
-        now = _parse_cph("2024-10-27T02:30:00+01:00")
-        result = next_window_start_dt(now, time(1, 0))
-        assert result.astimezone(UTC) > now.astimezone(UTC)
-        # Must have advanced to the next calendar day
-        assert result.date() > now.date()
-
-
-# ---------------------------------------------------------------------------
-# 4. interval_ends_before_window_start: correct across DST transitions
-# ---------------------------------------------------------------------------
-
-
-class TestIntervalEndsDst:
-    """interval_ends_before_window_start must be consistent across DST transitions."""
-
-    def test_spring_forward_interval_before_gap(self):
-        """An interval ending at 01:30 is before a 03:00 window on spring-forward day."""
-        now = _parse_cph("2024-03-31T00:00:00+01:00")
-        # Interval ends at 01:30 UTC+1
-        interval_end = _parse_cph("2024-03-31T01:30:00+01:00")
-        # Window starts at 03:00 (wall clock — UTC+2 after the spring-forward)
-        assert interval_ends_before_window_start(interval_end, time(3, 0), now)
-
-    def test_spring_forward_interval_after_gap(self):
-        """An interval ending at 04:00 UTC+2 is before tomorrow's 03:00 window.
-
-        When *now* is 03:30 UTC+2, the 03:00 wall-clock time has already passed
-        today, so ``next_window_start_dt`` advances to 03:00 tomorrow.
-        An interval ending at 04:00 *today* ends before 03:00 *tomorrow*, so
-        the function correctly returns ``True``.
-        """
-        now = _parse_cph("2024-03-31T03:30:00+02:00")
-        interval_end = _parse_cph("2024-03-31T04:00:00+02:00")
-        # 04:00 today < 03:00 tomorrow → interval ends before the (next-day) window
-        assert interval_ends_before_window_start(interval_end, time(3, 0), now)
-
-    def test_autumn_fallback_interval_before_fold(self):
-        """An interval ending at 01:30 UTC+2 is before a 03:00 window on fallback day."""
-        now = _parse_cph("2024-10-27T00:00:00+02:00")
-        interval_end = _parse_cph("2024-10-27T01:30:00+02:00")
-        assert interval_ends_before_window_start(interval_end, time(3, 0), now)
-
-    def test_autumn_fallback_interval_after_fold(self):
-        """An interval ending at 04:00 UTC+1 is before tomorrow's 03:00 window.
-
-        When *now* is 03:30 UTC+1 (post-fold), the 03:00 wall-clock time has
-        already passed today (03:00 == now's day, rolled to next-day).  An
-        interval ending at 04:00 today ends before 03:00 tomorrow.
-        """
-        now = _parse_cph("2024-10-27T03:30:00+01:00")
-        interval_end = _parse_cph("2024-10-27T04:00:00+01:00")
-        # 04:00 today < 03:00 tomorrow → interval ends before the (next-day) window
-        assert interval_ends_before_window_start(interval_end, time(3, 0), now)
-
-
-# ---------------------------------------------------------------------------
-# 5. Full planner run: planner executes without error on DST days
+# 3. Full planner run: planner executes without error on DST days
 # ---------------------------------------------------------------------------
 
 
@@ -339,9 +200,6 @@ class TestPlannerRunsDstDays:
 
     def _base_input(self, now_iso: str) -> PlannerInput:
         """Return a minimal PlannerInput for a 24-hour summer-like day."""
-        from custom_components.hsem.models.battery_schedule_input import (
-            BatteryScheduleInput,
-        )
         from custom_components.hsem.models.hourly_consumption_average import (
             HourlyConsumptionAverage,
         )
@@ -362,13 +220,6 @@ class TestPlannerRunsDstDays:
             )
             for h in range(24)
         ]
-        schedules = [
-            BatteryScheduleInput(
-                enabled=True,
-                start=time(17, 0),
-                end=time(21, 0),
-            )
-        ]
         return PlannerInput(
             now_iso=now_iso,
             timezone_name=_TZ_CPH.key,
@@ -387,7 +238,6 @@ class TestPlannerRunsDstDays:
             consumption_averages=consumption,
             price_points=prices,
             solcast_slots=solar,
-            battery_schedules=schedules,
             excess_export_enabled=False,
             months_winter=[1, 2, 3, 4, 10, 11, 12],
             is_read_only=True,

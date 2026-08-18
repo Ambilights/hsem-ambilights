@@ -62,12 +62,6 @@ from custom_components.hsem.custom_sensors.net_consumption_sensor import (
 from custom_components.hsem.custom_sensors.next_update_sensor import (
     HSEMNextUpdateSensor,
 )
-from custom_components.hsem.custom_sensors.ocpp_sensors import (
-    HSEMOCPPChargerInfoSensor,
-    HSEMOCPPChargerPowerSensor,
-    HSEMOCPPChargerSessionsSensor,
-    HSEMOCPPChargerStatusSensor,
-)
 from custom_components.hsem.custom_sensors.plan_explanation_sensor import (
     HSEMPlanExplanationSensor,
 )
@@ -170,14 +164,6 @@ async def async_setup_entry(  # NOSONAR -- HA platform callback, must be async
     # Savings tracker sensor — exposes actual vs missed savings metrics.
     savings_sensor = HSEMSavingsSensor(config_entry, coordinator)
 
-    # OCPP charger sensors — expose charger state when OCPP server is enabled.
-    ocpp_charger_status_sensor = HSEMOCPPChargerStatusSensor(config_entry, coordinator)
-    ocpp_charger_power_sensor = HSEMOCPPChargerPowerSensor(config_entry, coordinator)
-    ocpp_charger_info_sensor = HSEMOCPPChargerInfoSensor(config_entry, coordinator)
-    ocpp_charger_sessions_sensor = HSEMOCPPChargerSessionsSensor(
-        config_entry, coordinator
-    )
-
     async_add_entities(
         [
             degraded_mode_sensor,
@@ -208,10 +194,6 @@ async def async_setup_entry(  # NOSONAR -- HA platform callback, must be async
             import_cost_sensor,
             net_grid_balance_sensor,
             working_mode_sensor,
-            ocpp_charger_status_sensor,
-            ocpp_charger_power_sensor,
-            ocpp_charger_info_sensor,
-            ocpp_charger_sessions_sensor,
         ]
     )
 

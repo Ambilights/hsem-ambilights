@@ -7,7 +7,7 @@ diagnostics).
 
 The dump includes:
 - The most recent planner input (battery hardware values, prices, PV forecast,
-  consumption averages, schedule config) — suitable for reproducing the plan
+  consumption averages, and forecast inputs) — suitable for reproducing the plan
   in the test suite via
   :func:`~custom_components.hsem.utils.diagnostics.load_planner_input_from_dump`.
 - The selected plan (per-slot decisions, charge/discharge windows, explanation,

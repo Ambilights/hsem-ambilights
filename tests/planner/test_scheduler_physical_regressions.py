@@ -19,7 +19,7 @@ from custom_components.hsem.planner.engine_scheduling import _schedule_slots
 from custom_components.hsem.planner.soc_simulation import simulate_soc
 from custom_components.hsem.utils.prices import SlotPrice
 from custom_components.hsem.utils.recommendations import Recommendations
-from tests.planner.test_arbitrage_grid_charge import _make_arbitrage_input
+from tests.planner.fixtures import make_summer_day_input
 
 _NOW = datetime(2026, 8, 16, tzinfo=UTC)
 _BCS = Recommendations.BatteriesChargeSolar.value
@@ -105,7 +105,7 @@ def _simulate(slots: list[PlannedSlot], *, current: float, usable: float) -> Non
 
 def _solver_failure_input(*, excess_export: bool) -> PlannerInput:
     """Return the deterministic high-export fallback scenario."""
-    inp = _make_arbitrage_input()
+    inp = make_summer_day_input()
     inp.excess_export_enabled = excess_export
     for solar in inp.solcast_slots:
         if solar.hour == 13:
@@ -349,10 +349,11 @@ def test_regression_force_export_is_classified_before_reserve() -> None:
         _slot(2, net=1.0),
         _slot(3, net=-1.0, import_price=1.0, export_price=0.1),
     ]
-    inp = _make_arbitrage_input(schedules=[])
+    inp = make_summer_day_input()
     inp.excess_export_discharge_buffer_pct = 0.0
     inp.export_min_price = 0.0
     inp.battery_max_discharge_power_w = 5000.0
+    inp.battery_discharge_efficiency_pct = 100.0
 
     *_, required_capacity, _warnings = _schedule_slots(
         slots,

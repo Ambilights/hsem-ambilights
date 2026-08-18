@@ -78,7 +78,7 @@ Where $\eta_{chg}$ and $\eta_{dis}$ are efficiency fractions (e.g. 0.97).
 
 ## Score (selector objective)
 
-$$ S = C_{total} + P_{soc} + P_{grid} + P_{override} + V_{terminal} + T_{action} $$
+$$ S = C_{total} + P_{soc} + P_{grid} + V_{terminal} + T_{action} $$
 
 ### SoC penalties (quadratic guard)
 
@@ -104,13 +104,6 @@ $$ P_{grid} = \sum_{t \in slots} \max(0, \frac{|gi[t] - ge[t]|}{\Delta t} - L_{g
 
 Where $\Delta t$ is slot duration in hours, $L_{grid}$ is the configured grid
 power limit in kW, and $w_{grid}$ is the penalty weight per excess kWh.
-
-### Override penalty
-
-$$ P_{override} = N_{override} \cdot w_{override} $$
-
-Where $N_{override}$ counts slots whose recommendation was forced by an override,
-and $w_{override}$ is the cost per override slot.
 
 ### Terminal SoC value (opportunity cost)
 

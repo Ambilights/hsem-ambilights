@@ -461,9 +461,9 @@ def simulate_soc(
 
         # If the slot has a FORCE discharge/export recommendation but
         # no discharge actually happened (battery empty or PV surplus),
-        # clear it to wait_mode.  Schedule discharge windows
-        # (BatteriesDischargeMode) stay as-is — they represent the
-        # user's configured windows, not a forced action.
+        # clear it to wait_mode. Normal BatteriesDischargeMode recommendations
+        # stay as-is because they represent the planner-selected operating
+        # mode, not a forced export action.
         if (
             not milp_prepopulated
             and discharge <= 1e-9

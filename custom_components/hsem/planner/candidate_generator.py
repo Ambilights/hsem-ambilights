@@ -109,9 +109,6 @@ __all__ = [
     "generate_candidates",
 ]
 
-# The charge and discharge slot counts are derived dynamically from battery
-# capacity (see _apply_aggressive_strategy).
-
 
 # ---------------------------------------------------------------------------
 # Public dataclass
@@ -168,11 +165,11 @@ def generate_candidates(
 ) -> list[CandidatePlan]:
     """Generate all candidate plans from the already-populated baseline slots.
 
-    The *baseline_slots* list must have been fully processed by the normal
-    scheduling pipeline (prices, consumption, net consumption, discharge
-    windows, charge windows, export policy, optimisation) **before** this
-    function is called.  The SoC simulation has **not** yet been applied —
-    it will be run separately by the selector for each candidate.
+    The *baseline_slots* list must already contain populated prices, load, PV,
+    and EV demand, plus the baseline safety and context decisions applied
+    before candidate construction. The SoC simulation has **not** yet been
+    applied; the selector runs it separately for each non-MILP candidate and
+    verifies the solver-owned flows for the MILP candidate.
 
     Args:
         baseline_slots:
@@ -180,20 +177,16 @@ def generate_candidates(
             current HSEM planning output.  This list is **not** mutated; each
             candidate receives its own deep copy.
         inp:
-            The planner input for this run.  Used to derive per-slot power
-            limits and price thresholds for the aggressive strategy.
+            The planner input for this run. Supplies the economic, physical,
+            and safety parameters used by the MILP.
         now:
             Timezone-aware current datetime.
         max_charge_per_slot:
-            Maximum energy (kWh) storable per slot after conversion losses.
-            Used when the aggressive strategy forces charging.
+            Maximum battery-side energy (kWh) storable per slot.
         current_kwh:
-            Current battery energy above the discharge floor (kWh).  Used to
-            derive the number of charge slots needed to fill the battery for
-            the aggressive candidate (Bug 2 fix in issue #416).
+            Current battery energy above the discharge floor (kWh).
         usable_kwh:
-            Maximum usable battery capacity (kWh).  Used alongside
-            ``current_kwh`` for the aggressive slot count.
+            Maximum usable battery capacity above the discharge floor (kWh).
         max_discharge_per_slot:
             Maximum energy dischargeable per slot (kWh) passed through to the
             MILP optimizer.  ``None`` means unlimited.

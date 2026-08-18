@@ -71,24 +71,16 @@ Every layer must respect the rules below.
 
 #### Layer 1 — Planner engine (pre-simulation)
 
-Slots are assigned recommendations by the scheduling functions in strict
-priority order.  Once a slot has a non-`None` recommendation, later rules
-in the same layer must not change it.
+The dynamic MILP is the sole authority for actively optimised primary-battery
+decisions. Across the actionable horizon it jointly chooses grid and PV charge,
+local-load discharge, hold, and optional battery export from prices, load and
+PV forecasts, conversion losses, cycle wear, SoC limits, and physical power
+constraints. No user-defined daily charge or discharge windows constrain or
+pre-author these decisions.
 
-**Discharge schedule windows** (highest priority in layer 1):
-
-1. Slot falls inside a configured discharge window and price spread is met → `batteries_discharge_mode`
-
-**Charge schedule windows** (before each discharge window):
-
-1. Import price < 0 → `batteries_charge_grid`
-2. Solar surplus (`estimated_net_consumption < threshold`) → `batteries_charge_solar`
-3. Cheapest grid hour where spread ≥ `min_price_difference + cycle_cost` → `batteries_charge_grid`
-
-**Opportunistic grid charge** (outside any schedule):
-
-1. Import price < 0 → `batteries_charge_grid`
-2. Import price ≤ depreciation threshold − cycle cost → `batteries_charge_grid`
+Recommendation labels are derived from the accepted solution's explicit energy
+flows. A failed or invalid solve falls back to the passive candidate; it must
+not restore a heuristic active-battery plan.
 
 **Intentional battery export:**
 
@@ -250,30 +242,33 @@ The following must never be overridden by the EV label:
 `time_passed`, `missing_input_entities`.
 
 `batteries_discharge_mode` is **not** in this protected set — it is intentionally
-overrideable.  When an EV is scheduled to charge in a slot that is also inside a
-discharge window, the `ev_smart_charging` label wins so dashboards correctly reflect
-EV activity rather than showing a discharge recommendation during an active charge
-session.
+overrideable. When EV load is allocated to a local-discharge slot, the
+`ev_smart_charging` label wins so dashboards correctly reflect the active EV
+session. This relabelling does not change the accepted MILP energy flows.
 
 #### Layer 3 — Runtime resolver (current slot only, at hardware-write time)
 
 Applied to the current slot immediately before hardware writes, using live sensor data:
 
 1. `import_price < 0` → `force_export` (overrides everything)
-2. `batteries_charge_grid` → kept (must never be overridden by EV or discharge rule)
+2. `batteries_charge_grid` → kept (must never be overridden by EV relabelling)
 3. Any EV actively charging → `ev_smart_charging`
-4. Battery energy > remaining discharge-schedule need → `batteries_discharge_mode`
+4. Otherwise → keep the accepted planner recommendation
 
 Runtime resolution is copy-on-write. The working-mode sensor detaches the
 current recommendation and, when its effective label changes, substitutes that
 copy into a sensor-local `CoordinatorData` view. It must never mutate the
 planner-owned accepted slot or recommendation list. An in-flight hardware
 worker therefore retains the exact snapshot it accepted, and each later live
-refresh resolves again from the canonical planner output so a transient EV or
-discharge override clears when its live condition clears.
+refresh resolves again from the canonical planner output so a transient EV
+override clears when its live condition clears.
 
 ### Invariants for tests
 
+- Active grid charge, local discharge, and intentional battery export must come
+  from the accepted MILP flows, never from user-defined daily time windows.
+- With no negative-price or live-EV override, the runtime resolver must retain
+  the accepted planner recommendation.
 - A slot assigned `batteries_charge_grid` by the planner must never be relabelled by
   the EV load labelling pass (layer 2).
 - A slot assigned `batteries_discharge_mode` **may** be relabelled `ev_smart_charging`
@@ -1680,16 +1675,15 @@ score
 = total_cost
 + soc_guard_penalty
 + grid_limit_penalty
-+ override_penalty
 + terminal_soc_value
 + primary_action_tiebreak
 ```
 
 Where:
 
-- `soc_guard_penalty`, `grid_limit_penalty`, `override_penalty` are
-  **selector-only** synthetic terms.  They must **never** appear in
-  `total_cost`, because they do not represent real money paid or earned.
+- `soc_guard_penalty` and `grid_limit_penalty` are **selector-only**
+  synthetic terms. They must **never** appear in `total_cost`, because they
+  do not represent real money paid or earned.
 - `terminal_soc_value` is **selector-only**.  It is negative (credit) when
   the plan ends with more stored energy than it started with, and positive
   (penalty) when the plan empties the battery.  It prevents the selector
@@ -1935,7 +1929,7 @@ case `terminal_soc_value` is `0.0`. The flow-based
   `import_cost - export_revenue + cycle_cost + conversion_loss_cost`
   exactly.  No synthetic penalty may enter `total_cost`.
 - `score` must equal
-  `total_cost + soc_penalty + grid_limit_penalty + override_penalty + terminal_soc_value + primary_action_tiebreak`
+  `total_cost + soc_penalty + grid_limit_penalty + terminal_soc_value + primary_action_tiebreak`
   exactly.
 - When all penalties and selector-only inventory/tiebreak terms are zero,
   `score == total_cost`.
@@ -2078,8 +2072,8 @@ Required candidates on every run:
 
 The retired baseline/grid-charge/discharge/export/aggressive heuristic matrix is
 not generated. In particular, a failed solver must never restore the
-pre-candidate scheduled baseline, because that baseline has not passed the
-MILP's fuse, phase, export, EV, and secondary-storage constraints. The MILP is
+pre-solve heuristic baseline, because that baseline has not passed the MILP's
+fuse, phase, export, EV, and secondary-storage constraints. The MILP is
 the only candidate allowed to introduce actively optimized grid charge or
 intentional battery export.
 
@@ -2093,10 +2087,9 @@ Planner warnings have the same ownership rule. Global input-quality and solver
 diagnostics remain visible for every run, but recommendation-specific warnings
 created while building a candidate are surfaced only if that candidate wins.
 The retired `apply_excess_export` pass can no longer add heuristic export
-labels or warnings. Other pre-candidate schedules may still supply discharge
-labels as replacement-value context, but those labels do not author the
-selected plan; intentional battery export remains owned by the selected MILP
-candidate.
+labels or warnings. The selected MILP's explicit flows own every actively
+optimised primary-battery decision; intentional battery export remains owned
+by the selected MILP candidate.
 
 This invariant must always hold:
 
@@ -2451,11 +2444,10 @@ battery is reserved for the most expensive slots.
 
 The function groups discharge slots by **calendar day** and gives each
 day its own independent ``usable_kwh`` budget.  This correctly accounts
-for the fact that the battery is recharged by solar (or cheap grid
-hours) between discharge windows on different days.  Without per-day
-budgets, slots on day N+1 would compete with slots on day N for the
-same capacity pool — even though the battery is fully recharged in
-between.
+for the fact that the battery can be recharged by solar (or cheap grid
+hours) between groups of discharge slots on different days. Without per-day
+budgets, slots on day N+1 would compete with slots on day N for the same
+capacity pool even when the battery is recharged between them.
 
 Within each day the estimate is conservative: it assumes the battery
 starts at full capacity and there is no incoming charge between

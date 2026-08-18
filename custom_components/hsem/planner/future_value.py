@@ -81,9 +81,9 @@ def replacement_price_from_next_discharge(
 ) -> float | None:
     """Value stored energy from the first upcoming priced discharge window.
 
-    The first contiguous block matters: later schedule occurrences in a
-    multi-day horizon must not inflate the value assigned at this horizon's
-    endpoint. Only slots with published import/export prices are eligible.
+    The first contiguous block matters: later discharge blocks in a multi-day
+    horizon must not inflate the value assigned at this horizon's endpoint.
+    Only slots with published import/export prices are eligible.
 
     When ``forecast`` is supplied, only its points beyond the published prefix
     are eligible — a prediction never competes with a real price — and those

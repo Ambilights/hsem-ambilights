@@ -12,8 +12,8 @@ The config flow is a multi-step wizard. Steps appear in this order:
 quick_setup → init → prices → months → solcast → huawei_solar
     → battery_economics → power → secondary_storage → ev → [ev_second]
     → ev_planned_load
-    → [ev_second_planned_load] → ocpp → batteries_schedules
-    → batteries_wait_mode → batteries_excess_export → weighted_values
+    → [ev_second_planned_load] → batteries_wait_mode
+    → batteries_excess_export → weighted_values
     → energy_and_ml
 ```
 
@@ -213,30 +213,6 @@ Target SoC and deadline are configured outside this step:
 ### Step: `ev_second_planned_load`
 
 Second EV planned load integration (identical fields; only shown when second EV enabled).
-
-### Step: `ocpp`
-
-OCPP (Open Charge Point Protocol) integration for EV charger remote control.
-
-| Field | Key | Default | Description |
-|---|---|---|---|
-| OCPP enabled | `hsem_ocpp_enabled` | `False` | Master switch for OCPP integration |
-| OCPP port | `hsem_ocpp_port` | `9000` | TCP port for the OCPP WebSocket server |
-| OCPP charge point ID | `hsem_ocpp_cpid` | — | Charge point identifier (as configured in the charger) |
-| Start window | `hsem_ocpp_start_window_s` | `300` | Seconds before a scheduled charge slot to send `RemoteStartTransaction` |
-| Stop window | `hsem_ocpp_stop_window_s` | `300` | Seconds before a non-charge slot to send `RemoteStopTransaction` |
-
-### Step: `batteries_schedule_1/2/3`
-
-Battery charge/discharge schedule windows (up to three).
-
-| Field | Key | Default | Description |
-|---|---|---|---|
-| Enabled | `hsem_batteries_enable_batteries_schedule_N` | Varies | Toggle this schedule window |
-| Start time | `hsem_batteries_enable_batteries_schedule_N_start` | Varies | Window start (HH:MM:SS) |
-| End time | `hsem_batteries_enable_batteries_schedule_N_end` | Varies | Window end (HH:MM:SS) |
-
-Schedule 1 and 2 are enabled by default; schedule 3 is disabled by default.
 
 ### Step: `batteries_wait_mode`
 

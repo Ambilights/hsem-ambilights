@@ -119,12 +119,12 @@ Applied **only to the current slot** immediately before hardware writes. Overrid
 | 1 (highest) | Live import price < 0 | → `force_export` |
 | 2 | Current recommendation = `batteries_charge_grid` | Kept (never overridden) |
 | 3 | Any EV actively charging | → `ev_smart_charging` |
-| 4 | Battery energy > remaining schedule need | → `batteries_discharge_mode` |
+| — | None of the above | Accepted planner recommendation kept |
 
 **Protection rules:**
 
 - `force_export` (negative price) always wins — it overrides everything, including EV charging.
-- `batteries_charge_grid` is **never** overridden by EV or discharge rules.
+- `batteries_charge_grid` is **never** overridden by EV relabelling.
 - The resolver reads live sensor data that was stale at planning time (actual working mode, real-time EV state).
 
 ---

@@ -5,15 +5,10 @@ from __future__ import annotations
 from datetime import datetime
 
 from custom_components.hsem.models.planner_input import PlannerInput
-from custom_components.hsem.planner.charging.arbitrage_charge import (
-    apply_arbitrage_grid_charge,
-)
 from custom_components.hsem.planner.charging.opportunistic_charge import (
     apply_opportunistic_charge,
 )
-from custom_components.hsem.planner.charging.pre_charge import apply_charge_schedules
 from custom_components.hsem.planner.discharge_scheduler import (
-    apply_discharge_schedules,
     apply_force_export_policy,
     apply_optimization_strategy,
     calculate_required_battery_until_solar,
@@ -26,7 +21,6 @@ from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import clamp_efficiency
 from custom_components.hsem.utils.units import (
     max_energy_per_slot_kwh,
-    roundtrip_loss_pct,
 )
 
 
@@ -42,31 +36,11 @@ def _schedule_slots(
 ) -> tuple[float, float | None, float, float, list[str]]:
     """Run all charge/discharge scheduling passes."""
     mark_time_passed(slots, now)
-    apply_discharge_schedules(slots, inp.battery_schedules, now)
-    log_planner(
-        "debug",
-        "[core] _schedule_slots  pass=discharge_schedules  slots=%d",
-        len(slots),
-    )
     charge_eff = clamp_efficiency(inp.battery_charge_efficiency_pct)
-    roundtrip_loss = roundtrip_loss_pct(
-        inp.battery_charge_efficiency_pct,
-        inp.battery_discharge_efficiency_pct,
-    )
     max_charge_per_slot = max_energy_per_slot_kwh(
         inp.battery_max_charge_power_w,
         inp.interval_minutes,
         efficiency_fraction=charge_eff,
-    )
-    apply_charge_schedules(
-        slots,
-        inp.battery_schedules,
-        now,
-        max_charge_per_slot,
-        current_kwh=current_kwh,
-        usable_kwh=usable_kwh,
-        cycle_cost_per_kwh=effective_cycle_cost,
-        recommended_threshold=rt,
     )
     apply_opportunistic_charge(
         slots,
@@ -76,17 +50,6 @@ def _schedule_slots(
         max_charge_per_slot,
         rt,
         cycle_cost_per_kwh=effective_cycle_cost,
-    )
-    apply_arbitrage_grid_charge(
-        slots,
-        inp.battery_schedules,
-        now,
-        current_kwh,
-        usable_kwh,
-        max_charge_per_slot,
-        conversion_loss_pct=roundtrip_loss,
-        cycle_cost_per_kwh=effective_cycle_cost,
-        recommended_threshold=rt,
     )
     max_discharge_per_slot: float | None = None
     if inp.battery_max_discharge_power_w is not None:

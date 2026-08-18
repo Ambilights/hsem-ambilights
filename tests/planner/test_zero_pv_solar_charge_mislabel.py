@@ -3,8 +3,8 @@ as BatteriesChargeSolar.
 
 Bug
 ---
-``apply_optimization_strategy`` used ``NEAR_ZERO_CONSUMPTION_THRESHOLD_KWH``
-(0.1 kWh) to decide whether an unassigned summer slot should charge from
+``apply_optimization_strategy`` used a 0.1 kWh near-zero-consumption threshold
+to decide whether an unassigned summer slot should charge from
 solar.  A slot with a small positive house load (e.g. 0.08 kWh) and zero
 PV would pass the ``<= 0.1`` check and get ``BatteriesChargeSolar`` even
 though there was no PV surplus at all.  The result was a grid-charging

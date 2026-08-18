@@ -13,7 +13,6 @@ The :func:`build_sensor_config` factory function (in
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import time
 from typing import cast
 
 from custom_components.hsem.const import (
@@ -46,20 +45,6 @@ class EVChargerConfig:
     past_target_confidence_factor: float = 0.9
     force_max_discharge_power: bool = False
     max_discharge_power: int = 0
-
-
-@dataclass
-class BatteryScheduleConfig:
-    """Configuration for one charge/discharge battery schedule window.
-
-    Defines whether the schedule window is enabled and its start/end times.
-    Used as a nested config block within :class:`SensorConfig` for up to
-    three independent battery schedule windows.
-    """
-
-    enabled: bool = False
-    start: time | None = None
-    end: time | None = None
 
 
 @dataclass
@@ -120,12 +105,9 @@ class SensorConfig:
             Defaults to 97 % (3 % discharge-side loss).
         batteries_purchase_price: Battery pack purchase price for depreciation calc.
         batteries_expected_cycles: Expected total cycle life of the battery.
-        batteries_cycle_cost: User-configured extra per-kWh cycle cost.
-            Added to the auto-derived depreciation threshold.  0.0 = disabled.
+        batteries_cycle_cost: User-configured extra per-kWh cycle-wear cost.
+            Added to the auto-derived depreciation cost. 0.0 = no extra margin.
 
-        batteries_schedule_1: First discharge-window schedule config.
-        batteries_schedule_2: Second discharge-window schedule config.
-        batteries_schedule_3: Third discharge-window schedule config.
 
         batteries_enable_excess_export: Enable opportunistic forced-discharge export.
         batteries_excess_export_discharge_buffer: Safety buffer percentage to keep.
@@ -240,9 +222,9 @@ class SensorConfig:
     batteries_discharge_efficiency: float = 98.0
     batteries_purchase_price: float = 0.0
     batteries_expected_cycles: int = 6000
-    #: User-configured per-kWh cycle cost. When > 0 it is added directly to
-    #: the min-price-difference guard so cycling only happens when the price
-    #: spread covers both losses AND wear.  0.0 means no extra guard.
+    #: User-configured per-kWh cycle-wear margin. It is added to the canonical
+    #: auto-derived depreciation cost used by the MILP objective and scorer.
+    #: 0.0 means no extra margin.
     batteries_cycle_cost: float = 0.0
 
     #: Expected battery capacity loss at end-of-life as a percentage (0-100).
@@ -252,17 +234,6 @@ class SensorConfig:
         default_factory=lambda: cast(
             float, DEFAULT_CONFIG_VALUES["hsem_batteries_capacity_loss_pct"]
         )
-    )
-
-    # Battery discharge schedules
-    batteries_schedule_1: BatteryScheduleConfig = field(
-        default_factory=BatteryScheduleConfig
-    )
-    batteries_schedule_2: BatteryScheduleConfig = field(
-        default_factory=BatteryScheduleConfig
-    )
-    batteries_schedule_3: BatteryScheduleConfig = field(
-        default_factory=BatteryScheduleConfig
     )
 
     # Excess export
@@ -322,26 +293,11 @@ class SensorConfig:
     # any recommendation change.  0 disables the feature.
     planner_window_hysteresis_minutes: int = 10
 
-    # Embedded OCPP 1.6 server for EV charger control (issue #603).
-    ocpp_enabled: bool = False
-    ocpp_port: int = 9000
-    ocpp_cpid: str = ""
-    ocpp_start_window_s: int = 60
-    ocpp_stop_window_s: int = 180
-
     # Consumption weights
     house_consumption_energy_weight_1d: int = 50
     house_consumption_energy_weight_3d: int = 20
     house_consumption_energy_weight_7d: int = 15
     house_consumption_energy_weight_14d: int = 10
-
-    def schedule_configs(self) -> list[BatteryScheduleConfig]:
-        """Return all three schedule configs as a list."""
-        return [
-            self.batteries_schedule_1,
-            self.batteries_schedule_2,
-            self.batteries_schedule_3,
-        ]
 
     def weights_sum(self) -> int:
         """Return the sum of all four consumption weights."""

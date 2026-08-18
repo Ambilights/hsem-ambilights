@@ -700,29 +700,32 @@ class TestSelectBestCandidate:
 
     def test_rejected_plan_keeps_money_cost_distinct_from_selector_score(self):
         """Rejected diagnostics expose total_cost and score in separate fields."""
+        ordinary_slot = _make_simple_slot(
+            import_price=0.0,
+            recommendation=Recommendations.BatteriesWaitMode.value,
+        )
+        grid_limited_slot = _make_simple_slot(
+            import_price=0.0,
+            recommendation=Recommendations.BatteriesWaitMode.value,
+        )
+        grid_limited_slot.avg_house_consumption_kwh = 2.0
         winner_candidate = CandidatePlan(
             name="ordinary",
-            slots=[
-                _make_simple_slot(
-                    recommendation=Recommendations.BatteriesWaitMode.value
-                )
-            ],
+            slots=[ordinary_slot],
         )
         rejected_candidate = CandidatePlan(
-            name="forced",
-            slots=[
-                _make_simple_slot(
-                    recommendation=Recommendations.BatteriesChargeGrid.value
-                )
-            ],
+            name="grid_limited",
+            slots=[grid_limited_slot],
         )
         candidates = [winner_candidate, rejected_candidate]
         weights = self._cost_weights()
-        weights.override_penalty_per_slot = 10.0
+        weights.cycle_cost_per_kwh = 0.0
+        weights.grid_limit_kw = 1.0
+        weights.grid_limit_penalty_per_kwh = 10.0
         winner, rejected, _ = select_best_candidate(
             candidates,
             now=_NOW,
-            current_kwh=4.5,
+            current_kwh=0.0,
             usable_kwh=9.0,
             max_soc_capacity_kwh=9.0,
             max_charge_per_slot=1.25,
@@ -734,6 +737,9 @@ class TestSelectBestCandidate:
         )
         candidates_by_name = {candidate.name: candidate for candidate in candidates}
         assert winner is winner_candidate
+        assert rejected_candidate._cost is not None
+        assert rejected_candidate._cost.grid_limit_penalty > 0.0
+        assert rejected_candidate._cost.score > rejected_candidate._cost.total_cost
         assert rejected
         rejected_candidates = [candidates_by_name[plan.name] for plan in rejected]
         assert any(

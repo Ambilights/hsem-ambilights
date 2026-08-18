@@ -28,8 +28,8 @@ def apply_opportunistic_charge(
 ) -> None:
     """Charge the battery opportunistically when import prices are very low.
 
-    This is a *schedule-independent* charge pass: it runs even when no
-    discharge window is configured.  It covers two cases:
+    This pre-solve heuristic pass does not depend on user-defined windows.
+    It covers two cases:
 
     1. **Negative import price** — the grid pays the consumer.  Every
        negative-price future slot is eligible regardless of the battery level.
@@ -40,8 +40,8 @@ def apply_opportunistic_charge(
        opportunistically when the price is low enough to cover both
        depreciation and cycle wear.
 
-    Slots already assigned (by schedule pre-charge or prior passes) are
-    skipped.  Energy is limited to what the battery can still absorb.
+    Slots already assigned by prior passes are skipped. Energy is limited to
+    what the battery can still absorb.
 
     Args:
         slots: Mutable list of planned slots (modified in-place).
