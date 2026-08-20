@@ -29,6 +29,7 @@ from custom_components.hsem.models.secondary_storage_config import (
     SecondaryStorageConfig,
 )
 from custom_components.hsem.models.solcast_slot import SolcastSlot
+from custom_components.hsem.models.terminal_cost_to_go import TerminalCostToGo
 from custom_components.hsem.planner import engine_core, run_planner
 from custom_components.hsem.planner.cost_function import CostWeights, score_plan
 from custom_components.hsem.planner.future_value import (
@@ -176,28 +177,41 @@ def _established_terminal_export_input() -> PlannerInput:
     )
 
 
-def test_established_ten_kwh_export_at_0688_is_blocked() -> None:
-    """Do not dump a 10 kWh battery at 0.688 before dearer known imports.
+def test_no_forecast_replay_uses_only_hardware_floor_terminal_policy() -> None:
+    """Do not resurrect the retired full-inventory in-window scalar.
 
-    This is the exact 60-minute release reproduction.  The old plan discharged
-    all 10.000 DC kWh at 17:00 and exported it at 0.688 currency/kWh.  With
-    0.720 kWh PV and 0.500 kWh load, 0.050 kWh first refills the battery energy
-    used at 16:00.  The corrected 17:00 flow charges 0.050 DC kWh, exports only
-    0.170 AC kWh PV, discharges 0, and leaves at least 7 kWh in the final slot
-    after the horizon's roughly 2.7 kWh of local demand.
+    This exact 60-minute replay has no strictly post-boundary forecast demand.
+    Production must therefore assign zero economic terminal quantity instead
+    of valuing the full 10 kWh battery from published prices inside the current
+    window. Surplus may be exported only after the known local loads stay
+    covered; the hardware floor remains a hard constraint, with the nonzero
+    floor case covered by the exact 45-slot boundary regression.
     """
-    output = run_planner(_established_terminal_export_input())
-    hour_17 = next(
-        slot
-        for slot in output.slots
-        if slot.start.date().isoformat() == "2024-06-15" and slot.start.hour == 17
-    )
+    planner_input = _established_terminal_export_input()
+    output = run_planner(planner_input)
 
     assert output.winner_name == "milp"
-    assert hour_17.batteries_discharged_kwh == pytest.approx(0.0, abs=0.001)
-    assert hour_17.batteries_charged_kwh == pytest.approx(0.050, abs=0.001)
-    assert hour_17.grid_export_kwh == pytest.approx(0.170, abs=0.001)
-    assert output.slots[-1].estimated_battery_capacity_kwh > 7.0
+    assert output.plan_cost is not None
+    explanation = output.explanation
+    assert explanation.terminal_cost_to_go_source == "hardware_floor_only"
+    assert explanation.terminal_cost_to_go_tier_count == 0
+    assert explanation.terminal_cost_to_go_total_quantity_kwh == pytest.approx(0.0)
+    assert explanation.terminal_cost_to_go_initial_value == pytest.approx(0.0)
+    assert explanation.terminal_cost_to_go_final_value == pytest.approx(0.0)
+    assert output.plan_cost.terminal_soc_value == pytest.approx(0.0)
+    assert sum(slot.grid_import_kwh for slot in output.slots) == pytest.approx(
+        0.0,
+        abs=0.001,
+    )
+    hardware_floor_kwh = (
+        planner_input.battery_rated_capacity_kwh
+        * planner_input.battery_end_of_discharge_soc_pct
+        / 100.0
+    )
+    minimum_capacity_kwh = min(
+        slot.estimated_battery_capacity_kwh for slot in output.slots
+    )
+    assert max(hardware_floor_kwh - minimum_capacity_kwh, 0.0) == pytest.approx(0.0)
 
 
 def test_saved_live_economics_discharges_only_into_local_load() -> None:
@@ -461,12 +475,13 @@ def test_powmr_sbu_is_removed_from_primary_local_load_before_attribution() -> No
     _assert_export_source_balance(planned)
 
 
-def test_forecast_only_replacement_value_is_not_an_export_price_floor() -> None:
-    """A forecast-derived R=5 may coexist with export at 2 after free refill.
+def test_legacy_forecast_scalar_is_not_an_export_price_floor() -> None:
+    """Direct scalar compatibility allows export at 2 after free refill.
 
     The first two 60-minute slots have published prices; the third is the
-    unpublished tail.  Its only 5.000 forecast point creates R=5.000 without
-    becoming actionable.  Selling 1.000 AC kWh at 2.000 and refilling 1.000
+    unpublished tail. Its only 5.000 forecast point creates legacy R=5.000;
+    production primary planning now uses bounded cost-to-go tiers. Neither path
+    makes a forecast actionable. Selling 1.000 AC kWh at 2.000 and refilling 1.000
     DC kWh from free PV leaves terminal SoC unchanged, so the sale remains valid.
     """
     slots = [
@@ -740,18 +755,20 @@ def test_diagnostics_serializes_primary_and_pv_export_sources() -> None:
 def test_winner_slots_and_scores_match_final_and_direct_scoring(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Keep winner identity and every score view aligned on the 60-min replay.
+    """Keep winner identity and bounded terminal scoring aligned.
 
-    The selected candidate's slot list must be the final output list.  Its
-    selector score, final score, and a direct ``score_plan`` call using the
-    captured currency/kWh replacement value must match to 1e-6.  This prevents
-    source-field post-processing from changing costs or flows after selection.
+    The production engine must pass the same bounded cost-to-go object to
+    candidate generation and final scoring, while retiring the old scalar
+    replacement price. A direct score of the selected slots must match every
+    published winner view to 1e-6.
     """
     planner_input = _established_terminal_export_input()
+    captured_models: list[TerminalCostToGo | None] = []
     captured_replacement_prices: list[float | None] = []
     original_generate_candidates = engine_core.generate_candidates
 
     def _capture_generate_candidates(*args: Any, **kwargs: Any) -> Any:
+        captured_models.append(kwargs.get("terminal_cost_to_go"))
         captured_replacement_prices.append(kwargs.get("replacement_price_per_kwh"))
         return original_generate_candidates(*args, **kwargs)
 
@@ -761,9 +778,12 @@ def test_winner_slots_and_scores_match_final_and_direct_scoring(
         _capture_generate_candidates,
     )
     output = engine_core.run_planner(planner_input)
-    assert len(captured_replacement_prices) == 1
-    replacement_price = captured_replacement_prices[0]
-    assert replacement_price is not None
+    assert len(captured_models) == 1
+    assert captured_replacement_prices == [None]
+    terminal_model = captured_models[0]
+    assert terminal_model is not None
+    assert terminal_model.source == "hardware_floor_only"
+    assert terminal_model.total_quantity_kwh == pytest.approx(0.0)
 
     winner = next(c for c in output.candidates if c.name == output.winner_name)
     assert winner._cost is not None
@@ -789,8 +809,13 @@ def test_winner_slots_and_scores_match_final_and_direct_scoring(
         slot_duration_hours=1.0,
         now=datetime.fromisoformat(planner_input.now_iso),
         initial_battery_kwh=10.0,
-        replacement_price_per_kwh=replacement_price,
+        replacement_price_per_kwh=None,
+        terminal_cost_to_go=terminal_model,
     )
     assert direct.score == pytest.approx(output.plan_cost.score, abs=1e-6)
     assert direct.total_cost == pytest.approx(output.plan_cost.total_cost, abs=1e-6)
+    assert direct.terminal_soc_value == pytest.approx(
+        output.plan_cost.terminal_soc_value,
+        abs=1e-6,
+    )
     _assert_export_source_balance(output.slots)

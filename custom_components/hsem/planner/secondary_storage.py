@@ -131,8 +131,9 @@ def resolve_secondary_terminal_price(
 
     The mean is deliberate rather than a peak: the PowMr serves its dedicated
     load continuously, so stored energy is spent across the window rather than
-    concentrated on its dearest hour.  That makes this side less sensitive to a
-    forecast peak than the primary battery's ``top_n`` valuation.
+    concentrated on its dearest hour. That differs from the retained legacy
+    primary scalar helper; production primary planning uses bounded
+    residual-demand tiers instead.
     """
     if not config.valid:
         return None

@@ -21,12 +21,12 @@ common scenarios a real installation will encounter.
 8. [Data quality diagnostics](#data-quality-diagnostics)
 9. [Diagnostic accuracy and daily accounting](#diagnostic-accuracy-and-daily-accounting)
 10. [Scenario examples](#scenario-examples)
-   - [Winter day — cold, low PV, peak-hour pricing](#scenario-1-winter-day)
-   - [Summer day — high PV surplus](#scenario-2-summer-day-high-pv)
-   - [Cheap night price — grid charge opportunity](#scenario-3-cheap-night-price)
-   - [High PV day — excess export opportunity](#scenario-4-high-pv-day-excess-export)
-   - [Flat price day — no arbitrage value](#scenario-5-flat-price-day)
-   - [EV charging — solar-first smart plan](#scenario-6-ev-charging--solar-first-smart-plan)
+   - [Winter price arbitrage](#scenario-1-winter-price-arbitrage)
+   - [Summer day — high PV surplus](#scenario-2-summer-day--high-pv-surplus)
+   - [Cheap night price — grid charge opportunity](#scenario-3-cheap-night-price--grid-charge-opportunity)
+   - [High PV day — export now, refill later](#scenario-4-high-pv-day--export-now-refill-later)
+   - [Flat price day — self-consume, do not arbitrage](#scenario-5-flat-price-day--self-consume-do-not-arbitrage)
+   - [EV charging — MILP co-optimisation](#scenario-6-ev-charging--milp-co-optimisation)
 11. [Reading the plan explanation](#reading-the-plan-explanation)
 12. [Known limitations](#known-limitations)
 
@@ -582,6 +582,11 @@ The `PlanExplanation` object is designed to be surfaced directly as a HA sensor 
 | `forecast_pv_kwh` | Total PV production for the horizon |
 | `forecast_net_consumption_kwh` | Total load − PV (negative = net solar surplus) |
 | `battery_soc_pct` / `battery_soc_at_end_pct` | Starting and ending SoC |
+| `terminal_cost_to_go_source` / `terminal_cost_to_go_boundary` | Primary terminal model source and published-price boundary |
+| `terminal_cost_to_go_tier_count` / `terminal_cost_to_go_total_quantity_kwh` | Number and total battery-side quantity of bounded post-boundary tiers |
+| `terminal_cost_to_go_highest_value_per_kwh` / `terminal_cost_to_go_lowest_value_per_kwh` | Marginal-value range of the retained tiers |
+| `terminal_cost_to_go_initial_valued_quantity_kwh` / `terminal_cost_to_go_final_valued_quantity_kwh` | Initial and selected-final inventory covered by tiers |
+| `terminal_cost_to_go_initial_value` / `terminal_cost_to_go_final_value` | Piecewise inventory values used to derive the selector-only primary terminal term |
 | `constraints` | Active flags (e.g. `"winter_month"`, `"excess_export_enabled"`) |
 | `rejected_plans` | Alternatives with name, reason, and estimated cost |
 
@@ -961,16 +966,14 @@ if slot_power_kw > grid_limit_kw:
 
 ### Terminal inventory accounting
 
-Plans that empty either battery before the horizon ends look artificially cheap.
-The cost function accounts for this by pricing both batteries' remaining energy
-at the end of the horizon.
-
-The terminal term is uniform and undiscounted:
+Plans can look artificially cheap when they use inventory needed just beyond
+the published-price boundary. Primary storage therefore uses a bounded
+post-boundary cost-to-go; secondary storage retains its uniform terminal term:
 
 ```text
 primary_terminal_soc_value =
-    replacement_price_per_kwh
-    × (Σ batteries_discharged_kwh − Σ batteries_charged_kwh)
+    V_primary(initial_battery_kwh)
+    − V_primary(final_battery_kwh)
 
 secondary_terminal_soc_value =
     secondary_storage_replacement_price_per_kwh
@@ -983,27 +986,31 @@ terminal_soc_value =
     primary_terminal_soc_value + secondary_terminal_soc_value
 ```
 
-Each component depends only on final inventory, not on the route taken. Equal
-discharge and recharge of either battery cancel exactly, so real slot prices,
-efficiencies, wear, headroom, and power limits decide whether a cycle is
-economic.
+`V_primary(E)` is piecewise linear. Each tier represents only the battery-side
+energy that could serve one exactly aligned, non-actionable house-load slot
+strictly beyond the contiguous published-price prefix. Tier quantity is capped
+by residual house load after PV and accounted EV load, discharge efficiency,
+per-slot discharge power, and usable battery capacity. Its Unagi price is
+reduced by MAE plus operator margin; conversion loss and cycle wear are then
+removed from its marginal value. Duplicate points use the lower prediction,
+and invalid inputs fail closed.
 
-`replacement_price_from_next_discharge()` uses the first contiguous
-published, price-actionable heuristic discharge block and averages its
-`top_n` dearest import prices. `top_n` is based on usable battery capacity
-and maximum discharge energy per slot. It is terminal horizon context, not a
-hard per-slot export price and not a forecast of refill.
+Inventory above the combined tier quantity has no synthetic value. When no
+valid tier exists, diagnostics report `hardware_floor_only`: primary terminal
+value is zero and the existing effective hardware discharge floor is the only
+reserve. As official prices arrive, the boundary rolls forward; newly
+published demand leaves the tiers and is evaluated at its real price instead
+of moving a synthetic hold forward.
 
-With optional forecast valuation, the unpublished tail is reduced by its MAE
-plus the configured margin and the effective value is the higher of published
-and forecast-derived values. Forecast points never become slot prices, extend
-price actionability, or create an export opportunity; they can only raise the
-value of retained terminal inventory.
+Both primary and secondary accounting remain path-independent. Equal discharge
+and recharge restore the same final inventory and cancel exactly, so real slot
+prices, efficiencies, wear, headroom, and power limits decide whether a cycle
+is economic. `resolve_secondary_terminal_price()` remains a separate,
+uniform mean-of-window valuation for the dedicated PowMr load.
 
-`resolve_secondary_terminal_price()` uses the same published/forecast authority
-rule with a mean-of-window aggregation suited to the dedicated load. Its result
-is one uniform, undiscounted coefficient, never a per-slot secondary charge or
-discharge premium.
+Unagi remains valuation-only: it never becomes a slot import/export price,
+extends price actionability, authorises a storage action, or creates realised
+within-window savings.
 
 **Primary-action structural tiebreak (issues #638/#655).** A tiny weighted
 selector-only term resolves true economic ties without subsidising
@@ -1493,9 +1500,19 @@ Attributes:
         estimated_cost: 30.00
 ```
 
-### Understanding `score`
+### Understanding the two `score` fields
 
-`score` is the selector objective, not estimated savings. Lower is better:
+`PlanExplanation.score` is the legacy human-readable savings comparison:
+
+```text
+PlanExplanation.score = idle_cost - estimated_total_cost
+```
+
+Positive means the selected plan is cheaper than the idle comparator inside
+the actionable window; negative means it costs more there.
+
+`PlanCostBreakdown.score` is the candidate selector objective. Lower is
+better:
 
 ```text
 score = total_cost
@@ -1504,11 +1521,22 @@ score = total_cost
       + primary_action_tiebreak
 ```
 
-`estimated_total_cost` is the auditable within-horizon money outcome.
-`score` may be above or below it because terminal inventory and the structural
-tiebreak may have either sign. Compare candidate scores only with other
-candidates from the same planner run; do not interpret the sign as profit,
-loss, or savings versus `no_action`.
+`PlanCostBreakdown.total_cost` is the auditable within-horizon money outcome.
+Its `score` may be above or below it because terminal inventory and the
+structural tiebreak may have either sign. Compare candidate scores only with
+other candidates from the same planner run; do not interpret their sign as
+profit, loss, or savings versus `no_action`.
+
+### Understanding charge-only explanations
+
+The human-readable `PlanExplanation` describes actions that actually appear
+in the selected slots. Grid charge without any scheduled discharge is labelled
+`opportunistic_charge`, and its summary says that no discharge window is
+scheduled. If it costs more than the idle comparator inside the current
+actionable window, the explanation reports that within-window difference; it
+does not claim that discharge savings will occur in a window containing no
+discharge. Unagi terminal value is retained-inventory context, not realised
+revenue.
 
 ### Understanding `constraints`
 
@@ -1564,12 +1592,14 @@ the first gap. Price and Solcast PV publication/withdrawal events wake a
 debounced refresh; an event that arrives during that refresh guarantees one
 coalesced follow-up cycle.
 
-Optional forecast valuation is a separate horizon-end channel. After MAE and
-operator-margin haircut, it may raise the published replacement value used for
-terminal inventory, but it never populates slot prices, extends the actionable
-prefix, changes a physical bound, or authorises battery export. Beyond the
-boundary primary charge/discharge and `primary_battery_export_kwh` remain
-zero; natural PV flow may still appear as `pv_export_kwh`.
+Optional Unagi valuation is a separate horizon-end channel. After MAE and
+operator-margin haircut, exactly aligned post-boundary demand becomes bounded
+primary terminal tiers; published overlap is ignored. It never populates slot
+prices, extends the actionable prefix, changes a physical bound, or authorises
+battery export. An empty tier set falls back to
+`hardware_floor_only`. Beyond the boundary primary charge/discharge and
+`primary_battery_export_kwh` remain zero; natural PV flow may still appear as
+`pv_export_kwh`.
 
 ### No intra-day re-planning of past slots
 

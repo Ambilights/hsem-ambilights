@@ -31,6 +31,7 @@ from datetime import datetime
 from custom_components.hsem.models.ev_config import EVConfig
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.planner_input import PlannerInput
+from custom_components.hsem.models.terminal_cost_to_go import TerminalCostToGo
 from custom_components.hsem.planner.candidates._mutations import (
     _apply_passive_solar,
     _clear_all_charge_discharge,
@@ -161,6 +162,7 @@ def generate_candidates(
     usable_kwh: float = 0.0,
     max_discharge_per_slot: float | None = None,
     replacement_price_per_kwh: float | None = None,
+    terminal_cost_to_go: TerminalCostToGo | None = None,
     ev_configs: list[EVConfig] | None = None,
 ) -> list[CandidatePlan]:
     """Generate all candidate plans from the already-populated baseline slots.
@@ -191,8 +193,11 @@ def generate_candidates(
             Maximum energy dischargeable per slot (kWh) passed through to the
             MILP optimizer.  ``None`` means unlimited.
         replacement_price_per_kwh:
-            Terminal-SoC replacement price (currency/kWh) passed through to the
-            MILP optimizer.  ``None`` disables the terminal-SoC credit term.
+            Legacy uniform terminal value passed through for compatible direct
+            callers. Ignored when ``terminal_cost_to_go`` is supplied.
+        terminal_cost_to_go:
+            Bounded piecewise primary-inventory value passed to the MILP.
+            Production planning supplies this even when it has no tiers.
         ev_configs:
             Optional list of :class:`EVConfig` objects (one per EV).  When
             provided, the MILP co-optimises EV charging alongside the battery.
@@ -245,6 +250,7 @@ def generate_candidates(
             discharge_efficiency_pct=inp.battery_discharge_efficiency_pct,
             time_discount_rate=inp.time_discount_rate,
             replacement_price_per_kwh=replacement_price_per_kwh,
+            terminal_cost_to_go=terminal_cost_to_go,
             min_export_price=max(
                 inp.export_min_price,
                 calculate_recommended_threshold(

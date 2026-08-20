@@ -113,10 +113,10 @@ class CostWeights:
     # blocked slots because that export can never happen.
     battery_export_min_price: float = 0.0
 
-    # Battery capacity parameters used by the deferred-export correction in
-    # the terminal-SoC charge premium (issue #592).  Both must be positive
-    # for the correction to activate; defaults keep it disabled so existing
-    # callers are unaffected.
+    # Deprecated compatibility fields from the former terminal-SoC charge
+    # premium (issue #592). TerminalCostToGo now carries quantity and rate
+    # explicitly, so score_plan no longer reads these values; they remain for
+    # callers that still construct or inspect them.
     battery_usable_capacity_kwh: float = 0.0
     max_charge_per_slot_kwh: float = 0.0
 

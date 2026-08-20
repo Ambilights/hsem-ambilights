@@ -682,7 +682,7 @@ class TestWinnerCostIdentity:
         # alone.  The ``score`` field additionally includes selector-only
         # terms, including the terminal inventory value and
         # ``primary_action_tiebreak``.  Terminal inventory depends on horizon
-        # context (initial battery energy and replacement price); that context
+        # context (initial energy and bounded cost-to-go model); that context
         # is not embedded in the slots themselves, so checking the money
         # invariant is the right spec-invariant test for "plan_cost describes
         # the actual output slots".
@@ -841,7 +841,7 @@ class TestNoPostSelectionMutation:
         # that the engine re-simulated and re-scored after any fill pass.
         # ``score`` additionally includes selector-only terms, including the
         # terminal inventory value and ``primary_action_tiebreak``.  Terminal
-        # inventory depends on ``initial_battery_kwh``/``replacement_price``,
+        # inventory depends on initial energy and the bounded cost-to-go model,
         # which are not embedded in the slots themselves.
         fresh = score_plan(result.slots, weights, slot_duration_hours=1.0)
         assert fresh.total_cost == pytest.approx(

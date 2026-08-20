@@ -45,8 +45,9 @@ score = total_cost + soc_penalties + grid_limit_penalty + terminal_soc_value
 
 - Starts from `total_cost` (always includes real money).
 - Adds **synthetic penalties** (quadratic SoC guard and grid power limit).
-- Adds the **terminal inventory value** — a path-independent value of the
-  battery inventory change across the actionable horizon.
+- Adds the **terminal inventory value** — a path-independent, bounded primary
+  value plus the independent uniform secondary value at the actionable
+  boundary.
 - Adds a separately named **primary-action structural tiebreak** so a true
   economic tie prefers battery-to-house discharge without rewarding
   charge/discharge or export/refill cycles.
@@ -57,7 +58,7 @@ score = total_cost + soc_penalties + grid_limit_penalty + terminal_soc_value
 | Concern | `total_cost` | `score` |
 |---|---|---|
 | Auditable money | ✅ Yes | ✅ (as subset) |
-| Avoids drain-to-zero bias | ❌ No | ✅ (via terminal SoC value) |
+| Values justified post-boundary reserve | ❌ No | ✅ (via bounded terminal value) |
 | Avoids SoC bound violations | ❌ No | ✅ (via quadratic guard) |
 | Picks cheapest plan | ✅ If penalties=0 | ✅ Always |
 
@@ -65,36 +66,46 @@ A single number cannot serve both purposes without one of them being wrong.
 
 ### Terminal inventory value formulation
 
-Terminal inventory value is the sum of independent battery terms:
+Terminal inventory value is the sum of independent primary and secondary
+battery terms. Primary storage uses a bounded piecewise value function;
+secondary storage retains its uniform scalar:
 
-```
-primary_terminal = (E_primary_initial − E_primary_final) × p_primary
-secondary_terminal = (E_secondary_initial − E_secondary_final) × p_secondary
+```text
+V_primary(E)
+    = Σ_i v_i × min(q_i, max(E − Σ_{j<i} q_j, 0))
+
+primary_terminal
+    = V_primary(E_primary_initial) − V_primary(E_primary_final)
+
+secondary_terminal
+    = (E_secondary_initial − E_secondary_final) × p_secondary
+
 terminal_soc_value = primary_terminal + secondary_terminal
 ```
 
-The equivalent battery-flow form is:
+Each positive primary tier represents only the battery-side residual house
+demand of one exactly aligned, non-actionable slot beyond the contiguous
+published-price boundary. Quantity is bounded by load after PV/accounted EV,
+discharge efficiency and power, usable capacity, and a global capacity cap.
+Marginal value starts from the Unagi point after MAE and operator-margin
+haircut, then subtracts discharge conversion loss and cycle wear. Duplicate
+points use the lower value; invalid data creates no tier.
 
-```
-primary_terminal = p_primary × (Σ primary_discharge − Σ primary_charge)
-secondary_terminal = p_secondary × (Σ secondary_discharge − Σ secondary_charge)
-terminal_soc_value = primary_terminal + secondary_terminal
-```
+This replaces the old primary `max(published, forecast)` scalar, which could
+assign one expensive forecast price to the whole battery and keep a newly
+published peak reserved as the boundary rolled. When a price becomes official,
+its slot leaves the terminal tiers and is evaluated normally inside the
+actionable horizon. With no valid tier, the explicit
+`hardware_floor_only` model has zero primary terminal value; the effective
+hardware discharge floor is the only reserve.
 
-The replacement coefficient is sanitised non-negative (missing/non-finite
-resolves to zero), uniform, and undiscounted, so the value is path-independent:
-equal discharge and recharge cancel regardless of which slots contain them.
-`p_replacement` is horizon context from the first contiguous published,
-price-actionable heuristic discharge block (mean of its top-N import prices).
-When opt-in forecast valuation is available, the MAE-and-margin-haircut
-forecast value may raise, but never lower, that published value. Forecast
-points do not become slot prices or extend price authority.
-
-The replacement-price heuristic does not model future grid/PV refill. Refill
-economics remain in the explicit import/export prices, efficiencies, cycle
-wear, capacity, headroom, and power constraints. In particular, an export
-discharge followed by equal recharge has zero net terminal value rather than
-receiving a path-dependent reward or penalty.
+Unagi remains structurally non-actionable: it does not become a slot price,
+extend price authority, create revenue, or authorise a storage action. Both
+battery terms remain path-independent because they depend only on final
+inventory. An export discharge followed by equal recharge restores the same
+final inventory and has zero net terminal value; explicit prices,
+efficiencies, wear, capacity, headroom, and power constraints decide the
+cycle.
 
 ### Primary-action structural tiebreak
 

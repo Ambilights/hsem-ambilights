@@ -31,6 +31,14 @@ from custom_components.hsem.models.price_forecast import (
 from custom_components.hsem.utils.conversion import convert_to_float
 
 
+def _nonnegative_finite(value: Any) -> float | None:
+    """Return a finite non-negative number, or None when invalid."""
+    number = convert_to_float(value)
+    if number is None or not math.isfinite(number):
+        return None
+    return max(number, 0.0)
+
+
 def _parse_start(raw: Any) -> datetime | None:
     """Return a timezone-aware start, or None when unusable."""
     if isinstance(raw, datetime):
@@ -68,8 +76,11 @@ def build_price_forecast(
         failing the whole feed; a feed that yields no usable point returns
         ``usable == False``, which callers treat as "no contribution".
     """
+    parsed_margin = _nonnegative_finite(margin)
+    margin_valid = parsed_margin is not None
+    safe_margin = parsed_margin if parsed_margin is not None else 0.0
     if not enabled or not attributes:
-        return PriceForecast(enabled=enabled, margin=max(margin, 0.0))
+        return PriceForecast(enabled=enabled, margin=safe_margin)
 
     raw_points = attributes.get("forecast")
     points: list[ForecastPricePoint] = []
@@ -83,16 +94,25 @@ def build_price_forecast(
                 continue
             points.append(ForecastPricePoint(start=start, value=value))
 
-    # An absent error is treated as zero rather than as a reason to refuse the
-    # feed: the operator margin is then the only haircut, which is visible in
-    # the config rather than hidden in a silently-dropped channel.
-    mae = convert_to_float(attributes.get("mae")) or 0.0
-    if not math.isfinite(mae):
-        mae = 0.0
+    # A genuinely absent MAE remains zero. Explicit malformed or nonfinite
+    # confidence disables the whole valuation channel: retaining points while
+    # replacing its safety haircut would overvalue inventory. Keep confidence
+    # fields finite and remove points so coordinator signatures and diagnostics
+    # remain stable and JSON-safe while ``usable`` still fails closed.
+    if "mae" in attributes:
+        parsed_mae = _nonnegative_finite(attributes["mae"])
+        mae_valid = parsed_mae is not None
+        safe_mae = parsed_mae if parsed_mae is not None else 0.0
+    else:
+        mae_valid = True
+        safe_mae = 0.0
+
+    if not margin_valid or not mae_valid:
+        points.clear()
 
     return PriceForecast(
         points=tuple(points),
-        mae=max(mae, 0.0),
-        margin=max(margin, 0.0),
+        mae=safe_mae,
+        margin=safe_margin,
         enabled=True,
     )

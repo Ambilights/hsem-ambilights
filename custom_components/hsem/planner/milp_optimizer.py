@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from custom_components.hsem.models.secondary_storage_config import (
         SecondaryStorageConfig,
     )
+    from custom_components.hsem.models.terminal_cost_to_go import TerminalCostToGo
 
 # Name exported so the engine and tests can reference it without re-defining
 CANDIDATE_MILP = "milp"
@@ -78,6 +79,7 @@ def solve_milp(
     discharge_efficiency_pct: float = 97.0,
     time_discount_rate: float = 1.0,
     replacement_price_per_kwh: float | None = None,
+    terminal_cost_to_go: TerminalCostToGo | None = None,
     *,
     min_export_price: float = 0.0,
     ev_configs: list[EVConfig] | None = None,
@@ -577,6 +579,26 @@ def solve_milp(
 
         export_mode_off = column_layout.add("battery_export_mode", m)
         export_reserve_checkpoints = _next_solar_refill_checkpoints(pv_avail)
+
+    terminal_tiers = (
+        tuple(
+            tier
+            for tier in terminal_cost_to_go.tiers
+            if math.isfinite(tier.quantity_kwh)
+            and tier.quantity_kwh > 1e-9
+            and math.isfinite(tier.value_per_kwh)
+            and tier.value_per_kwh > 1e-9
+        )
+        if terminal_cost_to_go is not None
+        else ()
+    )
+    terminal_value_off: int | None = None
+    if terminal_tiers:
+        terminal_value_off = column_layout.add(
+            "primary_terminal_inventory",
+            len(terminal_tiers),
+            per_slot=False,
+        )
 
     base_n_vars = column_layout.column_count
     secondary_layout = None

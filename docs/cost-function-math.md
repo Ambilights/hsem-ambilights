@@ -107,20 +107,21 @@ power limit in kW, and $w_{grid}$ is the penalty weight per excess kWh.
 
 ### Terminal inventory value (opportunity cost)
 
-$$ V_p = (E_{p,initial} - E_{p,final}) \cdot p_{p,replacement} $$
+Primary storage uses a bounded piecewise value function, while secondary
+storage retains its uniform replacement coefficient:
+
+$$
+\mathcal{V}_p(E)
+= \sum_i v_i
+  \min\!\left(q_i,\max\!\left(E-\sum_{j<i}q_j,0\right)\right)
+$$
+
+$$ V_p = \mathcal{V}_p(E_{p,initial})
+         - \mathcal{V}_p(E_{p,final}) $$
 
 $$ V_s = (E_{s,initial} - E_{s,final}) \cdot p_{s,replacement} $$
 
 $$ V_{terminal} = V_p + V_s $$
-
-Equivalently, because battery charge and discharge are measured on the battery
-side,
-
-$$ V_p = p_{p,replacement} \cdot
-   \left(\sum_t discharge_p[t] - \sum_t charge_p[t]\right) $$
-
-$$ V_s = p_{s,replacement} \cdot
-   \left(\sum_t discharge_s[t] - \sum_t charge_s[t]\right) $$
 
 Where:
 
@@ -128,9 +129,10 @@ Where:
   floor at the start and end of the horizon (kWh)
 - $E_{s,initial}$ and $E_{s,final}$ = secondary stored energy above its reserve
   at the start and end of the horizon (kWh)
-- $p_{p,replacement}$ and $p_{s,replacement}$ = independent non-negative
-  replacement prices from the engine's published and optional forecast horizon
-  context; missing or non-finite values resolve to zero
+- $(q_i,v_i)$ = positive primary battery-side quantity and marginal-value
+  tiers, ordered by decreasing $v_i$
+- $p_{s,replacement}$ = the independent non-negative secondary replacement
+  price; missing or non-finite values resolve to zero
 
 **Sign convention:**
 
@@ -139,41 +141,52 @@ $$\begin{aligned}
 \Delta E_i &> 0 \mathrm{ (less energy at end)} \rightarrow V_i > 0 \mathrm{ (penalty)}
 \end{aligned}$$
 
-where $i \in \{p,s\}$.
+Here $i \in \{p,s\}$. For primary storage these signs apply only to inventory
+movement through a valued tier; movement wholly above total tier quantity has
+zero terminal value.
+For secondary storage the uniform coefficient applies across its usable
+inventory.
 
-Each component uses one uniform, undiscounted coefficient and depends only on
-that battery's initial and final inventory. Equal discharge and recharge of
-either battery therefore cancel exactly in $V_{terminal}$ regardless of slot
-positions. Actual import and export prices, conversion efficiencies, cycle
-wear, power limits, and available headroom decide whether a cycle is
-worthwhile.
+Both components depend only on final inventory. Equal discharge and recharge
+therefore cancel exactly in $V_{terminal}$ regardless of slot positions.
+Primary inventory above $\sum_i q_i$ has no synthetic salvage value.
 
-`replacement_price_from_next_discharge()` obtains the published value from the
-first contiguous future, price-actionable heuristic discharge block. It averages
-the `top_n` dearest import prices in that block, where `top_n` is derived from
-usable capacity and maximum discharge energy per slot. This is horizon-end
-context, not a per-slot export threshold and not a simulation of future grid or
-PV refill.
+The primary tiers come only from exactly aligned, future non-actionable Unagi
+points at or after the end of the contiguous published-price prefix. For each
+eligible physical slot:
 
-When forecast valuation is enabled, the unpublished forecast tail is reduced by
-its MAE plus the configured margin and valued with the same top-N rule. The
-effective replacement price is:
+$$
+p_i^* = \max(p_{Unagi,i}-\max(MAE,0)-\max(margin,0),0)
+$$
 
-$$ p_{p,replacement} = \max(p_{published}, p_{forecast\_haircut}) $$
+$$
+q_i = \min\!\left(
+  \frac{\max(load_i-PV_i-EV_{accounted,i},0)}{\eta_{dis}},
+  discharge\_limit_i,
+  usable\_capacity
+\right)
+$$
 
-Forecast points never become slot prices or make a slot price-actionable. They
-can only raise the value of retained terminal inventory; they cannot create a
-discharge or export opportunity.
+$$
+v_i = p_i^*\eta_{dis}
+      - p_i^*(1-\eta_{dis})
+      - cycle\_wear
+$$
 
-`resolve_secondary_terminal_price()` applies the same published/forecast
-`max()` authority rule using the secondary battery's mean-of-window aggregation
-rather than the primary battery's top-N aggregation. The result is passed
-unchanged as $p_{s,replacement}$ and never becomes a per-slot charge or
-discharge premium.
+Only finite positive tiers survive, duplicate points use the lower effective
+price, and total tier quantity is capped by usable capacity. If nothing
+survives, the explicit `hardware_floor_only` model has
+$\mathcal{V}_p(E)=0$; the effective hardware discharge floor is the only
+terminal reserve. When publication advances, the newly official slot leaves
+the tiers and is priced normally in-horizon.
+
+Unagi never becomes a slot price, changes price actionability, or authorises an
+action beyond the boundary. `resolve_secondary_terminal_price()` remains a
+separate uniform mean-of-window model for secondary storage.
 
 ### Primary-action structural tiebreak (selector only)
 
-The uniform terminal term is paired with a tiny weighted tiebreak:
+The terminal terms are paired with a tiny weighted tiebreak:
 
 $$ \epsilon = 0.00001\ \mathrm{currency/DC\ kWh} $$
 
@@ -260,15 +273,19 @@ For every planner run:
 4. When all penalties and selector-only inventory/tiebreak terms are zero: $S = C_{total}$
 5. Selector picks minimum $S$, not minimum $C_{total}$
 6. $score_{winner} = score_{final\_output}$ (no post-selection mutation)
-7. Two identical plans, one ending with more stored energy in either battery → lower $V_{terminal}$ → lower $S$
+7. Within an active primary tier, or anywhere under the secondary uniform
+   coefficient, an otherwise identical plan ending with more valued energy has
+   lower $V_{terminal}$ and lower $S$
 8. Equal primary or secondary battery discharge and recharge contribute zero
    net terminal value, regardless of which slots contain those actions
-9. $battery\_export_{AC}[t] + pv\_export[t] = grid\_export[t]$ within solver
+9. Primary inventory above total tier quantity has zero synthetic salvage
+   value; an empty `hardware_floor_only` model contributes zero
+10. $battery\_export_{AC}[t] + pv\_export[t] = grid\_export[t]$ within solver
    tolerance before publication and exactly at 0.001 kWh published precision
-10. $T_{action}$ exactly matches
+11. $T_{action}$ exactly matches
     $\epsilon\sum(charge+discharge)-1.5\epsilon\sum local$ after export-source
     reconciliation
-11. Raw MILP source attribution satisfies
+12. Raw MILP source attribution satisfies
     $battery\_export_{DC}[t]=\min(discharge[t],grid\_export[t]/\eta_{dis})$,
     and raw charge/discharge are never simultaneously positive
-12. Raw grid import and export are never simultaneously positive
+13. Raw grid import and export are never simultaneously positive

@@ -56,6 +56,16 @@ _EXPECTED_EXPLANATION_KEYS = {
     "incumbent_used",
     "incumbent_validation",
     "fallback_reason",
+    "terminal_cost_to_go_source",
+    "terminal_cost_to_go_boundary",
+    "terminal_cost_to_go_tier_count",
+    "terminal_cost_to_go_total_quantity_kwh",
+    "terminal_cost_to_go_highest_value_per_kwh",
+    "terminal_cost_to_go_lowest_value_per_kwh",
+    "terminal_cost_to_go_initial_valued_quantity_kwh",
+    "terminal_cost_to_go_final_valued_quantity_kwh",
+    "terminal_cost_to_go_initial_value",
+    "terminal_cost_to_go_final_value",
     "constraints",
     "rejected_plans",
 }
@@ -172,8 +182,9 @@ class TestPlannerOutputHasExplanation:
         """score must equal do_nothing_cost minus estimated_total_cost.
 
         A positive score means the selected plan is cheaper than idle;
-        a negative score means charging overhead exceeds discharge savings
-        within the planning window.
+        a negative score means the selected plan costs more within the
+        actionable window and may be justified by bounded post-boundary
+        inventory value without an in-window discharge.
         """
         output = run_planner(make_summer_day_input())
         exp = output.explanation
