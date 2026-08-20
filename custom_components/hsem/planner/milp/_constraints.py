@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from custom_components.hsem.planner.milp._layout import MilpBoundsBuilder
+
 if TYPE_CHECKING:
     from custom_components.hsem.models.ev_config import EVConfig
 
@@ -47,6 +49,7 @@ def _build_constraints(
     session_slots: int,
     slot_hours: float,
     _has_session_demand: bool,
+    bounds_builder: MilpBoundsBuilder,
     max_grid_export_per_slot_kwh: float = 0.0,
     export_limit_active: bool = False,
     battery_export_blocked: np.ndarray | None = None,  # type: ignore[name-defined]
@@ -58,9 +61,9 @@ def _build_constraints(
 ) -> dict:
     """Build all LP constraint matrices and variable bounds.
 
-    Returns a dict with keys:
-        ``A_eq``, ``b_eq``, ``A_ub``, ``b_ub``, ``bounds``,
-        ``ev_discharge_guard_active``, ``ed_ub_per_slot``.
+    Returns a dict with keys ``A_eq``, ``b_eq``, ``A_ub``, ``b_ub``,
+    ``ev_discharge_guard_active``, and ``ed_ub_per_slot``. Variable bounds
+    are written into *bounds_builder* by declared block name.
     """
     import numpy as np
 
@@ -421,44 +424,52 @@ def _build_constraints(
             )
             for t in range(m)
         ]
-    bounds: list[tuple[float, float | None]] = list(
+    bounds_builder.set(
+        "primary_charge",
         [
             ((0.0, max_charge_per_slot) if bool(price_actionable[t]) else (0.0, 0.0))
             for t in range(m)
-        ]  # ec[t]: no primary storage action beyond published price authority
-        + [(0.0, float(ed_ub_per_slot[t])) for t in range(m)]  # ed[t]
-        + grid_import_bounds
-        + grid_export_bounds
-        + [
-            (pv_avail[t], pv_avail[t]) for t in range(m)
-        ]  # pv[t] fixed to actual surplus
-        + [unbounded] * m  # m[t] (auxiliary, unbounded above, ≥ 0)
-        + [unbounded] * m  # s_max_pen[t] (penalty, ≥ 0)
-        + [unbounded] * m  # s_min_pen[t] (penalty, ≥ 0)
-        + [
-            (0.0, float(pv_avail[t])) for t in range(m)
-        ]  # curt[t] is discarded available PV, never fabricated grid energy
+        ],
+    )
+    bounds_builder.set(
+        "primary_discharge",
+        [(0.0, float(ed_ub_per_slot[t])) for t in range(m)],
+    )
+    bounds_builder.set("grid_import", grid_import_bounds)
+    bounds_builder.set("grid_export", grid_export_bounds)
+    bounds_builder.set(
+        "pv",
+        [(pv_avail[t], pv_avail[t]) for t in range(m)],
+    )
+    bounds_builder.fill("primary_throughput", unbounded)
+    bounds_builder.fill("soc_max_penalty", unbounded)
+    bounds_builder.fill("soc_min_penalty", unbounded)
+    bounds_builder.set(
+        "curtailment",
+        [(0.0, float(pv_avail[t])) for t in range(m)],
     )
     # --- EV bounds ---
     for ev_idx, ev in enumerate(active_evs):
         is_session_ev = ev_idx in session_ev_indices
+        ev_bounds: list[tuple[float, float | None]] = []
         for t in range(m):
             if is_session_ev and t < session_slots and ev.session_charge_kw is not None:
                 # Fixed bound: session demand (DC-side kWh per slot)
                 session_dc = ev.session_charge_kw * slot_hours * ev.charger_efficiency
                 session_dc = min(session_dc, ev.max_charge_per_slot)
-                bounds.append((session_dc, session_dc))
+                ev_bounds.append((session_dc, session_dc))
             elif not bool(price_actionable[t]):
                 # Optional smart charging must not treat an unpublished price
                 # as free. A live session remains fixed by the branch above.
-                bounds.append((0.0, 0.0))
+                ev_bounds.append((0.0, 0.0))
             else:
-                bounds.append((0.0, ev.max_charge_per_slot))
+                ev_bounds.append((0.0, ev.max_charge_per_slot))
+        bounds_builder.set(f"ev_{ev_idx}_charge", ev_bounds)
         # ev deadline penalty: [0, unbounded)
-        bounds.append((0.0, None))
+        bounds_builder.fill(f"ev_{ev_idx}_target_penalty", unbounded)
     # --- Fuse penalty bounds ---
     if fuse_active:
-        bounds += [unbounded] * m  # gi_pen[t] (penalty, ≥ 0)
+        bounds_builder.fill("grid_import_penalty", unbounded)
     if pv_export_ub_per_slot is not None:
         if (
             len(pv_export_ub_per_slot) != m
@@ -469,24 +480,34 @@ def _build_constraints(
         ):
             raise ValueError("incomplete explicit export-source layout")
         # Explicit source and binary-mode blocks follow primary/EV/fuse blocks.
-        for t in range(m):
-            export_blocked = (
-                no_export
-                or bool(battery_export_blocked[t])
-                or not bool(price_actionable[t])
-            )
-            bounds.append(
-                (0.0, 0.0) if export_blocked else (0.0, float(ed_ub_per_slot[t]))
-            )
-        bounds += [(0.0, max(float(pv_export_ub_per_slot[t]), 0.0)) for t in range(m)]
-        bounds += [(0.0, 1.0)] * (3 * m)
+        bounds_builder.set(
+            "primary_battery_export",
+            [
+                (
+                    (0.0, 0.0)
+                    if (
+                        no_export
+                        or bool(battery_export_blocked[t])
+                        or not bool(price_actionable[t])
+                    )
+                    else (0.0, float(ed_ub_per_slot[t]))
+                )
+                for t in range(m)
+            ],
+        )
+        bounds_builder.set(
+            "pv_export",
+            [(0.0, max(float(pv_export_ub_per_slot[t]), 0.0)) for t in range(m)],
+        )
+        bounds_builder.fill("export_source_mode", (0.0, 1.0))
+        bounds_builder.fill("primary_action_mode", (0.0, 1.0))
+        bounds_builder.fill("grid_flow_mode", (0.0, 1.0))
 
     return {
         "A_eq": A_eq,
         "b_eq": b_eq,
         "A_ub": A_ub,
         "b_ub": b_ub,
-        "bounds": bounds,
         "ev_discharge_guard_active": ev_discharge_guard_active,
         "ed_ub_per_slot": ed_ub_per_slot,
     }

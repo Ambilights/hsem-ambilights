@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from custom_components.hsem.planner.milp._layout import MilpBoundsBuilder
 
 _EPSILON_KWH = 1e-9
 
@@ -44,6 +47,7 @@ def _next_solar_refill_checkpoints(pv_avail: np.ndarray) -> np.ndarray:
 def _add_battery_export_reserve_constraints(
     constraints: dict[str, Any],
     *,
+    bounds_builder: MilpBoundsBuilder,
     n_vars: int,
     m: int,
     ec_off: int,
@@ -110,5 +114,5 @@ def _add_battery_export_reserve_constraints(
 
     constraints["A_ub"] = a_ub
     constraints["b_ub"] = b_ub
-    constraints["bounds"] += [(0.0, 1.0)] * m
+    bounds_builder.fill("battery_export_mode", (0.0, 1.0))
     return constraints

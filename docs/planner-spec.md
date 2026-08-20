@@ -1128,8 +1128,14 @@ A time-limited incumbent must pass all of these checks against the final model:
   `pv_export`, `export_source_mode`, `primary_action_mode`, and
   `grid_flow_mode` blocks, followed by optional export-reserve, bounded
   primary-terminal-inventory, and secondary-storage blocks;
+- every variable-bound producer assigns one complete block by its declared
+  `MilpColumnLayout` name; `MilpBoundsBuilder` places that block
+  at its declared offset, independent of producer call order;
+- unknown, duplicate, overlapping, wrong-width, or invalid bound assignments
+  are rejected, and finalization rejects every declared column that remains
+  unassigned;
 - the objective length, equality-matrix width, inequality-matrix width, and
-  bounds length all equal that layout's final `column_count`;
+  finalized bounds length all equal that layout's final `column_count`;
 - variable bounds are satisfied;
 - all equality and inequality rows are satisfied within solver tolerance;
 - every integer/binary variable is integral within tolerance.
@@ -1139,11 +1145,17 @@ used.  The candidate name intentionally remains exactly ``milp`` for both
 optimal and accepted-incumbent results because that name is a control-flow
 key: it preserves pre-populated primary/PowMr flows and prevents the
 secondary-storage utility bypass from overwriting the solved PowMr schedule.
-Offsets are obtained by block name from the layout declaration rather than
-recomputed from a hard-coded base width or positional formula. Adding or
-reordering a block can therefore never silently overlap EV, fuse, export-mode,
-or PowMr variables: construction fails before HiGHS is called if any consumer
-has the old width.
+Offsets and bounds slices are obtained by block name from the layout declaration
+rather than recomputed from a hard-coded base width, positional formula, or
+append order. A correctly named bounds assignment is resolved to its declared
+slice at write time, so changes to the layout declaration or the order of
+independent producers cannot redirect it through positional drift. Construction
+fails before HiGHS is called if a consumer supplies an
+unknown, duplicate, overlapping, wrong-width, invalid, or incomplete assignment.
+
+This is a structural construction invariant only. It does not alter any
+variable's lower or upper bound, add a model column or row, or change planner
+economics.
 
 `export_source_mode`, `primary_action_mode`, and `grid_flow_mode` are
 per-slot binary blocks in every solve. They make the export-source split,
@@ -1181,6 +1193,9 @@ time-limit incumbent adds ``milp_time_limit_incumbent``.
   ``milp`` candidate.
 - An accepted incumbent satisfies the same complete model used by HiGHS,
   including SoC, fuse, phase, export-reserve, EV, and PowMr constraints.
+- Every declared variable block receives exactly one valid, width-matched named
+  bounds assignment; unknown, duplicate, overlapping, invalid, or missing
+  assignments fail before HiGHS is called.
 - Optimal and accepted-incumbent candidates both retain the name ``milp``.
 - A fallback retains the failed MILP diagnostics even though the winning
   candidate is passive.
