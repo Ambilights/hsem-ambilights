@@ -23,6 +23,10 @@ from custom_components.hsem.planner.discharge_scheduler import (
     concentrate_discharge_on_expensive_slots,
 )
 from custom_components.hsem.planner.milp._constraints import _build_constraints
+from custom_components.hsem.planner.milp._layout import (
+    MilpBoundsBuilder,
+    MilpColumnLayout,
+)
 from custom_components.hsem.planner.milp_optimizer import (
     is_scipy_available,
     solve_milp,
@@ -176,7 +180,22 @@ def test_genuine_actionable_zero_and_negative_prices_remain_economic() -> None:
 
 def test_curtailment_variable_is_bounded_by_available_pv() -> None:
     """The LP cannot fabricate grid import and send it to curtailment."""
-    constraints = _build_constraints(
+    layout = MilpColumnLayout(slot_count=2)
+    for name in (
+        "primary_charge",
+        "primary_discharge",
+        "grid_import",
+        "grid_export",
+        "pv",
+        "primary_throughput",
+        "soc_max_penalty",
+        "soc_min_penalty",
+        "curtailment",
+    ):
+        layout.add(name, 2)
+    bounds_builder = MilpBoundsBuilder(layout)
+
+    _build_constraints(
         2,
         18,
         0,
@@ -210,10 +229,22 @@ def test_curtailment_variable_is_bounded_by_available_pv() -> None:
         0,
         1.0,
         False,
+        bounds_builder,
     )
-    assert constraints["bounds"][0:2] == [(0.0, 0.0), (0.0, 0.0)]
-    assert constraints["bounds"][2:4] == [(0.0, 0.0), (0.0, 0.0)]
-    assert constraints["bounds"][16:18] == [(0.0, 1.0), (0.0, 0.0)]
+    bounds = bounds_builder.finalize()
+
+    for lower, upper in bounds[0:4]:
+        assert lower == pytest.approx(0.0)
+        assert upper == pytest.approx(0.0)
+    expected_curtailment_upper = (1.0, 0.0)
+    for bound, expected_upper in zip(
+        bounds[16:18],
+        expected_curtailment_upper,
+        strict=True,
+    ):
+        lower, upper = bound
+        assert lower == pytest.approx(0.0)
+        assert upper == pytest.approx(expected_upper)
 
 
 @pytest.mark.skipif(not is_scipy_available(), reason="scipy not available")

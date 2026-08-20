@@ -66,11 +66,21 @@ Penalty variables `s_max_pen` and `s_min_pen` prevent infeasibility when the ini
 `MilpColumnLayout` is the single source of truth for all allocation. Every
 EV, fuse, export-source, export-mode, and secondary-storage block is appended
 through that layout and receives its offset by name; consumers must not repeat
-a hand-calculated base offset. Immediately before solving, the declared
-`column_count` must equal the objective length, both constraint-matrix widths,
-and the bounds length. Incumbent validation uses the same declared blocks.
-Adding or reordering a base block must therefore either shift every downstream
-consumer coherently or fail before HiGHS is called.
+a hand-calculated base offset. Variable-bound producers assign one complete
+block by that same declared name instead of extending a positional list. The
+layout-backed `MilpBoundsBuilder` writes each block at its declared offset.
+Correctly named assignments therefore land in the same variable slice regardless
+of the order in which independent producers run.
+Unknown, duplicate, overlapping, wrong-width, or invalid assignments fail
+immediately, and finalization fails if any declared column remains unassigned.
+
+Immediately before solving, the declared `column_count` must equal the
+objective length, both constraint-matrix widths, and the finalized bounds
+length. Incumbent validation uses the same declared blocks. Adding or reordering
+a base block must therefore either shift every downstream consumer coherently
+or fail before HiGHS is called. This hardening changes model construction only;
+the lower and upper bounds themselves, model width, constraints, objective, and
+planner economics are unchanged.
 
 Solver diagnostics expose the declaration as `model_variable_blocks`; each
 entry carries `offset`, `width`, and `per_slot`. The contiguous cursor and
@@ -165,7 +175,8 @@ If the conditional export reserve is enabled, its binary
 `battery_export_mode` block is appended next. Secondary storage follows all
 primary blocks. No consumer derives any of these offsets from `9n`, EV count,
 fuse state, or optional-block assumptions; it asks `MilpColumnLayout` for the
-named block.
+named block. Its bounds producer also assigns that named block directly, so the
+final bounds vector does not depend on extension-call order.
 
 ### Secondary stationary-storage extension (PowMr dedicated-load topology)
 
@@ -842,7 +853,9 @@ After the MILP (or passive) winner is selected, the engine runs a final pass ove
 - **Column-layout integrity**: objective, equality matrix, inequality matrix,
   bounds, and incumbent block validation all consume one
   `MilpColumnLayout` declaration and must agree on its final column count
-  before solving.
+  before solving. Every bounds block is assigned by name with its exact
+  declared width; unknown, duplicate, overlapping, invalid, or missing
+  assignments fail before the solver receives the model.
 
 ---
 

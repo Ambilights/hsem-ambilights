@@ -190,6 +190,7 @@ def _build_solve_and_finalize(
     p_soc = max(p_imp_max, 0.1) * 100.0
 
     from custom_components.hsem.planner.milp._constraints import _build_constraints
+    from custom_components.hsem.planner.milp._layout import MilpBoundsBuilder
     from custom_components.hsem.planner.milp._objective import _build_objective
 
     c_obj = _build_objective(
@@ -249,6 +250,7 @@ def _build_solve_and_finalize(
             now=now,
         )
 
+    bounds_builder = MilpBoundsBuilder(column_layout)
     constraints = _build_constraints(
         m,
         base_n_vars,
@@ -283,6 +285,7 @@ def _build_solve_and_finalize(
         session_slots,
         slot_hours,
         has_session_demand,
+        bounds_builder,
         max_grid_export_per_slot_kwh=max_grid_export_per_slot_kwh,
         export_limit_active=export_limit_active,
         battery_export_blocked=primary_export_blocked,
@@ -301,6 +304,7 @@ def _build_solve_and_finalize(
         assert export_reserve_checkpoints is not None
         constraints = _add_battery_export_reserve_constraints(
             constraints,
+            bounds_builder=bounds_builder,
             n_vars=base_n_vars,
             m=m,
             ec_off=ec_off,
@@ -325,6 +329,7 @@ def _build_solve_and_finalize(
 
         constraints = add_terminal_cost_to_go_constraints(
             constraints,
+            bounds_builder=bounds_builder,
             n_vars=base_n_vars,
             m=m,
             ec_off=ec_off,
@@ -357,6 +362,7 @@ def _build_solve_and_finalize(
         assert secondary_storage is not None
         constraints = _extend_secondary_constraints(
             constraints,
+            bounds_builder=bounds_builder,
             n_vars=n_vars,
             m=m,
             layout=secondary_layout,
@@ -449,7 +455,8 @@ def _build_solve_and_finalize(
     b_eq = constraints["b_eq"]
     A_ub = constraints["A_ub"]
     b_ub = constraints["b_ub"]
-    bounds = constraints["bounds"]
+    bounds = bounds_builder.finalize()
+    constraints["bounds"] = bounds
 
     # One declaration owns every block and validates all hand-built consumers.
     if n_vars != column_layout.column_count:

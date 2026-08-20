@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from custom_components.hsem.models.terminal_cost_to_go import TerminalValueTier
 
+if TYPE_CHECKING:
+    from custom_components.hsem.planner.milp._layout import MilpBoundsBuilder
+
 
 def add_terminal_cost_to_go_constraints(
     constraints: dict[str, Any],
     *,
+    bounds_builder: MilpBoundsBuilder,
     n_vars: int,
     m: int,
     ec_off: int,
@@ -41,7 +45,8 @@ def add_terminal_cost_to_go_constraints(
 
     constraints["A_ub"] = a_ub
     constraints["b_ub"] = b_ub
-    constraints["bounds"] += [
-        (0.0, max(float(tier.quantity_kwh), 0.0)) for tier in tiers
-    ]
+    bounds_builder.set(
+        "primary_terminal_inventory",
+        [(0.0, max(float(tier.quantity_kwh), 0.0)) for tier in tiers],
+    )
     return constraints

@@ -31,7 +31,10 @@ from custom_components.hsem.utils.units import (
 
 SecondaryLayout = dict[str, int]
 if TYPE_CHECKING:
-    from custom_components.hsem.planner.milp._layout import MilpColumnLayout
+    from custom_components.hsem.planner.milp._layout import (
+        MilpBoundsBuilder,
+        MilpColumnLayout,
+    )
 
 
 def _allocate_secondary_variables(
@@ -72,6 +75,7 @@ def _allocate_secondary_variables(
 def _extend_secondary_constraints(
     constraints: dict[str, Any],
     *,
+    bounds_builder: MilpBoundsBuilder,
     n_vars: int,
     m: int,
     layout: SecondaryLayout,
@@ -230,22 +234,35 @@ def _extend_secondary_constraints(
     constraints["b_eq"] = b_eq
     constraints["A_ub"] = a_ub
     constraints["b_ub"] = b_ub
-    constraints["bounds"] += (
+    bounds_builder.set(
+        "secondary_charge",
         [
             ((0.0, charge_limits[t][1]) if bool(price_actionable[t]) else (0.0, 0.0))
             for t in range(m)
-        ]
-        + [
+        ],
+    )
+    bounds_builder.set(
+        "secondary_discharge",
+        [
             ((0.0, config.usable_kwh) if bool(price_actionable[t]) else (0.0, 0.0))
             for t in range(m)
-        ]
-        + [(0.0, None)] * m
-        + [((0.0, 1.0) if bool(price_actionable[t]) else (0.0, 0.0)) for t in range(m)]
-        + [((0.0, 1.0) if bool(price_actionable[t]) else (0.0, 0.0)) for t in range(m)]
-        + [
+        ],
+    )
+    bounds_builder.fill("secondary_throughput", (0.0, None))
+    bounds_builder.set(
+        "secondary_charge_mode",
+        [((0.0, 1.0) if bool(price_actionable[t]) else (0.0, 0.0)) for t in range(m)],
+    )
+    bounds_builder.set(
+        "secondary_sbu_mode",
+        [((0.0, 1.0) if bool(price_actionable[t]) else (0.0, 0.0)) for t in range(m)],
+    )
+    bounds_builder.set(
+        "secondary_charge_steps",
+        [
             ((0.0, float(maximum_steps)) if bool(price_actionable[t]) else (0.0, 0.0))
             for t in range(m)
-        ]
+        ],
     )
     return constraints
 
