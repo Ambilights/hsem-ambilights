@@ -270,7 +270,7 @@ unversioned learned factors and residuals; the confidence value is retained.
 | Field | Default | Description |
 |---|---|---|
 | `excess_export_enabled` | `False` | Permit the MILP to schedule battery → grid export when full-horizon economics and constraints justify it; it does not force export by itself |
-| `excess_export_discharge_buffer_pct` | `10.0` | Safety SoC buffer kept before forced export |
+| `excess_export_discharge_buffer_pct` | `10.0` | Conditional safety SoC buffer retained through the demand window following an intentional battery-export slot; one contiguous PV-surplus run shares one checkpoint |
 | `excess_export_price_threshold` | Auto-calculated | Legacy/diagnostic depreciation threshold computed by `calculate_recommended_threshold()`. It is not a hard MILP export trigger; cycle wear and actual prices are already part of the objective. |
 | `export_min_price` | `0.0` | Below this export price the inverter throttles export to zero |
 | `battery_export_min_price` | `0.0` | Per-slot hard floor for intentional battery-to-grid export (issue #752). When > 0 and a slot's raw `export_price` is strictly below this value, the MILP fixes `bx[t] = 0`, so `primary_battery_export_kwh` is zero while normal local discharge and `pv_export_kwh` remain available. `force_batteries_discharge` is never labelled there. Reaching the threshold does NOT auto-trigger export; the optimizer still decides. Set to 0 to disable. |
@@ -448,6 +448,16 @@ enforces exact charge-or-discharge eligibility, so a slot cannot contain both
 primary actions. `grid_flow_mode[t]` independently selects import or export
 with finite physical per-slot bounds; both meter directions may be idle, but
 they cannot be positive together.
+
+The conditional export buffer uses one reserve checkpoint for every slot in a
+contiguous PV-surplus run. That checkpoint is after the run's following demand
+window—immediately before the next distinct PV-surplus run, or horizon end for
+the final run. Planned PV or cheap grid charging before the checkpoint may
+restore the reserve. If the full SoC trajectory cannot retain it, the planner
+may suppress the run's battery export instead of merely moving it to the
+highest-price slot. This grouping changes only checkpoint preprocessing; it
+does not add solver variables or constraints or change ordinary
+self-consumption, direct PV export, export caps/floors, or PowMr control.
 
 **Seasonal optimisation fill** (`apply_optimization_strategy`) — for all remaining `None` slots:
 

@@ -588,6 +588,44 @@ direct PV export remains available through `pv_export[t]`.
 
 Where $D_v$ is the deadline slot index for EV v.
 
+**Conditional battery-export reserve:**
+
+When excess export is enabled and
+`excess_export_discharge_buffer_pct > 0`, material battery-origin export
+activates binary `z_export[t]`:
+
+$$
+bx[t] \leq \mathrm{max\_discharge\_per\_slot}\,z_{export}[t]
+$$
+
+Let `[a,b]` be a maximal contiguous run of materially positive
+`pv_avail`. Every slot in that run uses the checkpoint derived from the final
+slot `b`: the last demand slot before the next distinct PV-surplus run, or the
+horizon end when this is the final run.
+
+$$
+checkpoint[t] = checkpoint[b] \qquad \forall t \in [a,b]
+$$
+
+An active export mode then requires:
+
+$$
+SoC[checkpoint[t]] \geq buffer_{kWh}
+    - usable_{kWh}(1-z_{export}[t])
+$$
+
+The common checkpoint evaluates every export in one solar run against the same
+following demand window. Later planned PV or grid charging before that point
+may restore the reserve. If it cannot, the optimal result may suppress all
+battery export from the run rather than simply move it to the highest-price
+slot.
+
+Run grouping is deterministic checkpoint preprocessing. It adds no variable,
+binary, bound, or constraint row, so the model width and solve-size contract
+are unchanged. It does not alter `no_export`, battery-export price floors,
+the shared export cap, hardware/dynamic SoC floors, local self-consumption,
+direct PV export, or PowMr behaviour.
+
 **Battery export minimum price floor (issue #752):**
 
 For each slot $t$, when `battery_export_min_price > 0` and the slot's **raw** `p_exp[t] < battery_export_min_price` (evaluated before the `min_export_price` and export-≤-import clamps):

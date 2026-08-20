@@ -15,7 +15,9 @@ def _next_solar_refill_checkpoints(pv_avail: np.ndarray) -> np.ndarray:
     A checkpoint is the slot immediately before the next forecast PV-surplus
     slot. When no later surplus exists, the horizon end is used. Requiring a
     reserve at that point protects the upcoming demand window while still
-    allowing a later grid-charge decision to restore the reserve.
+    allowing a later grid-charge decision to restore the reserve. A contiguous
+    run of PV-surplus slots is one refill opportunity, so every slot in that
+    run shares the checkpoint assigned to its final slot.
     """
     m = len(pv_avail)
     checkpoints = np.zeros(m, dtype=int)
@@ -25,6 +27,16 @@ def _next_solar_refill_checkpoints(pv_avail: np.ndarray) -> np.ndarray:
         if t + 1 < m and float(pv_avail[t + 1]) > _EPSILON_KWH:
             next_surplus = t + 1
         checkpoints[t] = m - 1 if next_surplus is None else max(t, next_surplus - 1)
+
+    run_start: int | None = None
+    for t in range(m + 1):
+        is_surplus = t < m and float(pv_avail[t]) > _EPSILON_KWH
+        if is_surplus and run_start is None:
+            run_start = t
+        elif not is_surplus and run_start is not None:
+            run_end = t - 1
+            checkpoints[run_start:t] = checkpoints[run_end]
+            run_start = None
 
     return checkpoints
 
