@@ -39,6 +39,7 @@ from custom_components.hsem.models.rejected_plan import RejectedPlan
 from custom_components.hsem.models.secondary_storage_config import (
     SecondaryStorageConfig,
 )
+from custom_components.hsem.models.terminal_cost_to_go import TerminalCostToGo
 from custom_components.hsem.planner.candidate_generator import (
     CANDIDATE_MILP,
     CANDIDATE_NO_ACTION,
@@ -117,6 +118,7 @@ def select_best_candidate(  # NOSONAR
     charge_efficiency_pct: float = 100.0,
     discharge_efficiency_pct: float = 100.0,
     replacement_price_per_kwh: float | None = None,
+    terminal_cost_to_go: TerminalCostToGo | None = None,
     # Optimization strategy parameters (score divergence fix)
     required_capacity: float = 0.0,
     months_winter: list[int] | None = None,
@@ -175,10 +177,11 @@ def select_best_candidate(  # NOSONAR
             Discharge-side efficiency (0-100 %).  Forwarded to
             :func:`~soc_simulation.simulate_soc`.  Defaults to 100 %.
         replacement_price_per_kwh:
-            Currency-per-kWh price used by :func:`~cost_function.score_plan`
-            to evaluate the terminal inventory value introduced by issue #413.
-            The caller derives it from the next relevant discharge block.
-            ``None`` disables the terminal inventory value.
+            Legacy uniform terminal value for backward-compatible callers.
+            Ignored when ``terminal_cost_to_go`` is supplied.
+        terminal_cost_to_go:
+            Bounded piecewise primary-inventory value shared with the MILP.
+            The scorer applies F(initial inventory) - F(final inventory).
         required_capacity:
             Battery reserve needed until the next forecast solar surplus.
         months_winter:
@@ -346,10 +349,8 @@ def select_best_candidate(  # NOSONAR
             winner.name,
         )
     else:
-        # Provide the deferred-export correction (issue #592) with the
-        # battery capacity context it needs.  CostWeights is a plain
-        # dataclass shared across candidates; setting these fields here is
-        # safe because score_plan is stateless and reads them immediately.
+        # Keep deprecated CostWeights compatibility fields synchronized for
+        # callers that inspect them. The scorer no longer reads these fields.
         cost_weights.battery_usable_capacity_kwh = usable_kwh
         cost_weights.max_charge_per_slot_kwh = max_charge_per_slot
 
@@ -362,6 +363,7 @@ def select_best_candidate(  # NOSONAR
                 now=now,
                 initial_battery_kwh=current_kwh,
                 replacement_price_per_kwh=replacement_price_per_kwh,
+                terminal_cost_to_go=terminal_cost_to_go,
             )
             c_cost = candidate._cost
             log_planner(

@@ -1,4 +1,4 @@
-"""Predicted prices may raise the value of stored energy, and nothing else.
+"""Forecast prices may value post-boundary demand, but never become actionable.
 
 Nord Pool publishes day-ahead around 13:00 CET, so a 48 h horizon carries an
 unpublished tail where ``price_actionable`` is False and no price-driven
@@ -9,22 +9,21 @@ phase throttle bites, so "catch up after 13:00" is not always available.
 
 The forecast channel closes that gap under two guarantees, both pinned here:
 
-1. **Charge-only.** Callers combine the predicted and published valuations
-   with ``max()``, so a cheap forecast collapses to the published-only answer.
-   A prediction can never lower the worth of stored energy into justifying a
-   discharge.
-2. **Never actionable.** The points live in ``PlannerInput.price_forecast``
-   and reach exactly two valuation helpers.  They never populate
+1. **Bounded and conservative.** Production primary valuation uses only exact
+   post-boundary slot matches, applies MAE plus margin, and caps value to
+   residual demand the battery can serve. The PowMr compatibility path still
+   takes the higher of published and forecast-derived scalar valuations.
+2. **Never actionable.** Forecast points remain separate from
    ``PlannedSlot.price`` and never extend ``price_actionable``.
 
-``test_expensive_forecast_raises_primary_valuation`` and
-``test_expensive_forecast_raises_secondary_valuation`` fail against
-v6.2.2-powmr.30, where neither helper accepts a forecast at all.
+The direct scalar Huawei helper tests below are retained for API compatibility;
+production primary planning is covered by the bounded cost-to-go regressions.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 
@@ -44,6 +43,7 @@ from custom_components.hsem.models.secondary_storage_config import (
 from custom_components.hsem.models.solcast_slot import SolcastSlot
 from custom_components.hsem.planner import run_planner
 from custom_components.hsem.planner.future_value import (
+    build_terminal_cost_to_go,
     forecast_effective_prices,
     replacement_price_from_next_discharge,
 )
@@ -120,11 +120,11 @@ def _secondary() -> SecondaryStorageConfig:
     )
 
 
-class TestPrimaryValuation:
-    """replacement_price_from_next_discharge — the Huawei side."""
+class TestLegacyPrimaryScalarValuation:
+    """Direct compatibility coverage for the retired production scalar path."""
 
     def test_expensive_forecast_raises_primary_valuation(self) -> None:
-        """A dear forecast lifts stored-energy value (fails against v30)."""
+        """A dear forecast lifts the direct compatibility helper's value."""
         slots = _published_slots(CHEAP_TODAY)
         published = replacement_price_from_next_discharge(slots, NOW, top_n=4)
         with_forecast = replacement_price_from_next_discharge(
@@ -289,13 +289,81 @@ class TestAttributeParsing:
                     {"start": "2026-08-17T01:00:00+02:00", "value": 1.5},
                     "not-a-dict",
                 ],
-                "mae": "bad",
             },
             enabled=True,
         )
         assert len(fc.points) == 1
         assert fc.points[0].value == pytest.approx(1.5)
         assert fc.mae == pytest.approx(0.0)
+
+    @pytest.mark.parametrize(
+        ("confidence_field", "confidence_value", "margin", "expected_usable"),
+        [
+            pytest.param(None, None, 0.0, True, id="absent-mae"),
+            pytest.param("mae", "bad", 0.0, False, id="malformed-mae"),
+            pytest.param("mae", float("nan"), 0.0, False, id="nan-mae"),
+            pytest.param("mae", float("inf"), 0.0, False, id="positive-inf-mae"),
+            pytest.param("mae", float("-inf"), 0.0, False, id="negative-inf-mae"),
+            pytest.param(None, None, "bad", False, id="malformed-margin"),
+            pytest.param(None, None, float("nan"), False, id="nan-margin"),
+            pytest.param(None, None, float("inf"), False, id="positive-inf-margin"),
+            pytest.param(
+                None,
+                None,
+                float("-inf"),
+                False,
+                id="negative-inf-margin",
+            ),
+        ],
+    )
+    def test_confidence_metadata_is_fail_closed_end_to_end(
+        self,
+        confidence_field: str | None,
+        confidence_value: Any,
+        margin: Any,
+        expected_usable: bool,
+    ) -> None:
+        """Only a genuinely absent MAE may use the zero-haircut default."""
+        published = _slot(NOW + timedelta(minutes=15), 1.0)
+        tail = _slot(NOW + timedelta(minutes=30), 0.0, actionable=False)
+        tail.avg_house_consumption_kwh = 1.0
+        tail.solcast_pv_estimate_kwh = 0.0
+        tail.ev_accounted_load_kwh = 0.0
+
+        attributes: dict[str, Any] = {
+            "forecast": [{"start": tail.start.isoformat(), "value": 5.0}],
+        }
+        if confidence_field is not None:
+            attributes[confidence_field] = confidence_value
+        forecast = build_price_forecast(
+            attributes,
+            enabled=True,
+            margin=margin,
+        )
+        cost_to_go = build_terminal_cost_to_go(
+            [published, tail],
+            NOW,
+            forecast=forecast,
+            usable_kwh=1.0,
+            max_discharge_per_slot=1.0,
+            discharge_efficiency_pct=100.0,
+            cycle_cost_per_kwh=0.0,
+        )
+
+        assert forecast.enabled is True
+        assert forecast.usable is expected_usable
+        if expected_usable:
+            assert forecast.mae == pytest.approx(0.0)
+            assert forecast_effective_prices(
+                forecast, NOW, [published, tail]
+            ) == pytest.approx([5.0])
+            assert cost_to_go.source == "forecast"
+            assert cost_to_go.total_quantity_kwh == pytest.approx(1.0)
+        else:
+            assert forecast.points == ()
+            assert forecast_effective_prices(forecast, NOW, [published, tail]) == []
+            assert cost_to_go.source == "hardware_floor_only"
+            assert cost_to_go.tiers == ()
 
     def test_margin_is_carried_even_when_disabled(self) -> None:
         fc = build_price_forecast(None, enabled=False, margin=0.25)
@@ -306,10 +374,10 @@ class TestAttributeParsing:
 class TestIsolationThroughRunPlanner:
     """The forecast must not leak into slot prices or the actionable prefix.
 
-    This is the structural guarantee the design rests on: predictions live in
-    ``PlannerInput.price_forecast`` and reach only the two valuation helpers,
-    so no actuator, MILP bound or export decision can see one.  Asserting it
-    end-to-end means a future refactor that wires the forecast into slot
+    Predictions live in ``PlannerInput.price_forecast`` and reach the bounded
+    primary cost-to-go builder plus the PowMr scalar compatibility helper; no
+    forecast becomes an actionable slot price. Asserting that boundary
+    end-to-end means a future refactor that wires a prediction into slot
     population fails here rather than in production.
     """
 
@@ -370,6 +438,51 @@ class TestIsolationThroughRunPlanner:
             house_power_includes_ev=False,
             is_read_only=True,
             price_forecast=forecast if with_forecast else PriceForecast(),
+        )
+
+    def test_engine_receives_bounded_forecast_cost_to_go(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Pass a quantity-capped Unagi model through the production engine."""
+        from custom_components.hsem.planner import engine_core
+
+        captured_models: list[Any] = []
+        captured_scalars: list[float | None] = []
+        original_generate_candidates = engine_core.generate_candidates
+
+        def capture_generate_candidates(*args: Any, **kwargs: Any) -> Any:
+            captured_models.append(kwargs.get("terminal_cost_to_go"))
+            captured_scalars.append(kwargs.get("replacement_price_per_kwh"))
+            return original_generate_candidates(*args, **kwargs)
+
+        monkeypatch.setattr(
+            engine_core,
+            "generate_candidates",
+            capture_generate_candidates,
+        )
+        output = run_planner(self._input(with_forecast=True))
+
+        assert len(captured_models) == 1
+        assert captured_scalars == [None]
+        model = captured_models[0]
+        assert model is not None
+        assert model.source == "forecast"
+        assert model.boundary == datetime(2024, 6, 16, 0, 0, tzinfo=UTC)
+        assert model.total_quantity_kwh == pytest.approx(9.0)
+        assert model.inventory_value(100.0) == pytest.approx(
+            sum(tier.quantity_kwh * tier.value_per_kwh for tier in model.tiers)
+        )
+        assert all(tier.start >= model.boundary for tier in model.tiers)
+        explanation = output.explanation
+        assert explanation.terminal_cost_to_go_source == model.source
+        assert explanation.terminal_cost_to_go_boundary == model.boundary.isoformat()
+        assert explanation.terminal_cost_to_go_tier_count == len(model.tiers)
+        assert explanation.terminal_cost_to_go_total_quantity_kwh == pytest.approx(
+            model.total_quantity_kwh
+        )
+        assert explanation.terminal_cost_to_go_initial_value == pytest.approx(
+            model.inventory_value(4.0)
         )
 
     def test_forecast_never_makes_the_tail_actionable(self) -> None:

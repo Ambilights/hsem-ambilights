@@ -1123,8 +1123,8 @@ A time-limited incumbent must pass all of these checks against the final model:
 - the central `MilpColumnLayout` declares nine core per-slot blocks, appends
   active EV and optional fuse blocks, then the named `primary_battery_export`,
   `pv_export`, `export_source_mode`, `primary_action_mode`, and
-  `grid_flow_mode` blocks, followed by optional export-reserve and
-  secondary-storage blocks;
+  `grid_flow_mode` blocks, followed by optional export-reserve, bounded
+  primary-terminal-inventory, and secondary-storage blocks;
 - the objective length, equality-matrix width, inequality-matrix width, and
   bounds length all equal that layout's final `column_count`;
 - variable bounds are satisfied;
@@ -1146,7 +1146,9 @@ has the old width.
 per-slot binary blocks in every solve. They make the export-source split,
 primary charge/discharge direction, and meter import/export direction exact.
 Secondary-storage and conditional export-reserve modes may add further integer
-blocks, but the base primary model is already mixed-integer.
+blocks. Positive primary terminal tiers add a non-integral, non-per-slot
+`primary_terminal_inventory` block; an empty `hardware_floor_only` model
+adds none. The base primary model is already mixed-integer.
 
 Diagnostics publish the ordered block metadata under
 `model_variable_blocks` and the common width under `model_column_count`,
@@ -1467,7 +1469,7 @@ how that plays out per slot, from cheapest to most expensive action.
       + (charge_loss·p_imp[t])·ec[t]
       + discharge_loss·(p_imp[t]·(ed[t]−bx[t]) + p_exp_pos[t]·bx[t])
       + p_soc·(s_max_pen[t] + s_min_pen[t]) ]
-+ R·Σ_t(ed[t] − ec[t])
+- V_primary(E_final)  # V_primary(E_initial) is a constant
 + ε·Σ_t(ec[t] + ed[t]) − 1.5ε·Σ_t(ed[t] − bx[t])
 + Σ_t δ_t·[(1−η_secondary_charge)·p_imp[t]·c_secondary[t]
            + (1−η_secondary_discharge)·p_imp[t]·d_secondary[t]
@@ -1537,33 +1539,48 @@ After the deadline slot `D`:
     the higher genuine avoided-cost value wins the surplus for that slot.
   - Grid import is never used for post-deadline EV charging.
 
-#### 6. Terminal inventory value and primary-action structural tiebreak
+#### 6. Bounded terminal cost-to-go and primary-action structural tiebreak
 
-At horizon end, the battery's remaining energy is valued **inside the LP
-objective** with one uniform, undiscounted coefficient:
+At the end of the contiguous published-price prefix, primary-battery inventory
+is valued **inside the MILP objective** by a bounded, piecewise-linear
+`TerminalCostToGo`, not by one replacement-price coefficient. Let its tiers
+`(q_i, v_i)` be ordered by decreasing positive marginal value, where both the
+quantity `q_i` and inventory are battery-side DC kWh:
 
 ```text
-R = max(replacement_price_per_kwh or 0, 0)  # non-finite resolves to 0
-terminal_soc_value = R * (Σ_t ed[t] - Σ_t ec[t])
-                   = R * (initial_battery_kwh - final_battery_kwh)
+V_primary(E) = Σ_i v_i × min(q_i, max(E - Σ_{j<i} q_j, 0))
+
+primary_terminal_soc_value
+    = V_primary(initial_battery_kwh)
+      - V_primary(final_battery_kwh)
 ```
 
-This is path-independent final-inventory accounting. The same $R$ applies to
-every battery-side charge and discharge, so an export discharge and equal
-later refill cancel exactly in `terminal_soc_value`. The cycle is then judged
-by actual import/export prices, charge and discharge efficiencies, cycle wear,
-available energy/headroom, and per-slot power limits. There is no per-slot
-`terminal_premium`, asymmetric charge credit, or deferred-export-price
+The MILP represents the final value with one allocation variable `y_i` per
+tier:
+
+```text
+0 <= y_i <= q_i
+Σ_i y_i <= final_battery_kwh
+objective contribution = -Σ_i v_i × y_i
+```
+
+The omitted `V_primary(initial_battery_kwh)` is constant for candidate
+selection and is restored in scorer and diagnostic accounting. Inventory above
+`Σ_i q_i` receives no invented salvage value. The model is path-independent:
+only final inventory determines `V_primary`, so an export discharge and equal
+later refill cancel exactly. Actual import/export prices, conversion
+efficiencies, cycle wear, available headroom, and per-slot power limits still
+decide whether the cycle is worthwhile. There is no per-slot
+`terminal_premium`, asymmetric charge credit, or deferred executable price
 side channel.
 
-Battery-origin export receives the full inventory opportunity cost because
-`bx[t]` remains part of `ed[t]`. There is no avoided-import cap on exported
-energy. This prevents aggregate battery export from being valued as though it
-displaced house import. If the optimizer can export and later refill
-economically, the equal battery movements cancel in the terminal term and the
+Battery-origin export changes final inventory through `ed[t]` and therefore
+crosses the same bounded tiers as local discharge. It cannot be valued as
+though it displaced house import. If the optimizer can export and later refill
+economically, equal battery movements restore the same final inventory and the
 explicit refill cost/opportunity cost decides the result.
 
-The uniform terminal term is paired with a tiny primary-action structural
+The bounded terminal term is paired with a tiny primary-action structural
 tiebreak:
 
 ```text
@@ -1601,65 +1618,74 @@ power constraints. These are solver outcomes, not terminal-premium caps.
 
 Required behavioural regressions make the distinction concrete:
 
-- With $R=3$, a 1.0 kWh battery may export 1.0 kWh at 2.0 when a later slot
-  can restore the full 1.0 kWh from otherwise-worthless PV. Initial and final
-  inventory match, so terminal value is zero; $R$ is not a hard export floor.
-- If the later PV energy or charge-power limit is only 0.4 kWh, only 0.4 kWh
-  may take that free export/refill cycle. The unrefillable 0.6 kWh still pays
-  terminal inventory value.
-- A free refill arriving after a 4.0-price local demand is too late to justify
-  selling the energy at 2.0 before that demand. Moving the same refill before
-  demand may make the export feasible without causing the dear import.
-- With grid refill, an export/refill cycle occurs only when export revenue
-  covers the actual refill import, both conversion losses, and cycle wear.
-  Forecast-derived $R$ changes none of those slot prices and cannot make a
-  non-actionable tail executable.
+- One post-boundary 1.0 kWh demand tier can value at most 1.0 kWh, never the
+  whole 25.5 kWh usable battery.
+- When an official price moves the boundary forward, that newly actionable
+  demand leaves the terminal tiers and is served according to its real price;
+  only still-unpublished aligned demand remains reserved.
+- With no valid tier, a full battery may serve every worthwhile actionable
+  demand down to its effective hardware floor instead of remaining full for an
+  imaginary tail.
+- Equal battery-side discharge and refill restore the same final inventory and
+  therefore contribute exactly zero primary terminal value, independent of
+  slot order or export destination.
+- A terminal tier cannot make its non-actionable source slot executable or
+  bypass EV, no-export, or conditional export-reserve constraints.
 
-##### Where `replacement_price` comes from
+##### Where primary terminal tiers come from
 
-`replacement_price_from_next_discharge()` values stored energy from the first
-contiguous upcoming **heuristic** discharge block whose slots are
-`price_actionable`. It takes the mean of that block's `top_n` dearest import
-prices; `top_n` is derived from usable battery capacity and maximum
-discharge energy per slot. The helper reads scheduling labels as horizon
-context. It does not simulate future PV/grid refill, charge headroom,
-efficiency, or the selected MILP flows.
+The primary `TerminalCostToGo` is built only from the opt-in Unagi import-price
+forecast **strictly outside the published-price authority window**. The
+boundary is the end of the contiguous future `price_actionable` prefix. A
+forecast point is eligible only when its UTC start exactly matches a future,
+non-actionable planner slot whose start is at or after that boundary. Published
+overlap, past points, off-cadence points, and points without an aligned planner
+load slot contribute nothing.
 
-When `PlannerInput.price_forecast` is populated (opt-in, off by default), the
-predicted unpublished tail is valued by the same rule — the mean of its `top_n`
-dearest prices — and the **higher of the two wins**:
+Each eligible Unagi price is reduced conservatively before valuation:
 
+```text
+effective_forecast_price
+    = max(forecast_price - max(MAE, 0) - max(operator_margin, 0), 0)
+
+eligible_house_load_ac
+    = max(house_load - PV - accounted_EV_load, 0)
+
+q_i = min(eligible_house_load_ac / discharge_efficiency,
+          max_discharge_per_slot,
+          usable_battery_kwh)
+
+v_i = effective_forecast_price * discharge_efficiency
+      - effective_forecast_price * (1 - discharge_efficiency)
+      - cycle_wear_per_kwh
 ```
-replacement_price = max(published_only, forecast_derived)
-```
 
-`resolve_secondary_terminal_price()` applies the identical `max()` rule for the
-secondary storage, using its own mean-of-window aggregation rather than
-`top_n`, because a dedicated load spends stored energy across the window
-instead of concentrating it on the dearest hour. The resolved scalar is passed
-unchanged as $R_{secondary}$ to the uniform final-inventory term; it never
-becomes a per-slot secondary charge or discharge premium.
+Only finite, positive `q_i` and `v_i` survive. Duplicate forecasts for one
+physical slot collapse to the lower effective price. Tiers are sorted by
+decreasing marginal value, with physical start as the deterministic tie-break,
+and their combined quantity is capped by usable capacity. Invalid forecast
+uncertainty or load/PV/EV inputs fail closed and create no tier.
 
-Two authority invariants hold, and both are covered by tests:
+This boundary rolls with publication. When an official price arrives, that
+slot leaves the cost-to-go and is evaluated through its real in-horizon price;
+the synthetic hold cannot migrate with the boundary and keep a newly published
+peak uneconomically reserved. If no valid post-boundary tier remains, the model
+is empty with source `hardware_floor_only`: terminal synthetic value is zero
+for the primary battery, and the existing effective hardware discharge floor
+is its only terminal reserve.
 
-1. **One-way valuation.** Taking the maximum means a cheap forecast collapses
-   to the published-only value. A prediction can raise the worth of terminal
-   inventory, encouraging charging or retention and potentially suppressing
-   discharge/export. It can never lower stored-energy value and thereby create
-   a discharge or export opportunity.
-2. **Never actionable.** Forecast points live only in
-   `PlannerInput.price_forecast`. They never populate `PlannedSlot.price`, never
-   extend `price_actionable`, and never become import cost, export revenue, a
-   physical bound, or actuator authority. Their only planner effect is through
-   the scalar horizon-end replacement value. The isolation is structural
-   rather than a flag each slot consumer must check.
+The forecast remains valuation-only. It never populates `PlannedSlot.price`,
+extends `price_actionable`, creates import cost or export revenue, changes a
+physical bound, or authorises a storage action beyond the boundary. The
+isolation is structural rather than a flag every slot consumer must remember.
+A confidence *interval* is deliberately not used: on the reference feed the
+80 % lower bound proved flat across a whole day (0.001–0.021 SEK/kWh through an
+evening peak whose point estimate was 0.752), carrying no useful shape.
 
-Every predicted price is reduced by `mae + margin` before use, where `mae` is
-the source's own published error for that horizon and `margin` is an operator
-haircut defaulting to `0`. A confidence *interval* is deliberately not used:
-on the reference feed the 80 % lower bound proved flat across a whole day
-(0.001–0.021 SEK/kWh through an evening peak whose point estimate was 0.752),
-carrying no shape and clearing no break-even test.
+Secondary storage retains its independent uniform terminal coefficient.
+`resolve_secondary_terminal_price()` may combine its published and forecast
+context with its dedicated-load mean-of-window rule; that scalar remains
+undiscounted and never becomes a per-slot secondary premium.
 
 Enabling forecast valuation requires a configured, existing valuation sensor;
 a stale sensor option is ignored while the feature is disabled. The accepted
@@ -1670,14 +1696,24 @@ debounced refresh path and must trigger a new planner run rather than reusing a
 plan valued from stale forecast data. Parser-rejected points do not enter the
 signature.
 
-The effective replacement value is logged and passed unchanged into the MILP
-and scorer; its published/forecast composition follows the rule above rather
-than separate executable price channels. MILP diagnostics expose
-`terminal_inventory_value` and `primary_action_tiebreak`. The MILP and scorer
-use the same coefficients and export-source semantics. Published diagnostics
-are recomputed from the final reconciled slot fields, so they match the
+The terminal model is exposed without pretending its forecast value is money
+already earned. Diagnostics publish `terminal_cost_to_go_source`
+(`forecast` or `hardware_floor_only` in production;
+`legacy_scalar` only for compatible direct callers), boundary, tier count,
+total bounded quantity, and the ordered tier details. They also publish
+initial/final inventory, initial/final valued quantity, and initial/final
+inventory value;
+`terminal_inventory_value` is the initial value minus the final value. MILP
+and scorer consume the same model and export-source semantics. Published
+diagnostics are recomputed from final reconciled slot fields, so they match the
 authoritative scorer even when solver writeback has removed a degenerate raw
 flow.
+
+`PlanExplanation` carries the compact source, boundary, tier count/quantity,
+highest/lowest marginal value, and initial/final valued quantity/value. Full
+ordered tier details remain in MILP diagnostics so recorder-backed explanation
+attributes stay bounded.
+
 `terminal_soc_credit` remains a legacy diagnostic key carrying the same
 signed value as `terminal_inventory_value`; despite its historical name, a
 positive value is a penalty for net inventory loss.
@@ -1707,8 +1743,8 @@ future_value_per_kwh = confidence_factor × mean(import_price[t] for t in next 2
   to account for the EV's future need being less certain than the house
   battery's scheduled discharge (depends on driving pattern, whether the EV
   stays plugged in, etc.).
-- Mirrors `replacement_price_from_next_discharge`, which applies the same
-  avoided-cost principle to the house battery's terminal SoC.
+- This remains an EV-specific scalar heuristic. Primary terminal inventory now
+  uses the bounded post-boundary `TerminalCostToGo` tiers described above.
 
 Because this benefit is priced in the same currency units as `p_imp` and
 `p_exp`, the MILP lets charge-past-target EV charging compete fairly
@@ -1906,11 +1942,11 @@ Where:
   synthetic terms. They must **never** appear in `total_cost`, because they
   do not represent real money paid or earned.
 - `terminal_soc_value` is **selector-only** and is the sum of independent
-  primary and secondary final-inventory terms. It is negative (credit) when
-  the plan ends with more valued stored energy than it started with, and
-  positive (penalty) when it ends with less. It prevents the selector from
-  preferring plans that look cheap only because they drained either battery
-  before end-of-horizon.
+  primary and secondary final-inventory terms. The primary contribution is
+  bounded by valid post-boundary demand tiers; the secondary remains uniform.
+  A component is negative (credit) when the plan ends with more *valued*
+  stored energy than it started with and positive (penalty) when it ends with
+  less.
 - `primary_action_tiebreak` is **selector-only** and may have either sign. It
   is the same ε-weighted primary charge/discharge/export expression used by
   the MILP; it resolves structural ties without being real money.
@@ -2087,13 +2123,13 @@ score_plan(slots_with_past).soc_penalty
 ### Terminal inventory value and primary-action structural tiebreak
 
 Plans must not look better merely because they empty either battery before the
-horizon ends. The scorer therefore uses the same uniform, undiscounted
-final-inventory terms as the MILP:
+horizon ends. The scorer therefore uses the same primary bounded cost-to-go and
+secondary uniform final-inventory term as the MILP:
 
 ```text
 primary_terminal_soc_value =
-    replacement_price_per_kwh
-    * (sum(batteries_discharged_kwh) - sum(batteries_charged_kwh))
+    V_primary(initial_battery_kwh)
+    - V_primary(final_battery_kwh)
 
 secondary_terminal_soc_value =
     secondary_storage_replacement_price_per_kwh
@@ -2106,14 +2142,13 @@ terminal_soc_value =
     primary_terminal_soc_value + secondary_terminal_soc_value
 ```
 
-Each component is equivalently its replacement price multiplied by
-`initial_battery_kwh - final_battery_kwh` for that battery. The aggregate
-contributes to `score`, never `total_cost`. Charging makes a component
-negative, discharging makes it positive, and equal charge/discharge for either
-battery cancels exactly regardless of path. The replacement-price sources and
-published/forecast authority rules are defined in the MILP objective section;
-neither coefficient is the minimum import price across the whole horizon or a
-model of future refill.
+For the primary, `final_battery_kwh` is initial inventory plus actionable
+charge minus actionable discharge; non-actionable storage is held. The bounded
+`V_primary` is defined in the MILP objective section. The secondary component
+remains its scalar replacement price multiplied by
+`initial_battery_kwh - final_battery_kwh`. The aggregate contributes to
+`score`, never `total_cost`. Equal net movement for either battery restores
+the same final inventory and cancels exactly regardless of path.
 
 The scorer also mirrors the MILP's primary-action structural tiebreak:
 
@@ -2148,14 +2183,15 @@ conversion loss, destination-aware pricing applies (issue #641):
 `local_discharge_dc` uses `imp_price_obj` — see Battery efficiency /
 Conversion loss pricing above. The LP and scorer use the same explicit split.
 
-Primary terminal accounting is active only when both `initial_battery_kwh`
-and `replacement_price_per_kwh` are supplied to `score_plan`. Secondary
-terminal accounting is independently active when secondary scoring is enabled
-and `secondary_storage_replacement_price_per_kwh` is supplied in `CostWeights`.
-Unit tests without either horizon context may omit those inputs, in which case
-the corresponding component, and therefore possibly `terminal_soc_value`, is
-`0.0`. The flow-based
-`primary_action_tiebreak` remains independently defined.
+Production primary terminal accounting is active when
+`initial_battery_kwh` and `terminal_cost_to_go` are supplied to
+`score_plan`. An empty `hardware_floor_only` model is still explicit and
+contributes zero. The legacy scalar `replacement_price_per_kwh` path remains
+only for compatible direct callers that do not pass a terminal model.
+Secondary terminal accounting is independently active when secondary scoring
+is enabled and `secondary_storage_replacement_price_per_kwh` is supplied in
+`CostWeights`. The flow-based `primary_action_tiebreak` remains
+independently defined.
 
 ### Invariants for tests
 
@@ -2171,9 +2207,11 @@ the corresponding component, and therefore possibly `terminal_soc_value`, is
   not the lowest `total_cost`.
 - `winner.score == output.plan_cost.score` for every planner run.
 - `winner.slots == output.slots` for every planner run.
-- Given two otherwise-identical plans, the one that ends with more stored
-  battery energy must have the lower `terminal_soc_value` and therefore the
-  lower `score` (all else equal).
+- Given two otherwise-identical primary plans whose final inventories differ
+  inside an active tier, the one ending with more valued stored energy must
+  have the lower `terminal_soc_value` and therefore the lower `score`.
+- Primary inventory above total tier quantity has no synthetic salvage value;
+  an empty `hardware_floor_only` model contributes exactly zero.
 - Equal primary battery-side discharge and recharge must contribute exactly
   zero net `terminal_soc_value`, regardless of their slot positions.
 - Equal secondary battery-side discharge and recharge must contribute exactly
@@ -2335,6 +2373,23 @@ output.slots == selected_candidate.slots
 ```
 
 No post-selection pass may mutate slots unless the plan is re-simulated and re-scored.
+
+### Truthful plan-explanation semantics
+
+Plan explanations describe only energy actions present in the final selected
+slots. A plan with grid charge but no scheduled discharge is
+`opportunistic_charge`; its summary must state that no discharge window is
+scheduled. If that plan costs more than the idle comparator inside the current
+actionable window, the rejected `do_nothing` reason may report the measured
+charging overhead or retained post-boundary inventory, but must not promise
+that discharge savings occur inside a window containing no discharge.
+
+`estimated_total_cost` and the idle comparator use only actionable slot money.
+The explanation's legacy `score` is their signed difference (positive means
+the selected plan is cheaper), not the candidate selector's lower-is-better
+`PlanCostBreakdown.score`. Terminal cost-to-go may explain why retaining energy
+changes selection, but forecast value must never be presented as realised
+within-window revenue or savings.
 
 ### Plan-level hysteresis (anti-flapping, issue #372)
 
@@ -2508,8 +2563,11 @@ Add tests for these invariants:
 - Final output slots equal selected candidate slots.
 - No post-selection mutation happens without re-score.
 - No-action includes normal PV/battery behavior.
-- Terminal SoC affects cost.
-- Emptying the battery is not free.
+- Valid terminal inventory value affects cost; an empty primary
+  `hardware_floor_only` model contributes zero.
+- Consuming primary valued-tier inventory or uniformly valued secondary
+  inventory is not free; primary inventory outside the tiers has no synthetic
+  value.
 - `no_action` is never selected, even when its diagnostic score is below the
   executable candidates.
 - Current partial slot uses remaining duration only.
@@ -2625,7 +2683,7 @@ Source selection is atomic per slot and follows this order:
 
 Accepted ENTSO-E values are redundant publications of executable day-ahead
 prices, not the opt-in valuation forecast described under
-`replacement_price`. They populate `PlannedSlot.price` and can extend the
+`TerminalCostToGo`. They populate `PlannedSlot.price` and can extend the
 price-actionable prefix. Source labels (`primary`, `entsoe`, or `forecast`)
 are carried with both channels through `HourlyRecommendation`, `PricePoint`,
 `PlannedSlot`, the plan-reuse signature, and diagnostics. A source-only
@@ -2675,11 +2733,13 @@ Beyond that boundary:
 - Optional EV arbitrage/deadline allocation is forbidden. A fixed live EV
   session remains a mandatory physical load, and unmet target energy is
   surfaced rather than priced as free.
-- Primary and secondary terminal/replacement valuation uses only actionable
-  prices.
+- Primary terminal tiers may read aligned Unagi points outside the prefix, at
+  or after this boundary instant, as valuation-only context. Secondary storage
+  retains its separate terminal-price rule. Neither mechanism makes a
+  non-actionable slot executable.
 
-An opt-in forecast-derived replacement value does not relax this boundary.
-It can value terminal inventory for actionable decisions, but it cannot make a
+An opt-in forecast-derived terminal value does not relax this boundary. It can
+value final inventory for actionable decisions, but it cannot make a
 non-actionable slot charge, discharge, export battery energy, or change
 inverter mode.
 

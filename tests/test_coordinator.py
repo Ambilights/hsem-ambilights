@@ -29,6 +29,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
+import math
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, cast
@@ -61,11 +64,13 @@ from custom_components.hsem.models.daily_plan_vs_actual_tracker import (
 from custom_components.hsem.models.live_state import LiveState
 from custom_components.hsem.models.plan_explanation import PlanExplanation
 from custom_components.hsem.models.planned_slot import PlannedSlot
+from custom_components.hsem.models.planner_input import PlannerInput
 from custom_components.hsem.models.planner_output import PlannerOutput
 from custom_components.hsem.models.sensor_config import SensorConfig
 from custom_components.hsem.models.state_snapshot import StateSnapshot
 from custom_components.hsem.utils.forecast_tracker import ForecastTracker
 from custom_components.hsem.utils.inverter_verify import CycleApplySummary
+from custom_components.hsem.utils.price_forecast import build_price_forecast
 from custom_components.hsem.utils.recommendations import Recommendations
 from custom_components.hsem.utils.solar_corrector import SolarForecastCorrector
 
@@ -514,6 +519,97 @@ class TestPriceForecastAuthority:
             )
             is True
         )
+
+    @pytest.mark.parametrize(
+        ("invalid_attributes", "invalid_margin"),
+        [
+            pytest.param(
+                {
+                    "forecast": [
+                        {
+                            "start": "2026-08-15T00:00:00+00:00",
+                            "value": 1.25,
+                        }
+                    ],
+                    "mae": float("nan"),
+                },
+                0.05,
+                id="nonfinite-mae",
+            ),
+            pytest.param(
+                {
+                    "forecast": [
+                        {
+                            "start": "2026-08-15T00:00:00+00:00",
+                            "value": 1.25,
+                        }
+                    ],
+                    "mae": 0.10,
+                },
+                float("nan"),
+                id="nonfinite-margin",
+            ),
+        ],
+    )
+    def test_invalid_valuation_confidence_has_stable_json_safe_signature(
+        self,
+        invalid_attributes: dict[str, Any],
+        invalid_margin: float,
+    ) -> None:
+        """An unchanged invalid feed cannot cause a perpetual replan loop."""
+        now = datetime(2026, 8, 14, 0, 5, tzinfo=UTC)
+        with patch(
+            "custom_components.hsem.coordinator_builder.hsem_now", return_value=now
+        ):
+            recommendations = generate_recommendation_intervals(15, 1)
+        live = LiveState()
+
+        signatures = [
+            _price_forecast_signature(
+                recommendations,
+                live,
+                now,
+                valuation_attributes=invalid_attributes,
+                valuation_enabled=True,
+                valuation_margin=invalid_margin,
+            )
+            for _ in range(2)
+        ]
+        forecast = build_price_forecast(
+            invalid_attributes,
+            enabled=True,
+            margin=invalid_margin,
+        )
+        planner_input = PlannerInput(price_forecast=forecast)
+        forecast_payload = asdict(planner_input)["price_forecast"]
+
+        assert signatures[0] == signatures[1]
+        valuation_signature = signatures[0][3]
+        assert valuation_signature == (
+            True,
+            round(forecast.mae, 5),
+            round(forecast.margin, 5),
+            (),
+        )
+        assert forecast.enabled is True
+        assert forecast.usable is False
+        assert forecast.points == ()
+        assert math.isfinite(forecast.mae)
+        assert math.isfinite(forecast.margin)
+        json.dumps(forecast_payload, allow_nan=False)
+
+        valid_signature = _price_forecast_signature(
+            recommendations,
+            live,
+            now,
+            valuation_attributes={
+                "forecast": invalid_attributes["forecast"],
+                "mae": 0.10,
+            },
+            valuation_enabled=True,
+            valuation_margin=0.05,
+        )
+        assert valid_signature != signatures[0]
 
     def test_valuation_attribute_changes_trigger_replan(self) -> None:
         now = datetime(2026, 8, 14, 0, 5, tzinfo=UTC)

@@ -10,14 +10,17 @@ up once real prices arrive.
 This module carries a *separate* price channel for that gap.  Two properties
 make it safe:
 
-- **It never enters** :class:`~custom_components.hsem.models.planned_slot.PlannedSlot`
-  ``.price`` and never extends ``price_actionable``.  Only the two valuation
-  helpers receive it, so no actuator, MILP bound or export decision can see a
-  prediction.  The isolation is structural, not a flag each consumer must
-  remember to honour.
-- **It can only raise the value of stored energy.**  Callers combine it with
-  ``max(published_only, forecast_derived)``, so a cheap forecast falls back to
-  the published-only result and can never justify a discharge.
+- **It never enters** PlannedSlot.price and never extends price_actionable. A
+  prediction cannot directly enable charge, discharge, or export in its own
+  slot. The primary optimiser sees only derived terminal inventory tiers, not
+  a forecast action price.
+- **Primary value is conservative and bounded.** After MAE and operator
+  margin, a forecast point contributes only when it aligns with residual local
+  load in a strictly non-actionable slot at or beyond the published boundary.
+  Its battery-side quantity is capped by physical discharge and usable
+  capacity, so excess final inventory receives no synthetic value. The legacy
+  secondary-storage scalar helper separately retains its charge-only
+  max(published-only, forecast-derived) behaviour.
 
 Prices are expected in the same basis as the configured import price sensor
 (VAT and fixed costs already applied); HSEM applies no currency or tax
@@ -26,6 +29,7 @@ transform anywhere, so matching the basis is the source's responsibility.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -69,8 +73,13 @@ class PriceForecast:
 
     @property
     def usable(self) -> bool:
-        """Whether this forecast may contribute to a valuation."""
-        return self.enabled and bool(self.points)
+        """Whether points and confidence inputs may contribute to valuation."""
+        return (
+            self.enabled
+            and bool(self.points)
+            and math.isfinite(self.mae)
+            and math.isfinite(self.margin)
+        )
 
     @property
     def haircut(self) -> float:

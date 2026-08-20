@@ -14,7 +14,7 @@ flowchart TD
     D{EV configs provided?}
     E[Rebuild net_load without pre-computed EV planned loads]
     F[Keep fixed EV planned load in net_load]
-    G[Build objective vector c_obj: money terms, uniform terminal inventory value, primary-action structural tiebreak, penalties, EV terms]
+    G[Build objective vector c_obj: money terms, bounded primary terminal value, uniform secondary terminal value, structural tiebreak, penalties, EV terms]
     H[Build equality constraints A_eq: site energy balance, exact battery/PV export-source balance, EV charger load]
     I[Build inequalities: SoC soft bounds, exact battery and meter directions, causal export-source split, cycle auxiliary, EV and fuse rows]
     J[Build bounds and integrality: finite import/export, source/action/grid binaries, optional reserve/PowMr modes]
@@ -254,8 +254,8 @@ $$
     + & \alpha_s m_s[t]
     && \text{secondary cycle wear} \\
 \bigg] \\
-+ & R \cdot \sum_t \bigl(ed[t]-ec[t]\bigr)
-    && \text{terminal inventory value (uniform, undiscounted)} \\
+- & \sum_i v_i y_i
+    && \text{primary bounded final-inventory value} \\
 + & R_s \cdot \sum_t \bigl(d_s[t]-c_s[t]\bigr)
     && \text{secondary terminal inventory value (uniform, undiscounted)} \\
 + & \epsilon_a \sum_t\bigl(ec[t]+ed[t]\bigr)
@@ -281,7 +281,9 @@ Where:
 | $\alpha$ | Battery cycle cost per kWh: $\alpha = \frac{P \cdot L_{pct}/100}{2 \cdot N \cdot C_u}$ |
 | $\epsilon_{\mathrm{chg}}$ | Charge-side loss fraction: $\epsilon_{\mathrm{chg}} = 1 - \eta_{\mathrm{chg}}$ |
 | $\epsilon_{\mathrm{dis}}$ | Discharge-side loss fraction: $\epsilon_{\mathrm{dis}} = 1 - \eta_{\mathrm{dis}}$ |
-| $R$ | Non-negative terminal-inventory replacement price (currency/kWh), from the engine; missing/non-finite resolves to zero |
+| $q_i$ | Battery-side quantity of primary terminal tier $i$, capped by aligned post-boundary residual demand and physical limits |
+| $v_i$ | Positive marginal value of primary tier $i$ after Unagi haircut, discharge loss, and cycle wear |
+| $y_i$ | Final primary inventory allocated to tier $i$, with $0\le y_i\le q_i$ |
 | $c_s[t], d_s[t], m_s[t]$ | Secondary stored charge, stored discharge, and wear auxiliary (kWh) |
 | $\eta_{\mathrm{s,chg}}, \eta_{\mathrm{s,dis}}$ | Secondary charge and discharge efficiencies |
 | $\alpha_s$ | Secondary cycle-wear cost per throughput kWh |
@@ -293,12 +295,31 @@ Where:
 | $\beta_{\mathrm{ev}}^{(v)}$ | EV charge-past-target benefit for EV v: `future_value_per_kwh` — avoided-future-import valuation (issue #630), or a $0.0001$ per kWh AC fallback tiebreaker when no future price data is available |
 
 The terminal terms are final-inventory valuations, not collections of per-slot
-premiums. For each battery, the same $R$ or $R_s$ multiplies every battery-side
-discharge and charge, so equal movements cancel exactly regardless of their
-slot positions. Slot prices, efficiencies, cycle wear, capacity, headroom, and
-power constraints then decide whether a refill cycle is worthwhile. This keeps
-secondary inventory valuation path-independent and retains the issue #694
-same-slot PV/export and issue #592 deferred-cheap-surplus behaviours without a
+premiums. Primary terminal variables obey:
+
+$$
+0\le y_i\le q_i,\qquad
+\sum_i y_i\le E_{initial}+\sum_t(ec[t]-ed[t]).
+$$
+
+When tiers exist, these variables occupy the conditional, non-per-slot
+`primary_terminal_inventory` column-layout block. An empty model adds no
+columns or constraints.
+
+Because tiers are ordered by decreasing $v_i$ and carry negative objective
+coefficients, the solver fills the highest-valued tiers first. The omitted
+constant $\mathcal{V}_p(E_{initial})$ is restored by scorer and diagnostics:
+
+$$
+V_p=\mathcal{V}_p(E_{initial})-\mathcal{V}_p(E_{final}).
+$$
+
+Primary inventory above $\sum_iq_i$ has no synthetic salvage value. Secondary
+storage still uses one uniform $R_s$. Both terms depend only on final inventory,
+so equal movements cancel regardless of slot positions. Slot prices,
+efficiencies, cycle wear, capacity, headroom, and power constraints then decide
+whether a refill cycle is worthwhile. This retains the issue #694 same-slot
+PV/export and issue #592 deferred-cheap-surplus behaviours without a
 path-dependent charge credit cap.
 
 Aggregate `gi[t]` and `ge[t]` already contain the secondary branch's actual
@@ -323,19 +344,25 @@ below about 0.01 currency. It is part of selector `score` under
 `PlanCostBreakdown.primary_action_tiebreak`, but not auditable
 `total_cost`.
 
-The engine derives $R$ from the first contiguous published,
-price-actionable heuristic discharge block, using the mean of its `top_n`
-dearest import prices. With opt-in forecast valuation, the unpublished
-forecast tail is reduced by MAE plus the configured margin and the effective
-value is `max(published_value, forecast_haircut_value)`. This heuristic is
-horizon-end inventory context: it neither models future grid/PV refill nor
-acts as a per-slot export floor. Forecast points do not enter slot prices,
-actionability, bounds, export revenue, or any physical flow constraint.
+The engine builds primary tiers only from future, exactly aligned,
+non-actionable Unagi points at or after the end of the contiguous published
+prefix. Published overlap and off-cadence predictions are discarded. Each
+price is reduced by MAE plus operator margin; its quantity is bounded by
+residual house load after PV/accounted EV load, discharge efficiency, per-slot
+power, and usable capacity. Its marginal value subtracts discharge conversion
+loss and cycle wear. Duplicate points use the lower value and non-finite inputs
+fail closed. If no positive tier survives, `hardware_floor_only` supplies no
+terminal objective variables and the effective hardware floor is the only
+reserve.
 
-`resolve_secondary_terminal_price()` uses the same published/forecast `max()`
-authority rule with the secondary battery's mean-of-window aggregation. The
-result is passed unchanged as $R_s$; it never becomes a per-slot secondary
-charge or discharge premium.
+When publication advances, a newly official slot leaves the terminal model and
+is evaluated through its real objective price. Unagi points never enter slot
+prices, actionability, export revenue, actuator authority, or a physical flow
+constraint.
+
+`resolve_secondary_terminal_price()` remains a separate published/forecast
+mean-of-window scalar. The result is passed unchanged as $R_s$; it never
+becomes a per-slot secondary charge or discharge premium.
 
 Plus EV pre-deadline benefit (undiscounted, per EV $v$ with deadline, slots $t \leq D_v$):
 
@@ -353,7 +380,16 @@ $$
 -\sum_{v \in \mathrm{past\_target}} \sum_{t} \delta_t \cdot \frac{\beta_{\mathrm{ev}}^{(v)}}{\eta_{\mathrm{charger}}^{(v)}} \cdot \mathrm{ev\_c}_v[t]
 $$
 
-$\beta_{\mathrm{ev}}^{(v)}$ is `EVConfig.future_value_per_kwh`: the avoided cost of importing the same energy later, computed as `confidence_factor × mean(import_price)` over the next 24 hours (`ev_future_charge_value_per_kwh` in `candidate_selector.py`, mirroring `replacement_price_from_next_discharge` for the house battery's terminal SoC). `confidence_factor` defaults to `0.9` and is configurable per EV (`hsem_ev_past_target_confidence_factor` / `hsem_ev_second_past_target_confidence_factor`) to discount for uncertainty in whether the EV will actually need the extra energy before its next charge.
+$\beta_{\mathrm{ev}}^{(v)}$ is `EVConfig.future_value_per_kwh`: the
+EV-specific avoided cost of importing the same energy later, computed as
+`confidence_factor × mean(import_price)` over the next 24 hours
+(`ev_future_charge_value_per_kwh` in `candidate_selector.py`).
+`confidence_factor` defaults to `0.9` and is configurable per EV
+(`hsem_ev_past_target_confidence_factor` /
+`hsem_ev_second_past_target_confidence_factor`) to discount for uncertainty
+in whether the EV will actually need the extra energy before its next charge.
+Primary house-battery inventory instead uses the bounded
+`TerminalCostToGo` tiers above.
 
 Because $\beta_{\mathrm{ev}}^{(v)}$ is priced in the same currency units as $p_{\mathrm{imp}}$ and $p_{\mathrm{exp}}$, charge-past-target EV charging competes fairly against both house battery charging and grid export — whichever has the higher genuine avoided-cost value wins the surplus for that slot. When no future price data is available (`future_value_per_kwh` is `None`), the MILP falls back to a tiny fixed tiebreaker ($0.0001$ per kWh AC) so surplus PV still prefers the EV over being wastefully curtailed/exported at near-zero or negative prices.
 
@@ -696,6 +732,24 @@ slot/source fields. The compatibility alias
 `score_plan()` even when rounding or a defensive writeback guard changes a
 raw solver flow.
 
+Primary terminal diagnostics also expose:
+
+- `terminal_cost_to_go_source`, `terminal_cost_to_go_boundary`,
+  `terminal_cost_to_go_tier_count`, and
+  `terminal_cost_to_go_total_quantity_kwh`;
+- `terminal_cost_to_go_highest_value_per_kwh` and
+  `terminal_cost_to_go_lowest_value_per_kwh`;
+- ordered `terminal_cost_to_go_tiers`, including each start, bounded
+  quantity, marginal value, and haircut forecast price;
+- initial/final inventory, valued quantity, and inventory value.
+
+`terminal_inventory_value` equals the reported initial inventory value minus
+the final inventory value. An empty `hardware_floor_only` model reports zero
+tiers and zero bounded quantity instead of inventing a replacement coefficient.
+Production sources are `forecast` and `hardware_floor_only`;
+`legacy_scalar` is reserved for compatible direct solver callers that omit
+the terminal model.
+
 ### EV charging fields written to slots
 
 | Field | Source |
@@ -734,10 +788,11 @@ After the MILP (or passive) winner is selected, the engine runs a final pass ove
   configured physical floor are clamped to 0 before solving. Genuine negative
   export prices remain negative when the floor is disabled, so free
   curtailment can beat costly export.
-- **Terminal inventory value**: Primary and secondary terms are independently
-  uniform and undiscounted in the objective, matching the cost function's
-  `terminal_soc_value`; equal discharge and recharge of either battery cancel
-  exactly.
+- **Terminal inventory value**: The primary term is a bounded,
+  undiscounted, piecewise value of final inventory; the secondary term is
+  uniform and undiscounted. Both match the cost function's
+  `terminal_soc_value`, and equal discharge and recharge of either battery
+  cancel exactly.
 - **Primary-action structural tiebreak**: Selector-only and kept separate from
   terminal value. It is
   `ε_aΣ(ec+ed)-1.5ε_aΣ(ed-bx)` with `ε_a=0.00001` currency/DC-kWh;

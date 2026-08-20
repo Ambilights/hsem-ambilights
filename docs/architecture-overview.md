@@ -211,7 +211,11 @@ The cost function returns two distinct aggregates:
   inventory value (`terminal_soc_value`), and `primary_action_tiebreak`. The
   selector picks the plan with the lowest **score**, not the lowest money cost.
 
-This split prevents the selector from preferring plans that look cheap only because they drain the battery to zero or violate soft safety constraints.
+This split prevents the selector from preferring plans that look cheap only
+because they consume justified primary tier inventory or uniformly valued
+secondary inventory without accounting for it, or because they violate soft
+safety constraints. An empty primary `hardware_floor_only` model adds no
+synthetic value.
 
 ### 3. MILP global optimisation
 

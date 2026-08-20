@@ -73,6 +73,7 @@ from collections.abc import Sequence
 from datetime import datetime
 
 from custom_components.hsem.models.planned_slot import PlannedSlot
+from custom_components.hsem.models.terminal_cost_to_go import TerminalCostToGo
 from custom_components.hsem.planner.cost_helpers import (
     PRIMARY_ACTION_TIEBREAK_COST,
     _resolve_cycle_cost,
@@ -106,6 +107,7 @@ def score_plan(
     now: datetime | None = None,
     initial_battery_kwh: float | None = None,
     replacement_price_per_kwh: float | None = None,
+    terminal_cost_to_go: TerminalCostToGo | None = None,
 ) -> PlanCostBreakdown:
     """Score a candidate plan and return a full cost breakdown.
 
@@ -134,11 +136,14 @@ def score_plan(
       value, and ``primary_action_tiebreak``. The candidate selector
       minimises this value.
 
-    Terminal inventory accounting (the spec-mandated ``terminal_soc_value``
-    term) is enabled when both
-    ``initial_battery_kwh`` and ``replacement_price_per_kwh`` are provided.
-    It prevents the selector from preferring plans that look "cheap" only
-    because they empty the battery before the end of the horizon.
+    Terminal inventory accounting is enabled when ``initial_battery_kwh``
+    and either the bounded ``terminal_cost_to_go`` model or the legacy
+    uniform replacement price are provided. Production primary planning uses
+    F(initial inventory) - F(final inventory), where F is quantity-capped. This
+    prevents a candidate looking better merely by consuming justified valued
+    tier inventory at horizon end. With no tiers, the hard discharge floor is
+    the only terminal protection. The scalar path remains for compatible
+    callers.
 
     Args:
         slots:
@@ -163,16 +168,16 @@ def score_plan(
             used instead.
         initial_battery_kwh:
             Energy stored above the discharge floor (kWh) at the start of
-            the horizon.  Required (together with
-            ``replacement_price_per_kwh``) to enable terminal inventory
-            accounting.
+            the horizon. Required whenever either terminal-value policy is
+            enabled.
             ``None`` disables the term.
         replacement_price_per_kwh:
-            Currency-per-kWh price used to value the change in stored
-            battery energy across the horizon.  The caller supplies the
-            applicable policy price.  Required (together with
-            ``initial_battery_kwh``) to enable terminal inventory accounting.
-            ``None`` disables the term.
+            Legacy uniform value per kWh of stored inventory. Ignored when
+            ``terminal_cost_to_go`` is supplied.
+        terminal_cost_to_go:
+            Bounded piecewise value of primary inventory at the actionable
+            boundary. Applied as F(initial inventory) - F(final inventory);
+            an empty model contributes zero economic terminal value.
 
     Returns:
         A :class:`PlanCostBreakdown` containing every cost component, the
@@ -244,6 +249,7 @@ def score_plan(
     grid_limit_penalty = 0.0
     terminal_soc_value = 0.0
     primary_action_tiebreak = 0.0
+    primary_inventory_change_kwh = 0.0
     secondary_costs = SecondaryCostAccumulator()
 
     # Discounted versions for the selector score (total_cost stays raw).
@@ -445,9 +451,15 @@ def score_plan(
                     grid_limit_penalty += pen
                     grid_limit_penalty_disc += pen * discount
 
-        # 7. Path-independent terminal inventory value.
+        if slot.price_actionable:
+            primary_inventory_change_kwh += (
+                slot.batteries_charged_kwh - slot.batteries_discharged_kwh
+            )
+
+        # 7. Legacy uniform terminal inventory value.
         if (
-            initial_battery_kwh is not None
+            terminal_cost_to_go is None
+            and initial_battery_kwh is not None
             and replacement_price_per_kwh is not None
             and slot.price_actionable
         ):
@@ -459,6 +471,15 @@ def score_plan(
             terminal_soc_value += (
                 slot.batteries_discharged_kwh - slot.batteries_charged_kwh
             ) * replacement_value
+
+    if initial_battery_kwh is not None and terminal_cost_to_go is not None:
+        final_inventory_kwh = max(
+            initial_battery_kwh + primary_inventory_change_kwh,
+            0.0,
+        )
+        terminal_soc_value += terminal_cost_to_go.inventory_value(
+            initial_battery_kwh
+        ) - terminal_cost_to_go.inventory_value(final_inventory_kwh)
 
     # ``total_cost`` is money only — never includes synthetic penalties.
     total_cost = import_cost - export_revenue + conversion_loss_cost + cycle_cost_total

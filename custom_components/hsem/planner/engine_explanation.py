@@ -343,12 +343,19 @@ def _build_explanation(
                 f"selected plan saves {savings:.4f} over the horizon."
             )
         elif savings < -1e-4:
-            do_nothing_reason = (
-                f"Battery idle would cost {do_nothing_cost:.4f}. "
-                f"Selected plan costs {abs(savings):.4f} more due to "
-                "charging overhead; discharge savings expected to materialise "
-                "within the current scheduling window."
-            )
+            if has_discharge:
+                do_nothing_reason = (
+                    f"Battery idle would cost {do_nothing_cost:.4f}. "
+                    f"Selected plan costs {abs(savings):.4f} more after "
+                    "charging overhead and its scheduled discharge."
+                )
+            else:
+                do_nothing_reason = (
+                    f"Battery idle would cost {do_nothing_cost:.4f}. "
+                    f"Selected plan costs {abs(savings):.4f} more due to "
+                    "charging overhead; no discharge is scheduled within the "
+                    "current actionable window."
+                )
         else:
             do_nothing_reason = (
                 f"Battery idle cost ({do_nothing_cost:.4f}) and selected plan "

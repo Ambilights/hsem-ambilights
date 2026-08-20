@@ -15,12 +15,12 @@ from custom_components.hsem.models.ev_config import EVConfig
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.planner_input import PlannerInput
 from custom_components.hsem.models.planner_output import PlannerOutput
+from custom_components.hsem.models.terminal_cost_to_go import TerminalCostToGo
 from custom_components.hsem.planner.candidate_generator import (
     CANDIDATE_MILP,
     generate_candidates,
 )
 from custom_components.hsem.planner.candidate_selector import (
-    replacement_price_from_next_discharge,
     select_best_candidate,
 )
 from custom_components.hsem.planner.cost_function import CostWeights, score_plan
@@ -45,6 +45,7 @@ from custom_components.hsem.planner.ev_planner import (
     EVChargingPlan,
     rebuild_ev_plan_from_slots,
 )
+from custom_components.hsem.planner.future_value import build_terminal_cost_to_go
 from custom_components.hsem.planner.secondary_storage import (
     populate_secondary_storage_load,
     resolve_secondary_terminal_price,
@@ -83,7 +84,7 @@ def _select_candidate(
     mcps: float,
     mdps: float | None,
     max_soc_kwh: float,
-    rppk: float | None,
+    terminal_cost_to_go: TerminalCostToGo,
     cw: CostWeights,
     sdh: float,
     rc: float,
@@ -98,7 +99,7 @@ def _select_candidate(
         current_kwh=current_kwh,
         usable_kwh=usable_kwh,
         max_discharge_per_slot=mdps,
-        replacement_price_per_kwh=rppk,
+        terminal_cost_to_go=terminal_cost_to_go,
         ev_configs=ev_configs,
     )
     winner, rejected, hyst = select_best_candidate(
@@ -115,7 +116,7 @@ def _select_candidate(
         slot_duration_hours=sdh,
         charge_efficiency_pct=inp.battery_charge_efficiency_pct,
         discharge_efficiency_pct=inp.battery_discharge_efficiency_pct,
-        replacement_price_per_kwh=rppk,
+        terminal_cost_to_go=terminal_cost_to_go,
         required_capacity=rc,
         months_winter=inp.months_winter,
         export_min_price=inp.export_min_price,
@@ -540,23 +541,28 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
         ),
     )
     sdh = inp.interval_minutes / 60.0
-    import math
-
-    top_n = 4
-    if mdps is not None and mdps > 1e-9:
-        top_n = math.ceil(usable_kwh / mdps)
-    rppk = replacement_price_from_next_discharge(
+    terminal_cost_to_go = build_terminal_cost_to_go(
         slots,
         now,
-        top_n=top_n,
-        interval_minutes=inp.interval_minutes,
         forecast=inp.price_forecast,
+        usable_kwh=usable_kwh,
+        max_discharge_per_slot=mdps,
+        discharge_efficiency_pct=inp.battery_discharge_efficiency_pct,
+        cycle_cost_per_kwh=effective_cycle_cost,
+    )
+    terminal_boundary = (
+        terminal_cost_to_go.boundary.isoformat()
+        if terminal_cost_to_go.boundary is not None
+        else "none"
     )
     log_planner(
         "debug",
-        "[core] run_planner  step=4_candidate_selection START  top_n=%d  rppk=%s",
-        top_n,
-        f"{rppk:.6f}" if rppk is not None else "None",
+        "[core] run_planner  step=4_candidate_selection START  source=%s "
+        "boundary=%s tiers=%d quantity=%.3f",
+        terminal_cost_to_go.source,
+        terminal_boundary,
+        len(terminal_cost_to_go.tiers),
+        terminal_cost_to_go.total_quantity_kwh,
     )
     # Note: concentrate_discharge_on_expensive_slots() is now applied per-candidate
     # in the selector before scoring, so we don't run it on the baseline here.
@@ -572,7 +578,7 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
         mcps,
         mdps,
         max_soc_kwh,
-        rppk,
+        terminal_cost_to_go,
         cw,
         sdh,
         rc,
@@ -756,13 +762,50 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
         winner.name,
         inp.milp_solver_timeout_seconds,
     )
+    selected_final_inventory_kwh = max(
+        current_kwh
+        + sum(
+            slot.batteries_charged_kwh - slot.batteries_discharged_kwh
+            for slot in slots
+            if utc_key(slot.end) > utc_key(now) and slot.price_actionable
+        ),
+        0.0,
+    )
+    expl.terminal_cost_to_go_source = terminal_cost_to_go.source
+    expl.terminal_cost_to_go_boundary = (
+        terminal_cost_to_go.boundary.isoformat()
+        if terminal_cost_to_go.boundary is not None
+        else None
+    )
+    expl.terminal_cost_to_go_tier_count = len(terminal_cost_to_go.tiers)
+    expl.terminal_cost_to_go_total_quantity_kwh = terminal_cost_to_go.total_quantity_kwh
+    expl.terminal_cost_to_go_highest_value_per_kwh = max(
+        (tier.value_per_kwh for tier in terminal_cost_to_go.tiers),
+        default=0.0,
+    )
+    expl.terminal_cost_to_go_lowest_value_per_kwh = min(
+        (tier.value_per_kwh for tier in terminal_cost_to_go.tiers),
+        default=0.0,
+    )
+    expl.terminal_cost_to_go_initial_valued_quantity_kwh = (
+        terminal_cost_to_go.inventory_valued_quantity(current_kwh)
+    )
+    expl.terminal_cost_to_go_final_valued_quantity_kwh = (
+        terminal_cost_to_go.inventory_valued_quantity(selected_final_inventory_kwh)
+    )
+    expl.terminal_cost_to_go_initial_value = terminal_cost_to_go.inventory_value(
+        current_kwh
+    )
+    expl.terminal_cost_to_go_final_value = terminal_cost_to_go.inventory_value(
+        selected_final_inventory_kwh
+    )
     pc = score_plan(
         slots,
         cw,
         slot_duration_hours=sdh,
         now=now,
         initial_battery_kwh=current_kwh,
-        replacement_price_per_kwh=rppk,
+        terminal_cost_to_go=terminal_cost_to_go,
     )
     for rp in candidate_rejected:
         expl.rejected_plans.append(rp)

@@ -26,10 +26,11 @@ class PlanExplanation:
             One-sentence human-readable summary of the selected plan.
         score:
             Estimated savings of the selected plan versus doing nothing
-            (battery fully idle).  Positive means the plan saves money
-            over the horizon; negative means pre-charging overhead exceeds
-            the expected discharge savings within this window.  Units are
-            local currency.
+            (battery fully idle) in the actionable published-price window.
+            Positive means the plan saves money there; negative means it costs
+            more there and may still be selected because bounded post-boundary
+            inventory value favours charging without an in-window discharge.
+            Units are local currency.
         estimated_total_cost:
             Estimated net grid cost for the planning horizon (local currency).
             Positive = net import cost; negative = net export revenue.
@@ -104,6 +105,18 @@ class PlanExplanation:
     incumbent_used: bool = False
     incumbent_validation: str = ""
     fallback_reason: str = ""
+    # Compact bounded terminal-value observability (full tiers stay in solver
+    # diagnostics so recorder-backed attributes remain small).
+    terminal_cost_to_go_source: str = "hardware_floor_only"
+    terminal_cost_to_go_boundary: str | None = None
+    terminal_cost_to_go_tier_count: int = 0
+    terminal_cost_to_go_total_quantity_kwh: float = 0.0
+    terminal_cost_to_go_highest_value_per_kwh: float = 0.0
+    terminal_cost_to_go_lowest_value_per_kwh: float = 0.0
+    terminal_cost_to_go_initial_valued_quantity_kwh: float = 0.0
+    terminal_cost_to_go_final_valued_quantity_kwh: float = 0.0
+    terminal_cost_to_go_initial_value: float = 0.0
+    terminal_cost_to_go_final_value: float = 0.0
     # Hysteresis fields (issue #372)
     hysteresis_active: bool = False
     hysteresis_reason: str = ""
@@ -141,6 +154,37 @@ class PlanExplanation:
             "incumbent_used": self.incumbent_used,
             "incumbent_validation": self.incumbent_validation,
             "fallback_reason": self.fallback_reason,
+            "terminal_cost_to_go_source": self.terminal_cost_to_go_source,
+            "terminal_cost_to_go_boundary": self.terminal_cost_to_go_boundary,
+            "terminal_cost_to_go_tier_count": self.terminal_cost_to_go_tier_count,
+            "terminal_cost_to_go_total_quantity_kwh": round(
+                self.terminal_cost_to_go_total_quantity_kwh,
+                6,
+            ),
+            "terminal_cost_to_go_highest_value_per_kwh": round(
+                self.terminal_cost_to_go_highest_value_per_kwh,
+                6,
+            ),
+            "terminal_cost_to_go_lowest_value_per_kwh": round(
+                self.terminal_cost_to_go_lowest_value_per_kwh,
+                6,
+            ),
+            "terminal_cost_to_go_initial_valued_quantity_kwh": round(
+                self.terminal_cost_to_go_initial_valued_quantity_kwh,
+                6,
+            ),
+            "terminal_cost_to_go_final_valued_quantity_kwh": round(
+                self.terminal_cost_to_go_final_valued_quantity_kwh,
+                6,
+            ),
+            "terminal_cost_to_go_initial_value": round(
+                self.terminal_cost_to_go_initial_value,
+                6,
+            ),
+            "terminal_cost_to_go_final_value": round(
+                self.terminal_cost_to_go_final_value,
+                6,
+            ),
             "constraints": list(self.constraints),
             "rejected_plans": [
                 {

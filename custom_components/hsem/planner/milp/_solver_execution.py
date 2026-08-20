@@ -52,6 +52,9 @@ def _build_solve_and_finalize(
         discharge_loss,
         time_discount_rate,
         replacement_price_per_kwh,
+        terminal_cost_to_go,
+        terminal_tiers,
+        terminal_value_off,
         fuse_active,
         usable_kwh,
         max_charge_per_slot,
@@ -131,6 +134,9 @@ def _build_solve_and_finalize(
         "discharge_loss",
         "time_discount_rate",
         "replacement_price_per_kwh",
+        "terminal_cost_to_go",
+        "terminal_tiers",
+        "terminal_value_off",
         "fuse_active",
         "usable_kwh",
         "max_charge_per_slot",
@@ -212,11 +218,15 @@ def _build_solve_and_finalize(
         charge_loss,
         discharge_loss,
         time_discount_rate,
-        replacement_price_per_kwh,
+        (replacement_price_per_kwh if terminal_cost_to_go is None else None),
         fuse_active,
         usable_kwh=usable_kwh,
         max_charge_per_slot=max_charge_per_slot,
     )
+
+    if terminal_value_off is not None:
+        for tier_i, tier in enumerate(terminal_tiers):
+            c_obj[terminal_value_off + tier_i] = -tier.value_per_kwh
 
     if export_mode_off is not None:
         c_obj[export_mode_off : export_mode_off + m] = export_mode_tiebreak_cost
@@ -306,6 +316,22 @@ def _build_solve_and_finalize(
             checkpoints=export_reserve_checkpoints,
             reserve_kwh=export_reserve_kwh,
             primary_export_off=primary_export_off,
+        )
+
+    if terminal_value_off is not None:
+        from custom_components.hsem.planner.milp._terminal_cost_to_go import (
+            add_terminal_cost_to_go_constraints,
+        )
+
+        constraints = add_terminal_cost_to_go_constraints(
+            constraints,
+            n_vars=base_n_vars,
+            m=m,
+            ec_off=ec_off,
+            ed_off=ed_off,
+            terminal_value_off=terminal_value_off,
+            tiers=terminal_tiers,
+            current_kwh=current_kwh,
         )
 
     # Explicit destination rows supersede the legacy static site-load cap.
@@ -610,8 +636,10 @@ def _build_solve_and_finalize(
             f"{mip_gap:.6f}" if mip_gap is not None else "n/a",
         )
 
-    # Uniform, path-independent final-inventory value. Non-actionable primary
-    # blocks are fixed at zero, so the solved sum is the published-price prefix.
+    # Path-independent final-inventory value: bounded and piecewise in
+    # production, uniform only for compatible legacy callers. Non-actionable
+    # primary blocks are fixed at zero, so the solved sum is the published-price
+    # prefix.
     ec_sol = result.x[ec_off : ec_off + m]
     ed_sol = result.x[ed_off : ed_off + m]
     primary_export_sol = result.x[primary_export_off : primary_export_off + m]
@@ -622,9 +650,14 @@ def _build_solve_and_finalize(
     replacement_price = max(replacement_price_per_kwh or 0.0, 0.0)
     if not math.isfinite(replacement_price):
         replacement_price = 0.0
-    terminal_inventory_value = replacement_price * (
-        float(np.sum(ed_sol)) - float(np.sum(ec_sol))
-    )
+    if terminal_cost_to_go is None:
+        terminal_inventory_value = replacement_price * (
+            float(np.sum(ed_sol)) - float(np.sum(ec_sol))
+        )
+    else:
+        terminal_inventory_value = terminal_cost_to_go.inventory_value(
+            current_kwh
+        ) - terminal_cost_to_go.inventory_value(final_soc_kwh)
     from custom_components.hsem.planner.cost_helpers import (
         PRIMARY_ACTION_TIEBREAK_COST,
     )
@@ -795,10 +828,20 @@ def _build_solve_and_finalize(
     # Publish the objective terms from the same three-decimal executable
     # flows consumed by score_plan. Exact action binaries ensure this is only
     # publication-rounding reconciliation, never concealment of a raw cycle.
-    terminal_inventory_value = replacement_price * sum(
-        out_slots[i].batteries_discharged_kwh - out_slots[i].batteries_charged_kwh
+    reconciled_inventory_change_kwh = sum(
+        out_slots[i].batteries_charged_kwh - out_slots[i].batteries_discharged_kwh
         for i in future_idx
     )
+    final_soc_kwh = max(
+        0.0,
+        min(current_kwh + reconciled_inventory_change_kwh, usable_kwh),
+    )
+    if terminal_cost_to_go is None:
+        terminal_inventory_value = -replacement_price * reconciled_inventory_change_kwh
+    else:
+        terminal_inventory_value = terminal_cost_to_go.inventory_value(
+            current_kwh
+        ) - terminal_cost_to_go.inventory_value(final_soc_kwh)
     primary_action_tiebreak = 0.0
     for slot_i in future_idx:
         slot = out_slots[slot_i]
@@ -842,7 +885,90 @@ def _build_solve_and_finalize(
             _min_action_kwh=min_action_kwh,
         )
     )
+    if terminal_cost_to_go is None:
+        terminal_source = "legacy_scalar"
+        terminal_boundary = None
+        terminal_tier_records: list[dict[str, object]] = []
+        terminal_total_quantity = max(usable_kwh, 0.0)
+        terminal_highest_value = replacement_price
+        terminal_lowest_value = replacement_price
+        terminal_initial_valued_quantity = max(
+            0.0,
+            min(current_kwh, usable_kwh),
+        )
+        terminal_final_valued_quantity = max(
+            0.0,
+            min(final_soc_kwh, usable_kwh),
+        )
+        terminal_initial_value = replacement_price * terminal_initial_valued_quantity
+        terminal_final_value = replacement_price * terminal_final_valued_quantity
+    else:
+        terminal_source = terminal_cost_to_go.source
+        terminal_boundary = (
+            terminal_cost_to_go.boundary.isoformat()
+            if terminal_cost_to_go.boundary is not None
+            else None
+        )
+        terminal_tier_records = [
+            {
+                "start": tier.start.isoformat(),
+                "quantity_kwh": round(tier.quantity_kwh, 6),
+                "value_per_kwh": round(tier.value_per_kwh, 6),
+                "forecast_price_per_kwh": round(
+                    tier.forecast_price_per_kwh,
+                    6,
+                ),
+            }
+            for tier in terminal_cost_to_go.tiers
+        ]
+        terminal_total_quantity = terminal_cost_to_go.total_quantity_kwh
+        terminal_values = [tier.value_per_kwh for tier in terminal_cost_to_go.tiers]
+        terminal_highest_value = max(terminal_values, default=0.0)
+        terminal_lowest_value = min(terminal_values, default=0.0)
+        terminal_initial_valued_quantity = (
+            terminal_cost_to_go.inventory_valued_quantity(current_kwh)
+        )
+        terminal_final_valued_quantity = terminal_cost_to_go.inventory_valued_quantity(
+            final_soc_kwh
+        )
+        terminal_initial_value = terminal_cost_to_go.inventory_value(current_kwh)
+        terminal_final_value = terminal_cost_to_go.inventory_value(final_soc_kwh)
+    terminal_inventory_value = terminal_initial_value - terminal_final_value
     diagnostics["terminal_inventory_value"] = round(terminal_inventory_value, 6)
+    diagnostics["terminal_soc_credit"] = diagnostics["terminal_inventory_value"]
+
+    diagnostics.update(
+        {
+            "terminal_cost_to_go_source": terminal_source,
+            "terminal_cost_to_go_boundary": terminal_boundary,
+            "terminal_cost_to_go_tier_count": len(terminal_tier_records),
+            "terminal_cost_to_go_total_quantity_kwh": round(
+                terminal_total_quantity,
+                6,
+            ),
+            "terminal_cost_to_go_highest_value_per_kwh": round(
+                terminal_highest_value,
+                6,
+            ),
+            "terminal_cost_to_go_lowest_value_per_kwh": round(
+                terminal_lowest_value,
+                6,
+            ),
+            "terminal_cost_to_go_tiers": terminal_tier_records,
+            "terminal_cost_to_go_initial_inventory_kwh": round(current_kwh, 6),
+            "terminal_cost_to_go_final_inventory_kwh": round(final_soc_kwh, 6),
+            "terminal_cost_to_go_initial_valued_quantity_kwh": round(
+                terminal_initial_valued_quantity,
+                6,
+            ),
+            "terminal_cost_to_go_final_valued_quantity_kwh": round(
+                terminal_final_valued_quantity,
+                6,
+            ),
+            "terminal_cost_to_go_initial_value": round(terminal_initial_value, 6),
+            "terminal_cost_to_go_final_value": round(terminal_final_value, 6),
+        }
+    )
     diagnostics["primary_action_tiebreak"] = round(
         primary_action_tiebreak,
         6,

@@ -7,7 +7,7 @@ Coverage
 - MILP falls back gracefully when the solver is given a degenerate problem.
 - MILP candidate is present in the output candidates list after a planner run.
 - Bug 2: ``_AGGRESSIVE_CHARGE_SLOTS`` scales with battery headroom, not a fixed 3.
-- Bug 3: ``replacement_price_per_kwh`` uses the minimum future price, not average.
+- Legacy scalar terminal-price behavior remains available to direct callers.
 - Bug 5: Aggressive strategy guards against **all** discharge windows, not just the
   first, when multiple discharge windows exist.
 - Performance: MILP solves a 96-slot (48 h × 30 min) horizon within 320 ms.
@@ -490,6 +490,69 @@ def test_milp_terminal_soc_matches_score_plan_with_varying_prices():
     )
 
 
+@_scipy_skip()
+def test_legacy_scalar_diagnostics_reconcile_clamped_inventory() -> None:
+    """Every published legacy inventory value uses the same scalar identity."""
+    replacement_price = 1.50
+    usable_kwh = 5.0
+    current_kwh = 7.0
+    slot = _make_slot(
+        hour=0,
+        import_price=0.20,
+        export_price=0.05,
+        consumption_kwh=0.0,
+    )
+
+    result = solve_milp(
+        [slot],
+        _NOW,
+        current_kwh=current_kwh,
+        usable_kwh=usable_kwh,
+        max_charge_per_slot=5.0,
+        max_discharge_per_slot=5.0,
+        cycle_cost_per_kwh=0.0,
+        charge_efficiency_pct=100.0,
+        discharge_efficiency_pct=100.0,
+        replacement_price_per_kwh=replacement_price,
+    )
+
+    assert result is not None
+    _planned, diagnostics = result
+    initial_inventory = diagnostics["terminal_cost_to_go_initial_inventory_kwh"]
+    final_inventory = diagnostics["terminal_cost_to_go_final_inventory_kwh"]
+    initial_quantity = diagnostics["terminal_cost_to_go_initial_valued_quantity_kwh"]
+    final_quantity = diagnostics["terminal_cost_to_go_final_valued_quantity_kwh"]
+    initial_value = diagnostics["terminal_cost_to_go_initial_value"]
+    final_value = diagnostics["terminal_cost_to_go_final_value"]
+
+    assert diagnostics["terminal_cost_to_go_source"] == "legacy_scalar"
+    assert diagnostics["terminal_cost_to_go_tier_count"] == 0
+    assert diagnostics["terminal_cost_to_go_tiers"] == []
+    assert diagnostics["terminal_cost_to_go_total_quantity_kwh"] == pytest.approx(
+        usable_kwh
+    )
+    assert diagnostics["terminal_cost_to_go_highest_value_per_kwh"] == pytest.approx(
+        replacement_price
+    )
+    assert diagnostics["terminal_cost_to_go_lowest_value_per_kwh"] == pytest.approx(
+        replacement_price
+    )
+    assert initial_inventory == pytest.approx(current_kwh)
+    assert initial_quantity == pytest.approx(usable_kwh)
+    assert initial_quantity == pytest.approx(
+        max(0.0, min(initial_inventory, usable_kwh))
+    )
+    assert final_quantity == pytest.approx(max(0.0, min(final_inventory, usable_kwh)))
+    assert initial_value == pytest.approx(replacement_price * initial_quantity)
+    assert final_value == pytest.approx(replacement_price * final_quantity)
+    assert diagnostics["terminal_inventory_value"] == pytest.approx(
+        initial_value - final_value
+    )
+    assert diagnostics["terminal_soc_credit"] == pytest.approx(
+        diagnostics["terminal_inventory_value"]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Performance test
 # ---------------------------------------------------------------------------
@@ -690,17 +753,16 @@ def test_aggressive_large_headroom_claims_all_available_charge_candidates():
 
 
 # ---------------------------------------------------------------------------
-# Bug 3: Terminal SoC replacement price uses min, not average
+# Legacy scalar terminal-price compatibility
 # ---------------------------------------------------------------------------
 
 
-def test_replacement_price_is_minimum_of_future_prices():
-    """Engine must pass min(future_import_prices) as replacement_price_per_kwh.
+def test_legacy_scalar_terminal_value_uses_caller_supplied_price():
+    """Keep direct scalar scorer behavior for compatibility callers.
 
-    We indirectly verify this by checking the terminal_soc_value in the plan_cost
-    breakdown uses the minimum price, not the average.  A plan that ends with more
-    stored energy than it started should have a lower (more negative) terminal_soc_value
-    when the minimum price is used vs. the average (because min < avg typically).
+    Production planning uses bounded TerminalCostToGo tiers in v7.1.3. The
+    optional scalar remains supported only for direct legacy callers: changing
+    that caller-supplied coefficient must still change terminal inventory value.
     """
     from custom_components.hsem.planner.cost_function import CostWeights, score_plan
 
@@ -732,7 +794,7 @@ def test_replacement_price_is_minimum_of_future_prices():
     min_price = min(import_prices)
     avg_price = sum(import_prices) / len(import_prices)
 
-    # Score with min price (as the engine now does)
+    # Score with a lower caller-supplied compatibility coefficient.
     cost_min = score_plan(
         slots,
         weights,
@@ -741,7 +803,7 @@ def test_replacement_price_is_minimum_of_future_prices():
         initial_battery_kwh=1.0,
         replacement_price_per_kwh=min_price,
     )
-    # Score with average price (old behaviour)
+    # Score with a higher caller-supplied compatibility coefficient.
     cost_avg = score_plan(
         slots,
         weights,
@@ -753,7 +815,7 @@ def test_replacement_price_is_minimum_of_future_prices():
 
     # Both should assign a credit (negative terminal_soc_value) because
     # terminal SoC > initial SoC.  The credit is larger (more negative) with
-    # the higher avg price.
+    # the higher caller-supplied coefficient.
     assert cost_min.terminal_soc_value < 1e-9, (
         "Expected negative terminal_soc_value (credit) when terminal SoC > initial SoC"
     )

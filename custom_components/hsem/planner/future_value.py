@@ -5,11 +5,26 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from datetime import datetime, timedelta
+from typing import Any
 
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.price_forecast import PriceForecast
+from custom_components.hsem.models.terminal_cost_to_go import (
+    TerminalCostToGo,
+    TerminalValueTier,
+)
 from custom_components.hsem.utils.datetime_utils import utc_key
+from custom_components.hsem.utils.misc import clamp_efficiency
 from custom_components.hsem.utils.recommendations import DISCHARGE_RECS
+
+
+def _finite_float(value: Any) -> float | None:
+    """Return a finite float, or None for malformed planner input."""
+    try:
+        number = float(value)
+    except TypeError, ValueError, OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def published_horizon_end(
@@ -45,8 +60,8 @@ def forecast_effective_prices(
     A prediction is only ever a stand-in for a price the market has not
     published yet.  Once real prices exist for a slot the forecast has nothing
     to add there and must not compete with them, so every point falling inside
-    the published prefix is dropped.  Without that filter an over-optimistic
-    forecast could beat a published price through the callers' ``max()`` and
+    the published prefix is dropped. Without that filter an over-optimistic
+    forecast could leak into the legacy scalar replacement valuation and
     size a plan on fiction while the real answer was already known.
 
     Each surviving point is reduced by the source's own published error plus
@@ -60,16 +75,173 @@ def forecast_effective_prices(
     """
     if forecast is None or not forecast.usable:
         return []
+    mae = _finite_float(forecast.mae)
+    margin = _finite_float(forecast.margin)
+    if mae is None or margin is None:
+        return []
+
     now_utc = utc_key(now)
     published_until = published_horizon_end(slots, now)
-    cut = forecast.haircut
-    return [
-        max(point.value - cut, 0.0)
-        for point in forecast.points
-        if math.isfinite(point.value)
-        and utc_key(point.start) > now_utc
-        and (published_until is None or utc_key(point.start) >= published_until)
-    ]
+    cut = max(mae, 0.0) + max(margin, 0.0)
+    if not math.isfinite(cut):
+        return []
+
+    effective: list[float] = []
+    for point in forecast.points:
+        value = _finite_float(point.value)
+        if value is None:
+            continue
+        point_start = utc_key(point.start)
+        if point_start <= now_utc or (
+            published_until is not None and point_start < published_until
+        ):
+            continue
+        effective.append(max(value - cut, 0.0))
+    return effective
+
+
+def build_terminal_cost_to_go(
+    slots: Sequence[PlannedSlot],
+    now: datetime,
+    *,
+    forecast: PriceForecast | None,
+    usable_kwh: float,
+    max_discharge_per_slot: float | None,
+    discharge_efficiency_pct: float,
+    cycle_cost_per_kwh: float,
+) -> TerminalCostToGo:
+    """Build bounded value tiers from aligned unpublished-price demand.
+
+    Forecast points remain valuation-only. A point contributes only when its
+    UTC start exactly matches a future, non-actionable planner slot at or after
+    the end of the contiguous published-price prefix. Its quantity is the
+    battery-side residual house demand the primary battery could physically
+    serve, excluding explicitly accounted EV demand and capped by power.
+
+    Marginal DC value follows the in-horizon scoring convention: avoided AC
+    import through discharge efficiency, less discharge loss and one resolved
+    cycle-wear charge. With no valid tier, the existing hardware/effective
+    dynamic floor remains the only reserve.
+    """
+    boundary = published_horizon_end(slots, now)
+    empty = TerminalCostToGo(boundary=boundary)
+    capacity = _finite_float(usable_kwh)
+    efficiency_pct = _finite_float(discharge_efficiency_pct)
+    wear = _finite_float(cycle_cost_per_kwh)
+    if (
+        forecast is None
+        or not forecast.usable
+        or capacity is None
+        or capacity <= 1e-9
+        or efficiency_pct is None
+        or wear is None
+    ):
+        return empty
+
+    mae = _finite_float(forecast.mae)
+    margin = _finite_float(forecast.margin)
+    if mae is None or margin is None:
+        return empty
+    haircut = max(mae, 0.0) + max(margin, 0.0)
+    if not math.isfinite(haircut):
+        return empty
+
+    discharge_eff = clamp_efficiency(efficiency_pct)
+    discharge_loss = 1.0 - discharge_eff
+    wear = max(wear, 0.0)
+    if max_discharge_per_slot is None:
+        per_slot_cap = capacity
+    else:
+        discharge_cap = _finite_float(max_discharge_per_slot)
+        if discharge_cap is None:
+            return empty
+        per_slot_cap = max(discharge_cap, 0.0)
+
+    now_utc = utc_key(now)
+    aligned_slots = {
+        utc_key(slot.start): slot
+        for slot in slots
+        if utc_key(slot.end) > now_utc
+        and not slot.price_actionable
+        and (boundary is None or utc_key(slot.start) >= boundary)
+    }
+    if not aligned_slots:
+        return empty
+
+    # Conservatively collapse duplicate predictions to the lower effective
+    # value for that one physical slot.
+    effective_by_start: dict[datetime, float] = {}
+    for point in forecast.points:
+        point_start = utc_key(point.start)
+        point_value = _finite_float(point.value)
+        if (
+            point_start <= now_utc
+            or point_start not in aligned_slots
+            or (boundary is not None and point_start < boundary)
+            or point_value is None
+        ):
+            continue
+        effective_price = max(point_value - haircut, 0.0)
+        previous = effective_by_start.get(point_start)
+        if previous is None or effective_price < previous:
+            effective_by_start[point_start] = effective_price
+
+    candidates: list[TerminalValueTier] = []
+    for start, effective_price in effective_by_start.items():
+        slot = aligned_slots[start]
+        house_load = _finite_float(slot.avg_house_consumption_kwh)
+        pv_estimate = _finite_float(slot.solcast_pv_estimate_kwh)
+        ev_accounted = _finite_float(slot.ev_accounted_load_kwh)
+        if house_load is None or pv_estimate is None or ev_accounted is None:
+            continue
+        eligible_house_load_ac = max(
+            house_load - pv_estimate - max(ev_accounted, 0.0),
+            0.0,
+        )
+        quantity_kwh = min(
+            eligible_house_load_ac / discharge_eff,
+            per_slot_cap,
+            capacity,
+        )
+        marginal_value = (
+            effective_price * discharge_eff - effective_price * discharge_loss - wear
+        )
+        if quantity_kwh <= 1e-9 or marginal_value <= 1e-9:
+            continue
+        candidates.append(
+            TerminalValueTier(
+                start=start,
+                quantity_kwh=quantity_kwh,
+                value_per_kwh=marginal_value,
+                forecast_price_per_kwh=effective_price,
+            )
+        )
+
+    # Highest-value demand gets first claim on finite terminal inventory.
+    candidates.sort(key=lambda tier: (-tier.value_per_kwh, utc_key(tier.start)))
+    remaining_capacity = capacity
+    tiers: list[TerminalValueTier] = []
+    for tier in candidates:
+        if remaining_capacity <= 1e-9:
+            break
+        quantity = min(tier.quantity_kwh, remaining_capacity)
+        tiers.append(
+            TerminalValueTier(
+                start=tier.start,
+                quantity_kwh=quantity,
+                value_per_kwh=tier.value_per_kwh,
+                forecast_price_per_kwh=tier.forecast_price_per_kwh,
+            )
+        )
+        remaining_capacity -= quantity
+
+    if not tiers:
+        return empty
+    return TerminalCostToGo(
+        tiers=tuple(tiers),
+        source="forecast",
+        boundary=boundary,
+    )
 
 
 def replacement_price_from_next_discharge(
@@ -80,6 +252,10 @@ def replacement_price_from_next_discharge(
     forecast: PriceForecast | None = None,
 ) -> float | None:
     """Value stored energy from the first upcoming priced discharge window.
+
+    This is the legacy scalar API retained for secondary-storage and direct
+    backward-compatible callers. Production primary planning uses
+    :func:`build_terminal_cost_to_go` instead.
 
     The first contiguous block matters: later discharge blocks in a multi-day
     horizon must not inflate the value assigned at this horizon's endpoint.
