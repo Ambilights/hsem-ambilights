@@ -109,6 +109,7 @@ class HSEMPredictionAccuracySensor(
             tracker = getattr(self.coordinator, "_prediction_tracker", None)
             if tracker is not None and tracker.soc_mae_7d is not None:
                 return cast(float, round(tracker.soc_mae_7d, 3))
+            return None
         if self._restored_state is not None:
             try:
                 return float(self._restored_state)

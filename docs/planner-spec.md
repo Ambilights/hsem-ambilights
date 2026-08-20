@@ -748,6 +748,173 @@ windows is not a reliability multiplier: with less than 14 days of history,
 the 7d and 14d sensors can contain the same source days, so equality is not
 independent corroboration and must not inflate their combined effective share.
 
+## Historical learning and diagnostic accounting
+
+These pipelines do not change the physical energy balance directly, but the
+PV corrector changes planner input. Their time and eligibility semantics are
+therefore part of the planner contract.
+
+### ML recorder history
+
+Recorder timestamps are normalized to Home Assistant's configured IANA
+timezone at the read boundary. Local date, day-of-week, day-of-year, and
+wall-clock slot are calendar features. Ordering, elapsed age, adjacency,
+cache expiry, and slot dictionary identity use UTC instants.
+
+For a cumulative energy meter, HSEM keeps the last reading of each physical
+slot. The difference between the previous and current slot-end readings is
+energy used in the **current** slot and is labelled with its current local
+timestamp. Only adjacent UTC slot identities may form a delta. Recorder gaps,
+counter resets, non-positive deltas, and values above the sanity ceiling are
+discarded rather than moved into another slot.
+
+A 15-minute local civil day may supply 92, 96, or 100 observations. Both
+autumn folds remain separate physical records even though they intentionally
+share one wall-clock model feature; a nonexistent spring slot is not
+fabricated. Today's actual replacement begins one physical slot before local
+midnight, includes completed slots only, filters by HA-local date, and keys
+them by canonical UTC start.
+Sequential training resets its lag across non-adjacent physical samples.
+Inference chains the real recommendation instants in physical UTC order, so
+spring skips nonexistent wall slots and autumn preserves both physical folds.
+
+
+The configured minimum history span defaults to 14 physical days. Processed
+history is cached for one physical hour and keyed by Home Assistant instance,
+import entity, optional export entity, net/gross mode, cadence, and required
+span. Temperature history is independently source-keyed. A predictor is
+replaced whenever its effective source/configuration context changes, so a
+sample-count retrain gate cannot preserve coefficients from the old context.
+Within an unchanged context, retraining compares valid sample fingerprints and
+reruns after four unseen or revised fingerprints. Revised readings therefore
+trigger retraining even when the rolling sample count remains constant.
+
+
+Net mode is fail-closed: an export entity is required, and training/today
+actuals use only physical slot keys present in both import and export sources.
+An absent export observation is never zero. If the aligned training result no
+longer spans the required history, ML population fails and legacy averages are
+used.
+
+Temperature is enabled only with sufficient recorder history. Training matches
+temperature by physical time; because this source is not a future weather
+forecast, inference holds the newest nearby observation across the horizon.
+Insufficient temperature history fits a model without that feature. Failure to
+fit any trained model returns control to legacy population; an untrained model
+must never publish a zero-load horizon.
+
+### Frozen forecast accuracy and solar learning
+
+Before current-slot live injection or planning, the coordinator snapshots raw,
+available PV only for future recommendation slots. After a successful plan it
+may register corrected PV, load, predicted end SoC, and action only while the
+slot remains physically in the future. A future replan may update these values;
+the last pre-slot values freeze when the UTC start instant arrives. Current or
+past planner values can never become or rewrite an eligible baseline.
+
+Instantaneous PV and load follow prior-sample semantics: the previous finite
+power pair represents `[previous_timestamp, now)`. Both the previous and
+current endpoint samples for both channels must be finite. Missing telemetry
+advances all sample state but rejects the interval, so recovery cannot bridge
+the gap. A non-positive interval or one longer than twice the effective
+coordinator cadence is also rejected.
+
+Accepted intervals are split by overlap with frozen slots on the UTC timeline.
+Each record tracks trusted coverage seconds. A production record is accuracy-
+eligible only when it has a frozen raw baseline and covers the full physical
+slot within tolerance. Missing time is unknown, never zero PV or load.
+Prediction eligibility additionally requires frozen SoC and action fields.
+
+Only eligible finalised records train the PV corrector. The per-hour factor
+uses raw PV versus actual PV; the recent residual uses corrected PV versus
+actual PV. Residual `slots_ahead` is the UTC physical distance from the
+current planning instant, not an index since midnight, so correction remains
+active throughout the day and across both DST folds.
+
+Prediction accuracy is emitted only on the coordinator cycle in which an
+eligible slot transitions to finalised and only when actual Huawei SoC is
+finite. No restored forecast record may be paired with a post-restart live SoC
+sample; only a slot newly finalised from the current live process enters the
+prediction tracker. Its warm-up/deduplication identity is the unique UTC slot
+start, not the number of coordinator polls.
+
+Restored legacy forecast records may deserialize, but records missing the
+raw/frozen schema are permanently ineligible for summary metrics and learning.
+Solar-corrector state is versioned: pre-v3 factors, history, and residuals
+learned under the old live-rewritten baseline are cold-reset on upgrade while
+the internal confidence value is retained. Valid v3 state restores the exact
+bounded per-hour and residual buffers plus a UTC processed-through watermark.
+The restore is atomic; malformed, non-finite, or future-dated watermark state
+cold-resets rather than entering planning. A prediction-accuracy scalar
+restored by Home Assistant is startup-only; after the first live coordinator
+snapshot the sensor reports a fresh metric or unavailable.
+
+### Daily plan-versus-actual and savings
+
+All daily labels and period rollups use the Home Assistant-local date. All
+interval ordering, duration, overlap, price boundaries, local-midnight
+boundaries, and DST folds use UTC instants.
+
+Cumulative import, export, and PV meter deltas are distributed uniformly
+between consecutive sample instants. The interval is split at every overlapping
+planner price boundary and local midnight. Energy is recorded even when a
+price channel is unavailable; money is added only for a finite authoritative
+price. A leading segment not covered by the new planner output uses the prior
+sampled price when authoritative rather than pricing the entire delta at the
+new value.
+
+Actual meters are accumulated before rollover. A cross-midnight interval is
+therefore apportioned by local date before the old day is persisted. Cumulative
+meter timestamp/value baselines and the SoC baseline survive rollover. If a
+daily meter decreases, its current non-negative reading is treated as energy
+since local midnight and retained for the new day. Plan values are recorded
+once after their slot starts, after rollover has selected the destination day.
+On a live cadence change, already-recorded physical coverage remains
+authoritative; only the uncovered fraction of an overlapping replacement slot
+may be added.
+
+Savings consumes the daily tracker's explicit per-cycle, per-date measured
+import-cost and export-revenue deltas once. It must not re-difference the
+cumulative daily totals. Charge savings integrates the **previous** positive,
+finite Huawei battery charge-power sample over the interval to the current
+finite endpoint. Equal/reversed timestamps, missing telemetry, and gaps beyond
+twice the effective cadence add no energy while still advancing sample state.
+
+Measured charge energy is divided by UTC overlap across planner slots and
+local dates. Only actionable slots whose recommendation is a charge mode and
+whose import price is finite/available contribute; their share is valued
+against that local delivery day's published mean import price. Planned charge
+The snapshot that governed elapsed time masks a later overlapping replan even
+when the prior slot is not actionable; the current snapshot fills only
+uncovered physical time.
+energy is never added repeatedly per coordinator poll. Automatic operation
+records the result as actual savings, other modes as missed savings, and the
+injected HA-local date anchors today/7-day/30-day rollups.
+
+### Invariants for historical and accounting tests
+
+- ML wall-calendar features are local, while identity, age, and adjacency are
+  physical UTC.
+- A cumulative-meter delta is labelled with the current slot, not one slot
+  early, and never spans a missing physical slot.
+- Both autumn folds remain distinct; spring gaps do not create observations.
+- A cache or predictor from another HA instance, entity pair, net mode,
+  cadence, history span, temperature context, or sequential mode is not reused.
+- Net ML history never substitutes zero for a missing export sample.
+- An untrained ML predictor falls back to legacy consumption.
+- A baseline observed at or after slot start is ineligible, and a post-start
+  replan cannot mutate a frozen baseline.
+- Forecast actual energy is assigned from the prior sample by UTC overlap;
+  missing endpoints and stale gaps cannot become zero or stale energy.
+- Only fully covered records affect accuracy, solar correction, or prediction
+  diagnostics.
+- Solar residual lead is relative to the current physical slot, not midnight.
+- Prediction diagnostics emit once at finalisation with finite actual SoC.
+- Cross-boundary meter deltas receive proportional prices and local dates.
+- Midnight rollover retains the first new-day energy and all meter baselines.
+- Savings uses per-cycle measured deltas and measured prior-sample charge
+  energy exactly once.
+
 ## SoC simulation
 
 SoC must be simulated forward through the full horizon.
@@ -2401,11 +2568,13 @@ In addition to the fixed daily decay, the
 :class:`~custom_components.hsem.utils.solar_corrector.SolarForecastCorrector`
 (introduced in issue #602) applies learned **per-hour accuracy factors** and
 an **intra-hour residual correction** to PV estimates before they enter the
-planner.  The corrector maintains a 4-day rolling history of (forecast, actual)
-ratios per hour-of-day, clamped to [0.3, 1.5].  A configurable confidence
-percentile (0.10–0.90, default 0.50) scales the correction — lower values are
-more conservative (less PV expected).  The raw Solcast data is never mutated;
-corrections are only applied at consumption time.
+planner. For each local clock-hour, the corrector retains the four most recent
+eligible physical quarter-slot **actual / raw forecast** ratios. At 15-minute
+cadence this is a four-sample window, not four days; the learned mean is clamped
+to [0.3, 1.5]. The internal confidence value dampens learned factors toward
+neutral below 0.50 and applies them at full strength from 0.50 upward. It is
+restored internal state, not a configurable entity. The raw Solcast data is
+never mutated; corrections are only applied at slot-population time.
 
 #### Solar correction invariant
 
@@ -2417,10 +2586,11 @@ corrected_pv = raw_pv × hour_factor × residual_factor
 ```
 
 Where:
-- `hour_factor ∈ [0.3, 1.5]` — the per-hour accuracy ratio clamped to prevent
-  single-day distortions
-- `residual_factor` — intra-hour live-surplus correction with 4-slot linear
-  decay over 2 hours
+- `hour_factor ∈ [0.3, 1.5]` — the mean eligible actual/raw ratio for the
+  slot's local wall hour, clamped to limit outliers
+- `residual_factor` — the mean of recent eligible closed-slot
+  actual/corrected ratios, decaying linearly toward 1.0 over the next eight
+  physical slots (two hours at 15-minute cadence)
 
 The clamping is symmetric (0.3 lower, 1.5 upper) so the corrector never
 amplifies a single outlier beyond these bounds.  Raw Solcast data is never

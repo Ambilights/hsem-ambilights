@@ -19,15 +19,16 @@ common scenarios a real installation will encounter.
 6. [Candidate generation and selection](#candidate-generation-and-selection)
 7. [Safety modes](#safety-modes)
 8. [Data quality diagnostics](#data-quality-diagnostics)
-9. [Scenario examples](#scenario-examples)
+9. [Diagnostic accuracy and daily accounting](#diagnostic-accuracy-and-daily-accounting)
+10. [Scenario examples](#scenario-examples)
    - [Winter day — cold, low PV, peak-hour pricing](#scenario-1-winter-day)
    - [Summer day — high PV surplus](#scenario-2-summer-day-high-pv)
    - [Cheap night price — grid charge opportunity](#scenario-3-cheap-night-price)
    - [High PV day — excess export opportunity](#scenario-4-high-pv-day-excess-export)
    - [Flat price day — no arbitrage value](#scenario-5-flat-price-day)
    - [EV charging — solar-first smart plan](#scenario-6-ev-charging--solar-first-smart-plan)
-10. [Reading the plan explanation](#reading-the-plan-explanation)
-11. [Known limitations](#known-limitations)
+11. [Reading the plan explanation](#reading-the-plan-explanation)
+12. [Known limitations](#known-limitations)
 
 ---
 
@@ -151,8 +152,24 @@ HSEM predicts house load for each slot.  Two modes are available (toggled via
 - **Legacy (default):** Weighted average across four rolling windows (1d, 3d,
   7d, 14d) with IQR outlier detection.  Requires HSEM custom sensor entities.
 - **ML (optional):** Ridge regression on recorder history with day-of-week,
-  day-of-year seasonality, and optional outdoor temperature.  No custom
-  sensors needed.
+  day-of-year seasonality, and optional outdoor temperature. No custom sensors
+  are needed.
+
+ML calendar features use Home Assistant-local date, day-of-week, day-of-year,
+and wall slot. Recorder ordering, elapsed age, adjacency, cache expiry, and
+slot lookup use canonical UTC instants, preserving both autumn DST folds and
+the 92/96/100-slot civil-day shape. Accumulator deltas are labelled with the
+current slot they measure, never the preceding slot, and recorder gaps are not
+collapsed into one oversized observation.
+
+ML requires the configured history span (14 days by default) and fails closed
+to legacy averages when it cannot train. Processed caches are keyed by the Home
+Assistant instance, meter entities, net/gross mode, cadence, and history
+requirement; changing context replaces the predictor. Net mode uses only
+physically aligned import/export slots and never treats a missing export sample
+as zero. Optional temperature is trained only with sufficient history; the
+latest nearby observation is held across inference because it is not a weather
+forecast. An untrained model never publishes a zero-load horizon.
 
 Regardless of mode, the planner receives a per-hour ``HourlyConsumptionAverage``:
 
@@ -224,30 +241,29 @@ Raw Solcast PV estimates are corrected in two stages before entering the
 planner (issue #602):
 
 **Per-hour accuracy factors:** The `SolarForecastCorrector` maintains a
-4-day rolling history of `(forecast, actual)` ratios for each hour of the
-day.  The ratio for a given hour is clamped to **[0.3, 1.5]** so that a
-single anomalous day cannot permanently distort the correction.  The
-factor is updated once per day when a full 24 h of actual production is
-available.
+rolling history of the most recent eligible `(raw forecast, actual)` pairs
+for each hour. The mean actual/raw ratio is clamped to **[0.3, 1.5]**.
 
-**Intra-hour residual correction:** When live solar production data is
-available mid-hour, the last 4 slots (2 hours) of the forecast horizon are
-adjusted with an exponentially decaying residual:
+**Short-term residual correction:** The mean actual/corrected ratio from the
+most recent eligible closed slots is clamped to the same bounds and decays
+linearly toward 1.0 over eight future slots:
 
 ```text
 corrected_pv = raw_pv × hour_factor × residual_factor
-residual_factor = 1.0 + (live_pv − forecast_pv) / max(forecast_pv, 0.01)
-                × decay_per_slot
+residual_factor = 1.0 + (mean_recent_ratio − 1.0)
+                × max(0, 1 − slots_ahead / 8)
 ```
 
-where `decay_per_slot` is `[0.66, 0.44, 0.22, 0.05]` across the 4 slots
-(linear decay over 2 h).  The correction is conservative in both
-directions: it raises PV estimates when live production exceeds forecast
-(cloud clearing) and lowers them when live production falls short (cloud
-arrival).
+Lead distance is measured from the current planning instant on the UTC
+timeline, not from local midnight. The correction therefore remains active
+after early morning and treats both DST folds as separate physical slots.
 
 The raw Solcast data is never mutated; corrections are only applied at
-consumption time when the planner reads PV estimates.
+consumption time when the planner reads PV estimates. Learning accepts only the
+last pre-slot baseline with complete trusted PV and load coverage. Current-slot
+live injection, a post-start replan, missing telemetry, or a stale sample gap
+cannot teach the corrector. Upgrading to v7.1.2 intentionally resets old
+unversioned learned factors and residuals; the confidence value is retained.
 
 ### Excess export and grid controls
 
@@ -1132,6 +1148,59 @@ directly to a sensor's `extra_state_attributes`:
   "today_pv_missing_hours": []
 }
 ```
+
+## Diagnostic accuracy and daily accounting
+
+These trackers are diagnostic and do not alter the selected plan, but their
+time and energy accounting follows the same physical-slot rules as the planner.
+
+### Frozen forecast accuracy
+
+For each future slot HSEM retains the last raw PV, corrected PV, load, predicted
+end SoC, and action observed before the slot starts. The baseline freezes at
+the UTC slot boundary. The previous finite PV/load power sample is integrated
+over its half-open interval and split by physical slot overlap. A missing
+endpoint advances sample state but invalidates that interval; a gap longer than
+twice the effective coordinator cadence is also rejected. Only a frozen slot
+with complete trusted actual coverage contributes to accuracy or correction
+learning.
+
+### Daily plan versus actual
+
+Cumulative import, export, and PV meter deltas are assumed uniform between
+their two sample instants. Each delta is split on the UTC timeline at planner
+price-slot boundaries and Home Assistant-local midnight, including DST
+transitions. Energy is counted even when a price is unavailable; money is
+added only under an authoritative finite price. An uncovered leading segment
+uses its prior known price rather than applying the newly sampled price to the
+whole interval.
+
+Actual meters are sampled before day rollover. A cross-midnight delta is
+therefore apportioned to both local dates before the old date is saved. Meter
+and SoC baselines survive rollover, and when a daily meter resets, its first
+positive reading is retained as new-day energy since midnight. Planned slot
+energy is captured once after the slot starts on the selected local date.
+If the configured cadence changes while Home Assistant is running, physical
+coverage already captured by the old layout remains authoritative and only the
+uncovered fraction of an overlapping new slot is added.
+
+### Savings
+
+Savings consumes the daily tracker's explicit per-cycle, per-date measured
+import-cost and export-revenue deltas; it does not re-difference a cumulative
+daily total. Cheap-charge savings uses measured positive Huawei battery charge
+power from the preceding valid interval, not the full planned charge energy on
+every coordinator poll. The interval is rejected after missing telemetry or a
+gap beyond twice the effective cadence, then split by overlap with actionable
+charge slots and local dates. Each eligible share is valued against that local
+day's published mean import price.
+The plan snapshot that governed elapsed time masks a later overlapping replan;
+the current plan can value only a physical tail that the preceding snapshot did
+not cover.
+
+Home Assistant's local date also anchors today, 7-day, and 30-day savings
+rollups. Automatic mode records earned savings; non-automatic operation records
+the same opportunity as missed savings.
 
 ---
 

@@ -296,9 +296,10 @@ Cumulative monetary sensors that track grid import cost and export revenue.
 
 ## Prediction accuracy sensor
 
-Tracks prediction accuracy across multiple horizons — solar, load, and battery SoC — up to 30 days.
+Tracks solar, load, end-of-slot battery SoC, and action accuracy from frozen
+pre-slot plans.
 
-**Entity:** `sensor.hsem_prediction_accuracy`
+**Entity:** `sensor.hsem_prediction_accuracy_sensor`
 
 | State | Meaning |
 |---|---|
@@ -311,26 +312,52 @@ Tracks prediction accuracy across multiple horizons — solar, load, and battery
 | `solar_mape` | % | Solar forecast MAPE |
 | `load_mae_kwh` | kWh | Load Mean Absolute Error |
 | `action_mix` | dict | Distribution of planner actions over the window |
+| `records_count` | count | Unique physical slots in the rolling scorecard |
+
+Only a slot that has a frozen baseline and complete trusted actual coverage is
+eligible. It is added on the exact coordinator cycle when the slot finalises
+and only when live Huawei SoC is finite. Restored or already-finalised records
+do not replay. The restored sensor scalar is startup-only: after the first live
+coordinator snapshot, the entity reports a fresh metric or unavailable.
+
+---
+
+## Forecast accuracy sensor
+
+Reports corrected PV and load forecast error from fully covered physical slots.
+
+**Entity:** `sensor.hsem_forecast_accuracy_sensor`
+
+| Property | Value |
+|---|---|
+| **State** | Eligible-slot PV MAE (kWh) |
+| **Attributes** | `mae_*`, `bias_*`, `rmse_*`, `mape_*`, eligible `latest_*`, and internal restore data |
+
+The baseline is the last raw/corrected PV and load plan observed before slot
+start. Actual PV/load power uses the preceding finite sample interval split by
+UTC overlap. Missing endpoints, stale gaps, incomplete coverage, and legacy
+live-rewritten records are excluded rather than counted as zero actuals.
 
 ---
 
 ## Solar confidence sensor
 
-Per-hour PV forecast accuracy factors and confidence percentile.
+Diagnostic view of the learned per-hour PV correction.
 
-**Entity:** `sensor.hsem_solar_confidence`
+**Entity:** `sensor.hsem_solar_confidence_sensor`
 
 | Attribute | Description |
 |---|---|
-| **State** | Mean accuracy factor across the horizon (ratio) |
-| `factors` | dict — per-hour correction factors for each slot |
-| `confidence_pct` | float — confidence percentile (e.g. 50 = median) |
+| **State** | Mean learned hour factor (ratio), unavailable before learning |
+| `hour_factors` | JSON-encoded map of local hour to correction factor |
+| `confidence` | Internal correction-strength value (default 0.50) |
+| `residual_count` | Eligible recent closed slots in the residual buffer |
 
 **Template example:**
 
 ```jinja2
-{{ states('sensor.hsem_solar_confidence') | float | round(3) }}
-Confidence: {{ state_attr('sensor.hsem_solar_confidence', 'confidence_pct') }}%
+{{ states('sensor.hsem_solar_confidence_sensor') | float | round(3) }}
+Confidence: {{ state_attr('sensor.hsem_solar_confidence_sensor', 'confidence') }}
 ```
 
 ---
@@ -408,12 +435,22 @@ Each `planned_windows` item contains `start`, `end`, `mode`, `charged_kwh`,
 
 ## Daily plan-vs-actual sensor
 
-Diagnostic sensor tracking daily cumulative plan-vs-actual energy deviations.
+Diagnostic sensor tracking Home Assistant-local daily plan-versus-actual
+energy and money.
 
-**Entity:** `sensor.hsem_daily_plan_vs_actual`
+**Entity:** `sensor.daily_plan_vs_actual`
 
-Tracks planned kWh vs actual kWh for import, export, PV, consumption, and battery
-throughput on a per-calendar-day basis using cumulative energy meter readings.
+| Property | Value |
+|---|---|
+| **State** | Today's measured net grid cost: import cost minus export revenue |
+| `today` | Nested planned, actual, and difference metrics |
+| `yesterday` | Most recent completed local-day record |
+| `history` | Recent daily records exposed in state attributes |
+
+Cumulative meter deltas are split by UTC price-slot overlap and local midnight.
+Energy remains counted without price authority, while money is omitted. Meter
+baselines survive rollover, and a daily reset's first positive reading is
+retained as energy since midnight.
 
 ---
 
@@ -484,21 +521,29 @@ Controls and reports the effective discharge floor SoC, which the planner uses a
 
 ## Savings tracker sensor
 
-Tracks actual vs missed savings over a rolling 90-day window.
+Tracks measured actual versus missed savings on Home Assistant-local dates.
 
-**Entity:** `sensor.hsem_savings_tracker`
+**Entity:** `sensor.hsem_savings_tracker_sensor`
 
 | Property | Value |
 |---|---|
 | **Type** | `sensor` |
-| **State** | Current day savings (local currency) |
-| **Attributes** | `actual_savings`, `missed_savings`, `total_savings`, `log` (90-day rolling list) |
+| **State** | `today_actual` savings (local currency) |
+| **Daily attributes** | `today_actual`, `today_missed`, `today_baseline` |
+| **Period attributes** | `last_7_days_*`, `last_30_days_*`, `total_*` |
+| **History attributes** | `daily`, `max_history_days`, `history_total_days` |
+
+Export revenue and import cost come from the daily tracker's explicit measured
+per-cycle deltas. Charge savings uses measured positive Huawei charge power
+from the preceding valid interval and divides it across overlapping actionable
+charge slots; it does not add the full planned charge again on every poll.
+Missing telemetry and stale gaps are rejected.
 
 **Template example:**
 
 ```jinja2
-Actual: {{ state_attr('sensor.hsem_savings_tracker', 'actual_savings') }}
-Missed: {{ state_attr('sensor.hsem_savings_tracker', 'missed_savings') }}
+Actual today: {{ state_attr('sensor.hsem_savings_tracker_sensor', 'today_actual') }}
+Missed today: {{ state_attr('sensor.hsem_savings_tracker_sensor', 'today_missed') }}
 ```
 
 ---
@@ -531,7 +576,7 @@ Detects when the inverter is actively curtailing PV production.
 |---|---|---|---|
 | `sensor.hsem_applier_status_sensor` | Inverter Apply Status | Hardware write success/failure | `ok`, `unverified`, `failed`, `skipped` |
 | `sensor.hsem_battery_soc_sensor` | Battery State of Charge | Battery SoC snapshot | Percentage (0–100) |
-| `sensor.hsem_daily_plan_vs_actual` | Daily Plan vs Actual | Daily energy plan-vs-actual tracking | Dict with cumulative metrics |
+| `sensor.daily_plan_vs_actual` | Daily Plan vs Actual | Daily energy plan-vs-actual tracking | Dict with cumulative metrics |
 | `sensor.hsem_degraded_mode_sensor` | System Health | Overall system health | `ok`, `degraded`, `error` |
 | `sensor.hsem_ev_charging_sensor` | EV Charging Active | Any EV actively charging | `on`, `off` |
 | `sensor.hsem_ev_optimal_charging_plan` | EV Optimal Charging Plan | Primary EV plan state | `charging`, `waiting`, etc. |
@@ -545,7 +590,7 @@ Detects when the inverter is actively curtailing PV production.
 | `sensor.hsem_next_update_sensor` | Next Update | Next scheduled coordinator cycle | ISO-8601 timestamp |
 | `sensor.hsem_missing_entities_sensor` | Missing Input Entities | Count of missing input entities | Integer |
 | `sensor.hsem_plan_explanation_sensor` | Plan Explanation | Planner strategy and cost breakdown | Winning candidate name |
-| `sensor.hsem_prediction_accuracy` | Prediction Accuracy | Multi-horizon forecast accuracy | `soc_mae_7d` |
+| `sensor.hsem_prediction_accuracy_sensor` | Prediction Accuracy | Multi-horizon forecast accuracy | `soc_mae_7d` |
 | `sensor.hsem_forecast_accuracy_sensor` | Forecast Accuracy | PV and load forecast MAE | kWh |
 | `sensor.hsem_recommendation_interval_sensor` | Recommendation Interval | Slot width and horizon info | Minutes |
 | `sensor.hsem_update_interval_sensor` | Update Interval | Current polling interval | Minutes |
@@ -554,7 +599,7 @@ Detects when the inverter is actively curtailing PV production.
 | `sensor.hsem_import_cost` | Import Cost | Cumulative import cost | Monetary (total_increasing) |
 | `sensor.hsem_net_grid_balance` | Net Grid Balance | Export income minus import cost | Monetary (measurement) |
 | `sensor.hsem_effective_discharge_floor` | Effective Discharge Floor | Current effective floor SoC | Percentage |
-| `sensor.hsem_savings_tracker` | Savings Tracker | Actual vs missed savings (90-day) | Monetary |
+| `sensor.hsem_savings_tracker_sensor` | Savings Tracker | Actual vs missed savings (90-day) | Monetary |
 | `sensor.hsem_pv_curtailment_sensor` | PV Curtailment | PV curtailment detection | `curtailed` / `normal` |
 
 ---

@@ -365,7 +365,11 @@ def populate_solcast(
                         corrector.get_corrected_pv(
                             slot.start.hour,
                             raw_estimate,
-                            slots_ahead=i,
+                            slots_ahead=corrector.slots_ahead_for(
+                                slot.start,
+                                interval_minutes,
+                                fallback=i,
+                            ),
                         ),
                         3,
                     )
@@ -394,7 +398,13 @@ def populate_solcast(
             if corrector is not None and raw_estimate > 0:
                 slot.solcast_pv_estimate_kwh = round(
                     corrector.get_corrected_pv(
-                        slot.start.hour, raw_estimate, slots_ahead=i
+                        slot.start.hour,
+                        raw_estimate,
+                        slots_ahead=corrector.slots_ahead_for(
+                            slot.start,
+                            interval_minutes,
+                            fallback=i,
+                        ),
                     ),
                     3,
                 )
@@ -417,7 +427,13 @@ def populate_solcast(
         if corrector is not None and raw_estimate > 0:
             slot.solcast_pv_estimate_kwh = round(
                 corrector.get_corrected_pv(
-                    slot.start.hour, raw_estimate, slots_ahead=i
+                    slot.start.hour,
+                    raw_estimate,
+                    slots_ahead=corrector.slots_ahead_for(
+                        slot.start,
+                        interval_minutes,
+                        fallback=i,
+                    ),
                 ),
                 3,
             )

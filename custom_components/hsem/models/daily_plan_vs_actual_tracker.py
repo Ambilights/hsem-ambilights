@@ -12,15 +12,36 @@ import json
 import math
 import os
 import tempfile
+from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
 from custom_components.hsem.models.daily_metrics import DailyMetrics
 from custom_components.hsem.models.daily_record import DailyRecord
 from custom_components.hsem.models.day_rollover_result import DayRolloverResult
+
+_ENERGY_EPSILON_KWH = 1e-9
+
+
+@dataclass(frozen=True)
+class ActualPriceInterval:
+    """Published prices covering one physical interval.
+
+    ``start`` and ``end`` are compared as UTC instants.  This preserves both
+    occurrences of an autumn DST fold even though they share the same local
+    wall-clock label.
+    """
+
+    start: datetime
+    end: datetime
+    import_price: float
+    export_price: float
+    import_price_available: bool = True
+    export_price_available: bool = True
 
 
 @dataclass
@@ -53,6 +74,23 @@ class DailyPlanVsActualTracker:
     _last_import_energy_kwh: float | None = field(default=None, repr=False)
     _last_export_energy_kwh: float | None = field(default=None, repr=False)
     _last_pv_energy_kwh: float | None = field(default=None, repr=False)
+    _last_import_sample_at: datetime | None = field(default=None, repr=False)
+    _last_export_sample_at: datetime | None = field(default=None, repr=False)
+    _last_pv_sample_at: datetime | None = field(default=None, repr=False)
+    _last_soc_sample_at: datetime | None = field(default=None, repr=False)
+    _last_import_price: float | None = field(default=None, repr=False)
+    _last_export_price: float | None = field(default=None, repr=False)
+    _last_import_price_available: bool = field(default=False, repr=False)
+    _last_export_price_available: bool = field(default=False, repr=False)
+    _pending_actual_by_date: dict[str, DailyMetrics] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    last_actual_delta: DailyMetrics = field(default_factory=DailyMetrics, repr=False)
+    last_actual_delta_by_date: dict[str, DailyMetrics] = field(
+        default_factory=dict,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         """Set today's date if not already set.
@@ -60,47 +98,56 @@ class DailyPlanVsActualTracker:
         History loading is deferred — call :meth:`load_history` explicitly
         to avoid blocking I/O during dataclass construction.
         """
-        if not self.today:
-            self.today = date.today().isoformat()
+        # ``today`` is intentionally injected by ``check_day_rollover(now)``.
+        # A process-local calendar date may differ from Home Assistant's
+        # configured timezone around midnight.
 
     # ------------------------------------------------------------------
     # Midday counter reset
     # ------------------------------------------------------------------
 
     async def check_day_rollover(self, now: datetime) -> DayRolloverResult | None:
-        """Check if the calendar day has changed and handle rollover.
+        """Finalise the prior HA-local day without discarding meter baselines.
 
-        When the day changes, the current day's record is finalised and saved,
-        counters are reset, and history is pruned to the maximum window.
-
-        Args:
-            now: Current datetime (timezone-aware).
-
-        Returns:
-            A :class:`DayRolloverResult` with the persisted record and saved
-            flag, or ``None`` if no rollover occurred.
+        Meter samples are accumulated before this method is called. Any
+        cross-midnight delta is split on the UTC timeline and staged by local
+        calendar date, so the old-day share is persisted before the new-day
+        share becomes the active accumulator.
         """
         today_str = now.date().isoformat()
+        if not self.today:
+            self.today = today_str
+            self.actual = self._pending_actual_by_date.pop(
+                today_str,
+                DailyMetrics(),
+            )
+            return None
         if today_str == self.today:
             return None
 
-        # Day has changed — finalise and save yesterday's record.
-        today_record = self._build_today_record()
-        saved = await self._save_record_to_history(today_record)
+        prior_record = self._build_today_record()
+        saved = await self._save_record_to_history(prior_record)
 
-        # Reset counters for the new day.
+        # A long coordinator outage can span more than one local date. Keep
+        # each staged date distinct rather than merging it into the restart day.
+        for day_str in sorted(self._pending_actual_by_date):
+            if day_str >= today_str:
+                continue
+            intermediate = DailyRecord(
+                date=day_str,
+                actual=self._pending_actual_by_date.pop(day_str),
+            )
+            intermediate.compute_diff()
+            saved = await self._save_record_to_history(intermediate) and saved
+
         self.today = today_str
-        self.actual = DailyMetrics()
+        self.actual = self._pending_actual_by_date.pop(today_str, DailyMetrics())
         self.plan = DailyMetrics()
-        self.last_soc_pct = None
-        self._last_import_energy_kwh = None
-        self._last_export_energy_kwh = None
-        self._last_pv_energy_kwh = None
 
-        return DayRolloverResult(
-            record=today_record,
-            saved=saved,
-        )
+        # Deliberately preserve the cumulative-meter, timestamp, and SoC
+        # baselines. They are required to account for the first physical
+        # interval after midnight (including daily meters that reset to zero).
+        return DayRolloverResult(record=prior_record, saved=saved)
 
     # ------------------------------------------------------------------
     # Accumulation helpers
@@ -117,64 +164,340 @@ class DailyPlanVsActualTracker:
         export_price: float = 0.0,
         import_price_available: bool = True,
         export_price_available: bool = True,
-    ) -> None:
-        """Accumulate actual energy and cost values.
+        *,
+        max_gap_seconds: float,
+        now: datetime | None = None,
+        price_intervals: Sequence[ActualPriceInterval] = (),
+    ) -> DailyMetrics:
+        """Accumulate measured deltas on the canonical physical timeline.
 
-        Energy values are expected to be *cumulative* since midnight (from
-        the energy meter).  The delta from the previous reading is added.
+        Cumulative meter energy is assumed to be distributed uniformly between
+        consecutive finite samples. The interval is split at published-price,
+        planner-slot, local-midnight, and DST boundaries using UTC instants.
+        Energy remains counted when a price is unavailable, while money is
+        omitted.
 
-        Battery cycles are tracked from SoC changes using
-        ``abs(soc[t] - soc[t-1]) * rated_capacity_kwh / 100``.
-
-        Args:
-            grid_import_energy_kwh: Cumulative grid import meter reading (kWh).
-            grid_export_energy_kwh: Cumulative grid export meter reading (kWh).
-            pv_energy_kwh: Cumulative PV production meter reading (kWh).
-            soc_pct: Current battery SoC percentage (0-100).
-            rated_capacity_kwh: Rated battery capacity in kWh for cycle tracking.
-            import_price: Current import price (currency/kWh).
-            export_price: Current export price (currency/kWh).
-            import_price_available: Whether the import price is authoritative.
-            export_price_available: Whether the export price is authoritative.
+        Missing or non-finite telemetry resets that channel's baseline. Invalid,
+        nonpositive, reversed, and over-limit physical intervals are rejected
+        after the new sample has advanced the baseline, preventing recovery from
+        bridging stale data. A decreasing cumulative meter is treated as a daily
+        reset, whose current reading belongs to the new local day.
         """
-        # Grid import delta from cumulative meter (kWh).
-        if grid_import_energy_kwh is not None:
-            if self._last_import_energy_kwh is not None:
-                delta = grid_import_energy_kwh - self._last_import_energy_kwh
-                if delta > 0:
-                    self.actual.grid_import_kwh += delta
-                    if import_price_available and math.isfinite(import_price):
-                        self.actual.grid_import_cost += delta * import_price
-            self._last_import_energy_kwh = grid_import_energy_kwh
+        self.last_actual_delta = DailyMetrics()
+        self.last_actual_delta_by_date = {}
 
-        # Grid export delta from cumulative meter (kWh).
-        if grid_export_energy_kwh is not None:
-            if self._last_export_energy_kwh is not None:
-                delta = grid_export_energy_kwh - self._last_export_energy_kwh
-                if delta > 0:
-                    self.actual.grid_export_kwh += delta
-                    if export_price_available and math.isfinite(export_price):
-                        self.actual.grid_export_rev += delta * export_price
-            self._last_export_energy_kwh = grid_export_energy_kwh
+        if now is not None and not self.today:
+            self.today = now.date().isoformat()
 
-        # PV production delta from cumulative meter (kWh).
-        if pv_energy_kwh is not None:
-            if self._last_pv_energy_kwh is not None:
-                delta = pv_energy_kwh - self._last_pv_energy_kwh
-                if delta > 0:
-                    self.actual.pv_produced_kwh += delta
-            self._last_pv_energy_kwh = pv_energy_kwh
+        import_sample = self._finite_sample(grid_import_energy_kwh)
+        if import_sample is not None:
+            self._accumulate_meter(
+                current=import_sample,
+                previous=self._last_import_energy_kwh,
+                previous_at=self._last_import_sample_at,
+                now=now,
+                max_gap_seconds=max_gap_seconds,
+                price_intervals=price_intervals,
+                energy_field="grid_import_kwh",
+                money_field="grid_import_cost",
+                prior_price=self._last_import_price,
+                prior_price_available=self._last_import_price_available,
+                price_kind="import",
+            )
+        self._last_import_energy_kwh = import_sample
+        self._last_import_sample_at = now
 
-        # Battery cycle tracking from SoC delta (pct → kWh).
-        if soc_pct is not None and self.last_soc_pct is not None:
-            pct_change = abs(soc_pct - self.last_soc_pct)
-            if rated_capacity_kwh > 0:
-                self.actual.battery_cycled_kwh += (
-                    pct_change * rated_capacity_kwh / 100.0
+        export_sample = self._finite_sample(grid_export_energy_kwh)
+        if export_sample is not None:
+            self._accumulate_meter(
+                current=export_sample,
+                previous=self._last_export_energy_kwh,
+                previous_at=self._last_export_sample_at,
+                now=now,
+                max_gap_seconds=max_gap_seconds,
+                price_intervals=price_intervals,
+                energy_field="grid_export_kwh",
+                money_field="grid_export_rev",
+                prior_price=self._last_export_price,
+                prior_price_available=self._last_export_price_available,
+                price_kind="export",
+            )
+        self._last_export_energy_kwh = export_sample
+        self._last_export_sample_at = now
+
+        finite_import_price = self._finite_sample(import_price)
+        finite_export_price = self._finite_sample(export_price)
+        self._last_import_price = finite_import_price
+        self._last_export_price = finite_export_price
+        self._last_import_price_available = (
+            import_price_available and finite_import_price is not None
+        )
+        self._last_export_price_available = (
+            export_price_available and finite_export_price is not None
+        )
+
+        pv_sample = self._finite_sample(pv_energy_kwh)
+        if pv_sample is not None:
+            self._accumulate_meter(
+                current=pv_sample,
+                previous=self._last_pv_energy_kwh,
+                previous_at=self._last_pv_sample_at,
+                now=now,
+                max_gap_seconds=max_gap_seconds,
+                price_intervals=price_intervals,
+                energy_field="pv_produced_kwh",
+            )
+        self._last_pv_energy_kwh = pv_sample
+        self._last_pv_sample_at = now
+
+        soc_sample = self._finite_sample(soc_pct)
+        capacity_kwh = self._finite_sample(rated_capacity_kwh)
+        previous_soc = self._finite_sample(self.last_soc_pct)
+        if (
+            soc_sample is not None
+            and previous_soc is not None
+            and capacity_kwh is not None
+            and capacity_kwh > 0
+        ):
+            cycled_kwh = abs(soc_sample - previous_soc) * capacity_kwh / 100.0
+            self._allocate_delta(
+                delta=cycled_kwh,
+                start=self._last_soc_sample_at,
+                end=now,
+                max_gap_seconds=max_gap_seconds,
+                price_intervals=price_intervals,
+                energy_field="battery_cycled_kwh",
+            )
+        self.last_soc_pct = soc_sample
+        self._last_soc_sample_at = now
+
+        return self.last_actual_delta
+
+    @staticmethod
+    def _finite_sample(value: float | None) -> float | None:
+        """Return a finite float sample, or None for missing/invalid data."""
+        if value is None or not math.isfinite(value):
+            return None
+        return float(value)
+
+    def _accumulate_meter(
+        self,
+        *,
+        current: float,
+        previous: float | None,
+        previous_at: datetime | None,
+        now: datetime | None,
+        max_gap_seconds: float,
+        price_intervals: Sequence[ActualPriceInterval],
+        energy_field: str,
+        money_field: str | None = None,
+        prior_price: float | None = None,
+        prior_price_available: bool = False,
+        price_kind: str | None = None,
+    ) -> None:
+        """Calculate one finite cumulative-meter delta and allocate it."""
+        if (
+            previous is None
+            or not math.isfinite(current)
+            or not math.isfinite(previous)
+        ):
+            return
+
+        delta = current - previous
+        effective_start = previous_at
+        if delta < -_ENERGY_EPSILON_KWH:
+            # Daily utility meters commonly reset at local midnight. Their
+            # first positive reading belongs to the new day rather than being
+            # a new baseline that should be silently discarded.
+            delta = max(current, 0.0)
+            if (
+                now is not None
+                and now.tzinfo is not None
+                and previous_at is not None
+                and previous_at.tzinfo is not None
+            ):
+                local_midnight = datetime.combine(
+                    now.date(),
+                    time.min,
+                    tzinfo=now.tzinfo,
+                )
+                if local_midnight.astimezone(UTC) > previous_at.astimezone(UTC):
+                    effective_start = local_midnight
+        elif delta < _ENERGY_EPSILON_KWH:
+            return
+
+        self._allocate_delta(
+            delta=delta,
+            start=effective_start,
+            end=now,
+            max_gap_seconds=max_gap_seconds,
+            price_intervals=price_intervals,
+            energy_field=energy_field,
+            money_field=money_field,
+            prior_price=prior_price,
+            prior_price_available=prior_price_available,
+            price_kind=price_kind,
+        )
+
+    def _allocate_delta(
+        self,
+        *,
+        delta: float,
+        start: datetime | None,
+        end: datetime | None,
+        max_gap_seconds: float,
+        price_intervals: Sequence[ActualPriceInterval],
+        energy_field: str,
+        money_field: str | None = None,
+        prior_price: float | None = None,
+        prior_price_available: bool = False,
+        price_kind: str | None = None,
+    ) -> None:
+        """Allocate one finite delta across a bounded physical interval."""
+        if (
+            not math.isfinite(delta)
+            or delta <= _ENERGY_EPSILON_KWH
+            or not self._valid_physical_interval(start, end, max_gap_seconds)
+        ):
+            return
+
+        segments = self._physical_segments(start, end, price_intervals)
+        if not segments:
+            return
+
+        total_seconds = sum(
+            (segment_end - segment_start).total_seconds()
+            for segment_start, segment_end, _, _ in segments
+        )
+        if total_seconds <= 0:
+            return
+
+        for segment_start, segment_end, day_str, interval in segments:
+            share = (segment_end - segment_start).total_seconds() / total_seconds
+            segment_price: float | None = None
+            if interval is not None and price_kind == "import":
+                if interval.import_price_available:
+                    segment_price = interval.import_price
+            elif interval is not None and price_kind == "export":
+                if interval.export_price_available:
+                    segment_price = interval.export_price
+            elif (
+                interval is None
+                and prior_price_available
+                and prior_price is not None
+                and math.isfinite(prior_price)
+            ):
+                segment_price = prior_price
+
+            self._record_actual_delta(
+                day_str,
+                energy_field,
+                delta * share,
+                money_field,
+                segment_price,
+            )
+
+    @staticmethod
+    def _valid_physical_interval(
+        start: datetime | None,
+        end: datetime | None,
+        max_gap_seconds: float,
+    ) -> bool:
+        """Return whether two samples define an accepted UTC interval."""
+        if (
+            start is None
+            or end is None
+            or start.tzinfo is None
+            or end.tzinfo is None
+            or not math.isfinite(max_gap_seconds)
+            or max_gap_seconds <= 0
+        ):
+            return False
+        elapsed_seconds = (end.astimezone(UTC) - start.astimezone(UTC)).total_seconds()
+        return 0 < elapsed_seconds <= max_gap_seconds
+
+    def _record_actual_delta(
+        self,
+        day_str: str,
+        energy_field: str,
+        energy: float,
+        money_field: str | None,
+        price: float | None,
+    ) -> None:
+        """Record an allocated delta in daily and per-cycle accumulators."""
+        daily = (
+            self.actual
+            if day_str == self.today
+            else self._pending_actual_by_date.setdefault(day_str, DailyMetrics())
+        )
+        cycle_day = self.last_actual_delta_by_date.setdefault(day_str, DailyMetrics())
+        for metrics in (daily, self.last_actual_delta, cycle_day):
+            setattr(metrics, energy_field, getattr(metrics, energy_field) + energy)
+            if money_field is not None and price is not None and math.isfinite(price):
+                setattr(
+                    metrics,
+                    money_field,
+                    getattr(metrics, money_field) + energy * price,
                 )
 
-        if soc_pct is not None:
-            self.last_soc_pct = soc_pct
+    @staticmethod
+    def _physical_segments(
+        start: datetime | None,
+        end: datetime | None,
+        price_intervals: Sequence[ActualPriceInterval],
+    ) -> list[tuple[datetime, datetime, str, ActualPriceInterval | None]]:
+        """Return UTC segments split by price boundaries and local midnight."""
+        if start is None or end is None or start.tzinfo is None or end.tzinfo is None:
+            return []
+
+        start_utc = start.astimezone(UTC)
+        end_utc = end.astimezone(UTC)
+        if end_utc <= start_utc:
+            return []
+
+        valid_intervals: list[tuple[datetime, datetime, ActualPriceInterval]] = []
+        boundaries = {start_utc, end_utc}
+        for candidate_interval in price_intervals:
+            if (
+                candidate_interval.start.tzinfo is None
+                or candidate_interval.end.tzinfo is None
+            ):
+                continue
+            interval_start = candidate_interval.start.astimezone(UTC)
+            interval_end = candidate_interval.end.astimezone(UTC)
+            if interval_end <= interval_start:
+                continue
+            valid_intervals.append((interval_start, interval_end, candidate_interval))
+            if start_utc < interval_start < end_utc:
+                boundaries.add(interval_start)
+            if start_utc < interval_end < end_utc:
+                boundaries.add(interval_end)
+
+        local_tz = end.tzinfo
+        next_date = start_utc.astimezone(local_tz).date() + timedelta(days=1)
+        final_date = end_utc.astimezone(local_tz).date()
+        while next_date <= final_date:
+            midnight = datetime.combine(next_date, time.min, tzinfo=local_tz)
+            midnight_utc = midnight.astimezone(UTC)
+            if start_utc < midnight_utc < end_utc:
+                boundaries.add(midnight_utc)
+            next_date += timedelta(days=1)
+
+        ordered = sorted(boundaries)
+        segments: list[tuple[datetime, datetime, str, ActualPriceInterval | None]] = []
+        for segment_start, segment_end in pairwise(ordered):
+            midpoint = segment_start + (segment_end - segment_start) / 2
+            interval = next(
+                (
+                    item
+                    for interval_start, interval_end, item in valid_intervals
+                    if interval_start <= midpoint < interval_end
+                ),
+                None,
+            )
+            day_str = midpoint.astimezone(local_tz).date().isoformat()
+            segments.append((segment_start, segment_end, day_str, interval))
+        return segments
 
     def accumulate_plan(
         self,
@@ -228,8 +551,10 @@ class DailyPlanVsActualTracker:
         return record
 
     def get_yesterday_record(self) -> DailyRecord | None:
-        """Return yesterday's record from history, or ``None``."""
-        yesterday_str = (date.today() - timedelta(days=1)).isoformat()
+        """Return the record before the injected HA-local date, if present."""
+        if not self.today:
+            return None
+        yesterday_str = (date.fromisoformat(self.today) - timedelta(days=1)).isoformat()
         for record in reversed(self.history):
             if record.date == yesterday_str:
                 return record
@@ -267,18 +592,19 @@ class DailyPlanVsActualTracker:
             return None
 
     async def _save_record_to_history(self, record: DailyRecord) -> bool:
-        """Append a record to the in-memory history, prune, and persist to disk.
+        """Upsert a daily record and persist the history atomically.
 
-        Uses atomic write (write to temp file, then rename) to protect against
-        corruption from crashes during write.
-
-        Args:
-            record: The :class:`DailyRecord` to save.
-
-        Returns:
-            ``True`` if the record was successfully persisted to disk.
+        Midnight may write a provisional crash-safe snapshot before the first
+        post-midnight meter sample arrives. The completed rollover replaces
+        that same date rather than appending a duplicate.
         """
-        self.history.append(record)
+        for index, existing in enumerate(self.history):
+            if existing.date == record.date:
+                self.history[index] = record
+                break
+        else:
+            self.history.append(record)
+        self.history.sort(key=lambda item: item.date)
         self._prune_history()
 
         return await self._write_history_file()

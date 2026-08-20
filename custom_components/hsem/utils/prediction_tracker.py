@@ -80,6 +80,7 @@ class PredictionTracker:
     _warmup_slots: int = 4  # Skip first 4 slots (1 hour) after restart
     _slots_seen: int = field(default=0, repr=False)
     _recorded_starts: set[datetime] = field(default_factory=set, repr=False)
+    _seen_starts: set[datetime] = field(default_factory=set, repr=False)
 
     # ------------------------------------------------------------------
     # Public API
@@ -115,8 +116,9 @@ class PredictionTracker:
                 deduplication).
         """
         slot_start_key = _utc_key(slot_start)
-        if slot_start_key in self._recorded_starts:
+        if slot_start_key in self._seen_starts:
             return
+        self._seen_starts.add(slot_start_key)
 
         self._slots_seen += 1
 
@@ -210,4 +212,6 @@ class PredictionTracker:
         """Remove the oldest records when the buffer exceeds the max size."""
         while len(self.records) > self.max_records:
             removed = self.records.pop(0)
-            self._recorded_starts.discard(_utc_key(removed.slot_start))
+            removed_key = _utc_key(removed.slot_start)
+            self._recorded_starts.discard(removed_key)
+            self._seen_starts.discard(removed_key)

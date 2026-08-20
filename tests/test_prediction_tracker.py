@@ -131,6 +131,26 @@ class TestWarmupGate:
         assert len(tracker.records) == 1
         assert tracker.soc_mae_7d is not None
 
+    def test_repeated_warmup_slot_counts_once(self) -> None:
+        """Replaying one skipped slot cannot consume the whole warm-up gate."""
+        tracker = PredictionTracker(_warmup_slots=4)
+        first = _make_record_args(hour=0, minute=0)
+
+        for _ in range(10):
+            tracker.add_record(**first)
+
+        assert tracker._slots_seen == 1
+        assert len(tracker.records) == 0
+
+        for minute in (15, 30, 45):
+            tracker.add_record(**_make_record_args(hour=0, minute=minute))
+        assert tracker._slots_seen == 4
+        assert len(tracker.records) == 0
+
+        tracker.add_record(**_make_record_args(hour=1, minute=0))
+        assert tracker._slots_seen == 5
+        assert len(tracker.records) == 1
+
     def test_reset_warmup(self) -> None:
         """Resetting the warm-up counter restarts the gate."""
         tracker = PredictionTracker()
