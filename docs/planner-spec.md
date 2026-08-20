@@ -113,12 +113,15 @@ not restore a heuristic active-battery plan.
    PV-plus-battery export in that slot. Import and export may both be zero,
    but can never both be positive or form a hidden wash flow.
 3. With excess export enabled, material `bx[t]` activates an export-mode
-   binary. The battery SoC at the end of the following
-   demand window (immediately before the next forecast PV-surplus slot, or
-   horizon end) must then retain
+   binary. The battery SoC at the end of the following demand window must then
+   retain
    `hsem_batteries_excess_export_discharge_buffer`. The reserve is conditional:
    normal self-consumption may use it, and a planned cheap grid charge before
-   the checkpoint may restore it.
+   the checkpoint may restore it. Every slot in one contiguous forecast
+   PV-surplus run shares the checkpoint derived from the run's final slot:
+   immediately before the next distinct PV-surplus run, or horizon end. The
+   common checkpoint prevents the final PV-positive slot from receiving a
+   different reserve test solely because it ends the run.
 4. `force_export` is separate PV routing: it holds the primary battery at zero
    charge and zero discharge while exporting available PV. It is never evidence
    of battery discharge.
@@ -1324,10 +1327,20 @@ bounds** on the discharge variable `ed[t]` (implemented as variable bounds in
    bx[t] <= max_discharge_per_slot * z_export[t]
    ```
 
-   Let `checkpoint[t]` be the final demand slot before the next forecast
-   PV-surplus slot, or the horizon end when no later surplus exists. When the
-   binary is on, primary SoC at that checkpoint must retain the configured
-   percentage of usable capacity:
+   A forecast PV-surplus run is a maximal contiguous sequence whose
+   `pv_avail[t]` is materially positive. For a slot outside such a run, let
+   `checkpoint[t]` be the final demand slot before the next run, or horizon
+   end when no later run exists. For every slot in a run `[a, b]`, use the
+   checkpoint derived from its final slot for the whole run:
+
+   ```text
+   checkpoint[t] = checkpoint[b]  for every t in [a, b]
+   ```
+
+   That common checkpoint is the end of the demand window following the run:
+   immediately before the next distinct PV-surplus run, or horizon end for the
+   final run. When the binary is on, primary SoC at that checkpoint must retain
+   the configured percentage of usable capacity:
 
    ```text
    SoC[checkpoint[t]] >= buffer_kwh - usable_kwh * (1 - z_export[t])
@@ -1336,8 +1349,26 @@ bounds** on the discharge variable `ed[t]` (implemented as variable bounds in
 
    This protects forecast demand plus an error buffer without creating a hard
    minimum SoC for ordinary self-consumption. Because the condition checks the
-   solved SoC trajectory at the checkpoint, future grid or PV charging may
-   legitimately restore the buffer before it is measured.
+   solved SoC trajectory at the common checkpoint, future grid or PV charging
+   may legitimately restore the buffer before it is measured. Conversely, if
+   subsequent demand consumes the available energy and no economical refill
+   restores the buffer, grouping may suppress every battery-export slot in the
+   run; it does not promise to move an export to the run's highest-price slot.
+
+   Run grouping changes only the precomputed checkpoint array. It adds no MILP
+   variable, binary, bound, or constraint row. `no_export`, export-price floors,
+   the shared grid-export cap, hardware and dynamic SoC floors, ordinary local
+   self-consumption, direct PV export, and secondary-storage behaviour retain
+   their existing scope.
+
+   **Checkpoint invariants:**
+
+   - every slot in one contiguous PV-surplus run has the same checkpoint;
+   - that checkpoint follows the run's subsequent demand window, not merely
+     the run itself;
+   - every slot in the final PV-surplus run uses horizon end;
+   - a common checkpoint may move, spread, or suppress intentional export
+     according to the same full-horizon economics and physical limits.
 
 When either export block applies, `bx[t]` is zero. The local-discharge
 quantity `ed[t]-bx[t]` remains available within house load. Post-processing
