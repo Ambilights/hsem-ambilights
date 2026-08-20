@@ -5,18 +5,22 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from custom_components.hsem.models.daily_diff import DailyDiff
 from custom_components.hsem.models.daily_metrics import DailyMetrics
 from custom_components.hsem.models.daily_plan_vs_actual_tracker import (
+    ActualPriceInterval,
     DailyPlanVsActualTracker,
 )
 from custom_components.hsem.models.daily_record import DailyRecord
 from custom_components.hsem.models.day_rollover_result import DayRolloverResult
+
+_MAX_GAP_SECONDS = 600.0
 
 
 class TestDailyMetrics:
@@ -187,10 +191,10 @@ class TestDailyRecord:
 class TestDailyPlanVsActualTracker:
     """Tests for :class:`DailyPlanVsActualTracker`."""
 
-    def test_init_sets_today(self) -> None:
-        """Tracker sets today's date on initialisation."""
+    def test_init_waits_for_ha_local_date(self) -> None:
+        """Tracker does not infer a process-local calendar date."""
         tracker = DailyPlanVsActualTracker()
-        assert tracker.today == date.today().isoformat()
+        assert tracker.today == ""
 
     def test_accumulate_plan_adds_values(self) -> None:
         """accumulate_plan correctly sums values."""
@@ -220,24 +224,32 @@ class TestDailyPlanVsActualTracker:
 
     def test_unavailable_prices_keep_energy_but_not_fabricated_money(self) -> None:
         """Meter baselines advance while unpublished intervals stay unpriced."""
+        zone = ZoneInfo("Europe/Stockholm")
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=zone)
         tracker = DailyPlanVsActualTracker()
         tracker.accumulate_actual(
             grid_import_energy_kwh=100.0,
             grid_export_energy_kwh=50.0,
+            import_price_available=False,
+            export_price_available=False,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start,
         )
         tracker.accumulate_actual(
             grid_import_energy_kwh=105.0,
             grid_export_energy_kwh=52.0,
-            import_price=0.0,
-            export_price=0.0,
-            import_price_available=False,
-            export_price_available=False,
+            import_price=3.0,
+            export_price=2.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start + timedelta(minutes=5),
         )
         tracker.accumulate_actual(
             grid_import_energy_kwh=106.0,
             grid_export_energy_kwh=53.0,
             import_price=3.0,
             export_price=2.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start + timedelta(minutes=10),
         )
         tracker.accumulate_plan(
             grid_import_kwh=4.0,
@@ -257,25 +269,464 @@ class TestDailyPlanVsActualTracker:
         assert tracker.plan.grid_import_cost == 0.0
         assert tracker.plan.grid_export_rev == 0.0
 
+    def test_meter_delta_is_split_across_two_price_slots(self) -> None:
+        """A two-minute, 2 kWh delta prices one minute in each slot."""
+        zone = ZoneInfo("Europe/Stockholm")
+        tracker = DailyPlanVsActualTracker(today="2026-08-20")
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=100.0,
+            import_price=1.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=datetime(2026, 8, 20, 12, 14, tzinfo=zone),
+        )
+        intervals = (
+            ActualPriceInterval(
+                datetime(2026, 8, 20, 12, 0, tzinfo=zone),
+                datetime(2026, 8, 20, 12, 15, tzinfo=zone),
+                1.0,
+                0.0,
+            ),
+            ActualPriceInterval(
+                datetime(2026, 8, 20, 12, 15, tzinfo=zone),
+                datetime(2026, 8, 20, 12, 30, tzinfo=zone),
+                3.0,
+                0.0,
+            ),
+        )
+
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=102.0,
+            import_price=3.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=datetime(2026, 8, 20, 12, 16, tzinfo=zone),
+            price_intervals=intervals,
+        )
+
+        assert tracker.actual.grid_import_kwh == pytest.approx(2.0)
+        assert tracker.actual.grid_import_cost == pytest.approx(4.0)
+
+    @pytest.mark.asyncio
+    async def test_cross_midnight_delta_uses_prior_and_new_prices(self) -> None:
+        """Uncovered old-day energy keeps the prior sampled price authority."""
+        zone = ZoneInfo("Europe/Stockholm")
+        tracker = DailyPlanVsActualTracker(today="2026-08-20")
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=100.0,
+            import_price=1.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=datetime(2026, 8, 20, 23, 55, tzinfo=zone),
+        )
+        new_day_intervals = (
+            ActualPriceInterval(
+                datetime(2026, 8, 21, 0, 0, tzinfo=zone),
+                datetime(2026, 8, 21, 0, 15, tzinfo=zone),
+                3.0,
+                0.0,
+            ),
+        )
+
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=110.0,
+            import_price=3.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=datetime(2026, 8, 21, 0, 5, tzinfo=zone),
+            price_intervals=new_day_intervals,
+        )
+        rollover = await tracker.check_day_rollover(
+            datetime(2026, 8, 21, 0, 5, tzinfo=zone)
+        )
+
+        assert rollover is not None
+        assert rollover.record.actual.grid_import_kwh == pytest.approx(5.0)
+        assert rollover.record.actual.grid_import_cost == pytest.approx(5.0)
+        assert tracker.actual.grid_import_kwh == pytest.approx(5.0)
+        assert tracker.actual.grid_import_cost == pytest.approx(15.0)
+
+    @pytest.mark.asyncio
+    async def test_midnight_meter_reset_keeps_first_new_day_energy(self) -> None:
+        """A daily-meter reset seeds midnight at zero instead of losing 2 kWh."""
+        zone = ZoneInfo("Europe/Stockholm")
+        tracker = DailyPlanVsActualTracker(today="2026-08-20")
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=100.0,
+            import_price=1.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=datetime(2026, 8, 20, 23, 55, tzinfo=zone),
+        )
+        new_day_intervals = (
+            ActualPriceInterval(
+                datetime(2026, 8, 21, 0, 0, tzinfo=zone),
+                datetime(2026, 8, 21, 0, 15, tzinfo=zone),
+                3.0,
+                0.0,
+            ),
+        )
+
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=2.0,
+            import_price=3.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=datetime(2026, 8, 21, 0, 5, tzinfo=zone),
+            price_intervals=new_day_intervals,
+        )
+        rollover = await tracker.check_day_rollover(
+            datetime(2026, 8, 21, 0, 5, tzinfo=zone)
+        )
+
+        assert rollover is not None
+        assert rollover.record.actual.grid_import_kwh == pytest.approx(0.0)
+        assert tracker.actual.grid_import_kwh == pytest.approx(2.0)
+        assert tracker.actual.grid_import_cost == pytest.approx(6.0)
+        assert tracker._last_import_energy_kwh == pytest.approx(2.0)
+
+    def test_autumn_fold_prices_both_physical_minutes(self) -> None:
+        """The repeated 02:00 hour retains distinct UTC price intervals."""
+        zone = ZoneInfo("Europe/Stockholm")
+        tracker = DailyPlanVsActualTracker(today="2026-10-25")
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=100.0,
+            import_price=1.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=datetime(2026, 10, 25, 2, 59, tzinfo=zone, fold=0),
+        )
+        fold_intervals = (
+            ActualPriceInterval(
+                datetime(2026, 10, 25, 2, 45, tzinfo=zone, fold=0),
+                datetime(2026, 10, 25, 2, 0, tzinfo=zone, fold=1),
+                1.0,
+                0.0,
+            ),
+            ActualPriceInterval(
+                datetime(2026, 10, 25, 2, 0, tzinfo=zone, fold=1),
+                datetime(2026, 10, 25, 2, 15, tzinfo=zone, fold=1),
+                3.0,
+                0.0,
+            ),
+        )
+
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=102.0,
+            import_price=3.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=datetime(2026, 10, 25, 2, 1, tzinfo=zone, fold=1),
+            price_intervals=fold_intervals,
+        )
+
+        assert tracker.actual.grid_import_kwh == pytest.approx(2.0)
+        assert tracker.actual.grid_import_cost == pytest.approx(4.0)
+
+    def test_long_gap_rejected_then_short_interval_recovers(self) -> None:
+        """A stale interval is skipped and the next short sample resumes."""
+        zone = ZoneInfo("Europe/Stockholm")
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=zone)
+        tracker = DailyPlanVsActualTracker(today="2026-08-20")
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=100.0,
+            grid_export_energy_kwh=50.0,
+            pv_energy_kwh=20.0,
+            soc_pct=50.0,
+            rated_capacity_kwh=10.0,
+            import_price=1.0,
+            export_price=0.5,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start,
+        )
+
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=110.0,
+            grid_export_energy_kwh=55.0,
+            pv_energy_kwh=25.0,
+            soc_pct=60.0,
+            rated_capacity_kwh=10.0,
+            import_price=2.0,
+            export_price=1.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start + timedelta(hours=1),
+        )
+
+        assert tracker.actual == DailyMetrics()
+
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=111.0,
+            grid_export_energy_kwh=56.0,
+            pv_energy_kwh=26.0,
+            soc_pct=61.0,
+            rated_capacity_kwh=10.0,
+            import_price=2.0,
+            export_price=1.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start + timedelta(hours=1, minutes=5),
+        )
+
+        assert tracker.actual.grid_import_kwh == pytest.approx(1.0)
+        assert tracker.actual.grid_import_cost == pytest.approx(2.0)
+        assert tracker.actual.grid_export_kwh == pytest.approx(1.0)
+        assert tracker.actual.grid_export_rev == pytest.approx(1.0)
+        assert tracker.actual.pv_produced_kwh == pytest.approx(1.0)
+        assert tracker.actual.battery_cycled_kwh == pytest.approx(0.1)
+
+    def test_nonpositive_intervals_reject_but_advance_baselines(self) -> None:
+        """Equal and reversed instants cannot bridge into recovery."""
+        zone = ZoneInfo("Europe/Stockholm")
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=zone)
+        tracker = DailyPlanVsActualTracker(today="2026-08-20")
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=100.0,
+            soc_pct=50.0,
+            rated_capacity_kwh=10.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start,
+        )
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=101.0,
+            soc_pct=51.0,
+            rated_capacity_kwh=10.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start,
+        )
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=102.0,
+            soc_pct=52.0,
+            rated_capacity_kwh=10.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start - timedelta(minutes=5),
+        )
+
+        assert tracker.actual == DailyMetrics()
+
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=103.0,
+            soc_pct=53.0,
+            rated_capacity_kwh=10.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start,
+        )
+
+        assert tracker.actual.grid_import_kwh == pytest.approx(1.0)
+        assert tracker.actual.battery_cycled_kwh == pytest.approx(0.1)
+
+    @pytest.mark.parametrize(
+        "invalid",
+        [float("nan"), float("inf"), float("-inf")],
+        ids=["nan", "positive_inf", "negative_inf"],
+    )
+    def test_nonfinite_meter_sample_resets_then_recovers(self, invalid: float) -> None:
+        """Invalid meter telemetry cannot poison totals or bridge recovery."""
+        zone = ZoneInfo("Europe/Stockholm")
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=zone)
+        tracker = DailyPlanVsActualTracker(today="2026-08-20")
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=100.0,
+            grid_export_energy_kwh=50.0,
+            pv_energy_kwh=20.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start,
+        )
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=invalid,
+            grid_export_energy_kwh=invalid,
+            pv_energy_kwh=invalid,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start + timedelta(minutes=5),
+        )
+
+        assert tracker.actual == DailyMetrics()
+        assert tracker._last_import_energy_kwh is None
+        assert tracker._last_export_energy_kwh is None
+        assert tracker._last_pv_energy_kwh is None
+
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=102.0,
+            grid_export_energy_kwh=52.0,
+            pv_energy_kwh=22.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start + timedelta(minutes=10),
+        )
+        assert tracker.actual == DailyMetrics()
+
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=103.0,
+            grid_export_energy_kwh=53.0,
+            pv_energy_kwh=23.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start + timedelta(minutes=15),
+        )
+        assert tracker.actual.grid_import_kwh == pytest.approx(1.0)
+        assert tracker.actual.grid_export_kwh == pytest.approx(1.0)
+        assert tracker.actual.pv_produced_kwh == pytest.approx(1.0)
+
+    def test_nonfinite_prior_meter_sample_is_rejected(self) -> None:
+        """Legacy invalid baselines are replaced before deltas resume."""
+        zone = ZoneInfo("Europe/Stockholm")
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=zone)
+        tracker = DailyPlanVsActualTracker(today="2026-08-20")
+        tracker._last_import_energy_kwh = float("nan")
+        tracker._last_export_energy_kwh = float("inf")
+        tracker._last_pv_energy_kwh = float("-inf")
+        tracker._last_import_sample_at = start
+        tracker._last_export_sample_at = start
+        tracker._last_pv_sample_at = start
+
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=100.0,
+            grid_export_energy_kwh=50.0,
+            pv_energy_kwh=20.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start + timedelta(minutes=5),
+        )
+        assert tracker.actual == DailyMetrics()
+
+        tracker.accumulate_actual(
+            grid_import_energy_kwh=101.0,
+            grid_export_energy_kwh=51.0,
+            pv_energy_kwh=21.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start + timedelta(minutes=10),
+        )
+        assert tracker.actual.grid_import_kwh == pytest.approx(1.0)
+        assert tracker.actual.grid_export_kwh == pytest.approx(1.0)
+        assert tracker.actual.pv_produced_kwh == pytest.approx(1.0)
+
+    @pytest.mark.parametrize(
+        "invalid",
+        [float("nan"), float("inf"), float("-inf")],
+        ids=["nan", "positive_inf", "negative_inf"],
+    )
+    def test_nonfinite_soc_resets_then_recovers(self, invalid: float) -> None:
+        """Invalid SoC requires a fresh finite pair before cycling resumes."""
+        zone = ZoneInfo("Europe/Stockholm")
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=zone)
+        tracker = DailyPlanVsActualTracker(today="2026-08-20")
+        tracker.accumulate_actual(
+            soc_pct=50.0,
+            rated_capacity_kwh=10.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start,
+        )
+        tracker.accumulate_actual(
+            soc_pct=invalid,
+            rated_capacity_kwh=10.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start + timedelta(minutes=5),
+        )
+        assert tracker.last_soc_pct is None
+        assert tracker.actual.battery_cycled_kwh == 0.0
+
+        tracker.accumulate_actual(
+            soc_pct=55.0,
+            rated_capacity_kwh=10.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start + timedelta(minutes=10),
+        )
+        assert tracker.actual.battery_cycled_kwh == 0.0
+
+        tracker.accumulate_actual(
+            soc_pct=56.0,
+            rated_capacity_kwh=10.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start + timedelta(minutes=15),
+        )
+        assert tracker.actual.battery_cycled_kwh == pytest.approx(0.1)
+
+    @pytest.mark.parametrize(
+        "invalid_capacity",
+        [float("nan"), float("inf"), float("-inf")],
+        ids=["nan", "positive_inf", "negative_inf"],
+    )
+    def test_nonfinite_capacity_skips_only_its_interval(
+        self,
+        invalid_capacity: float,
+    ) -> None:
+        """Invalid capacity skips cycling while retaining the current SoC seed."""
+        zone = ZoneInfo("Europe/Stockholm")
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=zone)
+        tracker = DailyPlanVsActualTracker(today="2026-08-20")
+        tracker.accumulate_actual(
+            soc_pct=50.0,
+            rated_capacity_kwh=10.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start,
+        )
+        tracker.accumulate_actual(
+            soc_pct=55.0,
+            rated_capacity_kwh=invalid_capacity,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start + timedelta(minutes=5),
+        )
+        assert tracker.actual.battery_cycled_kwh == 0.0
+
+        tracker.accumulate_actual(
+            soc_pct=56.0,
+            rated_capacity_kwh=10.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start + timedelta(minutes=10),
+        )
+        assert tracker.actual.battery_cycled_kwh == pytest.approx(0.1)
+
+    def test_nonfinite_prior_soc_is_rejected(self) -> None:
+        """A legacy invalid SoC baseline is replaced before cycling resumes."""
+        zone = ZoneInfo("Europe/Stockholm")
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=zone)
+        tracker = DailyPlanVsActualTracker(today="2026-08-20")
+        tracker.last_soc_pct = float("inf")
+        tracker._last_soc_sample_at = start
+
+        tracker.accumulate_actual(
+            soc_pct=50.0,
+            rated_capacity_kwh=10.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start + timedelta(minutes=5),
+        )
+        assert tracker.actual.battery_cycled_kwh == 0.0
+
+        tracker.accumulate_actual(
+            soc_pct=51.0,
+            rated_capacity_kwh=10.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start + timedelta(minutes=10),
+        )
+        assert tracker.actual.battery_cycled_kwh == pytest.approx(0.1)
+
     def test_accumulate_actual_soc_tracking(self) -> None:
         """Battery cycle tracking uses SoC delta converted to kWh."""
+        zone = ZoneInfo("Europe/Stockholm")
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=zone)
         tracker = DailyPlanVsActualTracker()
-        tracker.accumulate_actual(soc_pct=50.0, rated_capacity_kwh=10.0)
+        tracker.accumulate_actual(
+            soc_pct=50.0,
+            rated_capacity_kwh=10.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start,
+        )
         assert tracker.last_soc_pct == pytest.approx(50.0)
-        # No delta yet — battery_cycled unchanged.
         assert tracker.actual.battery_cycled_kwh == pytest.approx(0.0)
 
-        tracker.accumulate_actual(soc_pct=55.0, rated_capacity_kwh=10.0)
+        tracker.accumulate_actual(
+            soc_pct=55.0,
+            rated_capacity_kwh=10.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start + timedelta(minutes=5),
+        )
         assert tracker.last_soc_pct == pytest.approx(55.0)
-        # Delta = |55 - 50| = 5 pct-points → 5 * 10 / 100 = 0.5 kWh
         assert tracker.actual.battery_cycled_kwh == pytest.approx(0.5)
 
     def test_accumulate_actual_soc_discharge(self) -> None:
         """SoC decrease is tracked as positive cycle kWh."""
+        zone = ZoneInfo("Europe/Stockholm")
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=zone)
         tracker = DailyPlanVsActualTracker()
-        tracker.accumulate_actual(soc_pct=50.0, rated_capacity_kwh=10.0)
-        tracker.accumulate_actual(soc_pct=45.0, rated_capacity_kwh=10.0)
-        # Delta = |45 - 50| = 5 pct-points → 0.5 kWh
+        tracker.accumulate_actual(
+            soc_pct=50.0,
+            rated_capacity_kwh=10.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start,
+        )
+        tracker.accumulate_actual(
+            soc_pct=45.0,
+            rated_capacity_kwh=10.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=start + timedelta(minutes=5),
+        )
         assert tracker.actual.battery_cycled_kwh == pytest.approx(0.5)
 
     @pytest.mark.asyncio
@@ -290,7 +741,11 @@ class TestDailyPlanVsActualTracker:
         """Day rollover returns a result and resets counters."""
         tracker = DailyPlanVsActualTracker(today="2026-06-01")
         tracker.accumulate_plan(grid_import_kwh=5.0, import_price=1.0)
-        tracker.accumulate_actual(soc_pct=50.0)
+        tracker.accumulate_actual(
+            soc_pct=50.0,
+            max_gap_seconds=_MAX_GAP_SECONDS,
+            now=datetime(2026, 6, 1, 23, 55, tzinfo=ZoneInfo("Europe/Stockholm")),
+        )
 
         result = await tracker.check_day_rollover(datetime(2026, 6, 2, 0, 5, 0))
         assert result is not None
@@ -301,33 +756,32 @@ class TestDailyPlanVsActualTracker:
         assert tracker.today == "2026-06-02"
         assert tracker.plan.grid_import_kwh == pytest.approx(0.0)
         assert tracker.actual.battery_cycled_kwh == pytest.approx(0.0)
-        assert tracker.last_soc_pct is None
+        assert tracker.last_soc_pct == pytest.approx(50.0)
 
         # History should contain the saved record.
         assert len(tracker.history) == 1
         assert tracker.history[0].date == "2026-06-01"
 
     def test_get_today_record(self) -> None:
-        """get_today_record returns current accumulator state."""
-        tracker = DailyPlanVsActualTracker()
+        """get_today_record uses the injected HA-local date."""
+        tracker = DailyPlanVsActualTracker(today="2026-06-02")
         tracker.accumulate_plan(grid_import_kwh=3.0, import_price=2.0)
         record = tracker.get_today_record()
-        assert record.date == date.today().isoformat()
+        assert record.date == "2026-06-02"
         assert record.plan.grid_import_kwh == pytest.approx(3.0)
         assert record.plan.grid_import_cost == pytest.approx(6.0)
 
     def test_get_yesterday_record(self) -> None:
-        """get_yesterday_record returns the exact yesterday record."""
-        yesterday = (date.today() - timedelta(days=1)).isoformat()
-        tracker = DailyPlanVsActualTracker()
+        """get_yesterday_record uses the injected HA-local date."""
+        tracker = DailyPlanVsActualTracker(today="2026-06-02")
         record = DailyRecord(
-            date=yesterday,
+            date="2026-06-01",
             actual=DailyMetrics(grid_import_kwh=10.0),
         )
         tracker.history = [record]
         result = tracker.get_yesterday_record()
         assert result is not None
-        assert result.date == yesterday
+        assert result.date == "2026-06-01"
 
     def test_get_yesterday_record_none_when_empty(self) -> None:
         """get_yesterday_record returns None when history is empty."""
@@ -337,10 +791,8 @@ class TestDailyPlanVsActualTracker:
 
     def test_get_yesterday_record_none_when_only_today(self) -> None:
         """get_yesterday_record returns None when history only has today."""
-        today_str = date.today().isoformat()
-        tracker = DailyPlanVsActualTracker()
-        today_record = DailyRecord(date=today_str)
-        tracker.history = [today_record]
+        tracker = DailyPlanVsActualTracker(today="2026-06-02")
+        tracker.history = [DailyRecord(date="2026-06-02")]
         record = tracker.get_yesterday_record()
         assert record is None
 
@@ -388,7 +840,11 @@ class TestDailyPlanVsActualTracker:
                 import_price=1.0,
                 export_price=0.5,
             )
-            tracker.accumulate_actual(soc_pct=60.0)
+            tracker.accumulate_actual(
+                soc_pct=60.0,
+                max_gap_seconds=_MAX_GAP_SECONDS,
+                now=datetime(2026, 6, 1, 23, 55, tzinfo=ZoneInfo("Europe/Stockholm")),
+            )
 
             # Simulate day rollover to save.
             tracker.today = "2026-06-01"

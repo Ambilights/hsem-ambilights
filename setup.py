@@ -2,7 +2,7 @@ from setuptools import find_namespace_packages, setup
 
 setup(
     name="hsem",
-    version="7.1.1",
+    version="7.1.2",
     description="Personal Home Assistant energy planner for Huawei and PowMr storage",
     packages=find_namespace_packages(include=["custom_components.*"]),
     include_package_data=True,

@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import tempfile
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -34,8 +35,7 @@ class SavingsTracker:
         daily: Per-day snapshots keyed by ISO date string.
         _today: ISO-format date string for the current day.
         _switch_was_off: Whether the master switch was off this cycle.
-        _last_export_rev: Snapshot of daily_tracker grid_export_rev for delta.
-        _last_import_cost: Snapshot of daily_tracker grid_import_cost for delta.
+        _last_charge_sample_at: Last physical charge-power sample timestamp.
     """
 
     max_history_days: int = 90
@@ -49,21 +49,16 @@ class SavingsTracker:
     # Daily snapshots keyed by ISO date string.
     daily: dict[str, SavingsDay] = field(default_factory=dict)
 
-    # Per-cycle state.
+    # Per-cycle state. The HA-local date is injected by check_day_rollover.
     _today: str = ""
     _switch_was_off: bool = False
-
-    # Delta tracking snapshots from the daily plan-vs-actual tracker.
-    _last_export_rev: float | None = field(default=None, repr=False)
-    _last_import_cost: float | None = field(default=None, repr=False)
+    _last_charge_sample_at: datetime | None = field(default=None, repr=False)
+    _last_charge_power_w: float | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
-        """Set today's date if not already set."""
-        if not self._today:
-            self._today = date.today().isoformat()
-        # Ensure today has a daily entry.
-        if self._today not in self.daily:
-            self.daily[self._today] = SavingsDay(date=self._today)
+        """Preserve an explicitly injected HA-local date."""
+        if self._today:
+            self.daily.setdefault(self._today, SavingsDay(date=self._today))
 
     # ------------------------------------------------------------------
     # Accumulation
@@ -75,19 +70,10 @@ class SavingsTracker:
         charge_savings_delta: float,
         baseline_cost_delta: float,
         switch_on: bool,
+        *,
+        day: str | None = None,
     ) -> None:
-        """Accumulate one cycle's worth of savings data.
-
-        Actual savings accumulate when *switch_on* is ``True``; missed
-        savings accumulate when *switch_on* is ``False``.  Baseline cost
-        accumulates regardless.
-
-        Args:
-            export_revenue_delta: Export revenue earned this cycle (currency).
-            charge_savings_delta: Money saved by charging cheap now vs later.
-            baseline_cost_delta: What passive mode would have cost this cycle.
-            switch_on: ``True`` when the master switch is on (auto mode).
-        """
+        """Accumulate one physical interval's savings into its local date."""
         savings = export_revenue_delta + charge_savings_delta
 
         if switch_on:
@@ -98,13 +84,60 @@ class SavingsTracker:
         self.baseline_cost += baseline_cost_delta
         self._switch_was_off = not switch_on
 
-        # Accumulate into today's daily entry.
-        today_entry = self.daily.setdefault(self._today, SavingsDay(date=self._today))
+        target_day = day if day is not None else self._today
+        day_entry = self.daily.setdefault(target_day, SavingsDay(date=target_day))
         if switch_on:
-            today_entry.actual_savings += savings
+            day_entry.actual_savings += savings
         else:
-            today_entry.missed_savings += savings
-        today_entry.baseline_cost += baseline_cost_delta
+            day_entry.missed_savings += savings
+        day_entry.baseline_cost += baseline_cost_delta
+
+    def sample_charge_interval(
+        self,
+        now: datetime,
+        battery_power_w: float | None,
+        *,
+        max_gap_seconds: float,
+    ) -> tuple[datetime, datetime, float] | None:
+        """Integrate the prior finite Huawei power sample to this instant.
+
+        Timestamp and power state advance on every call. If either endpoint
+        lacks finite telemetry, the interval is rejected so recovery cannot
+        integrate stale power across a gap. Intervals exceeding the caller's
+        cadence ceiling and equal instants never add energy.
+        """
+        previous_at = self._last_charge_sample_at
+        previous_power_w = self._last_charge_power_w
+        current_power_w = (
+            float(battery_power_w)
+            if battery_power_w is not None and math.isfinite(battery_power_w)
+            else None
+        )
+        self._last_charge_sample_at = now
+        self._last_charge_power_w = current_power_w
+        if (
+            previous_at is None
+            or previous_at.tzinfo is None
+            or now.tzinfo is None
+            or previous_power_w is None
+            or current_power_w is None
+            or previous_power_w <= 0
+        ):
+            return None
+
+        elapsed_seconds = (
+            now.astimezone(UTC) - previous_at.astimezone(UTC)
+        ).total_seconds()
+        if (
+            elapsed_seconds <= 0
+            or not math.isfinite(max_gap_seconds)
+            or max_gap_seconds <= 0
+            or elapsed_seconds > max_gap_seconds
+        ):
+            return None
+
+        charged_kwh = previous_power_w * elapsed_seconds / 3_600_000.0
+        return previous_at, now, charged_kwh
 
     # ------------------------------------------------------------------
     # Period rollup properties
@@ -149,8 +182,12 @@ class SavingsTracker:
         return self._sum_period(30, "missed_savings")
 
     def _sum_period(self, days: int, field: str) -> float:
-        """Sum *field* over the last *days* calendar days."""
-        cutoff = (date.today() - timedelta(days=days - 1)).isoformat()
+        """Sum *field* relative to the injected HA-local calendar date."""
+        if not self._today:
+            return 0.0
+        cutoff = (
+            date.fromisoformat(self._today) - timedelta(days=days - 1)
+        ).isoformat()
         total = 0.0
         for d_str, entry in sorted(self.daily.items()):
             if d_str >= cutoff:
@@ -162,24 +199,17 @@ class SavingsTracker:
     # ------------------------------------------------------------------
 
     def check_day_rollover(self, today_str: str) -> SavingsDay | None:
-        """Check if the calendar day has changed and handle rollover.
-
-        When the day changes, the previous day's entry is finalised and
-        a fresh entry is created for the new day.
-
-        Args:
-            today_str: ISO-format date string for the current day.
-
-        Returns:
-            The finalised :class:`SavingsDay` for the previous day, or
-            ``None`` if no rollover occurred.
-        """
+        """Select the injected HA-local day without overwriting saved data."""
+        if not self._today:
+            self._today = today_str
+            self.daily.setdefault(today_str, SavingsDay(date=today_str))
+            return None
         if today_str == self._today:
             return None
 
         previous_day = self.daily.get(self._today)
         self._today = today_str
-        self.daily[today_str] = SavingsDay(date=today_str)
+        self.daily.setdefault(today_str, SavingsDay(date=today_str))
         return previous_day
 
     # ------------------------------------------------------------------

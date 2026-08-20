@@ -31,7 +31,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -67,6 +67,7 @@ from custom_components.hsem.custom_sensors.state_collector import (  # noqa: F40
 )
 from custom_components.hsem.models.daily_metrics import DailyMetrics
 from custom_components.hsem.models.daily_plan_vs_actual_tracker import (
+    ActualPriceInterval,
     DailyPlanVsActualTracker,
 )
 from custom_components.hsem.models.data_quality import DataQuality
@@ -99,10 +100,7 @@ from custom_components.hsem.utils.datetime_utils import (
 )
 from custom_components.hsem.utils.degraded_mode import DegradedMode
 from custom_components.hsem.utils.dynamic_floor import DynamicDischargeFloor
-from custom_components.hsem.utils.forecast_tracker import (
-    ForecastTracker,
-    compute_accumulated_energy,
-)
+from custom_components.hsem.utils.forecast_tracker import ForecastTracker
 from custom_components.hsem.utils.ha_helpers import ha_get_entity_state_and_convert
 from custom_components.hsem.utils.inverter_verify import CycleApplySummary
 from custom_components.hsem.utils.logger import (
@@ -120,7 +118,7 @@ from custom_components.hsem.utils.prediction_tracker import (
     _action_label,
 )
 from custom_components.hsem.utils.price_forecast import build_price_forecast
-from custom_components.hsem.utils.recommendations import Recommendations
+from custom_components.hsem.utils.recommendations import CHARGE_RECS, Recommendations
 from custom_components.hsem.utils.solar_corrector import SolarForecastCorrector
 from custom_components.hsem.utils.units import (
     is_material_planned_energy_kwh,
@@ -833,13 +831,19 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._solar_corrector: SolarForecastCorrector = SolarForecastCorrector()
         # Set of slot start times already fed to the solar corrector.
         self._solar_corrector_processed: set[datetime] = set()
+        self._solar_corrector_processed_through: datetime | None = None
 
         # Forecast-vs-actual tracker (predicted-vs-actual tracking, issue #373).
         self._forecast_tracker: ForecastTracker = ForecastTracker(max_slots=2880)
+        self._last_pv_power_w: float | None = None
+        self._last_load_power_w: float | None = None
         # Prediction accuracy tracker — SoC/MAE/action-mix scorecard (issue #601).
         self._prediction_tracker: PredictionTracker = PredictionTracker(
             max_records=2880
         )
+        # Expired unfinalised slots restored after a restart cannot be paired
+        # with a later live SoC sample.
+        self._prediction_restore_excluded: set[datetime] = set()
         # Daily plan-vs-actual tracker (diagnostic sensor with 90-day history).
         # The history file path is set in async_setup() once hass.config is available.
         self._daily_tracker: DailyPlanVsActualTracker = DailyPlanVsActualTracker()
@@ -847,6 +851,8 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         # Savings tracker (actual vs missed savings with 90-day history).
         self._savings_tracker: SavingsTracker = SavingsTracker()
         self._savings_tracker_initialized: bool = False
+        # Slot snapshots that priced the preceding physical charge interval.
+        self._savings_price_slots: tuple[PlannedSlot, ...] = ()
         # Financial tracker — cumulative import cost and export income (never reset).
         # The history file path is set in async_setup() once hass.config is available.
         self._financial_tracker: FinancialTracker = FinancialTracker()
@@ -1974,7 +1980,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 # -----------------------------------------------------------------------
                 # Register forecasts in the forecast tracker from the planner output.
                 # -----------------------------------------------------------------------
-                self._register_forecasts_from_planner(planner_output)
+                self._register_forecasts_from_planner(planner_output, now)
 
                 # -----------------------------------------------------------------------
                 # Daily plan-vs-actual accumulation from planner output.
@@ -2894,59 +2900,119 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
     # ------------------------------------------------------------------
 
     def _accumulate_forecast_actuals(self, now: datetime, live: LiveState) -> None:
-        """Accumulate actual PV and load energy into the current slot.
+        """Accumulate measured energy and close eligible forecast baselines.
 
-        Called every coordinator cycle to accumulate energy from instantaneous
-        power readings.  Uses the elapsed time since the last accumulation to
-        convert power (W) to energy (kWh).
+        The prior power sample represents ``[previous_timestamp, now)``.  The
+        tracker splits that interval by physical UTC overlap, so a cycle that
+        crosses a slot boundary cannot assign all energy to the new slot.
 
         Args:
             now: Current time (timezone-aware).
             live: The live HA entity state snapshot.
         """
-        # Compute elapsed seconds since last accumulation.
-        if self._last_accumulation_ts is not None:
-            elapsed = (
-                utc_key(now) - utc_key(self._last_accumulation_ts)
-            ).total_seconds()
-        else:
-            elapsed = 0.0
+        now_key = utc_key(now)
 
+        if self._hourly_recommendations and (
+            self._forecast_tracker.reconcile_unfinalised_layout(
+                (
+                    (recommendation.start, recommendation.end)
+                    for recommendation in self._hourly_recommendations
+                ),
+                now=now,
+            )
+        ):
+            # A 15↔60-minute options change invalidates every in-flight/future
+            # baseline. Reset both endpoints so no prior-power interval bridges
+            # the layout boundary; finalised accuracy history remains intact.
+            self._last_accumulation_ts = None
+            self._last_pv_power_w = None
+            self._last_load_power_w = None
+            getattr(self, "_prediction_restore_excluded", set()).clear()
+
+        # This method runs before the planner.  Capture raw, future-only inputs
+        # now so the post-planner registration cannot mistake corrected or
+        # live-injected current-slot values for a pre-slot forecast.
+        self._pre_plan_forecast_baselines = {
+            utc_key(rec.start): (
+                float(rec.solcast_pv_estimate_kwh),
+                bool(rec.solcast_pv_estimate_available),
+            )
+            for rec in self._hourly_recommendations
+            if utc_key(rec.start) > now_key
+        }
+        self._solar_corrector.set_reference_time(now)
+        self._forecast_tracker.freeze_forecasts(now)
+
+        previous_ts = self._last_accumulation_ts
+        previous_pv_power_w = getattr(self, "_last_pv_power_w", None)
+        previous_load_power_w = getattr(self, "_last_load_power_w", None)
         self._last_accumulation_ts = now
-
-        if elapsed <= 0:
-            return
-
-        # Find the current slot's record.
-        if not self._hourly_recommendations:
-            return
-
-        # Find the slot whose time range contains 'now'.
-        current_slot = None
-        for rec in self._hourly_recommendations:
-            if slot_contains(rec.start, rec.end, now):
-                current_slot = rec
-                break
-
-        if current_slot is None:
-            return
-
-        # Get or create the tracker record for this slot.
-        tracker_rec = self._forecast_tracker.get_or_create_record(
-            current_slot.start, current_slot.end
+        pv_missing = any(
+            "solar_production_power" in item for item in live.missing_entities_list
+        )
+        load_missing = any(
+            "house_consumption_power" in item for item in live.missing_entities_list
+        )
+        pv_sample = None if pv_missing else live.solar_production_power_w
+        load_sample = None if load_missing else live.house_consumption_power_w
+        self._last_pv_power_w = (
+            float(pv_sample)
+            if pv_sample is not None and math.isfinite(float(pv_sample))
+            else None
+        )
+        self._last_load_power_w = (
+            float(load_sample)
+            if load_sample is not None and math.isfinite(float(load_sample))
+            else None
         )
 
-        # Accumulate PV energy.
-        pv_power_w = live.solar_production_power_w or 0.0
-        pv_energy = compute_accumulated_energy(pv_power_w, elapsed)
-        tracker_rec.accumulate_pv(pv_energy)
-
-        # Accumulate load energy.
-        load_power_w = live.house_consumption_power_w or 0.0
-        load_energy = compute_accumulated_energy(load_power_w, elapsed)
-        tracker_rec.accumulate_load(load_energy)
+        if (
+            previous_ts is not None
+            and previous_pv_power_w is not None
+            and previous_load_power_w is not None
+            and self._last_pv_power_w is not None
+            and self._last_load_power_w is not None
+        ):
+            elapsed_seconds = (now_key - utc_key(previous_ts)).total_seconds()
+            effective_interval = getattr(self, "_timer_interval", None)
+            if isinstance(effective_interval, timedelta):
+                cadence_seconds = effective_interval.total_seconds()
+            else:
+                cadence_seconds = float(self._cfg.update_interval) * 60.0
+            # Never let an invalid/zero override make every real sample stale.
+            # Two expected polls may be bridged; anything longer is rejected.
+            cadence_seconds = max(cadence_seconds, 60.0)
+            max_gap_seconds = 2.0 * cadence_seconds
+            assigned_seconds = self._forecast_tracker.accumulate_power_interval(
+                previous_ts,
+                now,
+                pv_power_w=previous_pv_power_w,
+                load_power_w=previous_load_power_w,
+                max_gap_seconds=max_gap_seconds,
+            )
+            if elapsed_seconds > max_gap_seconds:
+                async_log(
+                    "debug",
+                    "[forecast_tracker] rejected stale %.1fs power sample gap "
+                    "(limit %.1fs)",
+                    elapsed_seconds,
+                    max_gap_seconds,
+                )
+            elif assigned_seconds + 1.0 < max(elapsed_seconds, 0.0):
+                async_log(
+                    "debug",
+                    "[forecast_tracker] only %.1fs of %.1fs sample interval "
+                    "overlapped frozen records",
+                    assigned_seconds,
+                    elapsed_seconds,
+                )
 
         # Finalise any slots whose end time has passed.
+        newly_finalised_keys = {
+            utc_key(frec.start)
+            for frec in self._forecast_tracker.records
+            if not frec.finalised and utc_key(frec.end) <= now_key
+        }
         self._forecast_tracker.finalise_past_records(now)
 
         # -------------------------------------------------------------------
@@ -2959,63 +3025,132 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             if not frec.finalised:
                 continue
             processed_key = utc_key(frec.start)
-            if processed_key in self._solar_corrector_processed:
+            processed_through = getattr(
+                self, "_solar_corrector_processed_through", None
+            )
+            corrector_watermark = self._solar_corrector.processed_through
+            if isinstance(corrector_watermark, datetime) and (
+                processed_through is None
+                or utc_key(corrector_watermark) > utc_key(processed_through)
+            ):
+                processed_through = corrector_watermark
+                self._solar_corrector_processed_through = corrector_watermark
+            if processed_key in self._solar_corrector_processed or (
+                processed_through is not None
+                and processed_key <= utc_key(processed_through)
+            ):
                 continue
 
+            # Mark incomplete / legacy-live records processed without teaching
+            # the corrector, so they cannot repeatedly enter this loop.
+            if not frec.accuracy_eligible:
+                self._solar_corrector_processed.add(processed_key)
+                self._solar_corrector.mark_processed(processed_key)
+                if processed_through is None or processed_key > utc_key(
+                    processed_through
+                ):
+                    self._solar_corrector_processed_through = processed_key
+                continue
+
+            raw_pv_kwh = frec.raw_forecast_pv_kwh
+            assert raw_pv_kwh is not None
+
             self._solar_corrector.update_hour(
-                frec.start.hour, frec.forecast_pv_kwh, frec.actual_pv_kwh
+                frec.start.hour, raw_pv_kwh, frec.actual_pv_kwh
             )
             self._solar_corrector.update_residual(
                 frec.forecast_pv_kwh, frec.actual_pv_kwh
             )
             self._solar_corrector_processed.add(processed_key)
+            self._solar_corrector.mark_processed(processed_key)
+            if processed_through is None or processed_key > utc_key(processed_through):
+                self._solar_corrector_processed_through = processed_key
+
+        # The persisted UTC watermark carries long-term replay protection.
+        # Retain only keys still present in the tracker's bounded live buffer.
+        tracked_keys = {
+            utc_key(record.start) for record in self._forecast_tracker.records
+        }
+        self._solar_corrector_processed.intersection_update(tracked_keys)
 
         # -------------------------------------------------------------------
         # Prediction accuracy scorecard (issue #601)
         # -------------------------------------------------------------------
         # Feed completed slots into the prediction accuracy tracker so the
         # sensor can report SoC MAE, solar MAPE, and action mix.
-        if self._last_planner_output is not None:
-            for frec in self._forecast_tracker.records:
-                if not frec.finalised:
-                    continue
-                # Find the matching planner slot for this forecast record.
-                planner_slot = None
-                for slot in self._last_planner_output.slots:
-                    if utc_key(slot.start) == utc_key(frec.start):
-                        planner_slot = slot
-                        break
-                if planner_slot is None:
-                    continue
-                self._prediction_tracker.add_record(
-                    predicted_soc=planner_slot.estimated_battery_soc_pct,
-                    actual_soc=live.huawei_batteries_soc_pct or 0.0,
-                    predicted_pv=planner_slot.solcast_pv_estimate_kwh,
-                    actual_pv=frec.actual_pv_kwh,
-                    predicted_load=planner_slot.avg_house_consumption_kwh,
-                    actual_load=frec.actual_load_kwh,
-                    action=_action_label(planner_slot.recommendation),
-                    slot_start=frec.start,
-                )
+        actual_soc_sample = live.huawei_batteries_soc_pct
+        actual_soc = (
+            float(actual_soc_sample)
+            if actual_soc_sample is not None and math.isfinite(float(actual_soc_sample))
+            else None
+        )
+        prediction_restore_excluded: set[datetime] = getattr(
+            self, "_prediction_restore_excluded", set()
+        )
+        for frec in self._forecast_tracker.records:
+            processed_key = utc_key(frec.start)
+            if (
+                not frec.finalised
+                or not frec.prediction_eligible
+                or processed_key not in newly_finalised_keys
+                or processed_key in prediction_restore_excluded
+                or actual_soc is None
+            ):
+                continue
+            forecast_soc_pct = frec.forecast_soc_pct
+            forecast_action = frec.forecast_action
+            assert forecast_soc_pct is not None
+            assert forecast_action is not None
+            self._prediction_tracker.add_record(
+                predicted_soc=forecast_soc_pct,
+                actual_soc=actual_soc,
+                predicted_pv=frec.forecast_pv_kwh,
+                actual_pv=frec.actual_pv_kwh,
+                predicted_load=frec.forecast_load_kwh,
+                actual_load=frec.actual_load_kwh,
+                action=forecast_action,
+                slot_start=frec.start,
+            )
+        prediction_restore_excluded.difference_update(newly_finalised_keys)
 
-    def _register_forecasts_from_planner(self, output: PlannerOutput) -> None:
-        """Register PV and load forecasts from planner output into the tracker.
+    def _register_forecasts_from_planner(
+        self, output: PlannerOutput, now: datetime
+    ) -> None:
+        """Register future planner forecasts against raw pre-plan baselines.
 
-        This is called after the planner runs successfully.  Forecast values
-        are only set if the tracker record exists and is not yet finalised.
+        Replans may refresh a future baseline, but the tracker freezes the last
+        value observed before physical slot start.  Current/past planner values
+        are excluded because current-slot PV/load may have been live-injected.
 
         Args:
             output: The :class:`~planner.engine.PlannerOutput` returned by the
                 planner engine.
+            now: Current time at which the planner output was observed.
         """
+        now_key = utc_key(now)
+        baselines = getattr(self, "_pre_plan_forecast_baselines", {})
         for slot in output.slots:
+            slot_key_utc = utc_key(slot.start)
+            if slot_key_utc <= now_key:
+                continue
+            baseline = baselines.get(slot_key_utc)
+            if baseline is None:
+                continue
+            raw_pv_kwh, raw_pv_available = baseline
+            if not raw_pv_available:
+                continue
+
             pv_forecast = getattr(slot, "solcast_pv_estimate_kwh", 0.0)
             load_forecast = getattr(slot, "avg_house_consumption_kwh", 0.0)
-
+            self._forecast_tracker.get_or_create_record(slot.start, slot.end)
             self._forecast_tracker.set_forecasts(
                 start=slot.start,
                 pv_kwh=pv_forecast,
                 load_kwh=load_forecast,
+                raw_pv_kwh=raw_pv_kwh,
+                forecast_soc_pct=slot.estimated_battery_soc_pct,
+                forecast_action=_action_label(slot.recommendation),
+                observed_at=now,
             )
 
     # ------------------------------------------------------------------
@@ -3028,40 +3163,34 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         live: LiveState,
         output: PlannerOutput,
     ) -> None:
-        """Accumulate plan and actual values into the daily tracker.
+        """Accumulate measured and planned values on HA's local timeline.
 
-        Plan side: sum planned import/export/cycle/PV from planner slots
-        whose end time has passed.
-
-        Actual side: use cumulative energy meter readings from live state,
-        falling back to SoC-based cycle tracking when meters are unavailable.
-
-        Args:
-            now: Current datetime (timezone-aware).
-            live: Live HA entity state snapshot.
-            output: Planner output with slot-level decisions.
+        Actual cumulative-meter deltas are sampled before rollover so an
+        interval crossing midnight can be split between both dates. Plan slots
+        are then recorded against the newly selected local day.
         """
         await self._init_daily_tracker()
         tracker = self._daily_tracker
+        effective_interval = getattr(self, "_timer_interval", None)
+        if isinstance(effective_interval, timedelta):
+            cadence_seconds = effective_interval.total_seconds()
+        else:
+            cadence_seconds = float(self._cfg.update_interval) * 60.0
+        cadence_seconds = max(cadence_seconds, 60.0)
+        max_gap_seconds = 2.0 * cadence_seconds
 
-        # Check and handle day rollover first.
-        await tracker.check_day_rollover(now)
-
-        # ---- Plan accumulation ----
-        # Accumulate plan values for the current in-progress slot (and any
-        # completed slots that may have been missed).  The current slot's
-        # plan values are captured before the SoC simulation zeroes them
-        # on the next planner run.
-        self._daily_plan_last_accumulated = _accumulate_plan_for_slots(
-            tracker,
-            output.slots,
-            now,
-            self._daily_plan_last_accumulated,
+        price_intervals = tuple(
+            ActualPriceInterval(
+                start=slot.start,
+                end=slot.end,
+                import_price=slot.price.import_price,
+                export_price=slot.price.export_price,
+                import_price_available=slot.import_price_available,
+                export_price_available=slot.export_price_available,
+            )
+            for slot in output.slots
         )
 
-        # ---- Actual accumulation ----
-        # Use cumulative energy meter readings when available.
-        # Battery cycle tracking uses SoC delta converted to kWh via rated capacity.
         soc_pct = live.huawei_batteries_soc_pct
         rated_cap_kwh = (live.huawei_batteries_rated_capacity_wh or 0.0) / 1000.0
         tracker.accumulate_actual(
@@ -3074,6 +3203,22 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             export_price=live.export_electricity_price,
             import_price_available=live.import_electricity_price_available,
             export_price_available=live.export_electricity_price_available,
+            max_gap_seconds=max_gap_seconds,
+            now=now,
+            price_intervals=price_intervals,
+        )
+
+        rollover = await tracker.check_day_rollover(now)
+        if rollover is not None:
+            self._daily_plan_last_accumulated = None
+
+        # Capture the plan once when its slot starts, after any local-date
+        # rollover reset has selected the destination accumulator.
+        self._daily_plan_last_accumulated = _accumulate_plan_for_slots(
+            tracker,
+            output.slots,
+            now,
+            self._daily_plan_last_accumulated,
         )
 
     # ------------------------------------------------------------------
@@ -3165,89 +3310,185 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         live: LiveState,
         output: PlannerOutput,
     ) -> None:
-        """Accumulate savings data for the current cycle.
-
-        Computes export revenue delta, charge savings delta, and baseline
-        cost delta from the daily tracker and planner output.
-
-        Args:
-            now: Current datetime (timezone-aware).
-            live: Live HA entity state snapshot.
-            output: Planner output with slot-level decisions.
-        """
+        """Accumulate date-specific savings from measured interval deltas."""
         await self._init_savings_tracker()
         st = self._savings_tracker
         dt = self._daily_tracker
+        savings_rollover = st.check_day_rollover(now.date().isoformat())
+        effective_interval = getattr(self, "_timer_interval", None)
+        if isinstance(effective_interval, timedelta):
+            cadence_seconds = effective_interval.total_seconds()
+        else:
+            cadence_seconds = float(self._cfg.update_interval) * 60.0
+        cadence_seconds = max(cadence_seconds, 60.0)
+        max_gap_seconds = 2.0 * cadence_seconds
 
-        # Check day rollover first.
-        today_str = now.date().isoformat()
-        st.check_day_rollover(today_str)
+        prior_price_slots = getattr(self, "_savings_price_slots", ())
+        self._savings_price_slots = tuple(replace(slot) for slot in output.slots)
 
-        # ---- Compute per-cycle deltas from the daily tracker ----
-        current_export_rev = dt.actual.grid_export_rev
-        current_import_cost = dt.actual.grid_import_cost
-
-        export_rev_delta = 0.0
-        if st._last_export_rev is not None:
-            export_rev_delta = max(0.0, current_export_rev - st._last_export_rev)
-        st._last_export_rev = current_export_rev
-
-        import_cost_delta = 0.0
-        if st._last_import_cost is not None:
-            import_cost_delta = max(0.0, current_import_cost - st._last_import_cost)
-        st._last_import_cost = current_import_cost
-
-        # ---- Charge savings: money saved by charging cheap now ----
-        charge_savings_delta = 0.0
-        import_price = live.import_electricity_price
-
-        # Compute average daily import price from planner slots for today.
-        avg_import_price = self._compute_daily_avg_import_price(output)
-
-        # Check if the current recommendation is a charge action.
-        hourly_rec = self._hourly_recommendation
-        from custom_components.hsem.utils.recommendations import CHARGE_RECS
-
-        if (
-            hourly_rec is not None
-            and hourly_rec.recommendation in CHARGE_RECS
-            and hourly_rec.price_actionable
-            and hourly_rec.import_price_available
-            and live.import_electricity_price_available
-            and math.isfinite(import_price)
-            and import_price < avg_import_price
-            and avg_import_price > 0
-        ):
-            charge_kwh = hourly_rec.batteries_charged_kwh or 0.0
-            if abs(charge_kwh) > 1e-9:
-                charge_savings_delta = charge_kwh * (avg_import_price - import_price)
-
-        # ---- Baseline cost: what passive mode would cost this cycle ----
-        baseline_cost_delta = import_cost_delta
-
-        # ---- Determine if the master switch is on ----
-        switch_on = live.force_working_mode_state == "auto"
-
-        st.accumulate(
-            export_revenue_delta=export_rev_delta,
-            charge_savings_delta=charge_savings_delta,
-            baseline_cost_delta=baseline_cost_delta,
-            switch_on=switch_on,
+        charge_sample = st.sample_charge_interval(
+            now,
+            live.huawei_batteries_charge_discharge_power_w,
+            max_gap_seconds=max_gap_seconds,
+        )
+        charge_savings_by_date = self._compute_actual_charge_savings(
+            output,
+            charge_sample,
+            prior_slots=prior_price_slots,
         )
 
+        actual_by_date = dt.last_actual_delta_by_date
+        switch_on = live.force_working_mode_state == "auto"
+        all_dates = sorted(set(actual_by_date) | set(charge_savings_by_date))
+        for day_str in all_dates:
+            actual = actual_by_date.get(day_str, DailyMetrics())
+            st.accumulate(
+                export_revenue_delta=actual.grid_export_rev,
+                charge_savings_delta=charge_savings_by_date.get(day_str, 0.0),
+                baseline_cost_delta=actual.grid_import_cost,
+                switch_on=switch_on,
+                day=day_str,
+            )
+
+        # Consume this cycle's explicit deltas. If daily accumulation fails on
+        # a later coordinator cycle, savings cannot accidentally reuse them.
+        dt.last_actual_delta_by_date = {}
+        if savings_rollover is not None and st.history_file:
+            saved = await st.save_history()
+            if not saved:
+                async_log(
+                    "warning",
+                    "Failed to persist corrected savings rollover for %s",
+                    savings_rollover.date,
+                )
+
+    @classmethod
+    def _compute_actual_charge_savings(
+        cls,
+        output: PlannerOutput,
+        charge_sample: tuple[datetime, datetime, float] | None,
+        *,
+        prior_slots: Sequence[PlannedSlot] = (),
+    ) -> dict[str, float]:
+        """Value measured charge over prior/current UTC-de-duplicated slots."""
+        if charge_sample is None:
+            return {}
+        interval_start, interval_end, charged_kwh = charge_sample
+        start_utc = utc_key(interval_start)
+        end_utc = utc_key(interval_end)
+        total_seconds = (end_utc - start_utc).total_seconds()
+        if total_seconds <= 0 or charged_kwh <= 1e-9:
+            return {}
+
+        local_tz = interval_end.tzinfo
+        if local_tz is None:
+            return {}
+
+        prior_authority = tuple(prior_slots)
+        current_authority = tuple(output.slots)
+        boundaries = {start_utc, end_utc}
+        for slot in (*prior_authority, *current_authority):
+            overlap_start = max(start_utc, utc_key(slot.start))
+            overlap_end = min(end_utc, utc_key(slot.end))
+            if overlap_end > overlap_start:
+                boundaries.update((overlap_start, overlap_end))
+
+        ordered_boundaries = sorted(boundaries)
+        segments: list[
+            tuple[datetime, datetime, PlannedSlot, tuple[PlannedSlot, ...], bool]
+        ] = []
+        for segment_start, segment_end in zip(
+            ordered_boundaries, ordered_boundaries[1:], strict=False
+        ):
+            prior_slot = next(
+                (
+                    slot
+                    for slot in prior_authority
+                    if utc_key(slot.start) <= segment_start
+                    and utc_key(slot.end) >= segment_end
+                ),
+                None,
+            )
+            if prior_slot is not None:
+                segments.append(
+                    (segment_start, segment_end, prior_slot, prior_authority, True)
+                )
+                continue
+            current_slot = next(
+                (
+                    slot
+                    for slot in current_authority
+                    if utc_key(slot.start) <= segment_start
+                    and utc_key(slot.end) >= segment_end
+                ),
+                None,
+            )
+            if current_slot is not None:
+                segments.append(
+                    (
+                        segment_start,
+                        segment_end,
+                        current_slot,
+                        current_authority,
+                        False,
+                    )
+                )
+        daily_averages: dict[tuple[bool, date], float] = {}
+        savings_by_date: dict[str, float] = {}
+        for (
+            overlap_start,
+            overlap_end,
+            slot,
+            source_slots,
+            uses_prior,
+        ) in segments:
+            overlap_seconds = (overlap_end - overlap_start).total_seconds()
+            import_price = slot.price.import_price
+            if (
+                overlap_seconds <= 0
+                or slot.recommendation not in CHARGE_RECS
+                or not slot.price_actionable
+                or not slot.import_price_available
+                or not math.isfinite(import_price)
+            ):
+                continue
+
+            midpoint = overlap_start + (overlap_end - overlap_start) / 2
+            local_date = midpoint.astimezone(local_tz).date()
+            average_key = (uses_prior, local_date)
+            avg_import_price = daily_averages.setdefault(
+                average_key,
+                cls._compute_daily_avg_import_price(
+                    source_slots,
+                    local_date,
+                    interval_end,
+                ),
+            )
+            if avg_import_price <= 0 or import_price >= avg_import_price:
+                continue
+
+            energy_share = charged_kwh * overlap_seconds / total_seconds
+            day_str = local_date.isoformat()
+            savings_by_date[day_str] = savings_by_date.get(day_str, 0.0) + (
+                energy_share * (avg_import_price - import_price)
+            )
+        return savings_by_date
+
     @staticmethod
-    def _compute_daily_avg_import_price(output: PlannerOutput) -> float:
-        """Compute the average import price for today from planner slots."""
-        today_str = date.today().isoformat()
-        prices: list[float] = []
-        for slot in output.slots:
-            slot_date = slot.start.strftime("%Y-%m-%d")
-            p = slot.price.import_price
-            if slot_date == today_str and slot.price_actionable and math.isfinite(p):
-                prices.append(float(p))
-        if not prices:
-            return 0.0
-        return sum(prices) / len(prices)
+    def _compute_daily_avg_import_price(
+        slots: Sequence[PlannedSlot],
+        target_date: date,
+        reference: datetime,
+    ) -> float:
+        """Compute a published-price mean for one injected HA-local date."""
+        prices = [
+            float(slot.price.import_price)
+            for slot in slots
+            if slot.start.astimezone(reference.tzinfo).date() == target_date
+            and slot.import_price_available
+            and math.isfinite(slot.price.import_price)
+        ]
+        return sum(prices) / len(prices) if prices else 0.0
 
     async def _init_savings_tracker(self) -> None:
         """Lazily initialise the savings tracker."""
@@ -3304,42 +3545,30 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             self._daily_tracker_initialized = True  # don't retry
 
     async def _async_handle_midnight(self, _now: datetime) -> None:
-        """Handle the midnight timer — persist the day's record and reset.
+        """Persist a provisional old-day snapshot without resetting baselines.
 
-        This is called by the HA time-change listener at 00:00:00 local time.
-        Saves yesterday's record, resets accumulators, and updates today's date
-        so the next update cycle does not double-save.
-
-        Args:
-            _now: The datetime at which the timer fired (unused).
+        The first post-midnight cumulative-meter sample is needed to split the
+        final physical interval across local midnight. The normal coordinator
+        cycle performs the final rollover and idempotently replaces this
+        crash-safe provisional record.
         """
         tracker = self._daily_tracker
-        if tracker.history_file:
-            today_record = tracker._build_today_record()
-            saved = await tracker._save_record_to_history(today_record)
+        new_day = _now.date().isoformat()
+        if tracker.history_file and tracker.today and tracker.today != new_day:
+            prior_record = tracker._build_today_record()
+            saved = await tracker._save_record_to_history(prior_record)
             if saved:
                 async_log(
                     "info",
-                    "Daily plan-vs-actual record saved for %s",
+                    "Provisional daily plan-vs-actual record saved for %s",
                     tracker.today,
                 )
             else:
                 async_log(
                     "warning",
-                    "Failed to save daily plan-vs-actual record for %s",
+                    "Failed to save provisional daily record for %s",
                     tracker.today,
                 )
-
-            # Reset accumulators for the new day so check_day_rollover()
-            # does not double-save on the next cycle.
-            tracker.today = _now.date().isoformat()
-            tracker.actual = DailyMetrics()
-            tracker.plan = DailyMetrics()
-            tracker.last_soc_pct = None
-            tracker._last_import_energy_kwh = None
-            tracker._last_export_energy_kwh = None
-            tracker._last_pv_energy_kwh = None
-            self._daily_plan_last_accumulated = None
 
         # Persist the financial tracker at midnight so daily log survives
         # HA restarts.
@@ -3384,59 +3613,63 @@ def _accumulate_plan_for_slots(
     now: datetime,
     last_accumulated: datetime | None,
 ) -> datetime | None:
-    """Accumulate plan values for the current in-progress slot.
+    """Accumulate each plan interval once on the physical UTC timeline.
 
-    Accumulates the FULL plan value for each slot exactly once, on the
-    first cycle where the slot is the current in-progress slot
-    (``start <= now < end``).  This captures the plan as it was when
-    the slot started, before the SoC simulation zeroes the plan fields
-    for past slots on subsequent planner runs.
+    The marker is the end of plan coverage already booked. On an ordinary
+    cadence, the current slot is captured in full at its first observation.
+    If a live 15/60-minute cadence change creates an overlapping layout, only
+    the still-uncovered fraction is added; an already-covered old interval is
+    never counted twice.
 
-    Completed past slots are also handled as a safety net for slots
-    that may become past between cycles (e.g. after a coordinator
-    restart).
+    Completed past slots are a safety net for coordinator gaps. They are
+    ignored on the first cycle so stale, zeroed startup slots cannot inflate
+    the plan.
 
     Returns:
-        The accumulation marker (start of the current slot if it was
-        just accumulated, or the last_accumulated value unchanged).
+        The physical end of accumulated plan coverage.
     """
+    coverage_end = last_accumulated
+    now_key = utc_key(now)
+
     for slot in slots:
         slot_start = as_tz(slot.start, now.tzinfo) if hasattr(slot, "start") else None
         slot_end = as_tz(slot.end, now.tzinfo) if hasattr(slot, "end") else None
+        if slot_start is None or slot_end is None:
+            continue
 
-        # Current in-progress slot: accumulate full plan on first encounter.
-        if (
-            slot_start is not None
-            and slot_end is not None
-            and slot_contains(slot_start, slot_end, now)
-        ):
-            if last_accumulated is None or utc_key(last_accumulated) < utc_key(
-                slot_start
-            ):
-                _add_slot_to_tracker(tracker, slot, fraction=1.0)
-                return slot_start  # Mark this slot as accumulated
-            return last_accumulated  # Already accumulated this slot
+        slot_start_key = utc_key(slot_start)
+        slot_end_key = utc_key(slot_end)
+        duration_seconds = (slot_end_key - slot_start_key).total_seconds()
+        if duration_seconds <= 0:
+            continue
 
-        # Safety net: completed past slots that may not have been
-        # accumulated yet.  Only active after the first cycle (when
-        # last_accumulated is not None) to avoid inflating plan values
-        # with stale zeroed fields from past slots on startup.
-        if (
-            last_accumulated is not None
-            and slot_end is not None
-            and utc_key(slot_end) <= utc_key(now)
-        ):
-            # Use slot_start in the skip-check because last_accumulated
-            # is now a slot-start marker (set by the current-slot branch).
-            if slot_start is not None and utc_key(slot_start) <= utc_key(
-                last_accumulated
-            ):
-                continue
-            _add_slot_to_tracker(tracker, slot, fraction=1.0)
+        is_current = slot_contains(slot_start, slot_end, now)
+        is_completed = slot_end_key <= now_key
+        if not is_current and not is_completed:
+            continue
+        if not is_current and coverage_end is None:
+            continue
 
-    # If no current slot was found, return the end of the last completed
-    # slot as the marker (prevents re-accumulation of past slots).
-    return _last_completed_slot_end(slots, now) or last_accumulated
+        uncovered_start = slot_start_key
+        if coverage_end is not None:
+            uncovered_start = max(uncovered_start, utc_key(coverage_end))
+        if uncovered_start >= slot_end_key:
+            if is_current:
+                return coverage_end
+            continue
+
+        uncovered_seconds = (slot_end_key - uncovered_start).total_seconds()
+        _add_slot_to_tracker(
+            tracker,
+            slot,
+            fraction=uncovered_seconds / duration_seconds,
+        )
+        coverage_end = slot_end
+        if is_current:
+            return coverage_end
+
+    # Preserve the old startup safety marker when no current slot exists.
+    return coverage_end or _last_completed_slot_end(slots, now)
 
 
 def _add_slot_to_tracker(

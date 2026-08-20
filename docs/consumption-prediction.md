@@ -19,7 +19,8 @@ imports; under-prediction leads to insufficient battery charging for peak hours.
 HSEM supports two prediction modes, toggled via ``hsem_ml_consumption_enabled``:
 
 - **Legacy** (default): Four-window weighted average using HSEM custom sensors
-- **ML** (new): Ridge regression on recorder history with DOW + seasonality + temperature
+- **ML** (optional): Ridge regression on recorder history with local-calendar
+  features, seasonality, and optional outdoor temperature
 
 ---
 
@@ -27,6 +28,27 @@ HSEM supports two prediction modes, toggled via ``hsem_ml_consumption_enabled``:
 
 When enabled, the ML predictor queries the HA recorder directly for historical
 energy data from the configured energy sensor.  No custom sensor entities are required.
+
+### Calendar features and physical slot identity
+
+Recorder timestamps are UTC instants. HSEM converts every aware timestamp to
+Home Assistant's configured timezone at the recorder boundary, then derives
+day-of-week, day-of-year, local date, and wall-clock slot features from that
+local value. Ordering, elapsed age, adjacency, and dictionary identity remain
+UTC-based physical instants.
+
+This separation is required at daylight-saving transitions. At 15-minute
+resolution a complete local civil day contains 92, 96, or 100 physical slots.
+Both occurrences of an autumn repeated hour remain distinct observations even
+though they intentionally share the same wall-clock model feature. A spring
+gap has no fabricated observations.
+
+For cumulative energy sensors, HSEM keeps the last reading in each physical
+slot. The delta from the previous slot's last reading to the current slot's
+last reading is energy consumed in the **current** slot and is labelled with
+that slot. Only adjacent physical slots are paired; recorder gaps, accumulator
+resets, non-positive deltas, and implausibly large deltas are rejected instead
+of being shifted or concentrated into another slot.
 
 ### Model formulation
 
@@ -58,13 +80,13 @@ For 15-minute slots ($S = 96$):
 
 | Index range | Count | Feature | Description |
 |---|---|---|---|
-| $0 \ldots 6S-1$ | 672 | one-hot $(\text{DOW}, \text{slot})$ | Day-of-week × 15-min slot |
-| $6S$, $6S+1$ | 2 | $\sin(\text{DOY}), \cos(\text{DOY})$ | Day-of-year seasonality |
-| $6S+2$ | 1 | $T$ | Outdoor temperature (°C), optional |
-| $6S+3$ | 1 | $E_{t-1}$ | Previous slot energy (sequential mode only) |
+| $0 \ldots 7S-1$ | 672 | one-hot $(\text{DOW}, \text{slot})$ | Day-of-week × 15-min wall slot |
+| $7S$, $7S+1$ | 2 | $\sin(\text{DOY}), \cos(\text{DOY})$ | Day-of-year seasonality |
+| $7S+2$ | 1 | $T$ | Outdoor temperature (°C), optional |
+| $7S+2$ without temperature; $7S+3$ with it | 1 | $E_{t-1}$ | Previous slot energy (sequential mode only) |
 
-Total: 674 (without temperature + sequential), 675 (with temperature),
-676 (with both).
+Total: 674 without either optional feature, 675 with temperature or sequential
+mode, and 676 with both.
 
 ### Prediction (independent mode)
 
@@ -96,14 +118,25 @@ $$
 where $f(\cdot)$ is the prediction function above and $E_{-1} = 0$.
 This captures intra-day momentum — a cooking spike at 08:00 naturally
 elevates 08:15's prediction.
+Sequential training resets the lag whenever two samples are not adjacent in
+physical UTC time. Inference follows the real recommendation instants in
+physical UTC order, skipping nonexistent spring wall slots and preserving both
+autumn folds without inventing a synthetic 96-slot civil day.
+
 
 ### Fitting
 
-The normal equation is solved via Cholesky decomposition
-(``numpy.linalg.solve``).  For $k \leq 676$, this takes ~40 ms.
-A retrain gate skips the solve when fewer than 4 new samples have arrived
-since the last fit.  The predictor instance is cached on the coordinator
-across cycles.
+Fitting is two-stage. Time-decay weighted `(day-of-week, slot)` group means are
+first shrunk toward the same wall slot's all-weekday mean. Weighted ridge
+regression then fits seasonality and any enabled temperature or lag feature to
+the remaining residual. This preserves the slot profile when individual
+weekday groups are sparse.
+
+A retrain gate compares valid sample fingerprints rather than only the rolling
+sample count. The matrix solve runs after at least four unseen or revised
+fingerprints, so corrected recent readings retrain the model even if the window
+count stays constant. The fit runs in Home Assistant's executor pool so it does
+not block the event loop.
 
 ### Adaptive safety buffer
 
@@ -131,16 +164,49 @@ and $\sigma$ shrinks, the buffer converges to zero automatically.
 
 ### Today's actuals
 
-For slots that have already passed today, the predictor uses actual meter
-readings from the energy sensor instead of predictions.  This anchors
-the battery SoC simulation to reality.
+For completed slots on the current Home Assistant-local date, the predictor
+uses actual meter deltas instead of predictions. The query starts one physical
+slot before local midnight so the first slot retains its left accumulator
+boundary. Actuals are keyed by canonical UTC slot start, so both folds of an
+autumn repeated hour survive independently and an in-progress slot is never
+treated as complete.
+
+When net-consumption mode is enabled, import and export actuals are joined only
+when both meters contain the same physical slot. A missing export observation
+is unknown, not zero.
+
+### Recorder caches and fail-safe fallback
+
+- The configured history minimum defaults to 14 physical days; recorder reads
+  are capped at 90 days.
+- Processed history is cached for one physical hour. The cache key includes
+  the Home Assistant instance, import and export entities, net/gross mode,
+  slot cadence, and required history span. Temperature history has its own
+  source-keyed cache.
+- Changing a source, cadence, history requirement, net/gross mode, temperature
+  availability, or sequential setting replaces the predictor. Coefficients
+  from one configuration cannot pass the new-context retrain gate.
+- Net mode requires an export entity and uses the physical intersection of
+  import and export history. If either source is unavailable or the aligned
+  result no longer spans the required history, HSEM falls back to legacy mode.
+- A configured temperature feature is used only when enough temperature
+  history exists. Training matches physical timestamps; inference uses the
+  newest nearby observed temperature and holds it across the horizon because
+  this input is not a future weather forecast. If history is insufficient,
+  HSEM fits without temperature.
+- If history cannot train a model, HSEM reports ML population failure and the
+  coordinator uses the legacy averages. It never publishes an all-zero load
+  horizon from an untrained predictor.
 
 ### Advantages over legacy mode
 
 - **15-min resolution**: matches Nord Pool spot market
 - **Day-of-week awareness**: Monday ≠ Saturday
 - **Seasonality**: winter mornings get higher predictions than summer
-- **Temperature**: cold/hot outdoor temps → higher heating/cooling load
+- **Temperature**: optional observed outdoor temperature can explain
+  weather-driven load
+- **DST-safe identity**: repeated-hour observations and cache age use physical
+  UTC time while model calendars remain local
 - **No custom sensors**: reads directly from recorder database
 
 ---
@@ -289,11 +355,15 @@ Weights are normalised after scaling so they still sum to the original total.
 2. **Minimum history**: Requires at least 14 days of recorder history for the
    energy sensor.  Falls back to legacy mode below this threshold.
 
-3. **Single energy source**: The model predicts from one energy accumulator.
-   It cannot combine signals from multiple meters (e.g. import + solar).
+3. **Meter topology**: The model starts from one configured accumulator. Net
+   mode can subtract a physically aligned export accumulator, but it cannot
+   reconstruct behind-the-meter loads that neither source measures.
 
 4. **No external events**: Holidays, parties, or unusual appliance usage are
    not explicitly modeled — they appear as unexplained variance.
+
+5. **No future weather feed**: Temperature inference holds the latest observed
+   value across the horizon; it does not forecast a temperature change.
 
 ### Legacy mode limitations
 
@@ -323,7 +393,8 @@ Weights are normalised after scaling so they still sum to the original total.
 The ML mode (ridge regression) addresses several legacy limitations and is the
 forward path.  Remaining improvements include:
 
-- **Prediction-vs-actual diagnostics**: Rolling MAE to measure model accuracy
+- **Future weather input**: Replace held observed temperature with an
+  authoritative forecast when one is available
 - **Multi-modal decomposition**: Separate models for weather-driven, EV-driven,
   and baseline load
 - **Configurable alpha and decay**: Expose regularization and time-decay as

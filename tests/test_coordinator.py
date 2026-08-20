@@ -40,6 +40,7 @@ import pytest
 from custom_components.hsem.coordinator import (
     CoordinatorData,
     HSEMDataUpdateCoordinator,
+    _accumulate_plan_for_slots,
     _apply_current_price_outage_hold,
     _apply_live_current_price_availability,
     _auto_full_negative_price_allowed,
@@ -54,18 +55,97 @@ from custom_components.hsem.coordinator_builder import generate_recommendation_i
 from custom_components.hsem.custom_sensors.hourly_data_populator.prices_solcast import (
     populate_price_and_solcast_from_snapshot,
 )
+from custom_components.hsem.models.daily_plan_vs_actual_tracker import (
+    DailyPlanVsActualTracker,
+)
 from custom_components.hsem.models.live_state import LiveState
 from custom_components.hsem.models.plan_explanation import PlanExplanation
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.planner_output import PlannerOutput
 from custom_components.hsem.models.sensor_config import SensorConfig
 from custom_components.hsem.models.state_snapshot import StateSnapshot
+from custom_components.hsem.utils.forecast_tracker import ForecastTracker
 from custom_components.hsem.utils.inverter_verify import CycleApplySummary
 from custom_components.hsem.utils.recommendations import Recommendations
+from custom_components.hsem.utils.solar_corrector import SolarForecastCorrector
 
 # ---------------------------------------------------------------------------
 # Helper: build a bare coordinator instance without calling __init__
 # ---------------------------------------------------------------------------
+
+
+class TestDailyPlanCadenceCoverage:
+    """Plan accounting remains physical when live slot cadence changes."""
+
+    @staticmethod
+    def _slot(start: datetime, minutes: int, grid_import_kwh: float) -> PlannedSlot:
+        return PlannedSlot(
+            start=start,
+            end=start + timedelta(minutes=minutes),
+            grid_import_kwh=grid_import_kwh,
+        )
+
+    def test_fifteen_to_sixty_adds_only_uncovered_hour_fraction(self) -> None:
+        zone = ZoneInfo("Europe/Stockholm")
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=zone)
+        tracker = DailyPlanVsActualTracker(today="2026-08-20")
+
+        marker = _accumulate_plan_for_slots(
+            tracker,
+            [self._slot(start, 15, 1.0)],
+            start + timedelta(minutes=5),
+            None,
+        )
+        assert marker == start + timedelta(minutes=15)
+        assert tracker.plan.grid_import_kwh == pytest.approx(1.0)
+
+        marker = _accumulate_plan_for_slots(
+            tracker,
+            [self._slot(start, 60, 4.0)],
+            start + timedelta(minutes=10),
+            marker,
+        )
+        assert marker == start + timedelta(minutes=60)
+        assert tracker.plan.grid_import_kwh == pytest.approx(4.0)
+
+        _accumulate_plan_for_slots(
+            tracker,
+            [self._slot(start, 60, 4.0)],
+            start + timedelta(minutes=12),
+            marker,
+        )
+        assert tracker.plan.grid_import_kwh == pytest.approx(4.0)
+
+    def test_sixty_to_fifteen_never_rebooks_covered_quarters(self) -> None:
+        zone = ZoneInfo("Europe/Stockholm")
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=zone)
+        tracker = DailyPlanVsActualTracker(today="2026-08-20")
+
+        marker = _accumulate_plan_for_slots(
+            tracker,
+            [self._slot(start, 60, 4.0)],
+            start + timedelta(minutes=5),
+            None,
+        )
+        assert marker == start + timedelta(minutes=60)
+
+        first_quarter = self._slot(start, 15, 1.0)
+        marker = _accumulate_plan_for_slots(
+            tracker,
+            [first_quarter],
+            start + timedelta(minutes=10),
+            marker,
+        )
+        second_quarter = self._slot(start + timedelta(minutes=15), 15, 1.0)
+        marker = _accumulate_plan_for_slots(
+            tracker,
+            [first_quarter, second_quarter],
+            start + timedelta(minutes=20),
+            marker,
+        )
+
+        assert marker == start + timedelta(minutes=60)
+        assert tracker.plan.grid_import_kwh == pytest.approx(4.0)
 
 
 class TestAutoFullPriceAuthority:
@@ -1911,3 +1991,583 @@ class TestCoordinatorDataExposure:
         """coordinator.data must be None before async_setup is called."""
         coord = _make_bare_coordinator()
         assert coord.data is None
+
+
+class TestForecastBaselineRegistration:
+    """Coordinator registration keeps only pre-slot raw/corrected forecasts."""
+
+    def test_replan_updates_future_then_current_live_values_are_ignored(self) -> None:
+        coordinator = _make_bare_coordinator()
+        coordinator._forecast_tracker = ForecastTracker()
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=UTC)
+        end = start + timedelta(minutes=15)
+        slot = PlannedSlot(start=start, end=end)
+        output = PlannerOutput(slots=[slot])
+
+        coordinator._pre_plan_forecast_baselines = {
+            start: (5.0, True),
+        }
+        slot.solcast_pv_estimate_kwh = 4.0
+        slot.avg_house_consumption_kwh = 2.0
+        slot.estimated_battery_soc_pct = 80.0
+        slot.recommendation = Recommendations.BatteriesChargeGrid.value
+        coordinator._register_forecasts_from_planner(
+            output,
+            datetime(2026, 8, 20, 9, 0, tzinfo=UTC),
+        )
+
+        coordinator._pre_plan_forecast_baselines = {
+            start: (4.5, True),
+        }
+        slot.solcast_pv_estimate_kwh = 3.0
+        slot.avg_house_consumption_kwh = 1.5
+        slot.estimated_battery_soc_pct = 65.0
+        slot.recommendation = Recommendations.BatteriesDischargeMode.value
+        coordinator._register_forecasts_from_planner(
+            output,
+            datetime(2026, 8, 20, 9, 30, tzinfo=UTC),
+        )
+
+        rec = coordinator._forecast_tracker.find_record(start)
+        assert rec is not None
+        assert rec.forecast_pv_kwh == pytest.approx(3.0)
+        assert rec.raw_forecast_pv_kwh == pytest.approx(4.5)
+        assert rec.forecast_load_kwh == pytest.approx(1.5)
+        assert rec.forecast_soc_pct == pytest.approx(65.0)
+        assert rec.forecast_action == "discharge"
+        assert rec.forecast_frozen is False
+
+        assert coordinator._forecast_tracker.freeze_forecasts(start) == 1
+        coordinator._pre_plan_forecast_baselines = {
+            start: (99.0, True),
+        }
+        slot.solcast_pv_estimate_kwh = 99.0
+        slot.avg_house_consumption_kwh = 99.0
+        slot.estimated_battery_soc_pct = 99.0
+        slot.recommendation = Recommendations.BatteriesWaitMode.value
+        coordinator._register_forecasts_from_planner(
+            output,
+            start + timedelta(seconds=5),
+        )
+
+        assert rec.forecast_pv_kwh == pytest.approx(3.0)
+        assert rec.raw_forecast_pv_kwh == pytest.approx(4.5)
+        assert rec.forecast_load_kwh == pytest.approx(1.5)
+        assert rec.forecast_soc_pct == pytest.approx(65.0)
+        assert rec.forecast_action == "discharge"
+        assert rec.forecast_frozen is True
+
+        # Complete the slot and prove PredictionTracker receives the frozen
+        # pre-slot SoC/action, not the post-start planner values above.
+        rec.actual_pv_kwh = 0.75
+        rec.actual_load_kwh = 1.25
+        rec.actual_coverage_seconds = 900.0
+        coordinator._solar_corrector = MagicMock()
+        coordinator._solar_corrector_processed = {start}
+        coordinator._prediction_tracker = MagicMock()
+        coordinator._hourly_recommendations = []
+        coordinator._last_accumulation_ts = None
+        coordinator._last_planner_output = output
+        live = LiveState()
+        live.huawei_batteries_soc_pct = 70.0
+
+        coordinator._accumulate_forecast_actuals(end + timedelta(seconds=1), live)
+
+        call_kwargs = coordinator._prediction_tracker.add_record.call_args.kwargs
+        assert call_kwargs["predicted_soc"] == pytest.approx(65.0)
+        assert call_kwargs["predicted_pv"] == pytest.approx(3.0)
+        assert call_kwargs["predicted_load"] == pytest.approx(1.5)
+        assert call_kwargs["action"] == "discharge"
+
+        coordinator._accumulate_forecast_actuals(end + timedelta(minutes=5), live)
+        coordinator._prediction_tracker.add_record.assert_called_once()
+
+    def test_legacy_restored_record_does_not_train_solar_corrector(self) -> None:
+        coordinator = _make_bare_coordinator()
+        coordinator._forecast_tracker = ForecastTracker()
+        start = datetime(2026, 8, 20, 9, 0, tzinfo=UTC)
+        end = start + timedelta(minutes=15)
+        coordinator._forecast_tracker.load_from_dict(
+            {
+                "records": [
+                    {
+                        "start": start.isoformat(),
+                        "end": end.isoformat(),
+                        "forecast_pv_kwh": 9.0,
+                        "forecast_load_kwh": 7.0,
+                        "actual_pv_kwh": 1.0,
+                        "actual_load_kwh": 2.0,
+                        "finalised": True,
+                        "mae_pv": 8.0,
+                        "mae_load": 5.0,
+                        "bias_pv": 8.0,
+                        "bias_load": 5.0,
+                    }
+                ]
+            }
+        )
+        corrector = MagicMock()
+        coordinator._solar_corrector = corrector
+        coordinator._solar_corrector_processed = set()
+        coordinator._hourly_recommendations = []
+        coordinator._last_accumulation_ts = None
+        coordinator._last_planner_output = None
+
+        coordinator._accumulate_forecast_actuals(
+            datetime(2026, 8, 20, 10, 0, tzinfo=UTC),
+            LiveState(),
+        )
+
+        corrector.update_hour.assert_not_called()
+        corrector.update_residual.assert_not_called()
+        assert start in coordinator._solar_corrector_processed
+        assert coordinator._forecast_tracker.summary.finalised_count == 0
+
+    def test_corrector_watermark_prevents_replay_without_coordinator_cache(
+        self,
+    ) -> None:
+        """The persisted corrector watermark is authoritative after restart."""
+        coordinator = _make_bare_coordinator()
+        tracker = ForecastTracker()
+        start = datetime(2026, 8, 20, 9, 0, tzinfo=UTC)
+        end = start + timedelta(minutes=15)
+        record = tracker.get_or_create_record(start, end)
+        assert tracker.set_forecasts(
+            start,
+            1.0,
+            1.0,
+            raw_pv_kwh=1.0,
+            observed_at=start - timedelta(minutes=1),
+        )
+        tracker.freeze_forecasts(start)
+        record.actual_pv_kwh = 0.8
+        record.actual_load_kwh = 1.0
+        record.actual_coverage_seconds = 900.0
+        record.finalise()
+        corrector = SolarForecastCorrector()
+        corrector.update_hour(9, 1.0, 0.8)
+        corrector.update_residual(1.0, 0.8)
+        corrector.mark_processed(start)
+        coordinator._forecast_tracker = tracker
+        coordinator._solar_corrector = corrector
+        coordinator._solar_corrector_processed = set()
+        coordinator._prediction_tracker = MagicMock()
+        coordinator._hourly_recommendations = []
+        coordinator._last_accumulation_ts = None
+
+        coordinator._accumulate_forecast_actuals(
+            end + timedelta(minutes=1),
+            LiveState(),
+        )
+
+        assert corrector._hour_history[9] == [(1.0, 0.8)]
+        assert corrector._recent_residuals == [(1.0, 0.8)]
+        assert coordinator._solar_corrector_processed_through == start
+
+    def test_gap_over_twice_effective_update_cadence_is_rejected(self) -> None:
+        coordinator = _make_bare_coordinator()
+        coordinator._forecast_tracker = ForecastTracker()
+        coordinator._solar_corrector = MagicMock()
+        coordinator._solar_corrector_processed = set()
+        coordinator._prediction_tracker = MagicMock()
+        coordinator._hourly_recommendations = []
+        coordinator._last_accumulation_ts = None
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=UTC)
+        end = start + timedelta(minutes=15)
+        rec = coordinator._forecast_tracker.get_or_create_record(start, end)
+        assert coordinator._forecast_tracker.set_forecasts(
+            start,
+            1.0,
+            1.0,
+            raw_pv_kwh=1.0,
+            forecast_soc_pct=75.0,
+            forecast_action="idle",
+            observed_at=start - timedelta(minutes=1),
+        )
+        coordinator._forecast_tracker.freeze_forecasts(start)
+        live = LiveState()
+        live.solar_production_power_w = 1000.0
+        live.house_consumption_power_w = 2000.0
+
+        coordinator._accumulate_forecast_actuals(start, live)
+        coordinator._accumulate_forecast_actuals(
+            start + timedelta(minutes=10, seconds=1),
+            live,
+        )
+
+        assert rec.actual_pv_kwh == pytest.approx(0.0)
+        assert rec.actual_load_kwh == pytest.approx(0.0)
+        assert rec.actual_coverage_seconds == pytest.approx(0.0)
+
+    @pytest.mark.parametrize("missing_pv", [None, float("nan")])
+    def test_missing_power_sample_cannot_create_full_zero_actual_coverage(
+        self,
+        missing_pv: float | None,
+    ) -> None:
+        coordinator = _make_bare_coordinator()
+        coordinator._forecast_tracker = ForecastTracker()
+        corrector = MagicMock()
+        coordinator._solar_corrector = corrector
+        coordinator._solar_corrector_processed = set()
+        coordinator._prediction_tracker = MagicMock()
+        coordinator._hourly_recommendations = []
+        coordinator._last_accumulation_ts = None
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=UTC)
+        end = start + timedelta(minutes=15)
+        rec = coordinator._forecast_tracker.get_or_create_record(start, end)
+        assert coordinator._forecast_tracker.set_forecasts(
+            start,
+            1.0,
+            1.0,
+            raw_pv_kwh=1.0,
+            forecast_soc_pct=75.0,
+            forecast_action="idle",
+            observed_at=start - timedelta(minutes=1),
+        )
+        coordinator._forecast_tracker.freeze_forecasts(start)
+        live = LiveState()
+        live.solar_production_power_w = cast(Any, missing_pv)
+        live.house_consumption_power_w = 2000.0
+
+        coordinator._accumulate_forecast_actuals(start, live)
+        live.solar_production_power_w = 1000.0
+        coordinator._accumulate_forecast_actuals(
+            start + timedelta(minutes=5),
+            live,
+        )
+        coordinator._accumulate_forecast_actuals(end, live)
+
+        assert rec.finalised is True
+        assert rec.actual_pv_kwh == pytest.approx(1.0 / 6.0)
+        assert rec.actual_load_kwh == pytest.approx(1.0 / 3.0)
+        assert rec.actual_coverage_seconds == pytest.approx(600.0)
+        assert rec.accuracy_eligible is False
+        assert coordinator._forecast_tracker.summary.finalised_count == 0
+        corrector.update_hour.assert_not_called()
+        corrector.update_residual.assert_not_called()
+
+    def test_restored_finalised_record_never_replays_prediction_accuracy(self) -> None:
+        """A restored completed slot is not paired with the post-restart live SoC."""
+        coordinator = _make_bare_coordinator()
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=UTC)
+        end = start + timedelta(minutes=15)
+        tracker = ForecastTracker()
+        rec = tracker.get_or_create_record(start, end)
+        assert tracker.set_forecasts(
+            start,
+            1.0,
+            1.0,
+            raw_pv_kwh=1.0,
+            forecast_soc_pct=75.0,
+            forecast_action="idle",
+            observed_at=start - timedelta(minutes=1),
+        )
+        tracker.freeze_forecasts(start)
+        rec.actual_pv_kwh = 0.5
+        rec.actual_load_kwh = 0.75
+        rec.actual_coverage_seconds = 900.0
+        rec.finalise()
+        restored = ForecastTracker()
+        restored.load_from_dict(tracker.to_dict())
+        coordinator._forecast_tracker = restored
+        coordinator._solar_corrector = MagicMock()
+        coordinator._solar_corrector_processed = {start}
+        coordinator._prediction_tracker = MagicMock()
+        coordinator._hourly_recommendations = []
+        coordinator._last_accumulation_ts = None
+        live = LiveState()
+        live.huawei_batteries_soc_pct = 70.0
+
+        coordinator._accumulate_forecast_actuals(end + timedelta(minutes=5), live)
+
+        coordinator._prediction_tracker.add_record.assert_not_called()
+
+    def test_restored_near_end_unfinalised_record_never_uses_live_soc(
+        self,
+    ) -> None:
+        """A restart one second before slot end cannot pair stale work with live SoC."""
+        coordinator = _make_bare_coordinator()
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=UTC)
+        end = start + timedelta(minutes=15)
+        source = ForecastTracker()
+        record = source.get_or_create_record(start, end)
+        assert source.set_forecasts(
+            start,
+            1.0,
+            1.0,
+            raw_pv_kwh=1.0,
+            forecast_soc_pct=75.0,
+            forecast_action="idle",
+            observed_at=start - timedelta(minutes=1),
+        )
+        source.freeze_forecasts(start)
+        record.actual_pv_kwh = 0.5
+        record.actual_load_kwh = 0.75
+        record.actual_coverage_seconds = 899.0
+        restored = ForecastTracker()
+        restored.load_from_dict(source.to_dict())
+
+        coordinator._forecast_tracker = restored
+        coordinator._prediction_restore_excluded = restored.restored_unfinalised_keys
+        coordinator._solar_corrector = MagicMock()
+        coordinator._solar_corrector_processed = {start}
+        coordinator._prediction_tracker = MagicMock()
+        coordinator._hourly_recommendations = []
+        coordinator._last_accumulation_ts = None
+        live = LiveState()
+        live.huawei_batteries_soc_pct = 70.0
+
+        coordinator._accumulate_forecast_actuals(
+            end + timedelta(minutes=1),
+            live,
+        )
+
+        coordinator._prediction_tracker.add_record.assert_not_called()
+        assert coordinator._prediction_restore_excluded == set()
+
+    @pytest.mark.parametrize(
+        ("old_minutes", "new_minutes"),
+        [(15, 60), (60, 15)],
+    )
+    def test_live_cadence_change_resets_endpoints_and_rebuilds_layout(
+        self,
+        old_minutes: int,
+        new_minutes: int,
+    ) -> None:
+        """Both cadence directions discard stale live slots without a power bridge."""
+        coordinator = _make_bare_coordinator()
+        tracker = ForecastTracker()
+        coordinator._forecast_tracker = tracker
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=UTC)
+        change_time = start + timedelta(minutes=5)
+
+        historical = tracker.get_or_create_record(
+            start - timedelta(hours=2),
+            start - timedelta(hours=1),
+        )
+        historical.finalise()
+        tracker.get_or_create_record(
+            start,
+            start + timedelta(minutes=old_minutes),
+        )
+        coordinator._hourly_recommendations = cast(
+            Any,
+            [
+                SimpleNamespace(
+                    start=start,
+                    end=start + timedelta(minutes=new_minutes),
+                    solcast_pv_estimate_kwh=1.0,
+                    solcast_pv_estimate_available=True,
+                )
+            ],
+        )
+        coordinator._solar_corrector = MagicMock()
+        coordinator._solar_corrector_processed = {historical.start}
+        coordinator._prediction_tracker = MagicMock()
+        coordinator._prediction_restore_excluded = {start}
+        coordinator._last_accumulation_ts = start - timedelta(minutes=5)
+        coordinator._last_pv_power_w = 1000.0
+        coordinator._last_load_power_w = 2000.0
+        live = LiveState()
+        live.solar_production_power_w = 1000.0
+        live.house_consumption_power_w = 2000.0
+
+        with patch.object(
+            tracker,
+            "accumulate_power_interval",
+            wraps=tracker.accumulate_power_interval,
+        ) as accumulate:
+            coordinator._accumulate_forecast_actuals(change_time, live)
+
+        accumulate.assert_not_called()
+        assert tracker.records == [historical]
+        assert coordinator._prediction_restore_excluded == set()
+        assert coordinator._last_accumulation_ts == change_time
+
+        rebuilt = tracker.get_or_create_record(
+            start,
+            start + timedelta(minutes=new_minutes),
+        )
+        assert tracker.set_forecasts(
+            start,
+            1.0,
+            1.0,
+            raw_pv_kwh=1.0,
+            observed_at=start - timedelta(minutes=1),
+        )
+        tracker.freeze_forecasts(change_time)
+        coordinator._accumulate_forecast_actuals(
+            change_time + timedelta(minutes=5),
+            live,
+        )
+
+        live_records = [record for record in tracker.records if not record.finalised]
+        assert [(record.start, record.end) for record in live_records] == [
+            (start, start + timedelta(minutes=new_minutes))
+        ]
+        assert rebuilt.actual_coverage_seconds == pytest.approx(300.0)
+        assert rebuilt.actual_pv_kwh == pytest.approx(1.0 / 12.0)
+        assert rebuilt.actual_load_kwh == pytest.approx(1.0 / 6.0)
+
+    @pytest.mark.parametrize("missing_soc", [None, float("nan")])
+    def test_newly_finalised_slot_skips_missing_actual_soc(
+        self,
+        missing_soc: float | None,
+    ) -> None:
+        """Missing/non-finite SoC cannot be fabricated as zero or retried later."""
+        coordinator = _make_bare_coordinator()
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=UTC)
+        end = start + timedelta(minutes=15)
+        tracker = ForecastTracker()
+        rec = tracker.get_or_create_record(start, end)
+        assert tracker.set_forecasts(
+            start,
+            1.0,
+            1.0,
+            raw_pv_kwh=1.0,
+            forecast_soc_pct=75.0,
+            forecast_action="idle",
+            observed_at=start - timedelta(minutes=1),
+        )
+        tracker.freeze_forecasts(start)
+        rec.actual_pv_kwh = 0.5
+        rec.actual_load_kwh = 0.75
+        rec.actual_coverage_seconds = 900.0
+        coordinator._forecast_tracker = tracker
+        coordinator._solar_corrector = MagicMock()
+        coordinator._solar_corrector_processed = {start}
+        coordinator._prediction_tracker = MagicMock()
+        coordinator._hourly_recommendations = []
+        coordinator._last_accumulation_ts = None
+        live = LiveState()
+        live.huawei_batteries_soc_pct = missing_soc
+
+        coordinator._accumulate_forecast_actuals(end + timedelta(seconds=1), live)
+
+        assert rec.finalised is True
+        coordinator._prediction_tracker.add_record.assert_not_called()
+
+        live.huawei_batteries_soc_pct = 70.0
+        coordinator._accumulate_forecast_actuals(end + timedelta(minutes=5), live)
+        coordinator._prediction_tracker.add_record.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("missing_pv", "missing_load"),
+        [
+            (None, 2000.0),
+            (float("nan"), 2000.0),
+            (1000.0, None),
+            (1000.0, float("nan")),
+        ],
+    )
+    def test_missing_endpoint_invalidates_interval_and_recovery_does_not_bridge(
+        self,
+        missing_pv: float | None,
+        missing_load: float | None,
+    ) -> None:
+        """Both sample endpoints must be finite; recovery starts a new interval."""
+        coordinator = _make_bare_coordinator()
+        coordinator._forecast_tracker = ForecastTracker()
+        corrector = MagicMock()
+        coordinator._solar_corrector = corrector
+        coordinator._solar_corrector_processed = set()
+        coordinator._prediction_tracker = MagicMock()
+        coordinator._hourly_recommendations = []
+        coordinator._last_accumulation_ts = None
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=UTC)
+        boundary = start + timedelta(minutes=15)
+        end = boundary + timedelta(minutes=15)
+        first = coordinator._forecast_tracker.get_or_create_record(start, boundary)
+        second = coordinator._forecast_tracker.get_or_create_record(boundary, end)
+        for slot_start in (start, boundary):
+            assert coordinator._forecast_tracker.set_forecasts(
+                slot_start,
+                1.0,
+                1.0,
+                raw_pv_kwh=1.0,
+                forecast_soc_pct=75.0,
+                forecast_action="idle",
+                observed_at=start - timedelta(minutes=1),
+            )
+        coordinator._forecast_tracker.freeze_forecasts(start)
+        live = LiveState()
+        live.solar_production_power_w = 1000.0
+        live.house_consumption_power_w = 2000.0
+
+        coordinator._accumulate_forecast_actuals(start, live)
+        live.solar_production_power_w = cast(Any, missing_pv)
+        live.house_consumption_power_w = missing_load
+        coordinator._accumulate_forecast_actuals(boundary, live)
+
+        assert first.finalised is True
+        assert first.actual_coverage_seconds == pytest.approx(0.0)
+        assert first.accuracy_eligible is False
+        assert coordinator._forecast_tracker.summary.finalised_count == 0
+        corrector.update_hour.assert_not_called()
+        corrector.update_residual.assert_not_called()
+
+        live.solar_production_power_w = 1000.0
+        live.house_consumption_power_w = 2000.0
+        coordinator._accumulate_forecast_actuals(
+            boundary + timedelta(minutes=5),
+            live,
+        )
+        coordinator._accumulate_forecast_actuals(
+            boundary + timedelta(minutes=10),
+            live,
+        )
+
+        assert second.actual_coverage_seconds == pytest.approx(300.0)
+        assert second.actual_pv_kwh == pytest.approx(1.0 / 12.0)
+        assert second.actual_load_kwh == pytest.approx(1.0 / 6.0)
+
+    @pytest.mark.parametrize(
+        "missing_label",
+        ["solar_production_power", "house_consumption_power"],
+    )
+    def test_missing_entity_marker_overrides_numeric_power_fallback(
+        self,
+        missing_label: str,
+    ) -> None:
+        """A numeric state-collector fallback cannot become an actual endpoint."""
+        coordinator = _make_bare_coordinator()
+        coordinator._forecast_tracker = ForecastTracker()
+        coordinator._solar_corrector = MagicMock()
+        coordinator._solar_corrector_processed = set()
+        coordinator._prediction_tracker = MagicMock()
+        coordinator._hourly_recommendations = []
+        coordinator._last_accumulation_ts = None
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=UTC)
+        end = start + timedelta(minutes=15)
+        rec = coordinator._forecast_tracker.get_or_create_record(start, end)
+        assert coordinator._forecast_tracker.set_forecasts(
+            start,
+            1.0,
+            1.0,
+            raw_pv_kwh=1.0,
+            forecast_soc_pct=75.0,
+            forecast_action="idle",
+            observed_at=start - timedelta(minutes=1),
+        )
+        coordinator._forecast_tracker.freeze_forecasts(start)
+        live = LiveState()
+        live.solar_production_power_w = 0.0
+        live.house_consumption_power_w = 0.0
+        live.missing_entities_list = [missing_label]
+
+        coordinator._accumulate_forecast_actuals(start, live)
+        live.solar_production_power_w = 1000.0
+        live.house_consumption_power_w = 2000.0
+        live.missing_entities_list = []
+        coordinator._accumulate_forecast_actuals(
+            start + timedelta(minutes=5),
+            live,
+        )
+        coordinator._accumulate_forecast_actuals(
+            start + timedelta(minutes=10),
+            live,
+        )
+
+        assert rec.actual_coverage_seconds == pytest.approx(300.0)
+        assert rec.actual_pv_kwh == pytest.approx(1.0 / 12.0)
+        assert rec.actual_load_kwh == pytest.approx(1.0 / 6.0)

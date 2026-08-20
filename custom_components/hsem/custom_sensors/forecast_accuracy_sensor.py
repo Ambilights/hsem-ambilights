@@ -24,16 +24,12 @@ The sensor is a *diagnostic* entity (``EntityCategory.DIAGNOSTIC``).
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, cast, override
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import (
-    STATE_UNAVAILABLE,
-    STATE_UNKNOWN,
-    EntityCategory,
-    UnitOfEnergy,
-)
+from homeassistant.const import EntityCategory, UnitOfEnergy
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from custom_components.hsem.coordinator import (
@@ -41,7 +37,9 @@ from custom_components.hsem.coordinator import (
     HSEMDataUpdateCoordinator,
 )
 from custom_components.hsem.entity import HSEMCoordinatorEntity, HSEMEntity
+from custom_components.hsem.utils.datetime_utils import now as hsem_now
 from custom_components.hsem.utils.forecast_tracker import ForecastTracker
+from custom_components.hsem.utils.persistence import finite_float
 from custom_components.hsem.utils.sensornames.diagnostics import (
     get_forecast_accuracy_sensor_entity_id,
     get_forecast_accuracy_sensor_name,
@@ -140,7 +138,7 @@ class HSEMForecastAccuracySensor(
         attrs = summary.as_dict()
 
         # Add latest slot info
-        finalised = [r for r in tracker.records if r.finalised]
+        finalised = [r for r in tracker.records if r.finalised and r.accuracy_eligible]
         if finalised:
             latest = finalised[-1]
             attrs["latest_pv_forecast_kwh"] = round(latest.forecast_pv_kwh, 3)
@@ -155,11 +153,10 @@ class HSEMForecastAccuracySensor(
             )
 
         # Include serialized tracker data for reboot persistence.
-        # Limit to most recent 24 records to stay under HA's 16 KB attribute limit.
-        _data = tracker.to_dict()
-        if _data:
-            _data["records"] = _data.get("records", [])[-24:]
-        attrs["_forecast_tracker_data"] = _data
+        # Keep lifecycle-important records within HA's 16 KB attribute limit.
+        attrs["_forecast_tracker_data"] = tracker.to_persistence_dict(
+            now=hsem_now(), max_records=24
+        )
 
         return cast(dict[str, Any], attrs)
 
@@ -182,8 +179,9 @@ class HSEMForecastAccuracySensor(
             return
 
         # Restore sensor state
-        if restored.state not in {STATE_UNAVAILABLE, STATE_UNKNOWN, None}:
-            self._restored_state = restored.state
+        restored_value = finite_float(restored.state, minimum=0.0)
+        if restored_value is not None:
+            self._restored_state = str(restored_value)
 
         tracker_data = restored.attributes.get("_forecast_tracker_data")
         if tracker_data is None:
@@ -193,4 +191,12 @@ class HSEMForecastAccuracySensor(
             self.coordinator, "_forecast_tracker", None
         )
         if tracker is not None:
-            tracker.load_from_dict(tracker_data)
+            try:
+                tracker.load_from_dict(tracker_data)
+            except TypeError, ValueError, OverflowError:
+                tracker.load_from_dict({})
+            excluded: set[datetime] = getattr(
+                self.coordinator, "_prediction_restore_excluded", set()
+            )
+            excluded.update(tracker.restored_unfinalised_keys)
+            self.coordinator._prediction_restore_excluded = excluded

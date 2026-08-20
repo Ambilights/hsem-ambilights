@@ -35,64 +35,63 @@ The key questions were:
 ## Decision
 
 We introduce **adaptive per-hour PV forecast correction** via the
-`SolarForecastCorrector` (`utils/solar_corrector.py`).  The corrector learns
+`SolarForecastCorrector` (`utils/solar_corrector.py`). The corrector learns
 from historical actual-vs-forecast PV ratios and applies corrections at
-slot-population time — **before** the planner runs.  Raw Solcast data is
+slot-population time — **before** the planner runs. Raw Solcast data is
 never mutated.
 
 This partially supersedes ADR-005's "non-adaptive" stance for PV data.
-Load forecasts and price data remain non-adaptive, and the diagnostic
-tracker infrastructure is unchanged.
+Load forecasts and price data remain non-adaptive. Learning is accepted only
+from the final pre-slot baseline and fully covered actual energy; live-injected
+current-slot values and incomplete telemetry are ineligible.
 
-### Per-hour accuracy factors (4-day rolling window)
+### Per-hour accuracy factors
 
 For each clock-hour (0–23), the corrector maintains a rolling window of the
-last 4 days of **actual / forecast** PV ratios for that hour.  The correction
-factor is the mean ratio, clamped to **[0.3, 1.5]** to prevent extreme values
-from a single bad forecast day.
+four most recent eligible **actual / raw forecast** PV ratios for that hour.
+At 15-minute cadence, these are normally the four most recent physical
+quarter-hour slots sharing that local clock-hour. This is a sample-count window,
+not a four-day window. The mean ratio is clamped to **[0.3, 1.5]**.
 
 ```
-factor[h] = clamp(mean(actual_pv / forecast_pv for last 4 days at hour h), 0.3, 1.5)
+factor[h] = clamp(mean(actual_pv / raw_pv for recent eligible samples at h), 0.3, 1.5)
 corrected_pv[t] = raw_pv[t] × factor[hour_of(t)]
 ```
 
-A 4-day window was chosen as a compromise: short enough to adapt to seasonal
-changes, long enough to filter out single-day noise.  Each hour is learned
-independently, so the corrector captures intra-day pattern differences
-(e.g., morning fog vs. afternoon clear skies).
+Each hour is learned independently. A near-zero raw forecast is skipped rather
+than producing an unstable ratio.
 
 ### Intra-hour residual correction (2h linear decay)
 
 In addition to the per-hour factor, a **residual correction** is applied to
-the current and next few slots.  The residual is the mean of the last 4
-**closed** slots' actual/forecast ratios.  It decays linearly to 1.0 over
-2 hours (8 slots at 15-min granularity).
+the current and next slots. The residual is the mean of the four most recent
+eligible **actual / corrected forecast** ratios. It decays linearly to 1.0
+over eight slots (2 hours at 15-minute granularity).
 
 ```
-residual = mean(actual/forecast for last 4 closed slots)
-decay[t] = 1.0 + (residual - 1.0) × max(0, 1 - elapsed_slots / 8)
+residual = mean(actual/corrected_forecast for recent eligible closed slots)
+decay[t] = 1.0 + (residual - 1.0) × max(0, 1 - slots_ahead / 8)
 final_pv[t] = corrected_pv[t] × decay[t]
 ```
 
-This handles short-term weather transitions — if clouds rolled in 30 minutes
-ago and PV is under-performing, the next few slots are adjusted downward
-before the per-hour factor catches up.
+The `slots_ahead` value is a physical UTC distance from the current planning
+instant, not an ordinal since midnight. The current in-progress slot maps to
+zero, future boundaries advance by cadence, and both folds of an autumn
+repeated hour remain distinct. This keeps the residual active throughout the
+day and makes its decay DST-safe.
 
-### Configurable confidence percentile
+### Confidence scaling
 
-A user-configurable **solar confidence** percentile (default 0.50, range
-0.10–0.90) scales how aggressively the correction is applied.  At 0.10
-(pessimistic), only the bottom 10 % of historical ratios inform the factor.
-At 0.90 (optimistic), the top 90 % are used.  At 0.50 (median), the
-correction is neutral.
-
-This is exposed via `sensor.hsem_solar_confidence` (a `number` entity) so
-users can tune it from the dashboard without restarting.
+The internal confidence value defaults to 0.50. Values below 0.50 damp the
+learned hour factor toward 1.0; values at or above 0.50 apply the learned
+factor at full strength. It does not select a historical percentile.
+`sensor.hsem_solar_confidence_sensor` exposes the current factors,
+confidence, and residual count as diagnostics.
 
 ### Integration point: slot population
 
 Corrections are applied in `planner/slot_population.py` → `populate_solcast()`
-**before** the planner runs.  The raw Solcast values from the HA sensor are
+**before** the planner runs. The raw Solcast values from the HA sensor are
 never modified — only the per-slot copies in `PlannedSlot` receive the
 correction.  This keeps the data pipeline auditable: the original forecast
 is always available for comparison.
@@ -101,9 +100,10 @@ is always available for comparison.
 
 | ADR-005 concern | How ADR-006 addresses it |
 |---|---|
-| Feedback loops | The correction is applied once per slot-population, before the planner. It does not depend on planner output — only on observed actuals vs forecasts. No loop. |
-| Non-stationary errors | The 4-day rolling window adapts to seasonal changes. The [0.3, 1.5] clamp prevents a single bad week from poisoning the factors. |
-| User transparency | The per-hour factors and residual are exposed as sensor attributes. The confidence percentile is user-configurable. The corrected PV is logged alongside the raw value. |
+| Feedback loops | Learning uses the frozen raw/corrected pre-slot baseline and measured energy, never a forecast rewritten after slot start. |
+| Missing or stale telemetry | Only complete trusted physical-slot coverage is eligible; gaps are not treated as zero production. |
+| Non-stationary errors | The rolling sample window adapts to change, while the [0.3, 1.5] clamp bounds both hour and residual ratios. |
+| User transparency | The per-hour factors, confidence, and residual count are exposed as sensor attributes; corrected and raw values remain separate. |
 | Minimal benefit | The correction is demonstrably beneficial: systematic per-hour bias of ±15 % over a full day translates to ±2–3 kWh of PV energy, which is enough to change the planner's charge/discharge decision. |
 
 ---
@@ -117,9 +117,9 @@ is always available for comparison.
 - **Per-hour granularity captures intra-day patterns:** Morning fog bias is
   corrected independently from midday clear-sky bias.
 - **Short-term weather transitions are handled:** The residual correction
-  adjusts within 30 minutes of a cloud event.
-- **User-tunable:** The confidence percentile lets risk-averse users plan
-  conservatively and risk-tolerant users plan optimistically.
+  adjusts after trusted closed-slot observations arrive.
+- **Stable baselines:** Replanning after a slot starts cannot rewrite the
+  forecast being evaluated or used for learning.
 - **No raw data mutation:** Solcast API values are preserved for audit.
 - **No new dependencies:** Pure Python, zero additional HA imports.
 
@@ -127,12 +127,10 @@ is always available for comparison.
 
 - **Added complexity:** The planner pipeline now has an additional correction
   step that must be understood when debugging PV-related planning issues.
-- **Cold start:** After a HA restart, the corrector has no history. It takes
-  4 days to build full per-hour factors. During this period, only the residual
-  correction is active (which itself needs 4 closed slots to initialise).
-- **Confidence percentile interaction:** At extremes (0.10 or 0.90), the
-  correction can be aggressive. Users who set the percentile too low may see
-  the planner ignore real PV surplus.
+- **Cold start:** An hour with no eligible samples uses neutral factor 1.0.
+  Residual correction is also neutral until an eligible closed slot exists.
+- **Incomplete intervals learn nothing:** A restart or telemetry gap can delay
+  learning, intentionally preferring no update over a false zero-actual sample.
 - **Divergence from ADR-005:** The original "non-adaptive" principle is now
   qualified. Future contributors must understand that PV correction is adaptive
   while load and price treatment remain fixed.
@@ -142,11 +140,17 @@ is always available for comparison.
 - Cold start: The corrector defaults to factor 1.0 (no correction) for hours
   with no history. The planner behaves identically to the pre-correction
   behaviour until data accumulates.
-- Confidence tuning: The default 0.50 (median) is neutral and safe. Extreme
-  values are documented with warnings.
+- Confidence scaling is bounded and never amplifies beyond the learned factor.
 - Debug logging: Corrected vs raw PV is logged at debug level for every slot.
-- The diagnostic `ForecastTracker` continues to track **raw** forecast errors,
-  providing an independent check on whether the correction is improving accuracy.
+- The diagnostic `ForecastTracker` reports corrected forecast error while
+  retaining raw PV separately for hour-factor learning.
+- State is schema-versioned. v7.1.2 discards pre-v3 learned factors,
+  history, and residuals because they may contain live-rewritten baselines;
+  the confidence value is retained and learning restarts from eligible slots.
+  Valid v3 state restores the exact bounded per-hour and residual buffers with
+  a UTC processed-through watermark, preventing duplicate learning after a
+  restart. Malformed, non-finite, or future-dated watermark state is rejected
+  atomically.
 
 ---
 

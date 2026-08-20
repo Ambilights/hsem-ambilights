@@ -1,11 +1,21 @@
 """Tests for the SavingsTracker model (issue #604)."""
 
-from datetime import date
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
+from custom_components.hsem.coordinator import HSEMDataUpdateCoordinator
+from custom_components.hsem.models.daily_plan_vs_actual_tracker import (
+    DailyPlanVsActualTracker,
+)
+from custom_components.hsem.models.live_state import LiveState
+from custom_components.hsem.models.planned_slot import PlannedSlot
+from custom_components.hsem.models.planner_output import PlannerOutput
 from custom_components.hsem.models.savings_day import SavingsDay
 from custom_components.hsem.models.savings_tracker import SavingsTracker
+from custom_components.hsem.utils.prices import SlotPrice
+from custom_components.hsem.utils.recommendations import Recommendations
 
 
 class TestSavingsDay:
@@ -62,12 +72,339 @@ class TestSavingsTracker:
     def test_defaults(self) -> None:
         """Default values should start at zero."""
         st = SavingsTracker()
+        assert st._today == ""
         assert st.actual_savings == 0.0
         assert st.missed_savings == 0.0
         assert st.baseline_cost == 0.0
         assert st.today_actual == 0.0
         assert st.today_missed == 0.0
         assert st.today_baseline == 0.0
+
+    def test_charge_sample_uses_prior_power_and_boundary_overlap(self) -> None:
+        """A boundary interval uses prior power and only its cheap-slot share."""
+        zone = ZoneInfo("Europe/Stockholm")
+        interval_start = datetime(2026, 8, 20, 10, 14, 55, tzinfo=zone)
+        interval_end = datetime(2026, 8, 20, 10, 15, 5, tzinfo=zone)
+        st = SavingsTracker(_today="2026-08-20")
+
+        assert (
+            st.sample_charge_interval(
+                interval_start,
+                3600.0,
+                max_gap_seconds=120.0,
+            )
+            is None
+        )
+        sample = st.sample_charge_interval(
+            interval_end,
+            0.0,
+            max_gap_seconds=120.0,
+        )
+        assert sample is not None
+        assert sample[2] == pytest.approx(0.01)
+
+        cheap_slot = PlannedSlot(
+            start=datetime(2026, 8, 20, 10, 0, tzinfo=zone),
+            end=datetime(2026, 8, 20, 10, 15, tzinfo=zone),
+            price=SlotPrice(1.0, 0.0),
+            recommendation=Recommendations.BatteriesChargeGrid.value,
+            batteries_charged_kwh=8.0,
+        )
+        expensive_slot = PlannedSlot(
+            start=datetime(2026, 8, 20, 10, 15, tzinfo=zone),
+            end=datetime(2026, 8, 20, 10, 30, tzinfo=zone),
+            price=SlotPrice(3.0, 0.0),
+            recommendation=Recommendations.BatteriesWaitMode.value,
+        )
+        output = PlannerOutput(slots=[cheap_slot, expensive_slot])
+
+        savings = HSEMDataUpdateCoordinator._compute_actual_charge_savings(
+            output,
+            sample,
+        )
+
+        # Only 5 seconds (0.005 kWh) overlap the cheap charge slot. The
+        # planner's full 8 kWh charge value must not be credited every cycle.
+        assert savings["2026-08-20"] == pytest.approx(0.005)
+
+        repeated = st.sample_charge_interval(
+            interval_end,
+            0.0,
+            max_gap_seconds=120.0,
+        )
+        assert repeated is None
+        assert (
+            HSEMDataUpdateCoordinator._compute_actual_charge_savings(
+                output,
+                repeated,
+            )
+            == {}
+        )
+
+    @pytest.mark.parametrize(
+        ("prior_minutes", "current_minutes"),
+        [(15, 60), (60, 15)],
+    )
+    def test_prior_layout_masks_current_overlap_after_cadence_change(
+        self,
+        prior_minutes: int,
+        current_minutes: int,
+    ) -> None:
+        """An elapsed interval is valued once by its prior plan authority."""
+        zone = ZoneInfo("Europe/Stockholm")
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=zone)
+        prior_slots = (
+            PlannedSlot(
+                start=start - timedelta(minutes=prior_minutes),
+                end=start,
+                price=SlotPrice(3.0, 0.0),
+                recommendation=Recommendations.BatteriesWaitMode.value,
+                price_actionable=False,
+            ),
+            PlannedSlot(
+                start=start,
+                end=start + timedelta(minutes=prior_minutes),
+                price=SlotPrice(1.0, 0.0),
+                recommendation=Recommendations.BatteriesChargeGrid.value,
+            ),
+        )
+        current_output = PlannerOutput(
+            slots=[
+                PlannedSlot(
+                    start=start - timedelta(minutes=current_minutes),
+                    end=start,
+                    price=SlotPrice(9.0, 0.0),
+                    recommendation=Recommendations.BatteriesWaitMode.value,
+                    price_actionable=False,
+                ),
+                PlannedSlot(
+                    start=start,
+                    end=start + timedelta(minutes=current_minutes),
+                    price=SlotPrice(0.0, 0.0),
+                    recommendation=Recommendations.BatteriesChargeGrid.value,
+                ),
+            ]
+        )
+
+        savings = HSEMDataUpdateCoordinator._compute_actual_charge_savings(
+            current_output,
+            (start, start + timedelta(minutes=5), 0.5),
+            prior_slots=prior_slots,
+        )
+
+        assert savings == {"2026-08-20": pytest.approx(0.5)}
+
+    def test_current_layout_fills_only_uncovered_prior_tail(self) -> None:
+        """Current slots value only sample time absent from the prior horizon."""
+        zone = ZoneInfo("Europe/Stockholm")
+        boundary = datetime(2026, 8, 20, 10, 0, tzinfo=zone)
+        prior_slots = (
+            PlannedSlot(
+                start=boundary - timedelta(minutes=30),
+                end=boundary - timedelta(minutes=15),
+                price=SlotPrice(3.0, 0.0),
+                recommendation=Recommendations.BatteriesWaitMode.value,
+                price_actionable=False,
+            ),
+            PlannedSlot(
+                start=boundary - timedelta(minutes=15),
+                end=boundary,
+                price=SlotPrice(1.0, 0.0),
+                recommendation=Recommendations.BatteriesChargeGrid.value,
+            ),
+        )
+        current_output = PlannerOutput(
+            slots=[
+                PlannedSlot(
+                    start=boundary,
+                    end=boundary + timedelta(minutes=15),
+                    price=SlotPrice(1.0, 0.0),
+                    recommendation=Recommendations.BatteriesChargeGrid.value,
+                ),
+                PlannedSlot(
+                    start=boundary + timedelta(minutes=15),
+                    end=boundary + timedelta(minutes=30),
+                    price=SlotPrice(5.0, 0.0),
+                    recommendation=Recommendations.BatteriesWaitMode.value,
+                ),
+            ]
+        )
+
+        savings = HSEMDataUpdateCoordinator._compute_actual_charge_savings(
+            current_output,
+            (
+                boundary - timedelta(minutes=5),
+                boundary + timedelta(minutes=5),
+                1.0,
+            ),
+            prior_slots=prior_slots,
+        )
+
+        assert savings == {"2026-08-20": pytest.approx(1.5)}
+
+    def test_nonactionable_prior_overlap_masks_current_replan(self) -> None:
+        """Current intent cannot retroactively fill covered prior time."""
+        zone = ZoneInfo("Europe/Stockholm")
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=zone)
+        prior_slots = (
+            PlannedSlot(
+                start=start,
+                end=start + timedelta(minutes=15),
+                price=SlotPrice(1.0, 0.0),
+                recommendation=Recommendations.BatteriesChargeGrid.value,
+                price_actionable=False,
+            ),
+        )
+        current_output = PlannerOutput(
+            slots=[
+                PlannedSlot(
+                    start=start,
+                    end=start + timedelta(minutes=60),
+                    price=SlotPrice(0.0, 0.0),
+                    recommendation=Recommendations.BatteriesChargeGrid.value,
+                )
+            ]
+        )
+
+        savings = HSEMDataUpdateCoordinator._compute_actual_charge_savings(
+            current_output,
+            (start, start + timedelta(minutes=5), 0.5),
+            prior_slots=prior_slots,
+        )
+
+        assert savings == {}
+
+    @pytest.mark.asyncio
+    async def test_midnight_charge_savings_retain_prior_plan_horizon(
+        self,
+    ) -> None:
+        """Old/new charge shares use the plans that governed each interval."""
+        zone = ZoneInfo("Europe/Stockholm")
+        midnight = datetime(2026, 8, 21, 0, 0, tzinfo=zone)
+        old_expensive = PlannedSlot(
+            start=midnight - timedelta(minutes=30),
+            end=midnight - timedelta(minutes=15),
+            price=SlotPrice(3.0, 0.0),
+            recommendation=Recommendations.BatteriesWaitMode.value,
+            price_actionable=False,
+        )
+        old_cheap = PlannedSlot(
+            start=midnight - timedelta(minutes=15),
+            end=midnight,
+            price=SlotPrice(1.0, 0.0),
+            recommendation=Recommendations.BatteriesChargeGrid.value,
+        )
+        old_output = PlannerOutput(slots=[old_expensive, old_cheap])
+        new_cheap = PlannedSlot(
+            start=midnight,
+            end=midnight + timedelta(minutes=15),
+            price=SlotPrice(1.0, 0.0),
+            recommendation=Recommendations.BatteriesChargeGrid.value,
+        )
+        new_expensive = PlannedSlot(
+            start=midnight + timedelta(minutes=15),
+            end=midnight + timedelta(minutes=30),
+            price=SlotPrice(3.0, 0.0),
+            recommendation=Recommendations.BatteriesWaitMode.value,
+        )
+        new_unpublished = PlannedSlot(
+            start=midnight + timedelta(minutes=30),
+            end=midnight + timedelta(minutes=45),
+            price=SlotPrice(100.0, 0.0),
+            recommendation=Recommendations.BatteriesWaitMode.value,
+            import_price_available=False,
+            price_actionable=False,
+        )
+        new_output = PlannerOutput(slots=[new_cheap, new_expensive, new_unpublished])
+
+        coordinator = object.__new__(HSEMDataUpdateCoordinator)
+        coordinator._savings_tracker = SavingsTracker(_today="2026-08-20")
+        coordinator._savings_tracker_initialized = True
+        coordinator._daily_tracker = DailyPlanVsActualTracker(today="2026-08-20")
+        coordinator._timer_interval = timedelta(minutes=5)
+        coordinator._savings_price_slots = ()
+        live = LiveState()
+        live.force_working_mode_state = "auto"
+        live.huawei_batteries_charge_discharge_power_w = 3600.0
+
+        await coordinator._accumulate_savings(
+            midnight - timedelta(minutes=5),
+            live,
+            old_output,
+        )
+        # The live planner object can be superseded after the cycle; the
+        # accounting authority must remain the cached snapshot.
+        old_cheap.recommendation = Recommendations.BatteriesWaitMode.value
+        await coordinator._accumulate_savings(midnight, live, new_output)
+
+        new_cheap.recommendation = Recommendations.BatteriesWaitMode.value
+        live.huawei_batteries_charge_discharge_power_w = 0.0
+        await coordinator._accumulate_savings(
+            midnight + timedelta(minutes=5),
+            live,
+            new_output,
+        )
+
+        tracker = coordinator._savings_tracker
+        assert tracker.daily["2026-08-20"].actual_savings == pytest.approx(0.3)
+        assert tracker.daily["2026-08-21"].actual_savings == pytest.approx(0.3)
+        assert tracker.actual_savings == pytest.approx(0.6)
+
+    def test_charge_sample_long_gap_advances_without_stale_energy(self) -> None:
+        """A valid sample pair beyond the cadence ceiling is not integrated."""
+        zone = ZoneInfo("Europe/Stockholm")
+        st = SavingsTracker(_today="2026-08-20")
+        start = datetime(2026, 8, 20, 10, 0, tzinfo=zone)
+
+        assert (
+            st.sample_charge_interval(
+                start,
+                1000.0,
+                max_gap_seconds=600.0,
+            )
+            is None
+        )
+        assert (
+            st.sample_charge_interval(
+                start + timedelta(hours=1),
+                1000.0,
+                max_gap_seconds=600.0,
+            )
+            is None
+        )
+
+        sample = st.sample_charge_interval(
+            start + timedelta(hours=1, minutes=5),
+            1000.0,
+            max_gap_seconds=600.0,
+        )
+        assert sample is not None
+        assert sample[0] == start + timedelta(hours=1)
+        assert sample[2] == pytest.approx(1.0 / 12.0)
+
+    def test_charge_sample_autumn_fold_uses_physical_duration(self) -> None:
+        """The Stockholm autumn fold is measured on the UTC timeline."""
+        zone = ZoneInfo("Europe/Stockholm")
+        st = SavingsTracker(_today="2026-10-25")
+        first_fold = datetime(2026, 10, 25, 2, 59, tzinfo=zone, fold=0)
+        second_fold = datetime(2026, 10, 25, 2, 1, tzinfo=zone, fold=1)
+
+        assert (
+            st.sample_charge_interval(
+                first_fold,
+                1000.0,
+                max_gap_seconds=180.0,
+            )
+            is None
+        )
+        sample = st.sample_charge_interval(
+            second_fold,
+            1000.0,
+            max_gap_seconds=180.0,
+        )
+
+        assert sample is not None
+        assert sample[2] == pytest.approx(1.0 / 30.0)
 
     def test_accumulate_switch_on(self) -> None:
         """When switch is on, savings accumulate as actual."""
@@ -144,6 +481,23 @@ class TestSavingsTracker:
         assert "2026-06-26" in st.daily
         assert st.daily["2026-06-26"].actual_savings == 0.0
 
+    def test_day_rollover_preserves_staged_new_day_entry(self) -> None:
+        """Rollover must not overwrite interval data staged for the new day."""
+        st = SavingsTracker(_today="2026-06-25")
+        staged = SavingsDay(
+            date="2026-06-26",
+            actual_savings=1.25,
+            baseline_cost=2.5,
+        )
+        st.daily["2026-06-26"] = staged
+
+        result = st.check_day_rollover("2026-06-26")
+
+        assert result is not None
+        assert st.daily["2026-06-26"] is staged
+        assert st.today_actual == pytest.approx(1.25)
+        assert st.today_baseline == pytest.approx(2.5)
+
     def test_day_rollover_no_change(self) -> None:
         """When the day hasn't changed, rollover returns None."""
         st = SavingsTracker()
@@ -154,7 +508,7 @@ class TestSavingsTracker:
     def test_period_rollups(self) -> None:
         """7-day and 30-day rollups should sum correctly."""
         st = SavingsTracker()
-        today = date.today()
+        today = date(2026, 6, 26)
         st._today = today.isoformat()
 
         # Add entries for last 7 days.

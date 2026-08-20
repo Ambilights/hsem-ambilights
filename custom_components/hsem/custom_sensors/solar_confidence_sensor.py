@@ -8,7 +8,7 @@ or ``unavailable`` when no factors have been learned yet.
 Attributes
 ----------
 - ``hour_factors`` — JSON-serialized dict of per-hour factors (0–23).
-- ``confidence`` — Configured confidence percentile.
+- ``confidence`` — Internal/restored correction strength.
 - ``residual_count`` — Number of intra-hour residuals in the buffer.
 - ``_solar_corrector_data`` — Serialised corrector state for reboot persistence.
 
@@ -22,11 +22,7 @@ from typing import Any, cast, override
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import (
-    STATE_UNAVAILABLE,
-    STATE_UNKNOWN,
-    EntityCategory,
-)
+from homeassistant.const import EntityCategory
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from custom_components.hsem.coordinator import (
@@ -34,12 +30,18 @@ from custom_components.hsem.coordinator import (
     HSEMDataUpdateCoordinator,
 )
 from custom_components.hsem.entity import HSEMCoordinatorEntity, HSEMEntity
+from custom_components.hsem.utils.datetime_utils import now as hsem_now
+from custom_components.hsem.utils.persistence import finite_float
 from custom_components.hsem.utils.sensornames.diagnostics import (
     get_solar_confidence_sensor_entity_id,
     get_solar_confidence_sensor_name,
     get_solar_confidence_sensor_unique_id,
 )
-from custom_components.hsem.utils.solar_corrector import SolarForecastCorrector
+from custom_components.hsem.utils.solar_corrector import (
+    FACTOR_MAX,
+    FACTOR_MIN,
+    SolarForecastCorrector,
+)
 
 
 class HSEMSolarConfidenceSensor(
@@ -154,8 +156,13 @@ class HSEMSolarConfidenceSensor(
             return
 
         # Restore sensor state
-        if restored.state not in {STATE_UNAVAILABLE, STATE_UNKNOWN, None}:
-            self._restored_state = restored.state
+        restored_value = finite_float(
+            restored.state,
+            minimum=FACTOR_MIN,
+            maximum=FACTOR_MAX,
+        )
+        if restored_value is not None:
+            self._restored_state = str(restored_value)
 
         corrector_data = restored.attributes.get("_solar_corrector_data")
         if corrector_data is None:
@@ -165,4 +172,7 @@ class HSEMSolarConfidenceSensor(
             self.coordinator, "_solar_corrector", None
         )
         if corrector is not None:
-            corrector.load_from_dict(corrector_data)
+            corrector.load_from_dict(corrector_data, restored_at=hsem_now())
+            self.coordinator._solar_corrector_processed_through = (
+                corrector.processed_through
+            )
