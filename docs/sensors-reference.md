@@ -98,7 +98,7 @@ all planner output as attributes.
 | `hardware_writes_blocked` | bool | Safety gate preventing hardware writes |
 | `apply_status` | string | Last apply result: `ok`, `unverified`, `failed`, `skipped` |
 | `apply_failed_entities` | list[string] | Entities that failed the last hardware write |
-| `data_quality` | dict | Structured input completeness report |
+| `data_quality` | dict | Structured price/PV and load-forecast completeness report |
 | `entsoe_price_backup_status` | dict | Paired backup status: `configured`, `matched_slots`, and `rejection_reason` |
 | `force_working_mode_state` | string | Active override mode or `auto` |
 
@@ -247,6 +247,7 @@ Displays the planner's strategy rationale and per-candidate cost breakdown.
 | `rejected_plans` | Alternatives with name, reason, and full cost breakdown |
 | `hysteresis_active` | Whether plan-level hysteresis was applied |
 | `hysteresis_reason` | Explanation of hysteresis decision |
+| `data_quality_complete` | `True` only when price/PV inputs are complete and `load_forecast_ready` is true |
 
 ---
 
@@ -703,25 +704,35 @@ These changes are internal to the planner and do not expose new entities:
 
 ## Data quality attribute
 
-The `data_quality` dict on the working mode sensor provides a structured
-input completeness report. Example structure:
+The `data_quality` dict on `sensor.hsem_working_mode` is the serialized
+planner `DataQuality` report. Example structure:
 
 ```json
 {
-  "import_price": true,
-  "export_price": true,
-  "house_consumption": true,
-  "solar_production": true,
-  "battery_soc": true,
-  "battery_capacity": true,
-  "solcast_today": true,
-  "solcast_tomorrow": false,
-  "ev_connected": true,
-  "ev_soc": true,
-  "ev_second_connected": null,
-  "ev_second_soc": null
+  "is_complete": false,
+  "load_forecast_ready": false,
+  "load_forecast_reason": "zero_forecast_with_live_demand",
+  "horizon_has_tomorrow": true,
+  "horizon_days": 2,
+  "price_actionable_until": "2030-01-02T00:00:00+01:00",
+  "price_actionable_slots": 96,
+  "tomorrow_price_missing_hours": [],
+  "tomorrow_pv_missing_hours": [],
+  "day2_price_missing_hours": [],
+  "day2_pv_missing_hours": [],
+  "today_price_missing_hours": [],
+  "today_pv_missing_hours": []
 }
 ```
 
-Each key is a sensor category; the value is `true` (available), `false`
-(missing), or `null` (not configured / not applicable).
+`load_forecast_ready` is false when historical-average provenance or a
+populated future slot is missing/non-finite. A complete identically-zero
+profile is valid while finite live house demand is at most 50 W; above 50 W,
+`load_forecast_reason` is `zero_forecast_with_live_demand`.
+`load_forecast_reason` is `null` whenever readiness is true.
+`is_complete` requires both load readiness and complete price/PV inputs.
+
+The Plan Explanation sensor exposes the aggregate
+`data_quality_complete` boolean. Forecast-authority generation mismatches are
+written to debug logs only; they do not add an HA attribute or entity. v7.1.6
+does not change any Unagi or terminal cost-to-go diagnostic field.

@@ -75,6 +75,12 @@ provided.
   [ENTSO-E Price Backup](entsoe-price-backup.md) for the complete setup and
   validation sequence.
 
+A registered price, PV, or valuation-source update that arrives during a solve
+invalidates that in-flight result. HSEM publishes no command from the older
+snapshot and runs a fresh coalesced cycle. If an older inverter mode still
+briefly appears after such an update, collect debug logs showing the captured
+and current forecast-authority generations.
+
 **1d. Critical sensors missing → Error mode**
 
 If any of these five entities are missing, HSEM enters `error` mode and
@@ -94,11 +100,25 @@ If any of these five entities are missing, HSEM enters `error` mode and
 **1e. Consumption energy sensors not ready after restart**
 
 The `sensor.hsem_house_consumption_energy_*` sensors use HA's statistics table.
-After a restart they need the first statistics period to complete before they
-can restore.
+After a restart they may exist while their restored state is still
+`unknown` or `unavailable`. HSEM keeps that state missing; it does not turn
+it into a zero-load forecast.
 
-- **Fix:** Wait for the next statistics cycle (usually 5 minutes). HSEM
-  shortens its interval to 1 minute until these are ready.
+- **Check:** Open `sensor.hsem_working_mode` and inspect
+  `data_quality.load_forecast_ready` and `load_forecast_reason`. A complete
+  zero profile is valid while live house demand is at most 50 W. With live
+  demand above 50 W, `zero_forecast_with_live_demand` identifies a
+  contradictory restored profile.
+- **Behaviour:** Automatic control publishes `batteries_wait_mode` with a
+  strict primary hold and zero secondary action. No optimized zero-load plan or
+  stale plan is reused. An explicit manual force mode remains higher authority.
+- **Fix:** Wait for the next statistics cycle (usually 5 minutes), or repair any
+  average sensor that remains unavailable. HSEM retries every minute. Recovery
+  invalidates same-slot plan reuse and triggers one fresh solve.
+
+This readiness gate does not disable Unagi. Once consumption is ready, Unagi
+selection, forecast haircut, terminal tiers, and terminal cost-to-go semantics
+are unchanged.
 
 ---
 

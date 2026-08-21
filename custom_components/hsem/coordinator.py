@@ -32,6 +32,7 @@ import asyncio
 import contextlib
 import math
 from collections.abc import Callable, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -163,6 +164,8 @@ FORCE_DISCHARGE_REPLAN_MIN_REMAINING_SECONDS = 60
 CORRECTIVE_MILP_SOLVER_STATUSES = frozenset(
     {"optimal", "time_limit_feasible_incumbent"}
 )
+LOAD_FORECAST_LIVE_DEMAND_THRESHOLD_W = 50.0
+LOAD_FORECAST_ZERO_EPSILON_KWH = 1e-9
 
 type _PriceChannelSignature = tuple[bool, float | None]
 type _PriceSlotSignature = tuple[
@@ -185,6 +188,138 @@ type _PriceForecastSignature = tuple[
     tuple[_PriceSlotSignature, ...],
     _ValuationForecastSignature,
 ]
+type _LoadSlotSignature = tuple[str, float, float, float, float, float]
+type _LoadForecastSignature = tuple[_LoadSlotSignature, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ForecastAuthorityPlanState:
+    """Accepted plan state restored when a late authority event aborts a cycle."""
+
+    last_planner_input: PlannerInput | None
+    last_planner_output: PlannerOutput | None
+    last_plan_slot_start: datetime | None
+    previous_planner_winner_name: str | None
+    previous_planner_winner_score: float
+    window_hys_previous_rec: str | None
+    window_hys_previous_slot_start: datetime | None
+    window_hysteresis_expiry: datetime | None
+    current_slot_start: datetime | None
+    current_slot_price_actionable: bool | None
+    current_slot_ev_power_w: float
+    current_slot_ev_second_power_w: float
+    current_required_battery: float
+    plan_explanation: PlanExplanation
+    data_quality: DataQuality
+    ev_charging_plan: EVChargingPlan | None
+    ev_second_charging_plan: EVChargingPlan | None
+    hourly_recommendation: HourlyRecommendation | None
+    hourly_recommendations: list[HourlyRecommendation]
+
+
+@dataclass(frozen=True)
+class _LoadForecastReadiness:
+    """Validated future consumption profile and its accepted-plan signature."""
+
+    ready: bool
+    reason: str | None
+    signature: _LoadForecastSignature | None
+
+
+def _assess_load_forecast(
+    recommendations: Sequence[HourlyRecommendation],
+    now: datetime,
+    *,
+    population_succeeded: bool,
+    live_house_demand_w: float | None,
+) -> _LoadForecastReadiness:
+    """Validate future load provenance without rejecting genuine measured zero."""
+    if not population_succeeded:
+        return _LoadForecastReadiness(False, "source_unavailable", None)
+
+    now_utc = utc_key(now)
+    future_slots = sorted(
+        (rec for rec in recommendations if utc_key(rec.end) > now_utc),
+        key=lambda rec: utc_key(rec.start),
+    )
+    if not future_slots:
+        return _LoadForecastReadiness(False, "missing_future_slots", None)
+
+    signature_slots: list[_LoadSlotSignature] = []
+    weighted_profile_is_zero = True
+    for rec in future_slots:
+        raw_values = (
+            rec.avg_house_consumption_kwh,
+            rec.avg_house_consumption_1d_kwh,
+            rec.avg_house_consumption_3d_kwh,
+            rec.avg_house_consumption_7d_kwh,
+            rec.avg_house_consumption_14d_kwh,
+        )
+        canonical_values: list[float] = []
+        for raw_value in raw_values:
+            if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                return _LoadForecastReadiness(False, "invalid_future_values", None)
+            number = float(raw_value)
+            if not math.isfinite(number) or number < 0.0:
+                return _LoadForecastReadiness(False, "invalid_future_values", None)
+            canonical_values.append(round(number, 5))
+
+        weighted, avg_1d, avg_3d, avg_7d, avg_14d = canonical_values
+        if weighted > LOAD_FORECAST_ZERO_EPSILON_KWH:
+            weighted_profile_is_zero = False
+        signature_slots.append(
+            (
+                utc_key(rec.start).isoformat(),
+                weighted,
+                avg_1d,
+                avg_3d,
+                avg_7d,
+                avg_14d,
+            )
+        )
+
+    finite_live_demand_w = (
+        float(live_house_demand_w)
+        if live_house_demand_w is not None
+        and not isinstance(live_house_demand_w, bool)
+        and math.isfinite(live_house_demand_w)
+        else None
+    )
+    if (
+        weighted_profile_is_zero
+        and finite_live_demand_w is not None
+        and finite_live_demand_w > LOAD_FORECAST_LIVE_DEMAND_THRESHOLD_W
+    ):
+        return _LoadForecastReadiness(False, "zero_forecast_with_live_demand", None)
+
+    return _LoadForecastReadiness(True, None, tuple(signature_slots))
+
+
+def _load_forecast_signatures_match(
+    current: _LoadForecastSignature | None,
+    baseline: _LoadForecastSignature | None,
+) -> bool:
+    """Return whether two load signatures match within the canonical epsilon."""
+    if current is None or baseline is None:
+        return current is baseline
+    if len(current) != len(baseline):
+        return False
+    for current_slot, baseline_slot in zip(current, baseline, strict=True):
+        if current_slot[0] != baseline_slot[0]:
+            return False
+        if any(
+            not math.isclose(
+                current_value,
+                baseline_value,
+                rel_tol=0.0,
+                abs_tol=LOAD_FORECAST_ZERO_EPSILON_KWH,
+            )
+            for current_value, baseline_value in zip(
+                current_slot[1:], baseline_slot[1:], strict=True
+            )
+        ):
+            return False
+    return True
 
 
 def _canonical_price_channel(
@@ -315,6 +450,22 @@ def _apply_live_current_price_availability(
     )
 
 
+def _set_strict_storage_hold(
+    current: HourlyRecommendation,
+) -> HourlyRecommendation:
+    """Clear plan-derived storage motion and publish explicit hold intent."""
+    current.recommendation = Recommendations.BatteriesWaitMode.value
+    current.primary_battery_hold = True
+    current.batteries_charged_kwh = 0.0
+    current.batteries_discharged_kwh = 0.0
+    current.secondary_storage_mode = SECONDARY_MODE_UTILITY
+    current.secondary_storage_charge_current_a = 0.0
+    current.secondary_storage_charged_kwh = 0.0
+    current.secondary_storage_discharged_kwh = 0.0
+    current.secondary_storage_grid_import_kwh = 0.0
+    return current
+
+
 def _apply_current_price_outage_hold(
     recommendations: list[HourlyRecommendation],
     live: LiveState,
@@ -329,16 +480,28 @@ def _apply_current_price_outage_hold(
     )
     if current is None or current.price_actionable:
         return None
+    return _set_strict_storage_hold(current)
 
-    current.recommendation = Recommendations.BatteriesWaitMode.value
-    current.primary_battery_hold = True
-    current.batteries_charged_kwh = 0.0
-    current.batteries_discharged_kwh = 0.0
-    current.secondary_storage_mode = SECONDARY_MODE_UTILITY
-    current.secondary_storage_charge_current_a = 0.0
-    current.secondary_storage_charged_kwh = 0.0
-    current.secondary_storage_discharged_kwh = 0.0
-    return current
+
+def _apply_load_forecast_hold(
+    recommendations: list[HourlyRecommendation],
+    live: LiveState,
+    now: datetime,
+    *,
+    load_forecast_ready: bool,
+) -> HourlyRecommendation | None:
+    """Publish a strict current-slot hold while the load forecast is unsafe."""
+    if load_forecast_ready:
+        return None
+    if str(live.force_working_mode_state).strip().lower() != "auto":
+        return None
+    current = next(
+        (rec for rec in recommendations if slot_contains(rec.start, rec.end, now)),
+        None,
+    )
+    if current is None:
+        return None
+    return _set_strict_storage_hold(current)
 
 
 def _next_slot_boundary_utc(now: datetime, interval_minutes: int) -> datetime:
@@ -638,7 +801,7 @@ class CoordinatorData:
     apply_summary: CycleApplySummary | None = None
     #: Human-readable explanation of why the selected plan was chosen.
     plan_explanation: PlanExplanation = field(default_factory=PlanExplanation)
-    #: Structured data-quality report for price and PV inputs.
+    #: Structured data-quality report for price, PV, and load-forecast inputs.
     data_quality: DataQuality = field(default_factory=DataQuality)
     #: Selection/rejection status for the paired ENTSO-E published-price backup.
     entsoe_price_backup_status: PriceBackupStatus = field(
@@ -760,6 +923,10 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._last_planner_output: PlannerOutput | None = None
         self._price_source_update_debounce_task: asyncio.Task[None] | None = None
         self._price_source_update_pending: bool = False
+        # Monotonic generation for registered price, PV, and valuation-source
+        # events. A cycle captures this before collecting its snapshot so an
+        # in-flight solve cannot publish commands after newer authority arrives.
+        self._forecast_authority_generation: int = 0
         self._phase_safety_update_debounce_task: asyncio.Task[None] | None = None
         self._phase_safety_update_pending: bool = False
 
@@ -805,6 +972,11 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._last_plan_slot_start: datetime | None = None
         self._last_plan_import_price: float | None = None
         self._last_plan_price_forecast_signature: _PriceForecastSignature | None = None
+        self._last_plan_load_forecast_signature: _LoadForecastSignature | None = None
+        # Invalid load data arms a durable recovery solve. It is cleared only
+        # after a ready plan is accepted and published.
+        self._load_forecast_recovery_replan_pending: bool = False
+        self._last_load_forecast_readiness_reason: str | None = None
         # EV planned-load config that affects planner optimisation.
         self._last_plan_ev_target_soc: float | None = None
         self._last_plan_ev_smart_charging: bool | None = None
@@ -1193,6 +1365,9 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
     async def _async_handle_price_source_change(self, _event: Event) -> None:
         """Coalesce price state/attribute changes into one durable refresh."""
+        self._forecast_authority_generation = (
+            getattr(self, "_forecast_authority_generation", 0) + 1
+        )
         self._price_source_update_pending = True
         task = self._price_source_update_debounce_task
         if task is not None and not task.done():
@@ -1202,6 +1377,81 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             name="hsem_price_source_update_debounce",
             eager_start=False,
         )
+
+    def _forecast_authority_generation_changed(
+        self,
+        captured_generation: int,
+        *,
+        phase: str,
+    ) -> bool:
+        """Return whether newer forecast authority invalidated this cycle."""
+        current_generation = getattr(self, "_forecast_authority_generation", 0)
+        if current_generation == captured_generation:
+            return False
+        async_log(
+            "debug",
+            "[replan] Discarding stale coordinator cycle before %s: "
+            "forecast authority generation advanced %d→%d; the queued "
+            "source refresh will rebuild it from a fresh snapshot.",
+            phase,
+            captured_generation,
+            current_generation,
+        )
+        return True
+
+    def _capture_forecast_authority_plan_state(
+        self,
+    ) -> _ForecastAuthorityPlanState:
+        """Snapshot accepted plan caches that a late stale cycle may mutate."""
+        return _ForecastAuthorityPlanState(
+            last_planner_input=self._last_planner_input,
+            last_planner_output=self._last_planner_output,
+            last_plan_slot_start=self._last_plan_slot_start,
+            previous_planner_winner_name=self._previous_planner_winner_name,
+            previous_planner_winner_score=self._previous_planner_winner_score,
+            window_hys_previous_rec=self._window_hys_previous_rec,
+            window_hys_previous_slot_start=self._window_hys_previous_slot_start,
+            window_hysteresis_expiry=self._window_hysteresis_expiry,
+            current_slot_start=self._current_slot_start,
+            current_slot_price_actionable=self._current_slot_price_actionable,
+            current_slot_ev_power_w=self._current_slot_ev_power_w,
+            current_slot_ev_second_power_w=self._current_slot_ev_second_power_w,
+            current_required_battery=self._current_required_battery,
+            plan_explanation=self._plan_explanation,
+            data_quality=self._data_quality,
+            ev_charging_plan=self._ev_charging_plan,
+            ev_second_charging_plan=self._ev_second_charging_plan,
+            hourly_recommendation=self._hourly_recommendation,
+            hourly_recommendations=self._hourly_recommendations,
+        )
+
+    def _restore_forecast_authority_plan_state(
+        self,
+        state: _ForecastAuthorityPlanState,
+    ) -> None:
+        """Roll back plan caches after a late authority generation abort."""
+        self._last_planner_input = state.last_planner_input
+        self._last_planner_output = state.last_planner_output
+        self._last_plan_slot_start = state.last_plan_slot_start
+        self._previous_planner_winner_name = state.previous_planner_winner_name
+        self._previous_planner_winner_score = state.previous_planner_winner_score
+        self._window_hys_previous_rec = state.window_hys_previous_rec
+        self._window_hys_previous_slot_start = state.window_hys_previous_slot_start
+        if self._window_hysteresis_expiry != state.window_hysteresis_expiry:
+            self._cancel_window_hysteresis_expiry()
+            if state.window_hysteresis_expiry is not None:
+                self._schedule_window_hysteresis_expiry(state.window_hysteresis_expiry)
+        self._current_slot_start = state.current_slot_start
+        self._current_slot_price_actionable = state.current_slot_price_actionable
+        self._current_slot_ev_power_w = state.current_slot_ev_power_w
+        self._current_slot_ev_second_power_w = state.current_slot_ev_second_power_w
+        self._current_required_battery = state.current_required_battery
+        self._plan_explanation = state.plan_explanation
+        self._data_quality = state.data_quality
+        self._ev_charging_plan = state.ev_charging_plan
+        self._ev_second_charging_plan = state.ev_second_charging_plan
+        self._hourly_recommendation = state.hourly_recommendation
+        self._hourly_recommendations = state.hourly_recommendations
 
     async def _async_price_source_update_debounced(self) -> None:
         """Refresh after publication/withdrawal without dropping busy events."""
@@ -1290,6 +1540,10 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             UpdateFailed: When an unrecoverable error occurs during the pipeline.
         """
         async_log("debug", "------ HSEM Coordinator: starting update cycle")
+        forecast_authority_generation = getattr(
+            self, "_forecast_authority_generation", 0
+        )
+        forecast_authority_plan_state = self._capture_forecast_authority_plan_state()
         now = hsem_now()
         corrective_live_replan = False
         corrective_request_slot: datetime | None = None
@@ -1298,7 +1552,9 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         corrective_candidate_winner = ""
         corrective_candidate_solver = "not_run"
         plan_state_should_persist = False
+        normal_planner_output_to_commit: PlannerOutput | None = None
         price_forecast_signature: _PriceForecastSignature | None = None
+        load_forecast_signature: _LoadForecastSignature | None = None
         price_authority_changed = False
         # An exact hysteresis-expiry callback must survive degraded or failed
         # cycles.  Consume it only after this cycle actually ran the planner
@@ -1473,6 +1729,48 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                     len(self._snapshot.energy_average_values),
                 )
 
+            load_forecast_readiness = _assess_load_forecast(
+                self._hourly_recommendations,
+                now,
+                population_succeeded=consumption_ok,
+                live_house_demand_w=live.house_consumption_power_w,
+            )
+            consumption_ok = load_forecast_readiness.ready
+            load_forecast_signature = load_forecast_readiness.signature
+            readiness_reason = load_forecast_readiness.reason
+            previous_readiness_reason = getattr(
+                self, "_last_load_forecast_readiness_reason", None
+            )
+            if consumption_ok:
+                assert load_forecast_signature is not None
+                if not self._data_quality.load_forecast_ready:
+                    self._data_quality = replace(
+                        self._data_quality,
+                        load_forecast_ready=True,
+                        load_forecast_reason=None,
+                    )
+                if previous_readiness_reason is not None:
+                    async_log(
+                        "info",
+                        "[load] Forecast recovered (%s); a fresh plan is required.",
+                        previous_readiness_reason,
+                    )
+            else:
+                assert readiness_reason is not None
+                self._load_forecast_recovery_replan_pending = True
+                self._data_quality = DataQuality(
+                    load_forecast_ready=False,
+                    load_forecast_reason=readiness_reason,
+                )
+                if readiness_reason != previous_readiness_reason:
+                    async_log(
+                        "warning",
+                        "[load] Forecast is not ready (%s); automatic control "
+                        "will publish a strict storage hold.",
+                        readiness_reason,
+                    )
+            self._last_load_forecast_readiness_reason = readiness_reason
+
             # Adjust timer based on missing-entities or pending-consumption status.
             if live.missing_entities or not consumption_ok:
                 await self._set_update_interval(1)
@@ -1542,6 +1840,27 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 # pending consumption history prevents a planner run below.
                 self._hourly_recommendation = price_outage_hold
                 state = price_outage_hold.recommendation
+            load_forecast_hold = _apply_load_forecast_hold(
+                self._hourly_recommendations,
+                live,
+                now,
+                load_forecast_ready=consumption_ok,
+            )
+            if load_forecast_hold is not None:
+                assert readiness_reason is not None
+                self._hourly_recommendation = load_forecast_hold
+                state = load_forecast_hold.recommendation
+                self._plan_explanation = PlanExplanation(
+                    selected_strategy="safety_hold",
+                    winner_name="safety_hold",
+                    summary=(
+                        "Battery held because the house-load forecast is not "
+                        f"ready ({readiness_reason})."
+                    ),
+                    constraints=[f"load_forecast:{readiness_reason}"],
+                    solver_status="not_run",
+                    fallback_reason=readiness_reason,
+                )
             price_forecast_attributes = _price_forecast_attributes(
                 self._snapshot,
                 cfg,
@@ -1677,6 +1996,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                     live,
                     now,
                     price_forecast_signature=price_forecast_signature,
+                    load_forecast_signature=load_forecast_signature,
                 )
 
                 if should_replan:
@@ -1734,6 +2054,14 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                     candidate_planner_output = await self.hass.async_add_executor_job(
                         run_planner, planner_input
                     )
+                    if self._forecast_authority_generation_changed(
+                        forecast_authority_generation,
+                        phase="planner solve",
+                    ):
+                        self._restore_forecast_authority_plan_state(
+                            forecast_authority_plan_state
+                        )
+                        return
                     if hysteresis_expiry_replan:
                         hysteresis_expiry_replan_completed = True
                     if corrective_live_replan:
@@ -1773,18 +2101,16 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                                 or "(none)",
                                 corrective_rejection_reason,
                             )
+                            # The retained accepted output is mutable downstream.
+                            # Isolate this corrective publication from its cache.
+                            planner_output = deepcopy(planner_output)
                     else:
                         planner_output = candidate_planner_output
-                        self._last_planner_output = planner_output
+                        normal_planner_output_to_commit = planner_output
                         plan_state_should_persist = True
 
                     if corrective_live_replan and corrective_output_accepted:
                         plan_state_should_persist = True
-
-                    # Record the time this plan was created so the slot-boundary
-                    # check in _should_replan uses the actual plan time.
-                    if not corrective_live_replan:
-                        self._last_plan_slot_start = now
 
                     for warning in planner_output.warnings:
                         async_log("debug", "[planner] %s", warning)
@@ -1823,7 +2149,15 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                         "_last_planner_output must be set when _should_replan"
                         " returns False"
                     )
-                    planner_output = self._last_planner_output
+                    planner_output = deepcopy(self._last_planner_output)
+                    self._current_required_battery = (
+                        planner_output.required_capacity_kwh
+                    )
+                    self._data_quality = planner_output.data_quality
+                    self._ev_charging_plan = planner_output.ev_charging_plan
+                    self._ev_second_charging_plan = (
+                        planner_output.ev_second_charging_plan
+                    )
                     async_log(
                         "debug",
                         "[replan] Skipping planner — no material changes detected."
@@ -2021,8 +2355,19 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                         e,
                     )
 
+        except asyncio.CancelledError:
+            self._restore_forecast_authority_plan_state(forecast_authority_plan_state)
+            raise
         except Exception as exc:
+            self._restore_forecast_authority_plan_state(forecast_authority_plan_state)
             raise UpdateFailed(f"HSEM update cycle failed: {exc}") from exc
+
+        if self._forecast_authority_generation_changed(
+            forecast_authority_generation,
+            phase="publication",
+        ):
+            self._restore_forecast_authority_plan_state(forecast_authority_plan_state)
+            return
 
         # Final sort and timestamp.
         self._hourly_recommendations.sort(key=lambda x: utc_key(x.start))
@@ -2067,12 +2412,17 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
         # Notify all subscriber entities atomically.
         self.async_set_updated_data(data)
+        if normal_planner_output_to_commit is not None:
+            self._last_planner_output = normal_planner_output_to_commit
+            self._last_plan_slot_start = now
+
         if hysteresis_expiry_replan_completed:
             self._window_hysteresis_expiry_replan_pending = False
         self._persist_plan_state_if_accepted(
             live,
             plan_state_should_persist,
             price_forecast_signature=price_forecast_signature,
+            load_forecast_signature=load_forecast_signature,
         )
         if corrective_live_replan and corrective_request_slot is not None:
             # Commit the corrected plan and consume the once-per-slot request
@@ -2400,6 +2750,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         now: datetime,
         *,
         price_forecast_signature: _PriceForecastSignature | None = None,
+        load_forecast_signature: _LoadForecastSignature | None = None,
     ) -> bool:
         """Determine whether the planner should be re-run.
 
@@ -2417,6 +2768,23 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         """
         # First run — always plan.
         if self._last_planner_output is None:
+            return True
+
+        if getattr(self, "_load_forecast_recovery_replan_pending", False):
+            async_log(
+                "debug",
+                "[replan] Load forecast recovered after a safety hold — re-planning.",
+            )
+            return True
+
+        if load_forecast_signature is not None and not _load_forecast_signatures_match(
+            load_forecast_signature,
+            getattr(self, "_last_plan_load_forecast_signature", None),
+        ):
+            async_log(
+                "debug",
+                "[replan] Future load forecast changed — re-planning.",
+            )
             return True
 
         if price_forecast_signature is not None and price_forecast_signature != getattr(
@@ -2650,6 +3018,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         live: LiveState,
         *,
         price_forecast_signature: _PriceForecastSignature | None = None,
+        load_forecast_signature: _LoadForecastSignature | None = None,
     ) -> None:
         """Record the current state after a successful plan run.
 
@@ -2690,6 +3059,9 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         )
         if price_forecast_signature is not None:
             self._last_plan_price_forecast_signature = price_forecast_signature
+        if load_forecast_signature is not None:
+            self._last_plan_load_forecast_signature = load_forecast_signature
+            self._load_forecast_recovery_replan_pending = False
 
     def _persist_plan_state_if_accepted(
         self,
@@ -2697,12 +3069,14 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         plan_state_should_persist: bool,
         *,
         price_forecast_signature: _PriceForecastSignature | None = None,
+        load_forecast_signature: _LoadForecastSignature | None = None,
     ) -> None:
         """Advance material-change baselines only for a published new plan."""
         if plan_state_should_persist:
             self._persist_plan_state(
                 live,
                 price_forecast_signature=price_forecast_signature,
+                load_forecast_signature=load_forecast_signature,
             )
 
     def _freeze_ev_charger_power_for_current_slot(

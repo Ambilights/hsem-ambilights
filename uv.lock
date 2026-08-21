@@ -1067,7 +1067,7 @@ wheels = [
 
 [[package]]
 name = "hsem"
-version = "7.1.5"
+version = "7.1.6"
 source = { editable = "." }
 dependencies = [
     { name = "homeassistant" },

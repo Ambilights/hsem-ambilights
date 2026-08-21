@@ -83,6 +83,7 @@ from custom_components.hsem.custom_sensors.update_interval_sensor import (
 from custom_components.hsem.custom_sensors.working_mode_sensor import (
     HSEMWorkingModeSensor,
 )
+from custom_components.hsem.models.hourly_recommendation import HourlyRecommendation
 from custom_components.hsem.models.live_state import LiveState
 from custom_components.hsem.models.sensor_config import SensorConfig
 from custom_components.hsem.utils.datetime_utils import utc_key
@@ -857,6 +858,584 @@ class TestDryRunCycle:
         data = captured[0]
         assert isinstance(data, CoordinatorData)
         assert data.last_updated is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("race_stage", ["planner_solve", "post_solve_tracker"])
+    async def test_forecast_authority_event_discards_in_flight_cycle(
+        self, race_stage: str
+    ) -> None:
+        """Only a fresh rerun may publish after authority changes in flight."""
+        from types import SimpleNamespace
+
+        from custom_components.hsem.models.planned_slot import PlannedSlot
+        from custom_components.hsem.models.planner_output import PlannerOutput
+        from custom_components.hsem.utils.recommendations import Recommendations
+
+        config_entry = make_fake_config_entry({"hsem_read_only": True})
+        hass = make_fake_hass(_BASE_ENTITY_STATES)
+        coord = make_bare_coordinator(hass=hass, config_entry=config_entry)
+        coord._forecast_authority_generation = 0
+        coord._set_update_interval = AsyncMock()  # type: ignore[method-assign]
+        accepted_output = PlannerOutput(winner_name="accepted")
+        coord._last_planner_output = accepted_output
+        coord._previous_planner_winner_name = "accepted"
+        coord._previous_planner_winner_score = 7.0
+
+        captured: list[CoordinatorData] = []
+        publish = MagicMock(side_effect=captured.append)
+        coord.async_set_updated_data = publish  # type: ignore[method-assign]
+
+        race_reached = asyncio.Event()
+        release_race = asyncio.Event()
+        fresh_solve_reached = asyncio.Event()
+        release_fresh_solve = asyncio.Event()
+        solve_outputs: list[PlannerOutput] = []
+        planner_inputs: list[Any] = []
+
+        async def staged_executor(_func: Any, *_args: Any) -> PlannerOutput:
+            assert len(_args) == 1
+            planner_input = _args[0]
+            planner_inputs.append(planner_input)
+            solve_number = len(solve_outputs) + 1
+            if race_stage == "planner_solve" and solve_number == 1:
+                race_reached.set()
+                await release_race.wait()
+            if solve_number == 2:
+                fresh_solve_reached.set()
+                await release_fresh_solve.wait()
+            recommendation = (
+                Recommendations.ForceBatteriesDischarge.value
+                if solve_number == 1
+                else Recommendations.BatteriesWaitMode.value
+            )
+            winner = SimpleNamespace(
+                name=f"milp_{solve_number}",
+                _cost=SimpleNamespace(score=float(solve_number)),
+            )
+            output = PlannerOutput(
+                slots=[
+                    PlannedSlot(
+                        start=rec.start,
+                        end=rec.end,
+                        recommendation=recommendation,
+                        primary_battery_hold=solve_number > 1,
+                        batteries_discharged_kwh=(0.1 if solve_number == 1 else 0.0),
+                        grid_export_kwh=0.1 if solve_number == 1 else 0.0,
+                        ev_charger_calculated_power=(
+                            1111.0 if solve_number == 1 else 2222.0
+                        ),
+                    )
+                    for rec in coord._hourly_recommendations
+                ],
+                winner_name=winner.name,
+                candidates=[winner],
+            )
+            solve_outputs.append(output)
+            return output
+
+        first_tracker_call = True
+
+        async def staged_daily_tracker(*_args: Any) -> None:
+            nonlocal first_tracker_call
+            if race_stage == "post_solve_tracker" and first_tracker_call:
+                first_tracker_call = False
+                race_reached.set()
+                await release_race.wait()
+
+        def create_task(
+            coro: Any,
+            *,
+            name: str | None = None,
+            eager_start: bool = False,
+        ) -> asyncio.Task[Any]:
+            del eager_start
+            return asyncio.create_task(coro, name=name)
+
+        hass.async_add_executor_job = staged_executor
+        hass.async_create_task = create_task
+        coord._accumulate_daily_plan_actuals = staged_daily_tracker  # type: ignore[assignment,method-assign]
+        coord._accumulate_financials = AsyncMock()  # type: ignore[method-assign]
+        coord._accumulate_savings = AsyncMock()  # type: ignore[method-assign]
+
+        with (
+            _patch_all_ha_helpers(),
+            patch(
+                "custom_components.hsem.coordinator."
+                "PRICE_SOURCE_UPDATE_DEBOUNCE_SECONDS",
+                0.0,
+            ),
+        ):
+            initial_cycle = asyncio.create_task(coord._async_handle_update())
+            await asyncio.wait_for(race_reached.wait(), timeout=5.0)
+
+            await coord._async_handle_price_source_change(MagicMock())
+            assert coord._forecast_authority_generation == 1
+
+            follow_up = coord._price_source_update_debounce_task
+            assert follow_up is not None
+            release_race.set()
+            await asyncio.wait_for(initial_cycle, timeout=5.0)
+            await asyncio.wait_for(fresh_solve_reached.wait(), timeout=5.0)
+
+            # The stale cycle has returned and the fresh solve is deliberately
+            # blocked, so no coordinator generation (and therefore no hardware
+            # intent) may have escaped from the stale result.
+            publish.assert_not_called()
+            assert coord._last_planner_output is accepted_output
+            assert coord._last_plan_slot_start is None
+            assert coord._previous_planner_winner_name == "accepted"
+            assert coord._previous_planner_winner_score == pytest.approx(7.0)
+            assert coord._window_hys_previous_rec is None
+            assert coord._window_hys_previous_slot_start is None
+            assert coord._current_slot_start is None
+            assert coord._current_slot_price_actionable is None
+            assert coord._current_slot_ev_power_w == pytest.approx(0.0)
+            assert coord._current_slot_ev_second_power_w == pytest.approx(0.0)
+            assert len(planner_inputs) == 2
+            assert planner_inputs[1].previous_winner_name == "accepted"
+            assert planner_inputs[1].previous_winner_score == pytest.approx(7.0)
+
+            release_fresh_solve.set()
+            await asyncio.wait_for(follow_up, timeout=5.0)
+
+        assert len(solve_outputs) == 2
+        publish.assert_called_once()
+        assert len(captured) == 1
+        assert captured[0].hourly_recommendation is not None
+        assert captured[0].hourly_recommendation.recommendation == (
+            Recommendations.BatteriesWaitMode.value
+        )
+        assert captured[0].hourly_recommendation.ev_charger_calculated_power == (
+            pytest.approx(2222.0)
+        )
+        assert coord._last_planner_output is solve_outputs[-1]
+        assert coord._price_source_update_debounce_task is None
+
+    @pytest.mark.asyncio
+    async def test_authority_event_during_reuse_preserves_accepted_output(
+        self,
+    ) -> None:
+        """A late source event must not mutate the cached plan on a reuse cycle."""
+        from custom_components.hsem.models.planned_slot import PlannedSlot
+        from custom_components.hsem.models.planner_output import PlannerOutput
+        from custom_components.hsem.planner.ev_planner import EVChargingPlan
+        from custom_components.hsem.utils.datetime_utils import (
+            now as hsem_now,
+            slot_contains,
+        )
+        from custom_components.hsem.utils.recommendations import Recommendations
+
+        config_entry = make_fake_config_entry(
+            {
+                "hsem_read_only": True,
+                "hsem_ev_force_charge_now": True,
+                "hsem_ev_planned_load_charger_power_kw": 7.0,
+            }
+        )
+        hass = make_fake_hass(_BASE_ENTITY_STATES)
+        coord = make_bare_coordinator(hass=hass, config_entry=config_entry)
+        coord._forecast_authority_generation = 0
+        coord._set_update_interval = AsyncMock()  # type: ignore[method-assign]
+
+        now = hsem_now()
+        recommendation_slots = generate_recommendation_intervals(
+            coord._cfg.recommendation_interval_minutes,
+            coord._cfg.recommendation_interval_length,
+        )
+        accepted_ev_plan = EVChargingPlan(state="waiting")
+        accepted_output = PlannerOutput(
+            slots=[
+                PlannedSlot(
+                    start=rec.start,
+                    end=rec.end,
+                    recommendation=Recommendations.BatteriesWaitMode.value,
+                    price_actionable=True,
+                    ev_charger_calculated_power=9999.0,
+                )
+                for rec in recommendation_slots
+            ],
+            ev_charging_plan=accepted_ev_plan,
+            winner_name="accepted",
+        )
+        accepted_current_slot = next(
+            slot
+            for slot in accepted_output.slots
+            if slot_contains(slot.start, slot.end, now)
+        )
+        coord._last_planner_output = accepted_output
+        coord._last_plan_slot_start = accepted_current_slot.start
+        coord._ev_charging_plan = accepted_ev_plan
+        coord._current_slot_start = accepted_current_slot.start
+        coord._current_slot_price_actionable = True
+        coord._current_slot_ev_power_w = 1111.0
+        coord._should_replan = MagicMock(return_value=False)  # type: ignore[method-assign]
+
+        captured: list[CoordinatorData] = []
+        publish = MagicMock(side_effect=captured.append)
+        coord.async_set_updated_data = publish  # type: ignore[method-assign]
+        hass.async_add_executor_job = AsyncMock(
+            side_effect=AssertionError("reuse cycle must not invoke the planner")
+        )
+
+        tracker_reached = asyncio.Event()
+        release_tracker = asyncio.Event()
+        first_tracker_call = True
+
+        async def staged_daily_tracker(*_args: Any) -> None:
+            nonlocal first_tracker_call
+            if first_tracker_call:
+                first_tracker_call = False
+                tracker_reached.set()
+                await release_tracker.wait()
+
+        coord._accumulate_daily_plan_actuals = staged_daily_tracker  # type: ignore[assignment,method-assign]
+        coord._accumulate_financials = AsyncMock()  # type: ignore[method-assign]
+        coord._accumulate_savings = AsyncMock()  # type: ignore[method-assign]
+
+        allow_fresh_cycle = asyncio.Event()
+        original_debounced = coord._async_price_source_update_debounced
+
+        async def gated_debounced() -> None:
+            await allow_fresh_cycle.wait()
+            await original_debounced()
+
+        coord._async_price_source_update_debounced = gated_debounced  # type: ignore[method-assign]
+
+        def create_task(
+            coro: Any,
+            *,
+            name: str | None = None,
+            eager_start: bool = False,
+        ) -> asyncio.Task[Any]:
+            del eager_start
+            return asyncio.create_task(coro, name=name)
+
+        hass.async_create_task = create_task
+
+        with (
+            _patch_all_ha_helpers(),
+            patch(
+                "custom_components.hsem.coordinator."
+                "PRICE_SOURCE_UPDATE_DEBOUNCE_SECONDS",
+                0.0,
+            ),
+        ):
+            stale_cycle = asyncio.create_task(coord._async_handle_update())
+            await asyncio.wait_for(tracker_reached.wait(), timeout=5.0)
+
+            # Reuse applies EV freezing and force-charge overrides before this
+            # tracker await. Those mutations must be isolated from the cache.
+            assert accepted_current_slot.ev_charger_calculated_power == pytest.approx(
+                9999.0
+            )
+            assert accepted_ev_plan.state == "waiting"
+
+            await coord._async_handle_price_source_change(MagicMock())
+            follow_up = coord._price_source_update_debounce_task
+            assert follow_up is not None
+
+            release_tracker.set()
+            await asyncio.wait_for(stale_cycle, timeout=5.0)
+
+            publish.assert_not_called()
+            assert coord._last_planner_output is accepted_output
+            assert coord._ev_charging_plan is accepted_ev_plan
+            assert accepted_current_slot.ev_charger_calculated_power == pytest.approx(
+                9999.0
+            )
+            assert accepted_ev_plan.state == "waiting"
+
+            allow_fresh_cycle.set()
+            await asyncio.wait_for(follow_up, timeout=5.0)
+
+        publish.assert_called_once()
+        assert len(captured) == 1
+        assert captured[0].hourly_recommendation is not None
+        assert captured[0].hourly_recommendation.ev_charger_calculated_power == (
+            pytest.approx(7000.0)
+        )
+        assert captured[0].ev_charging_plan is not None
+        assert captured[0].ev_charging_plan.state == "charging"
+        assert coord._last_planner_output is accepted_output
+        assert accepted_current_slot.ev_charger_calculated_power == pytest.approx(
+            9999.0
+        )
+        assert accepted_ev_plan.state == "waiting"
+        assert coord._price_source_update_debounce_task is None
+
+    @pytest.mark.asyncio
+    async def test_post_solve_failure_restores_accepted_plan_state(self) -> None:
+        """A failed prepublication stage must leave accepted plan caches intact."""
+        from types import SimpleNamespace
+
+        from homeassistant.helpers.update_coordinator import UpdateFailed
+
+        from custom_components.hsem.models.planned_slot import PlannedSlot
+        from custom_components.hsem.models.planner_output import PlannerOutput
+        from custom_components.hsem.utils.recommendations import Recommendations
+
+        config_entry = make_fake_config_entry({"hsem_read_only": True})
+        hass = make_fake_hass(_BASE_ENTITY_STATES)
+        coord = make_bare_coordinator(hass=hass, config_entry=config_entry)
+        coord._set_update_interval = AsyncMock()  # type: ignore[method-assign]
+
+        accepted_output = PlannerOutput(winner_name="accepted")
+        accepted_explanation = coord._plan_explanation
+        accepted_quality = coord._data_quality
+        coord._last_planner_output = accepted_output
+        coord._previous_planner_winner_name = "accepted"
+        coord._previous_planner_winner_score = 7.0
+
+        async def staged_executor(_func: Any, *_args: Any) -> PlannerOutput:
+            winner = SimpleNamespace(
+                name="replacement",
+                _cost=SimpleNamespace(score=1.0),
+            )
+            return PlannerOutput(
+                slots=[
+                    PlannedSlot(
+                        start=rec.start,
+                        end=rec.end,
+                        recommendation=Recommendations.ForceBatteriesDischarge.value,
+                        batteries_discharged_kwh=0.1,
+                        grid_export_kwh=0.1,
+                        ev_charger_calculated_power=2222.0,
+                    )
+                    for rec in coord._hourly_recommendations
+                ],
+                winner_name=winner.name,
+                candidates=[winner],
+            )
+
+        hass.async_add_executor_job = staged_executor
+        publish = MagicMock()
+        coord.async_set_updated_data = publish  # type: ignore[method-assign]
+        coord._register_forecasts_from_planner = MagicMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("post-solve registration failed")
+        )
+
+        with (
+            _patch_all_ha_helpers(),
+            pytest.raises(UpdateFailed, match="post-solve registration failed"),
+        ):
+            await coord._async_run_update_cycle()
+
+        publish.assert_not_called()
+        assert coord._last_planner_input is None
+        assert coord._last_planner_output is accepted_output
+        assert coord._last_plan_slot_start is None
+        assert coord._previous_planner_winner_name == "accepted"
+        assert coord._previous_planner_winner_score == pytest.approx(7.0)
+        assert coord._window_hys_previous_rec is None
+        assert coord._window_hys_previous_slot_start is None
+        assert coord._current_slot_start is None
+        assert coord._current_slot_price_actionable is None
+        assert coord._current_slot_ev_power_w == pytest.approx(0.0)
+        assert coord._current_slot_ev_second_power_w == pytest.approx(0.0)
+        assert coord._plan_explanation is accepted_explanation
+        assert coord._data_quality is accepted_quality
+        assert coord._hourly_recommendation is None
+        assert coord._hourly_recommendations == []
+
+    @pytest.mark.asyncio
+    async def test_cancelled_post_solve_cycle_restores_accepted_plan_state(
+        self,
+    ) -> None:
+        """Cancellation after plan mutation must roll back before propagating."""
+        from types import SimpleNamespace
+
+        from custom_components.hsem.models.planned_slot import PlannedSlot
+        from custom_components.hsem.models.planner_output import PlannerOutput
+        from custom_components.hsem.utils.recommendations import Recommendations
+
+        config_entry = make_fake_config_entry({"hsem_read_only": True})
+        hass = make_fake_hass(_BASE_ENTITY_STATES)
+        coord = make_bare_coordinator(hass=hass, config_entry=config_entry)
+        coord._set_update_interval = AsyncMock()  # type: ignore[method-assign]
+
+        accepted_output = PlannerOutput(winner_name="accepted")
+        accepted_explanation = coord._plan_explanation
+        accepted_quality = coord._data_quality
+        accepted_recommendations = coord._hourly_recommendations
+        coord._last_planner_output = accepted_output
+        coord._previous_planner_winner_name = "accepted"
+        coord._previous_planner_winner_score = 7.0
+        coord._current_required_battery = 4.2
+
+        async def staged_executor(_func: Any, *_args: Any) -> PlannerOutput:
+            winner = SimpleNamespace(
+                name="replacement",
+                _cost=SimpleNamespace(score=1.0),
+            )
+            return PlannerOutput(
+                slots=[
+                    PlannedSlot(
+                        start=rec.start,
+                        end=rec.end,
+                        recommendation=Recommendations.ForceBatteriesDischarge.value,
+                        batteries_discharged_kwh=0.1,
+                        grid_export_kwh=0.1,
+                    )
+                    for rec in coord._hourly_recommendations
+                ],
+                required_capacity_kwh=9.0,
+                winner_name=winner.name,
+                candidates=[winner],
+            )
+
+        tracker_reached = asyncio.Event()
+        release_tracker = asyncio.Event()
+
+        async def blocked_daily_tracker(*_args: Any) -> None:
+            tracker_reached.set()
+            await release_tracker.wait()
+
+        hass.async_add_executor_job = staged_executor
+        coord._register_forecasts_from_planner = MagicMock()  # type: ignore[method-assign]
+        coord._accumulate_daily_plan_actuals = blocked_daily_tracker  # type: ignore[assignment,method-assign]
+        coord._accumulate_financials = AsyncMock()  # type: ignore[method-assign]
+        coord._accumulate_savings = AsyncMock()  # type: ignore[method-assign]
+        publish = MagicMock()
+        coord.async_set_updated_data = publish  # type: ignore[method-assign]
+
+        with _patch_all_ha_helpers():
+            cycle = asyncio.create_task(coord._async_run_update_cycle())
+            await asyncio.wait_for(tracker_reached.wait(), timeout=5.0)
+
+            assert coord._last_planner_input is not None
+            assert coord._hourly_recommendation is not None
+            assert coord._hourly_recommendation.recommendation == (
+                Recommendations.ForceBatteriesDischarge.value
+            )
+            assert coord._current_required_battery == pytest.approx(9.0)
+            assert coord._previous_planner_winner_name == "replacement"
+
+            cycle.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cycle
+
+        publish.assert_not_called()
+        assert coord._last_planner_input is None
+        assert coord._last_planner_output is accepted_output
+        assert coord._last_plan_slot_start is None
+        assert coord._previous_planner_winner_name == "accepted"
+        assert coord._previous_planner_winner_score == pytest.approx(7.0)
+        assert coord._window_hys_previous_rec is None
+        assert coord._window_hys_previous_slot_start is None
+        assert coord._current_slot_start is None
+        assert coord._current_slot_price_actionable is None
+        assert coord._current_slot_ev_power_w == pytest.approx(0.0)
+        assert coord._current_slot_ev_second_power_w == pytest.approx(0.0)
+        assert coord._current_required_battery == pytest.approx(4.2)
+        assert coord._plan_explanation is accepted_explanation
+        assert coord._data_quality is accepted_quality
+        assert coord._hourly_recommendation is None
+        assert coord._hourly_recommendations is accepted_recommendations
+
+    @pytest.mark.asyncio
+    async def test_zero_load_with_live_demand_publishes_strict_hold(self) -> None:
+        """A contradictory zero load must skip solve and replace no cached intent."""
+        from custom_components.hsem.models.planned_slot import PlannedSlot
+        from custom_components.hsem.models.planner_output import PlannerOutput
+        from custom_components.hsem.utils.recommendations import Recommendations
+
+        config_entry = make_fake_config_entry({"hsem_read_only": True})
+        hass = make_fake_hass(_BASE_ENTITY_STATES)
+        coord = make_bare_coordinator(hass=hass, config_entry=config_entry)
+        coord._set_update_interval = AsyncMock()  # type: ignore[method-assign]
+
+        accepted_slots = generate_recommendation_intervals(
+            coord._cfg.recommendation_interval_minutes,
+            coord._cfg.recommendation_interval_length,
+        )
+        accepted_output = PlannerOutput(
+            slots=[
+                PlannedSlot(
+                    start=rec.start,
+                    end=rec.end,
+                    recommendation=Recommendations.ForceBatteriesDischarge.value,
+                    batteries_discharged_kwh=0.5,
+                    grid_export_kwh=0.5,
+                )
+                for rec in accepted_slots
+            ],
+            winner_name="accepted_force_export",
+        )
+        accepted_start = accepted_slots[0].start
+        accepted_load_signature = (
+            (accepted_start.isoformat(), 0.25, 0.25, 0.25, 0.25, 0.25),
+        )
+        coord._last_planner_output = accepted_output
+        coord._last_plan_slot_start = accepted_start
+        coord._last_plan_load_forecast_signature = accepted_load_signature
+        coord._load_forecast_recovery_replan_pending = False
+        coord._last_load_forecast_readiness_reason = None
+
+        def populate_zero_house_load(
+            recommendations: list[HourlyRecommendation],
+            *_args: Any,
+            **_kwargs: Any,
+        ) -> bool:
+            for recommendation in recommendations:
+                recommendation.avg_house_consumption_kwh = 0.0
+                recommendation.avg_house_consumption_1d_kwh = 0.0
+                recommendation.avg_house_consumption_3d_kwh = 0.0
+                recommendation.avg_house_consumption_7d_kwh = 0.0
+                recommendation.avg_house_consumption_14d_kwh = 0.0
+            return True
+
+        planner_executor = AsyncMock(
+            side_effect=AssertionError(
+                "contradictory zero load must not invoke the planner"
+            )
+        )
+        hass.async_add_executor_job = planner_executor
+        captured: list[CoordinatorData] = []
+        publish = MagicMock(side_effect=captured.append)
+        coord.async_set_updated_data = publish  # type: ignore[method-assign]
+
+        with (
+            _patch_all_ha_helpers(),
+            patch(
+                "custom_components.hsem.coordinator."
+                "populate_avg_house_consumption_from_snapshot",
+                side_effect=populate_zero_house_load,
+            ),
+        ):
+            await coord._async_run_update_cycle()
+
+        planner_executor.assert_not_awaited()
+        publish.assert_called_once()
+        assert len(captured) == 1
+        data = captured[0]
+        assert data.data_quality.load_forecast_ready is False
+        assert (
+            data.data_quality.load_forecast_reason == "zero_forecast_with_live_demand"
+        )
+        assert data.data_quality.is_complete is False
+        assert data.plan_explanation.selected_strategy == "safety_hold"
+        assert data.plan_explanation.solver_status == "not_run"
+        assert data.plan_explanation.fallback_reason == "zero_forecast_with_live_demand"
+
+        held = data.hourly_recommendation
+        assert held is not None
+        assert held.recommendation == Recommendations.BatteriesWaitMode.value
+        assert held.primary_battery_hold is True
+        assert held.batteries_charged_kwh == pytest.approx(0.0)
+        assert held.batteries_discharged_kwh == pytest.approx(0.0)
+        assert held.grid_import_kwh == pytest.approx(0.0)
+        assert held.grid_export_kwh == pytest.approx(0.0)
+        assert held.secondary_storage_mode == "utility"
+        assert held.secondary_storage_charge_current_a == pytest.approx(0.0)
+        assert held.secondary_storage_charged_kwh == pytest.approx(0.0)
+        assert held.secondary_storage_discharged_kwh == pytest.approx(0.0)
+        assert held.secondary_storage_grid_import_kwh == pytest.approx(0.0)
+
+        assert coord._last_planner_output is accepted_output
+        assert coord._last_plan_slot_start is accepted_start
+        assert coord._last_plan_load_forecast_signature is accepted_load_signature
+        assert coord._load_forecast_recovery_replan_pending is True
+        coord._set_update_interval.assert_awaited_once_with(1)
 
     @pytest.mark.asyncio
     async def test_live_state_populated_from_mock_states(self) -> None:
@@ -2049,6 +2628,19 @@ def _patch_all_ha_helpers():
     """
     import contextlib
 
+    def populate_valid_house_load(
+        recommendations: list[HourlyRecommendation],
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> bool:
+        for recommendation in recommendations:
+            recommendation.avg_house_consumption_kwh = 0.25
+            recommendation.avg_house_consumption_1d_kwh = 0.25
+            recommendation.avg_house_consumption_3d_kwh = 0.25
+            recommendation.avg_house_consumption_7d_kwh = 0.25
+            recommendation.avg_house_consumption_14d_kwh = 0.25
+        return True
+
     @contextlib.contextmanager
     def _ctx():
         patches = [
@@ -2066,7 +2658,7 @@ def _patch_all_ha_helpers():
             patch(
                 "custom_components.hsem.coordinator"
                 ".populate_avg_house_consumption_from_snapshot",
-                return_value=True,
+                side_effect=populate_valid_house_load,
             ),
             patch(
                 "custom_components.hsem.coordinator"
