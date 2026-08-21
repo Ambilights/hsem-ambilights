@@ -294,6 +294,7 @@ def make_bare_coordinator(
     coord._last_planner_input = None
     coord._price_source_update_debounce_task = None
     coord._price_source_update_pending = False
+    coord._forecast_authority_generation = 0
     coord._window_hys_previous_rec = None
     coord._window_hys_previous_slot_start = None
     coord._previous_planner_winner_name = None
@@ -858,6 +859,72 @@ class TestDryRunCycle:
         data = captured[0]
         assert isinstance(data, CoordinatorData)
         assert data.last_updated is not None
+
+    @pytest.mark.asyncio
+    async def test_boundary_price_burst_runs_one_full_cycle(self) -> None:
+        """A boundary-adjacent import/export burst solves and publishes once."""
+        from datetime import UTC, datetime
+        from types import SimpleNamespace
+
+        config_entry = make_fake_config_entry({"hsem_read_only": True})
+        hass = make_fake_hass(_BASE_ENTITY_STATES)
+        coord = make_bare_coordinator(hass=hass, config_entry=config_entry)
+        coord._set_update_interval = AsyncMock()  # type: ignore[method-assign]
+
+        captured: list[CoordinatorData] = []
+        publish = MagicMock(side_effect=captured.append)
+        coord.async_set_updated_data = publish  # type: ignore[method-assign]
+
+        original_executor = hass.async_add_executor_job
+        executor_calls = 0
+
+        async def counting_executor(func: Any, *args: Any) -> Any:
+            nonlocal executor_calls
+            executor_calls += 1
+            return await original_executor(func, *args)
+
+        def create_task(
+            coro: Any,
+            *,
+            name: str | None = None,
+            eager_start: bool = False,
+        ) -> asyncio.Task[Any]:
+            del eager_start
+            return asyncio.create_task(coro, name=name)
+
+        hass.async_add_executor_job = counting_executor
+        hass.async_create_task = create_task
+        boundary = datetime(2026, 8, 21, 18, 45, tzinfo=UTC)
+        import_event = SimpleNamespace(
+            data={"entity_id": "sensor.import_electricity_price"}
+        )
+        export_event = SimpleNamespace(
+            data={"entity_id": "sensor.export_electricity_price"}
+        )
+
+        with (
+            _patch_all_ha_helpers(),
+            patch(
+                "custom_components.hsem.coordinator."
+                "PRICE_SOURCE_UPDATE_DEBOUNCE_SECONDS",
+                0.0,
+            ),
+            patch.object(coord, "_schedule_next_slot_boundary") as schedule,
+        ):
+            await coord._async_handle_slot_boundary(boundary)
+            await coord._async_handle_price_source_change(import_event)  # type: ignore[arg-type]
+            await coord._async_handle_price_source_change(export_event)  # type: ignore[arg-type]
+            queued = coord._price_source_update_debounce_task
+            assert queued is not None
+            await asyncio.wait_for(queued, timeout=5.0)
+
+        assert executor_calls == 1
+        publish.assert_called_once()
+        assert len(captured) == 1
+        assert isinstance(captured[0], CoordinatorData)
+        assert coord._forecast_authority_generation == 3
+        assert coord._price_source_update_debounce_task is None
+        schedule.assert_called_once()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("race_stage", ["planner_solve", "post_solve_tracker"])

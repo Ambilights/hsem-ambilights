@@ -923,9 +923,9 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._last_planner_output: PlannerOutput | None = None
         self._price_source_update_debounce_task: asyncio.Task[None] | None = None
         self._price_source_update_pending: bool = False
-        # Monotonic generation for registered price, PV, and valuation-source
-        # events. A cycle captures this before collecting its snapshot so an
-        # in-flight solve cannot publish commands after newer authority arrives.
+        # Monotonic generation for exact slot boundaries plus registered price,
+        # PV, and valuation-source events. A cycle captures this before its
+        # snapshot so old-slot/source intent cannot publish after newer authority.
         self._forecast_authority_generation: int = 0
         self._phase_safety_update_debounce_task: asyncio.Task[None] | None = None
         self._phase_safety_update_pending: bool = False
@@ -1363,18 +1363,34 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             replace(current_data, cfg=cfg, live=live, last_updated=utc_now_iso())
         )
 
-    async def _async_handle_price_source_change(self, _event: Event) -> None:
+    async def _async_handle_price_source_change(self, event: Event) -> None:
         """Coalesce price state/attribute changes into one durable refresh."""
         self._forecast_authority_generation = (
             getattr(self, "_forecast_authority_generation", 0) + 1
         )
+        entity_id = event.data.get("entity_id")
+        if not isinstance(entity_id, str) or not entity_id:
+            entity_id = "(unknown)"
+        async_log(
+            "debug",
+            "[replan] Forecast authority event entity_id=%s generation=%d; "
+            "queued shared refresh.",
+            entity_id,
+            self._forecast_authority_generation,
+        )
+        self._queue_forecast_authority_refresh()
+
+    def _queue_forecast_authority_refresh(self) -> None:
+        """Queue one durable refresh for source events or a slot boundary."""
+        if getattr(self, "_tearing_down", False):
+            return
         self._price_source_update_pending = True
         task = self._price_source_update_debounce_task
         if task is not None and not task.done():
             return
         self._price_source_update_debounce_task = self.hass.async_create_task(
             self._async_price_source_update_debounced(),
-            name="hsem_price_source_update_debounce",
+            name="hsem_forecast_authority_update_debounce",
             eager_start=False,
         )
 
@@ -1384,7 +1400,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         *,
         phase: str,
     ) -> bool:
-        """Return whether newer forecast authority invalidated this cycle."""
+        """Return whether newer planning authority invalidated this cycle."""
         current_generation = getattr(self, "_forecast_authority_generation", 0)
         if current_generation == captured_generation:
             return False
@@ -1392,7 +1408,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             "debug",
             "[replan] Discarding stale coordinator cycle before %s: "
             "forecast authority generation advanced %d→%d; the queued "
-            "source refresh will rebuild it from a fresh snapshot.",
+            "shared refresh will rebuild it from a fresh snapshot.",
             phase,
             captured_generation,
             current_generation,
@@ -1454,17 +1470,32 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._hourly_recommendations = state.hourly_recommendations
 
     async def _async_price_source_update_debounced(self) -> None:
-        """Refresh after publication/withdrawal without dropping busy events."""
+        """Refresh after a boundary/source burst without dropping busy events."""
         try:
             while True:
                 await asyncio.sleep(PRICE_SOURCE_UPDATE_DEBOUNCE_SECONDS)
                 # Events already coalesced into the snapshot about to be read
-                # are consumed here. Any event arriving during collection,
-                # solve, or publication sets this flag again and guarantees a
-                # follow-up cycle with the newer source state.
-                self._price_source_update_pending = False
-                async with self._update_lock:
-                    await self._async_run_update_cycle()
+                # are consumed only after the lock is acquired. An event that
+                # arrives while another cycle owns the lock is therefore part
+                # of this fresh snapshot instead of forcing a redundant pass.
+                try:
+                    async with self._update_lock:
+                        self._price_source_update_pending = False
+                        await self._async_run_update_cycle()
+                except Exception as err:
+                    if not self._price_source_update_pending:
+                        raise
+                    async_log(
+                        "warning",
+                        "[replan] Shared forecast-authority refresh failed at "
+                        "generation %d while newer authority was pending; "
+                        "retrying: %s",
+                        getattr(self, "_forecast_authority_generation", 0),
+                        err,
+                    )
+                    continue
+                # Any event arriving during collection, solve, or publication
+                # sets this flag again and guarantees one fresh follow-up.
                 if not self._price_source_update_pending:
                     break
         except asyncio.CancelledError:
@@ -2501,15 +2532,22 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             self._schedule_next_slot_boundary(now)
 
     async def _async_handle_slot_boundary(self, now: datetime) -> None:
-        """Run one non-droppable cycle at a recommendation-slot boundary."""
+        """Queue one non-droppable cycle at a recommendation-slot boundary."""
         self._slot_boundary_timer_unsub = None
         if self._tearing_down:
             return
+        self._forecast_authority_generation = (
+            getattr(self, "_forecast_authority_generation", 0) + 1
+        )
         try:
-            async with self._update_lock:
-                if self._tearing_down:
-                    return
-                await self._async_run_update_cycle()
+            async_log(
+                "debug",
+                "[replan] Slot boundary %s advanced forecast-authority generation "
+                "to %d; queued shared refresh.",
+                now.isoformat(),
+                self._forecast_authority_generation,
+            )
+            self._queue_forecast_authority_refresh()
         finally:
             if not self._tearing_down:
                 self._schedule_next_slot_boundary(hsem_now())

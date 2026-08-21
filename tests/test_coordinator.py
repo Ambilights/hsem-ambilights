@@ -713,6 +713,7 @@ def _make_bare_coordinator() -> HSEMDataUpdateCoordinator:
     coord._secondary_storage_update_debounce_task = None
     coord._price_source_update_debounce_task = None
     coord._price_source_update_pending = False
+    coord._forecast_authority_generation = 0
     coord._current_slot_start = None
     coord._current_slot_price_actionable = None
     coord._current_slot_ev_power_w = 0.0
@@ -902,7 +903,7 @@ class TestLightweightSecondaryStorageEvents:
 
     @pytest.mark.asyncio
     async def test_price_event_waits_for_busy_coordinator_lock(self) -> None:
-        """A publication/withdrawal event survives overlap with an active cycle."""
+        """An event queued while lock-blocked is consumed by the fresh cycle."""
         coordinator = _make_bare_coordinator()
         await coordinator._update_lock.acquire()
         try:
@@ -924,10 +925,18 @@ class TestLightweightSecondaryStorageEvents:
                 await asyncio.sleep(0)
                 run_cycle.assert_not_awaited()
 
+                await coordinator._async_handle_price_source_change(
+                    cast(
+                        Any,
+                        SimpleNamespace(data={"entity_id": "sensor.import_price"}),
+                    )
+                )
+                assert coordinator._price_source_update_pending is True
                 coordinator._update_lock.release()
                 await task
 
                 run_cycle.assert_awaited_once()
+                assert coordinator._forecast_authority_generation == 1
                 assert coordinator._price_source_update_debounce_task is None
         finally:
             if coordinator._update_lock.locked():
@@ -948,6 +957,7 @@ class TestLightweightSecondaryStorageEvents:
 
         coordinator.hass.async_create_task.assert_called_once()
         assert coordinator._price_source_update_pending is True
+        assert coordinator._forecast_authority_generation == 2
         coroutine = coordinator.hass.async_create_task.call_args.args[0]
         coroutine.close()
 
@@ -981,6 +991,75 @@ class TestLightweightSecondaryStorageEvents:
             await task
 
         assert run.await_count == 2
+        assert coordinator._price_source_update_pending is False
+        assert coordinator._price_source_update_debounce_task is None
+
+    @pytest.mark.asyncio
+    async def test_pending_event_retries_after_refresh_exception(self) -> None:
+        """A failed stale pass cannot strand a newer authority event."""
+        coordinator = _make_bare_coordinator()
+        coordinator._price_source_update_pending = True
+        event = cast(
+            Any,
+            SimpleNamespace(data={"entity_id": "sensor.import_price"}),
+        )
+
+        async def run_cycle() -> None:
+            if run.await_count == 1:
+                await coordinator._async_handle_price_source_change(event)
+                raise RuntimeError("stale refresh failed")
+
+        with (
+            patch(
+                "custom_components.hsem.coordinator."
+                "PRICE_SOURCE_UPDATE_DEBOUNCE_SECONDS",
+                0.0,
+            ),
+            patch.object(
+                coordinator,
+                "_async_run_update_cycle",
+                new_callable=AsyncMock,
+                side_effect=run_cycle,
+            ) as run,
+        ):
+            task = asyncio.create_task(
+                coordinator._async_price_source_update_debounced()
+            )
+            coordinator._price_source_update_debounce_task = task
+            await task
+
+        assert run.await_count == 2
+        assert coordinator._forecast_authority_generation == 1
+        assert coordinator._price_source_update_pending is False
+        assert coordinator._price_source_update_debounce_task is None
+
+    @pytest.mark.asyncio
+    async def test_refresh_exception_without_new_event_propagates(self) -> None:
+        """A standalone refresh failure remains visible to the task owner."""
+        coordinator = _make_bare_coordinator()
+        coordinator._price_source_update_pending = True
+
+        with (
+            patch(
+                "custom_components.hsem.coordinator."
+                "PRICE_SOURCE_UPDATE_DEBOUNCE_SECONDS",
+                0.0,
+            ),
+            patch.object(
+                coordinator,
+                "_async_run_update_cycle",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("refresh failed"),
+            ) as run,
+        ):
+            task = asyncio.create_task(
+                coordinator._async_price_source_update_debounced()
+            )
+            coordinator._price_source_update_debounce_task = task
+            with pytest.raises(RuntimeError, match="refresh failed"):
+                await task
+
+        run.assert_awaited_once()
         assert coordinator._price_source_update_pending is False
         assert coordinator._price_source_update_debounce_task is None
 
@@ -1297,9 +1376,26 @@ class TestExactCoordinatorTimers:
     @pytest.mark.asyncio
     async def test_slot_boundary_waits_for_busy_cycle_then_runs_once(self) -> None:
         coordinator = _make_bare_coordinator()
+        coordinator.hass = MagicMock()
+
+        def create_task(
+            coro: Any,
+            *,
+            name: str | None = None,
+            eager_start: bool = False,
+        ) -> asyncio.Task[Any]:
+            del eager_start
+            return asyncio.create_task(coro, name=name)
+
+        coordinator.hass.async_create_task.side_effect = create_task
         await coordinator._update_lock.acquire()
         try:
             with (
+                patch(
+                    "custom_components.hsem.coordinator."
+                    "PRICE_SOURCE_UPDATE_DEBOUNCE_SECONDS",
+                    0.0,
+                ),
                 patch.object(
                     coordinator, "_async_run_update_cycle", new_callable=AsyncMock
                 ) as run_cycle,
@@ -1311,14 +1407,118 @@ class TestExactCoordinatorTimers:
                     )
                 )
                 await asyncio.sleep(0)
+                queued = coordinator._price_source_update_debounce_task
+                assert queued is not None
                 run_cycle.assert_not_awaited()
                 coordinator._update_lock.release()
                 await task
+                await queued
                 run_cycle.assert_awaited_once()
                 schedule.assert_called_once()
         finally:
             if coordinator._update_lock.locked():
                 coordinator._update_lock.release()
+
+    @pytest.mark.asyncio
+    async def test_slot_boundary_and_price_burst_share_one_cycle(self) -> None:
+        """Quarter-hour import/export events must join the boundary refresh."""
+        coordinator = _make_bare_coordinator()
+        coordinator.hass = MagicMock()
+
+        def create_task(
+            coro: Any,
+            *,
+            name: str | None = None,
+            eager_start: bool = False,
+        ) -> asyncio.Task[Any]:
+            del eager_start
+            return asyncio.create_task(coro, name=name)
+
+        coordinator.hass.async_create_task.side_effect = create_task
+        await coordinator._update_lock.acquire()
+        boundary = datetime(2026, 8, 14, 12, 15, tzinfo=UTC)
+        import_event = cast(
+            Any,
+            SimpleNamespace(data={"entity_id": "sensor.import_price"}),
+        )
+        export_event = cast(
+            Any,
+            SimpleNamespace(data={"entity_id": "sensor.export_price"}),
+        )
+
+        try:
+            with (
+                patch(
+                    "custom_components.hsem.coordinator."
+                    "PRICE_SOURCE_UPDATE_DEBOUNCE_SECONDS",
+                    0.0,
+                ),
+                patch.object(
+                    coordinator, "_async_run_update_cycle", new_callable=AsyncMock
+                ) as run_cycle,
+                patch.object(coordinator, "_schedule_next_slot_boundary") as schedule,
+            ):
+                await coordinator._async_handle_slot_boundary(boundary)
+                queued = coordinator._price_source_update_debounce_task
+                assert queued is not None
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                run_cycle.assert_not_awaited()
+                await coordinator._async_handle_price_source_change(import_event)
+                await coordinator._async_handle_price_source_change(export_event)
+                coordinator.hass.async_create_task.assert_called_once()
+                coordinator._update_lock.release()
+                await queued
+        finally:
+            if coordinator._update_lock.locked():
+                coordinator._update_lock.release()
+
+        run_cycle.assert_awaited_once()
+        schedule.assert_called_once()
+        assert coordinator._forecast_authority_generation == 3
+        assert coordinator._price_source_update_pending is False
+        assert coordinator._price_source_update_debounce_task is None
+
+    @pytest.mark.asyncio
+    async def test_slot_boundary_without_source_event_runs_once(self) -> None:
+        """The shared debounce must not make a quiet boundary droppable."""
+        coordinator = _make_bare_coordinator()
+        coordinator.hass = MagicMock()
+
+        def create_task(
+            coro: Any,
+            *,
+            name: str | None = None,
+            eager_start: bool = False,
+        ) -> asyncio.Task[Any]:
+            del eager_start
+            return asyncio.create_task(coro, name=name)
+
+        coordinator.hass.async_create_task.side_effect = create_task
+
+        with (
+            patch(
+                "custom_components.hsem.coordinator."
+                "PRICE_SOURCE_UPDATE_DEBOUNCE_SECONDS",
+                0.0,
+            ),
+            patch.object(
+                coordinator, "_async_run_update_cycle", new_callable=AsyncMock
+            ) as run_cycle,
+            patch.object(coordinator, "_schedule_next_slot_boundary") as schedule,
+        ):
+            await coordinator._async_handle_slot_boundary(
+                datetime(2026, 8, 14, 12, 15, tzinfo=UTC)
+            )
+            queued = coordinator._price_source_update_debounce_task
+            assert queued is not None
+            await queued
+
+        run_cycle.assert_awaited_once()
+        schedule.assert_called_once()
+        assert coordinator._forecast_authority_generation == 1
+        assert coordinator._price_source_update_pending is False
+        assert coordinator._price_source_update_debounce_task is None
 
     @pytest.mark.asyncio
     async def test_hysteresis_expiry_waits_and_forces_fresh_plan(self) -> None:

@@ -1616,18 +1616,27 @@ Missing price data is surfaced in `data_quality`. The numeric display fallback
 remains `0.0`, but availability distinguishes it from a genuinely published
 zero or negative price. The planner optimizes only the contiguous published
 prefix and enforces a price-neutral primary Hold plus secondary Utility beyond
-the first gap. Price and Solcast PV publication/withdrawal events wake a
-debounced refresh; an event that arrives during that refresh guarantees one
-coalesced follow-up cycle.
+the first gap.
 
-Each registered price, PV, or valuation-source event increments a monotonic
-authority generation before debounce coalescing. A cycle captures that
-generation before its snapshot and checks it after the solve and again
-immediately before publication. If newer authority arrived, the stale cycle
-publishes no coordinator data, accepted-plan signature, or hardware intent; the
-debounce worker runs a fresh coalesced cycle instead. This guard affects solve
-freshness only. It does not change the actionable-price boundary, Unagi
-forecast selection or haircut, terminal-tier construction, or terminal
+The exact recommendation-slot boundary and price, Solcast PV, or valuation
+publication/withdrawal events share one durable 250 ms refresh window. A quiet
+boundary runs once. Boundary-adjacent import/export events that arrive before
+the shared worker starts join that same cycle before its snapshot and solver
+work. If another event opened the window first, the boundary uses its remaining
+delay rather than restarting it. Events accumulated while the worker waits for
+another coordinator cycle are consumed before its fresh snapshot rather than
+causing a redundant follow-up solve. If a newer event is pending when the
+superseded pass fails, the worker logs that failure and still runs the fresh
+follow-up; a standalone failure remains visible normally.
+
+Each exact boundary and registered price, PV, or valuation-source event
+increments a monotonic authority generation before debounce coalescing. A cycle
+captures that generation before its snapshot and checks it after the solve and
+again immediately before publication. If newer authority arrived, the stale
+cycle publishes no coordinator data, accepted-plan signature, or hardware
+intent; the debounce worker runs a fresh coalesced cycle instead. This guard
+affects solve freshness only. It does not change the actionable-price boundary,
+Unagi forecast selection or haircut, terminal-tier construction, or terminal
 cost-to-go scoring.
 
 Optional Unagi valuation is a separate horizon-end channel. After MAE and
