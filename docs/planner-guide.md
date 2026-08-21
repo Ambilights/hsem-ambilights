@@ -322,9 +322,10 @@ revealed when PowMr SBU removes a dedicated load already present in the site
 measurement. Active flexible EV demand is excluded from battery-eligible local
 sinks, so PV serves it before residual PV can be classified as export.
 An SBU slot may therefore both avoid residual import and reveal PV export. The
-PowMr discharge still pays its full terminal-inventory value, conversion loss,
-and wear, so Utility wins when the incremental meter value does not cover those
-costs.
+PowMr discharge still pays its full terminal-inventory value and wear. Its
+conversion loss is already included in the battery draw and site flow, so it is
+not charged a second time; Utility wins when the incremental meter value does
+not cover those physical and economic costs.
 
 The corresponding slot diagnostics are
 `primary_battery_export_kwh = discharge_efficiency × bx[t]` and

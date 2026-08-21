@@ -336,6 +336,10 @@ def make_bare_coordinator(
     coord._options_update_task = None
     coord._options_update_debounce_task = None
     coord._secondary_storage_update_debounce_task = None
+    coord._secondary_storage_update_pending = False
+    coord._secondary_control_write_generation = 0
+    coord._secondary_control_write_expectations = {}
+    coord._secondary_control_delayed_echoes = {}
     coord._override_expiry = None
 
     # CoordinatorEntity support — some entity methods call this

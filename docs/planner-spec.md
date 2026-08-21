@@ -433,8 +433,9 @@ exactly the dedicated load plus its DC-side overhead and never directly
 backfeeds. SBU still changes the aggregate site balance: if PV already serves
 part of that dedicated load, moving it to battery may both avoid residual grid
 import and reveal PV for export. That export remains non-battery/PV-origin; the
-secondary discharge pays its full terminal-inventory, conversion-loss, and wear
-terms.
+secondary discharge pays its full terminal-inventory and wear terms. Its
+conversion loss is already physical in $d_t=L_t/\eta_d+overhead$ and is not
+priced again as a separate objective term.
 
 Let $E_0$ be energy above the reserve and $E_{usable}$ the energy between the
 minimum and maximum SoC. The secondary state equation is hard-constrained:
@@ -521,10 +522,12 @@ load removed by SBU may not exceed the original site-load cap. This prevents a
 nominally valid primary self-consumption allocation from becoming unexecutable
 export when PowMr changes from utility to SBU.
 
-The MILP and authoritative candidate scorer both include secondary conversion
-loss, cycle wear, time discount, and a horizon-tail value for stored energy.
-The secondary terminal term is uniform and undiscounted across every actionable
-slot:
+The MILP and authoritative candidate scorer both include secondary cycle wear,
+time discount, and a horizon-tail value for stored energy. Secondary conversion
+losses are already represented by charge-side site draw $c_t/\eta_c$ and
+discharge-side battery draw $L_t/\eta_d+overhead$; adding another loss-price
+coefficient would count the same energy twice. The secondary terminal term is
+uniform and undiscounted across every actionable slot:
 
 ```text
 secondary_terminal_soc_value
@@ -537,8 +540,9 @@ secondary_terminal_soc_value
 
 Equal secondary discharge and refill therefore cancel exactly regardless of
 their slot positions or prices. There is no per-slot secondary charge premium
-or discharge premium. Actual grid import/export, conversion loss, cycle wear,
-headroom, and power constraints decide whether the cycle is worthwhile.
+or discharge premium. Actual grid import/export, physical conversion loss,
+cycle wear, headroom, and power constraints decide whether the cycle is
+worthwhile.
 Non-MILP candidates receive a physically valid utility-bypass plan so candidate
 comparison never leaves the dedicated load unaccounted.
 
@@ -546,15 +550,19 @@ Each successful MILP solve with valid secondary storage emits exactly one
 aggregate debug record with the prefix ``[milp] secondary_result``.  Disabled
 secondary storage emits no result record.  The line contains solved ternary-mode
 counts, stored charge and discharge energy, isolated grid-import saving/cost,
-secondary conversion loss, cycle wear, terminal credit, net diagnostic value,
-start/end SoC, and a conservative reason slug.  It is deliberately one line per
-solve rather than one line per slot so verbose logging remains usable on
-15-minute, multi-day horizons.
+the compatibility `conversion_loss` field (always `0.0` because physical loss
+is already in flows/inventory), cycle wear, terminal credit, net diagnostic
+value, start/end SoC, and a conservative reason slug.  It is deliberately one
+line per solve rather than one line per slot so verbose logging remains usable
+on 15-minute, multi-day horizons.
 
-The conversion-loss, cycle-cost, and terminal-value fields use the same shared
-secondary cost accumulator as :func:`score_plan`; diagnostics must never
-introduce a parallel cost formula.  ``terminal_credit`` is the sign-inverted
-``secondary_terminal_soc_value`` so a credit is positive in the logged net:
+The compatibility conversion-loss field, cycle-cost, and terminal-value fields
+use the same shared secondary cost accumulator as :func:`score_plan`;
+diagnostics must never introduce a parallel cost formula.
+``secondary_conversion_loss_cost`` and ``conversion_loss`` remain present
+for schema stability and are always zero. ``terminal_credit`` is the
+sign-inverted ``secondary_terminal_soc_value`` so a credit is positive in
+the logged net:
 
 ```text
 net = sbu_saving - charge_cost - cycle_cost - conversion_loss
@@ -638,8 +646,8 @@ installation, which has no PowMr PV input, it stops PowMr charging completely.
   discharge, grid-import, capacity, SoC, current, and mode fields
 - successful enabled MILP solves emit one ``secondary_result`` line each
 - disabled or invalid secondary storage emits no ``secondary_result`` line
-- logged secondary conversion, cycle, and terminal terms equal the authoritative
-  candidate scorer's terms for the same solved slots
+- logged secondary conversion remains zero, while cycle and terminal terms equal
+  the authoritative candidate scorer's terms for the same solved slots
 - equal secondary charge and discharge contribute exactly zero net
   ``secondary_terminal_soc_value`` regardless of slot prices or positions
 - building or logging the summary leaves the solved slot list unchanged
@@ -1061,15 +1069,22 @@ the current-slot topology correction, but is not itself a high-rate planning
 trigger. Secondary
 SoC and the smoothed dedicated-load input use lightweight event callbacks and
 request one coalesced update only after changing by at least 1 percentage point
-or 25 W respectively; output/charger priority and charge-current control state
-changes use the same short debounce but remain immediately material. The
-comparison baseline advances only after a newly accepted plan has been
-successfully published. Reused plans and rejected corrective candidates must
-not swallow cumulative secondary-storage drift. Failed cycles therefore retry
-on a later material state event. If the coordinator is already running when a
-debounce expires, the material event waits for the current cycle's lock and is
-processed once instead of being dropped. All listener and debounce handles are
-cancelled during coordinator teardown.
+or 25 W respectively. Output/charger priority and charge-current changes are
+immediately material unless the value exactly matches an in-flight
+HSEM-authored write or the one delayed echo expected after a verified write.
+A verified output write advances the accepted live baseline, so that write
+cannot invalidate the plan that requested it. A mismatching/manual/inverter
+change always remains material. If a tentatively suppressed transition fails,
+is unverified, or is cancelled, HSEM queues a recovery cycle.
+
+The comparison baseline otherwise advances only after a newly accepted plan has
+been successfully published. Reused plans and rejected corrective candidates
+must not swallow cumulative secondary-storage drift. The debounce queue records
+events even while its task is already active: an event before state collection
+is consumed by that fresh snapshot, while an event during the cycle causes
+another pass. If another coordinator cycle owns the lock, the event waits
+rather than being dropped. All listener, pending, expectation, and debounce
+state is cleared during coordinator teardown.
 
 Control-entity callbacks are ignored whenever secondary hardware control is
 disabled, including stale listeners registered before an options change. SoC
@@ -1517,17 +1532,17 @@ how that plays out per slot, from cheapest to most expensive action.
       + p_soc·(s_max_pen[t] + s_min_pen[t]) ]
 - V_primary(E_final)  # V_primary(E_initial) is a constant
 + ε·Σ_t(ec[t] + ed[t]) − 1.5ε·Σ_t(ed[t] − bx[t])
-+ Σ_t δ_t·[(1−η_secondary_charge)·p_imp[t]·c_secondary[t]
-           + (1−η_secondary_discharge)·p_imp[t]·d_secondary[t]
-           + α_secondary·m_secondary[t]]
++ Σ_t δ_t·α_secondary·m_secondary[t]
 + R_secondary·Σ_t(d_secondary[t] − c_secondary[t])
 + Σ_ev [ ev_penalty·ev_pen + tiebreaker·Σ_t ev_c[t] ]
 ```
 
-The aggregate grid terms already contain the secondary branch's actual import
-cost or avoided import. Secondary conversion loss and wear are discounted with
-the other within-horizon money terms. Its terminal inventory coefficient is
-uniform and undiscounted, matching the authoritative scorer.
+The aggregate grid terms contain the secondary branch's actual charge import
+and avoided load, while the secondary inventory trajectory contains its
+discharge loss. Those physical efficiency effects are therefore not repriced.
+Secondary wear is discounted with the other within-horizon money terms. Its
+terminal inventory coefficient is uniform and undiscounted, matching the
+authoritative scorer.
 
 #### 1. Serve house load from PV (free)
 

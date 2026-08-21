@@ -139,6 +139,7 @@ async def _apply_top_level(
     )
     sensor = MagicMock(spec=HSEMWorkingModeSensor)
     sensor.hass = MagicMock()
+    sensor.coordinator = MagicMock()
 
     with (
         patch(
@@ -179,7 +180,8 @@ async def test_huawei_failure_allows_powmr_utility_zero_stop(
     secondary_applier.assert_awaited_once()
     await_args = secondary_applier.await_args
     assert await_args is not None
-    assert await_args.kwargs == {"fail_closed_only": True}
+    assert await_args.kwargs["fail_closed_only"] is True
+    assert await_args.kwargs["control_write_observer"] is not None
     effective_rec = await_args.args[3]
     assert effective_rec.secondary_storage_mode == SECONDARY_MODE_UTILITY
     assert effective_rec.secondary_storage_charge_current_a == pytest.approx(0.0)

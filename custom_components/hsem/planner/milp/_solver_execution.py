@@ -245,7 +245,6 @@ def _build_solve_and_finalize(
             config=secondary_storage,
             slots=slots,
             future_idx=future_idx,
-            p_imp_obj=p_imp_obj,
             time_discount_rate=time_discount_rate,
             now=now,
         )

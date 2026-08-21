@@ -7,7 +7,6 @@ from dataclasses import dataclass
 
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.planner.cost_types import CostWeights
-from custom_components.hsem.utils.misc import clamp_efficiency
 
 
 @dataclass
@@ -58,16 +57,11 @@ def secondary_slot_cost(
         # conversion valuation or a replacement/terminal incentive.
         return (0.0, cycle, 0.0)
 
-    import_price = max(import_price, 0.0)
-    charge_eff = clamp_efficiency(weights.secondary_storage_charge_efficiency_pct)
-    discharge_eff = clamp_efficiency(weights.secondary_storage_discharge_efficiency_pct)
-    conversion = (
-        charge * (1.0 - charge_eff) + discharge * (1.0 - discharge_eff)
-    ) * import_price
-
-    # ``export_price`` remains in the internal API for caller symmetry, but
-    # inventory value is intentionally independent of every per-slot price.
-    _ = export_price
+    # The physical site balance and final battery inventory already include
+    # secondary conversion losses. Retain the diagnostic field/API but do not
+    # price the same loss a second time here.
+    conversion = 0.0
+    _ = import_price, export_price
     replacement = max(
         weights.secondary_storage_replacement_price_per_kwh or 0.0,
         0.0,

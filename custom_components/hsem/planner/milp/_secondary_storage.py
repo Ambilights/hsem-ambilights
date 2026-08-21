@@ -274,13 +274,15 @@ def _add_secondary_objective(
     config: SecondaryStorageConfig,
     slots: list[PlannedSlot],
     future_idx: list[int],
-    p_imp_obj: np.ndarray,  # type: ignore[name-defined]
     time_discount_rate: float,
     now: datetime,
 ) -> None:
-    """Add secondary wear, conversion-loss, and terminal-value coefficients."""
-    charge_eff = clamp_efficiency(config.charge_efficiency_pct)
-    discharge_eff = clamp_efficiency(config.discharge_efficiency_pct)
+    """Add secondary wear and terminal-value coefficients.
+
+    Secondary conversion losses already affect the physical site balance and
+    final battery inventory. Pricing them here as well would charge the same
+    loss twice and bias the optimizer away from SBU operation.
+    """
     use_discount = time_discount_rate < 1.0 - 1e-9
     replacement = max(config.replacement_price_per_kwh or 0.0, 0.0)
     if not math.isfinite(replacement):
@@ -296,10 +298,6 @@ def _add_secondary_objective(
             midpoint = start_utc + (utc_key(slot.end) - start_utc) / 2
             discount = time_discount_rate ** hours_ahead(now, midpoint)
 
-        objective[layout["charge"] + t] += (1.0 - charge_eff) * p_imp_obj[t] * discount
-        objective[layout["discharge"] + t] += (
-            (1.0 - discharge_eff) * p_imp_obj[t] * discount
-        )
         objective[layout["throughput"] + t] += (
             max(config.cycle_cost_per_kwh, 0.0) * discount
         )

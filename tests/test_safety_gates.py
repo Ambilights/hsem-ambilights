@@ -1755,6 +1755,7 @@ class TestWorkingModeSensorTopLevelGate:
 
             sensor = MagicMock(spec=HSEMWorkingModeSensor)
             sensor.hass = MagicMock()
+            sensor.coordinator = MagicMock()
 
             await HSEMWorkingModeSensor._async_apply_hardware_writes(sensor, data)
 
