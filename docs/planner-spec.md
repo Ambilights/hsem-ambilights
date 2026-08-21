@@ -2500,9 +2500,21 @@ to the ``hourly_recommendations`` list and ultimately to hardware writes.
 When a transition is held, the coordinator schedules a one-shot callback at
 the exact hold expiry and forces a fresh planner run. The expiry does not depend
 on a drifting periodic poll, and it waits for an in-progress coordinator cycle
-instead of being dropped. Independently, a one-shot callback at every exact
-recommendation-slot boundary guarantees that the new slot is planned and
-applied on time. Boundary discovery advances on the UTC timeline while testing
+instead of being dropped.
+
+Independently, a one-shot callback at every exact recommendation-slot boundary
+queues the new slot through the same durable 250 ms refresh window as price,
+PV, and valuation-source events. A quiet boundary still produces exactly one
+cycle. Import/export updates arriving before the shared worker starts join that
+pending cycle before its snapshot and solver work, avoiding a stale first solve
+and duplicate replacement solve in the ordinary boundary burst. If another
+event opened the window first, the boundary uses the remaining delay rather
+than restarting it. The boundary also advances the authority generation, so a
+pre-boundary cycle already in flight cannot publish old-slot intent after the
+new slot starts. A genuinely later source event during the shared solve retains
+the existing stale-generation rejection and follow-up cycle.
+
+Boundary discovery advances on the UTC timeline while testing
 local wall-clock alignment, so DST folds never schedule a callback in the past.
 Both callbacks are cancelled during teardown; a degraded or
 failed expiry cycle leaves the forced-replan request pending until recovery.
@@ -2838,20 +2850,26 @@ channel. In automatic mode, a current outage immediately publishes
 flows, and secondary Utility/zero current, even if another missing input skips
 the planner. An explicit user force mode remains higher authority. Primary and
 dedicated forecast price entity changes, plus both Solcast PV sources, are
-debounced and replayed if another event arrives while a refresh is running. The
-accepted forecast-authority signature includes each future slot's finite PV
-value and availability, so PV publication, withdrawal, or correction cannot
-silently reuse a plan built from stale solar data.
+debounced through the same durable queue as the exact recommendation-slot
+boundary. Boundary-adjacent source events are absorbed before the queued cycle
+starts; an event arriving after that cycle starts is replayed. The worker
+consumes pending events only after acquiring the coordinator lock, so updates
+that accumulated while another cycle held the lock do not force an unnecessary
+second solve. The accepted forecast-authority signature includes each future
+slot's finite PV value and availability, so PV publication, withdrawal, or
+correction cannot silently reuse a plan built from stale solar data.
 
-Every registered price, PV, or valuation-source event also increments a
-monotonic forecast-authority generation synchronously, before debounce
-coalescing. An update cycle captures that generation before collecting its
-snapshot. If it changes while the planner is solving, or after asynchronous
-trackers run but before coordinator publication, the entire stale cycle is
-discarded: it publishes no coordinator data, advances no accepted-plan
+Every exact slot boundary and every registered price, PV, or valuation-source
+event also increments a monotonic forecast-authority generation synchronously,
+before debounce coalescing. An update cycle captures that generation before
+collecting its snapshot. If it changes while the planner is solving, or after
+asynchronous trackers run but before coordinator publication, the entire stale
+cycle is discarded: it publishes no coordinator data, advances no accepted-plan
 signature, and produces no hardware intent. The durable debounce worker then
 runs one fresh coalesced cycle; an event arriving during that refresh marks one
-further pass pending.
+further pass pending. If the superseded pass raises after that newer event, the
+worker logs the failure and still runs the pending fresh pass. Without newer
+authority pending, the exception remains visible to the task owner.
 
 This freshness guard changes only which snapshot may publish. It does not alter
 the actionable-price boundary, Unagi valuation inputs, forecast haircuts,

@@ -75,11 +75,15 @@ provided.
   [ENTSO-E Price Backup](entsoe-price-backup.md) for the complete setup and
   validation sequence.
 
-A registered price, PV, or valuation-source update that arrives during a solve
-invalidates that in-flight result. HSEM publishes no command from the older
-snapshot and runs a fresh coalesced cycle. If an older inverter mode still
-briefly appears after such an update, collect debug logs showing the captured
-and current forecast-authority generations.
+At an exact recommendation boundary, HSEM uses the shared 250 ms refresh window
+so normal import/export source updates can usually join before solving. If the
+window was already open, the boundary uses its remaining delay. A registered
+price, PV, or valuation-source update that genuinely arrives during
+a solve still invalidates that in-flight result. HSEM publishes no command from
+the older snapshot and runs a fresh coalesced cycle. Debug logs name the source
+entity and generation for each event. If an older inverter mode still briefly
+appears after such an update, collect logs showing the boundary, source entity,
+and captured/current forecast-authority generations.
 
 **1d. Critical sensors missing → Error mode**
 
