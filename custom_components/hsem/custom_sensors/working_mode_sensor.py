@@ -925,6 +925,7 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
                         live,
                         effective_secondary_rec,
                         fail_closed_only=fail_closed_only,
+                        control_write_observer=self.coordinator,
                     )
                     combined_summary.results.extend(secondary_summary.results)
 

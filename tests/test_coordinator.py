@@ -711,6 +711,10 @@ def _make_bare_coordinator() -> HSEMDataUpdateCoordinator:
     coord._options_update_task = None
     coord._options_update_debounce_task = None
     coord._secondary_storage_update_debounce_task = None
+    coord._secondary_storage_update_pending = False
+    coord._secondary_control_write_generation = 0
+    coord._secondary_control_write_expectations = {}
+    coord._secondary_control_delayed_echoes = {}
     coord._price_source_update_debounce_task = None
     coord._price_source_update_pending = False
     coord._forecast_authority_generation = 0
@@ -869,6 +873,152 @@ class TestLightweightSecondaryStorageEvents:
         coroutine.close()
 
     @pytest.mark.asyncio
+    async def test_matching_in_flight_control_echo_is_acknowledged(self) -> None:
+        """HSEM's own verified output transition must not wake the solver."""
+        coordinator = _make_bare_coordinator()
+        hass = self._configure(coordinator)
+        coordinator._last_plan_secondary_output_priority = "utility"
+        token = coordinator.secondary_control_write_started(
+            "select.powmr_output",
+            "sbu",
+        )
+
+        await coordinator._async_handle_secondary_storage_change(
+            cast(
+                Any,
+                SimpleNamespace(
+                    data={
+                        "entity_id": "select.powmr_output",
+                        "old_state": SimpleNamespace(state="utility"),
+                        "new_state": SimpleNamespace(state="SBU"),
+                    }
+                ),
+            )
+        )
+
+        hass.async_create_task.assert_not_called()
+        expectation = coordinator._secondary_control_write_expectations[
+            "select.powmr_output"
+        ]
+        assert expectation.suppressed_replan is True
+
+        coordinator.secondary_control_write_finished(
+            "select.powmr_output",
+            "sbu",
+            token,
+            verified=True,
+            echo_expected=True,
+        )
+
+        assert coordinator._last_plan_secondary_output_priority == "sbu"
+        assert "select.powmr_output" not in (
+            coordinator._secondary_control_write_expectations
+        )
+        assert (
+            "select.powmr_output" not in coordinator._secondary_control_delayed_echoes
+        )
+
+    @pytest.mark.asyncio
+    async def test_matching_delayed_verified_echo_is_suppressed_once(self) -> None:
+        """A callback dispatched just after verification is still self-authored."""
+        coordinator = _make_bare_coordinator()
+        hass = self._configure(coordinator)
+        token = coordinator.secondary_control_write_started(
+            "select.powmr_charger",
+            "only solar",
+        )
+        coordinator.secondary_control_write_finished(
+            "select.powmr_charger",
+            "only solar",
+            token,
+            verified=True,
+            echo_expected=True,
+        )
+
+        await coordinator._async_handle_secondary_storage_change(
+            cast(
+                Any,
+                SimpleNamespace(
+                    data={
+                        "entity_id": "select.powmr_charger",
+                        "old_state": SimpleNamespace(state="utility"),
+                        "new_state": SimpleNamespace(state="Only Solar"),
+                    }
+                ),
+            )
+        )
+
+        hass.async_create_task.assert_not_called()
+        assert "select.powmr_charger" not in (
+            coordinator._secondary_control_delayed_echoes
+        )
+
+    @pytest.mark.asyncio
+    async def test_mismatching_control_event_remains_material(self) -> None:
+        """A manual or inverter-authored deviation must still trigger a cycle."""
+        coordinator = _make_bare_coordinator()
+        hass = self._configure(coordinator)
+        coordinator.secondary_control_write_started(
+            "select.powmr_output",
+            "sbu",
+        )
+
+        await coordinator._async_handle_secondary_storage_change(
+            cast(
+                Any,
+                SimpleNamespace(
+                    data={
+                        "entity_id": "select.powmr_output",
+                        "old_state": SimpleNamespace(state="sbu"),
+                        "new_state": SimpleNamespace(state="utility"),
+                    }
+                ),
+            )
+        )
+
+        hass.async_create_task.assert_called_once()
+        assert coordinator._secondary_storage_update_pending is True
+        expectation = coordinator._secondary_control_write_expectations[
+            "select.powmr_output"
+        ]
+        assert expectation.suppressed_replan is False
+        hass.async_create_task.call_args.args[0].close()
+
+    @pytest.mark.asyncio
+    async def test_failed_write_replays_a_tentatively_suppressed_echo(self) -> None:
+        """An unverified transition must reconcile any event ignored in flight."""
+        coordinator = _make_bare_coordinator()
+        hass = self._configure(coordinator)
+        token = coordinator.secondary_control_write_started(
+            "select.powmr_output",
+            "sbu",
+        )
+        await coordinator._async_handle_secondary_storage_change(
+            cast(
+                Any,
+                SimpleNamespace(
+                    data={
+                        "entity_id": "select.powmr_output",
+                        "old_state": SimpleNamespace(state="utility"),
+                        "new_state": SimpleNamespace(state="sbu"),
+                    }
+                ),
+            )
+        )
+
+        coordinator.secondary_control_write_finished(
+            "select.powmr_output",
+            "sbu",
+            token,
+            verified=False,
+            echo_expected=False,
+        )
+
+        hass.async_create_task.assert_called_once()
+        assert coordinator._secondary_storage_update_pending is True
+        hass.async_create_task.call_args.args[0].close()
+
+    @pytest.mark.asyncio
     async def test_material_event_waits_for_busy_coordinator_lock(self) -> None:
         """A one-off priority event survives overlap with an active cycle."""
         coordinator = _make_bare_coordinator()
@@ -888,6 +1038,7 @@ class TestLightweightSecondaryStorageEvents:
                     coordinator._async_secondary_storage_update_debounced()
                 )
                 coordinator._secondary_storage_update_debounce_task = task
+                coordinator._secondary_storage_update_pending = True
                 await asyncio.sleep(0)
                 await asyncio.sleep(0)
                 run_cycle.assert_not_awaited()
@@ -900,6 +1051,78 @@ class TestLightweightSecondaryStorageEvents:
         finally:
             if coordinator._update_lock.locked():
                 coordinator._update_lock.release()
+
+    @pytest.mark.asyncio
+    async def test_event_during_active_secondary_cycle_runs_again(self) -> None:
+        """A final PowMr event cannot be lost while the first cycle is running."""
+        coordinator = _make_bare_coordinator()
+        coordinator._secondary_storage_update_pending = True
+        first_cycle_started = asyncio.Event()
+        release_first_cycle = asyncio.Event()
+        cycle_count = 0
+
+        async def run_cycle() -> None:
+            nonlocal cycle_count
+            cycle_count += 1
+            if cycle_count == 1:
+                first_cycle_started.set()
+                await release_first_cycle.wait()
+
+        with (
+            patch(
+                "custom_components.hsem.coordinator."
+                "SECONDARY_STORAGE_UPDATE_DEBOUNCE_SECONDS",
+                0.0,
+            ),
+            patch.object(
+                coordinator,
+                "_async_run_update_cycle",
+                side_effect=run_cycle,
+            ),
+        ):
+            task = asyncio.create_task(
+                coordinator._async_secondary_storage_update_debounced()
+            )
+            coordinator._secondary_storage_update_debounce_task = task
+            await first_cycle_started.wait()
+
+            coordinator._queue_secondary_storage_update()
+            release_first_cycle.set()
+            await task
+
+        assert cycle_count == 2
+        assert coordinator._secondary_storage_update_pending is False
+        assert coordinator._secondary_storage_update_debounce_task is None
+
+    def test_in_flight_output_is_not_a_material_replan_delta(self) -> None:
+        """A periodic snapshot must recognize the output transition it requested."""
+        coordinator = _make_bare_coordinator()
+        hass = self._configure(coordinator)
+        now = datetime(2026, 8, 21, 18, 30, tzinfo=UTC)
+        live = LiveState()
+        live.secondary_storage.soc_pct = 75.0
+        live.secondary_storage.load_power_w = 190.0
+        live.secondary_storage.output_source_priority = "utility"
+        coordinator._last_planner_output = PlannerOutput()
+        coordinator._last_plan_slot_start = now
+        coordinator._persist_plan_state(live)
+        token = coordinator.secondary_control_write_started(
+            "select.powmr_output",
+            "sbu",
+        )
+        live.secondary_storage.output_source_priority = "sbu"
+
+        assert coordinator._should_replan(live, now) is False
+
+        coordinator.secondary_control_write_finished(
+            "select.powmr_output",
+            "sbu",
+            token,
+            verified=False,
+            echo_expected=False,
+        )
+        hass.async_create_task.assert_called_once()
+        hass.async_create_task.call_args.args[0].close()
 
     @pytest.mark.asyncio
     async def test_price_event_waits_for_busy_coordinator_lock(self) -> None:

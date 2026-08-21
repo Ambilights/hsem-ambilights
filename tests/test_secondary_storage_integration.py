@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -438,6 +439,108 @@ async def test_error_degraded_mode_blocks_adapter() -> None:
 
     assert summary.results == []
     verifier.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_powmr_write_observer_wraps_each_verified_operation() -> None:
+    """Every ordered write stays observable through its verification window."""
+    cfg = _config(read_only=False, control=True)
+    live = LiveState()
+    live.secondary_storage.soc_pct = 50.0
+    live.secondary_storage.load_power_w = 100.0
+    observer = MagicMock()
+    observer.secondary_control_write_started.side_effect = [11, 12]
+
+    async def verified(**kwargs: object) -> ApplyResult:
+        status = (
+            ApplyStatus.SKIPPED
+            if kwargs["entity_id"]
+            == cfg.secondary_storage.charger_source_priority_entity
+            else ApplyStatus.OK
+        )
+        return ApplyResult(
+            entity_id=str(kwargs["entity_id"]),
+            desired=kwargs["desired"],
+            actual=kwargs["desired"],
+            status=status,
+            attempts=0 if status == ApplyStatus.SKIPPED else 1,
+        )
+
+    with patch(
+        "custom_components.hsem.custom_sensors.secondary_storage_applier.async_write_and_verify",
+        new_callable=AsyncMock,
+        side_effect=verified,
+    ):
+        summary = await async_apply_secondary_storage(
+            MagicMock(),
+            cfg,
+            live,
+            _rec(SECONDARY_MODE_SBU),
+            control_write_observer=observer,
+        )
+
+    assert summary.overall_status == ApplyStatus.OK
+    assert observer.secondary_control_write_started.call_args_list == [
+        call(
+            cfg.secondary_storage.charger_source_priority_entity,
+            POWMR_CHARGER_SOLAR_ONLY,
+        ),
+        call(
+            cfg.secondary_storage.output_source_priority_entity,
+            POWMR_OUTPUT_SBU,
+        ),
+    ]
+    assert observer.secondary_control_write_finished.call_args_list == [
+        call(
+            cfg.secondary_storage.charger_source_priority_entity,
+            POWMR_CHARGER_SOLAR_ONLY,
+            11,
+            verified=True,
+            echo_expected=False,
+        ),
+        call(
+            cfg.secondary_storage.output_source_priority_entity,
+            POWMR_OUTPUT_SBU,
+            12,
+            verified=True,
+            echo_expected=True,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_powmr_cancelled_write_resolves_observer_as_unverified() -> None:
+    """Cancellation cannot leave an in-flight echo suppression token behind."""
+    cfg = _config(read_only=False, control=True)
+    live = LiveState()
+    live.secondary_storage.soc_pct = 50.0
+    live.secondary_storage.load_power_w = 100.0
+    observer = MagicMock()
+    observer.secondary_control_write_started.return_value = 42
+
+    with (
+        patch(
+            "custom_components.hsem.custom_sensors.secondary_storage_applier.async_write_and_verify",
+            new_callable=AsyncMock,
+            side_effect=asyncio.CancelledError,
+        ),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await async_apply_secondary_storage(
+            MagicMock(),
+            cfg,
+            live,
+            _rec(SECONDARY_MODE_SBU),
+            control_write_observer=observer,
+        )
+
+    observer.secondary_control_write_finished.assert_called_once_with(
+        cfg.secondary_storage.charger_source_priority_entity,
+        POWMR_CHARGER_SOLAR_ONLY,
+        42,
+        verified=False,
+        echo_expected=False,
+    )
 
 
 @pytest.mark.asyncio

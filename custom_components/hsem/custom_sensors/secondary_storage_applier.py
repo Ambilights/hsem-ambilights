@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
+from typing import Any, Protocol
 
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 
@@ -22,6 +22,7 @@ from custom_components.hsem.utils.ha_helpers import (
     async_set_select_option,
 )
 from custom_components.hsem.utils.inverter_verify import (
+    ApplyResult,
     ApplyStatus,
     CycleApplySummary,
     async_write_and_verify,
@@ -43,6 +44,30 @@ class SecondaryWrite:
     kind: str
     entity_id: str
     desired: str | float
+
+
+class SecondaryControlWriteObserver(Protocol):
+    """Observe the lifetime of one verified PowMr control write."""
+
+    def secondary_control_write_started(
+        self,
+        entity_id: str,
+        desired: str | float,
+    ) -> int:
+        """Return a token identifying the newly started write."""
+        ...
+
+    def secondary_control_write_finished(
+        self,
+        entity_id: str,
+        desired: str | float,
+        token: int,
+        *,
+        verified: bool,
+        echo_expected: bool,
+    ) -> None:
+        """Resolve a write token after verification or cancellation."""
+        ...
 
 
 def _quantize_current(value: float, minimum: float, maximum: float) -> float:
@@ -183,6 +208,45 @@ async def _execute_write(sensor: Any, operation: SecondaryWrite) -> None:
     )
 
 
+async def _async_apply_secondary_write(
+    sensor: Any,
+    operation: SecondaryWrite,
+    observer: SecondaryControlWriteObserver | None,
+) -> ApplyResult:
+    """Write and verify one PowMr control while acknowledging its state echo."""
+    numeric = operation.kind == "number"
+    token = (
+        observer.secondary_control_write_started(
+            operation.entity_id,
+            operation.desired,
+        )
+        if observer is not None
+        else None
+    )
+    verified = False
+    echo_expected = False
+    try:
+        result = await async_write_and_verify(
+            entity_id=operation.entity_id,
+            desired=operation.desired,
+            writer=partial(_execute_write, sensor, operation),
+            reader=partial(_read_entity, sensor, operation.entity_id, numeric),
+            backoff=get_write_failure_backoff(sensor),
+        )
+        verified = result.status in {ApplyStatus.OK, ApplyStatus.SKIPPED}
+        echo_expected = result.status == ApplyStatus.OK
+        return result
+    finally:
+        if observer is not None and token is not None:
+            observer.secondary_control_write_finished(
+                operation.entity_id,
+                operation.desired,
+                token,
+                verified=verified,
+                echo_expected=echo_expected,
+            )
+
+
 async def async_apply_secondary_storage(
     sensor: Any,
     cfg: SensorConfig,
@@ -190,6 +254,7 @@ async def async_apply_secondary_storage(
     rec: HourlyRecommendation,
     *,
     fail_closed_only: bool = False,
+    control_write_observer: SecondaryControlWriteObserver | None = None,
 ) -> CycleApplySummary:
     """Apply the current PowMr plan behind global and feature-specific gates."""
     summary = CycleApplySummary()
@@ -234,13 +299,10 @@ async def async_apply_secondary_storage(
 
     charger_safely_disabled = False
     for operation in operations:
-        numeric = operation.kind == "number"
-        result = await async_write_and_verify(
-            entity_id=operation.entity_id,
-            desired=operation.desired,
-            writer=partial(_execute_write, sensor, operation),
-            reader=partial(_read_entity, sensor, operation.entity_id, numeric),
-            backoff=get_write_failure_backoff(sensor),
+        result = await _async_apply_secondary_write(
+            sensor,
+            operation,
+            control_write_observer,
         )
         summary.results.append(result)
         if (
@@ -259,17 +321,10 @@ async def async_apply_secondary_storage(
                     cfg.secondary_storage.charger_source_priority_entity or "",
                     POWMR_CHARGER_SOLAR_ONLY,
                 )
-                fallback_result = await async_write_and_verify(
-                    entity_id=fallback.entity_id,
-                    desired=fallback.desired,
-                    writer=partial(_execute_write, sensor, fallback),
-                    reader=partial(
-                        _read_entity,
-                        sensor,
-                        fallback.entity_id,
-                        False,
-                    ),
-                    backoff=get_write_failure_backoff(sensor),
+                fallback_result = await _async_apply_secondary_write(
+                    sensor,
+                    fallback,
+                    control_write_observer,
                 )
                 summary.results.append(fallback_result)
             break

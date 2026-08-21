@@ -103,7 +103,10 @@ from custom_components.hsem.utils.degraded_mode import DegradedMode
 from custom_components.hsem.utils.dynamic_floor import DynamicDischargeFloor
 from custom_components.hsem.utils.forecast_tracker import ForecastTracker
 from custom_components.hsem.utils.ha_helpers import ha_get_entity_state_and_convert
-from custom_components.hsem.utils.inverter_verify import CycleApplySummary
+from custom_components.hsem.utils.inverter_verify import (
+    DEFAULT_NUMERIC_TOLERANCE,
+    CycleApplySummary,
+)
 from custom_components.hsem.utils.logger import (
     HSEM_LOGGER as _LOGGER,
     async_log,
@@ -143,6 +146,28 @@ OPTIONS_UPDATE_DEBOUNCE_SECONDS = 0.25
 SECONDARY_STORAGE_UPDATE_DEBOUNCE_SECONDS = 1.0
 SECONDARY_STORAGE_SOC_REPLAN_DELTA_PCT = 1.0
 SECONDARY_STORAGE_LOAD_REPLAN_DELTA_W = 25.0
+
+
+def _secondary_control_values_match(actual: object, desired: object) -> bool:
+    """Return whether a PowMr control state matches HSEM's requested value."""
+    if actual is None or desired is None:
+        return actual is desired
+    if isinstance(desired, (int, float)) and not isinstance(desired, bool):
+        if isinstance(actual, bool) or not isinstance(actual, (str, int, float)):
+            return False
+        try:
+            actual_number = float(actual)
+            desired_number = float(desired)
+        except TypeError, ValueError:
+            return False
+        return (
+            math.isfinite(actual_number)
+            and math.isfinite(desired_number)
+            and abs(actual_number - desired_number) <= DEFAULT_NUMERIC_TOLERANCE
+        )
+    return str(actual).strip().casefold() == str(desired).strip().casefold()
+
+
 PRICE_SOURCE_UPDATE_DEBOUNCE_SECONDS = 0.25
 # Phase meters update roughly every ten seconds.  While a charge actuator is
 # actually running, publish a fresh live snapshot promptly so the runtime cap
@@ -768,6 +793,15 @@ def _apply_force_charge_now(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(slots=True)
+class _SecondaryControlWriteExpectation:
+    """One in-flight HSEM-authored PowMr control transition."""
+
+    token: int
+    desired: str | float
+    suppressed_replan: bool = False
+
+
 @dataclass
 class CoordinatorData:
     """Snapshot of a single HSEM update cycle.
@@ -1062,6 +1096,12 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         # so the planner only runs once after the user stops clicking.
         self._options_update_debounce_task: asyncio.Task | None = None
         self._secondary_storage_update_debounce_task: asyncio.Task | None = None
+        self._secondary_storage_update_pending: bool = False
+        self._secondary_control_write_generation: int = 0
+        self._secondary_control_write_expectations: dict[
+            str, _SecondaryControlWriteExpectation
+        ] = {}
+        self._secondary_control_delayed_echoes: dict[str, str | float] = {}
 
     @callback
     def async_publish_apply_summary(self, summary: CycleApplySummary) -> None:
@@ -1078,6 +1118,92 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             return
         self.data.apply_summary = summary
         self.async_update_listeners()
+
+    @callback
+    def secondary_control_write_started(
+        self,
+        entity_id: str,
+        desired: str | float,
+    ) -> int:
+        """Register one HSEM-authored PowMr write before verification starts."""
+        self._secondary_control_write_generation += 1
+        token = self._secondary_control_write_generation
+        self._secondary_control_write_expectations[entity_id] = (
+            _SecondaryControlWriteExpectation(token=token, desired=desired)
+        )
+        self._secondary_control_delayed_echoes.pop(entity_id, None)
+        return token
+
+    @callback
+    def secondary_control_write_finished(
+        self,
+        entity_id: str,
+        desired: str | float,
+        token: int,
+        *,
+        verified: bool,
+        echo_expected: bool,
+    ) -> None:
+        """Resolve an HSEM-authored write without hiding external changes."""
+        expectation = self._secondary_control_write_expectations.get(entity_id)
+        if (
+            expectation is None
+            or expectation.token != token
+            or not _secondary_control_values_match(expectation.desired, desired)
+        ):
+            return
+        del self._secondary_control_write_expectations[entity_id]
+
+        if verified:
+            output_entity = self._cfg.secondary_storage.output_source_priority_entity
+            if entity_id == output_entity:
+                self._last_plan_secondary_output_priority = str(desired)
+            if echo_expected and not expectation.suppressed_replan:
+                # HA may dispatch the state callback just after the verifier
+                # returns. Suppress exactly one matching delayed echo.
+                self._secondary_control_delayed_echoes[entity_id] = desired
+            return
+
+        self._secondary_control_delayed_echoes.pop(entity_id, None)
+        if expectation.suppressed_replan:
+            # A matching state event was tentatively ignored while the write
+            # was in flight. If verification failed, reconcile that state in
+            # a fresh coordinator cycle.
+            self._queue_secondary_storage_update()
+
+    def _secondary_control_write_matches(
+        self,
+        entity_id: str | None,
+        value: object,
+        *,
+        mark_suppressed: bool = False,
+    ) -> bool:
+        """Return whether a live value is the exact in-flight HSEM target."""
+        if entity_id is None:
+            return False
+        expectation = self._secondary_control_write_expectations.get(entity_id)
+        if expectation is None or not _secondary_control_values_match(
+            value, expectation.desired
+        ):
+            return False
+        if mark_suppressed:
+            expectation.suppressed_replan = True
+        return True
+
+    @callback
+    def _queue_secondary_storage_update(self) -> None:
+        """Queue a durable, coalesced cycle for a material PowMr state event."""
+        if self._tearing_down:
+            return
+        self._secondary_storage_update_pending = True
+        task = self._secondary_storage_update_debounce_task
+        if task is not None and not task.done():
+            return
+        self._secondary_storage_update_debounce_task = self.hass.async_create_task(
+            self._async_secondary_storage_update_debounced(),
+            name="hsem_secondary_storage_update_debounce",
+            eager_start=False,
+        )
 
     # ------------------------------------------------------------------
     # HA lifecycle
@@ -1165,7 +1291,10 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         secondary_task = getattr(self, "_secondary_storage_update_debounce_task", None)
         if secondary_task is not None and not secondary_task.done():
             secondary_task.cancel()
-            self._secondary_storage_update_debounce_task = None
+        self._secondary_storage_update_debounce_task = None
+        self._secondary_storage_update_pending = False
+        self._secondary_control_write_expectations = {}
+        self._secondary_control_delayed_echoes = {}
         price_task = getattr(self, "_price_source_update_debounce_task", None)
         if price_task is not None and not price_task.done():
             price_task.cancel()
@@ -1216,10 +1345,11 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         if not cfg.enabled:
             return
 
-        entity_id = event.data.get("entity_id")
+        raw_entity_id = event.data.get("entity_id")
         new_state = event.data.get("new_state")
-        if not entity_id or new_state is None:
+        if not isinstance(raw_entity_id, str) or not raw_entity_id or new_state is None:
             return
+        entity_id = raw_entity_id
 
         material = False
         if entity_id == cfg.soc_entity:
@@ -1251,36 +1381,46 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             if not cfg.control_enabled:
                 return
             old_state = event.data.get("old_state")
-            material = old_state is None or old_state.state != new_state.state
+            if old_state is not None and _secondary_control_values_match(
+                old_state.state, new_state.state
+            ):
+                return
+            if self._secondary_control_write_matches(
+                entity_id,
+                new_state.state,
+                mark_suppressed=True,
+            ):
+                return
+            delayed = self._secondary_control_delayed_echoes.pop(entity_id, None)
+            if delayed is not None and _secondary_control_values_match(
+                new_state.state, delayed
+            ):
+                return
+            material = True
 
         if not material:
             return
-
-        task = self._secondary_storage_update_debounce_task
-        if task is not None and not task.done():
-            return
-        self._secondary_storage_update_debounce_task = self.hass.async_create_task(
-            self._async_secondary_storage_update_debounced(),
-            name="hsem_secondary_storage_update_debounce",
-            eager_start=False,
-        )
+        self._queue_secondary_storage_update()
 
     async def _async_secondary_storage_update_debounced(self) -> None:
-        """Run one full cycle after coalescing secondary-storage events."""
+        """Run durable full cycles after coalescing secondary-storage events."""
         try:
-            await asyncio.sleep(SECONDARY_STORAGE_UPDATE_DEBOUNCE_SECONDS)
-            # Unlike generic high-rate triggers, a material secondary control
-            # event must not be dropped merely because another cycle currently
-            # owns the coordinator lock. Wait for that cycle, then process the
-            # event exactly once. Teardown cancellation interrupts both sleep
-            # and lock acquisition safely.
-            async with self._update_lock:
-                await self._async_run_update_cycle()
+            while self._secondary_storage_update_pending and not self._tearing_down:
+                await asyncio.sleep(SECONDARY_STORAGE_UPDATE_DEBOUNCE_SECONDS)
+                # Unlike generic high-rate triggers, a material secondary
+                # event must not be dropped merely because another cycle owns
+                # the coordinator lock. An event arriving during the cycle
+                # leaves pending set and causes another pass.
+                async with self._update_lock:
+                    self._secondary_storage_update_pending = False
+                    await self._async_run_update_cycle()
         except asyncio.CancelledError:
             return
         finally:
             if self._secondary_storage_update_debounce_task is asyncio.current_task():
                 self._secondary_storage_update_debounce_task = None
+            if self._secondary_storage_update_pending and not self._tearing_down:
+                self._queue_secondary_storage_update()
 
     async def _async_handle_phase_safety_change(self, _event: Event) -> None:
         """Refresh the live phase snapshot while a charge actuator is running.
@@ -3016,15 +3156,23 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                     "[replan] Secondary dedicated load changed materially — re-planning.",
                 )
                 return True
-            if (
-                secondary.output_source_priority
-                != self._last_plan_secondary_output_priority
+            if not _secondary_control_values_match(
+                secondary.output_source_priority,
+                self._last_plan_secondary_output_priority,
             ):
-                async_log(
-                    "debug",
-                    "[replan] Secondary output priority changed — re-planning.",
+                output_entity = (
+                    self._cfg.secondary_storage.output_source_priority_entity
                 )
-                return True
+                if not self._secondary_control_write_matches(
+                    output_entity,
+                    secondary.output_source_priority,
+                    mark_suppressed=True,
+                ):
+                    async_log(
+                        "debug",
+                        "[replan] Secondary output priority changed — re-planning.",
+                    )
+                    return True
 
         # Forced working mode changed.
         if live.force_working_mode_state != self._last_plan_force_mode:

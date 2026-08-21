@@ -180,6 +180,26 @@ def test_secondary_never_exports_or_over_supplies_dedicated_load() -> None:
         assert slot.grid_export_kwh == pytest.approx(0.0)
 
 
+def test_secondary_physical_loss_is_not_double_priced_out_of_sbu() -> None:
+    """SBU wins when avoided import exceeds its loss-aware inventory cost."""
+    result, _diagnostics = _solve(
+        _slots([1.0], house_load_kwh=0.1),
+        _powmr(
+            current_soc_pct=80.0,
+            discharge_efficiency_pct=50.0,
+            inverter_standby_power_w=0.0,
+            replacement_price_per_kwh=0.4,
+            base_load_includes_dedicated_load=True,
+        ),
+        primary_max_discharge_per_slot=0.0,
+    )
+
+    solved = result[0]
+    assert solved.secondary_storage_mode == SECONDARY_MODE_SBU
+    assert solved.secondary_storage_discharged_kwh == pytest.approx(0.2)
+    assert solved.grid_import_kwh == pytest.approx(0.0)
+
+
 def test_secondary_soc_never_crosses_twenty_percent_reserve() -> None:
     """The hard state equation must preserve the configured 3 kWh reserve."""
     result, _diagnostics = _solve(
@@ -803,8 +823,8 @@ def test_secondary_terminal_value_is_uniform_final_inventory_accounting() -> Non
     assert breakdown.secondary_terminal_soc_value == pytest.approx(0.0)
 
 
-def test_secondary_milp_terminal_coefficients_are_uniform_and_undiscounted() -> None:
-    """MILP uses the same replacement value for every charge/discharge slot."""
+def test_secondary_milp_does_not_reprice_physical_conversion_losses() -> None:
+    """Only terminal value remains on charge/discharge objective coefficients."""
     slots = _slots([0.05, 5.00])
     layout, n_vars = _allocate_secondary_variables(0, len(slots))
     objective = np.zeros(n_vars)
@@ -813,14 +833,13 @@ def test_secondary_milp_terminal_coefficients_are_uniform_and_undiscounted() -> 
         objective,
         layout=layout,
         config=_powmr(
-            charge_efficiency_pct=100.0,
-            discharge_efficiency_pct=100.0,
+            charge_efficiency_pct=70.0,
+            discharge_efficiency_pct=80.0,
             cycle_cost_per_kwh=0.0,
             replacement_price_per_kwh=2.0,
         ),
         slots=slots,
         future_idx=[0, 1],
-        p_imp_obj=np.asarray([0.05, 5.00]),
         time_discount_rate=0.5,
         now=_NOW,
     )
@@ -857,6 +876,8 @@ def test_secondary_result_costs_match_authoritative_scorer() -> None:
     )
     summary = diagnostics["secondary_result"]
 
+    assert breakdown.secondary_conversion_loss_cost == pytest.approx(0.0)
+    assert summary["conversion_loss"] == pytest.approx(0.0)
     assert summary["conversion_loss"] == pytest.approx(
         breakdown.secondary_conversion_loss_cost,
         abs=1e-6,

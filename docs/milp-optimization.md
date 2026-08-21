@@ -208,8 +208,10 @@ plus configured inverter overhead. That dedicated-load equality fixes the exact
 battery draw and prevents direct PowMr backfeed. Because SBU removes the load
 from the aggregate site balance, it may both avoid residual grid import and
 reveal PV for export when PV already served part of the dedicated load. The
-secondary discharge pays its full terminal-inventory, conversion-loss, and wear
-terms, so export is an economic outcome rather than a free SBU credit.
+secondary discharge pays its full terminal-inventory and wear terms. Conversion
+loss is already represented by physical battery draw, final inventory, and site
+flow; it is not priced again as a separate coefficient. Export therefore
+remains an economic outcome rather than a free SBU credit.
 
 When house history is configured to include the dedicated load, the site-bus
 credit is conservatively capped at `min(dedicated_load, gross_house_load)`.
@@ -258,10 +260,6 @@ $$
     && \text{SoC soft-constraint penalties} \\
     + & p_{\mathrm{fuse}} \cdot \mathrm{gi\_pen}[t]
     && \text{Main fuse grid-import penalty} \\
-    + & (1-\eta_{\mathrm{s,chg}})p_{\mathrm{imp}}[t]c_s[t]
-    && \text{secondary charge conversion loss} \\
-    + & (1-\eta_{\mathrm{s,dis}})p_{\mathrm{imp}}[t]d_s[t]
-    && \text{secondary discharge conversion loss} \\
     + & \alpha_s m_s[t]
     && \text{secondary cycle wear} \\
 \bigg] \\
@@ -327,16 +325,19 @@ $$
 
 Primary inventory above $\sum_iq_i$ has no synthetic salvage value. Secondary
 storage still uses one uniform $R_s$. Both terms depend only on final inventory,
-so equal movements cancel regardless of slot positions. Slot prices,
+so equal movements cancel regardless of slot positions. Slot prices, physical
 efficiencies, cycle wear, capacity, headroom, and power constraints then decide
-whether a refill cycle is worthwhile. This retains the issue #694 same-slot
-PV/export and issue #592 deferred-cheap-surplus behaviours without a
-path-dependent charge credit cap.
+whether a refill cycle is worthwhile. Secondary charge draw already enters the
+site balance as $c_s/\eta_{s,chg}$, and SBU battery draw already enters
+inventory as $L/\eta_{s,dis}+overhead$; no separate conversion coefficient is
+needed. This retains the issue #694 same-slot PV/export and issue #592
+deferred-cheap-surplus behaviours without a path-dependent charge credit cap.
 
 Aggregate `gi[t]` and `ge[t]` already contain the secondary branch's actual
 import avoidance and any PV export revealed by SBU. Utility therefore wins when
-that incremental value does not cover the secondary inventory, conversion-loss,
-and wear terms; a mixed slot may validly avoid import and reveal export.
+that incremental value does not cover the secondary inventory and wear terms;
+physical conversion loss is already present in grid flow and inventory. A mixed
+slot may validly avoid import and reveal export.
 
 The structural tiebreak uses the exact export-source split, so $ed[t]-bx[t]$
 is local battery discharge. Its per-DC-kWh perturbation is

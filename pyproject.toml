@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hsem"
-version = "7.1.7"
+version = "7.1.8"
 description = "Personal Home Assistant energy planner for Huawei and PowMr storage"
 readme = "README.md"
 license = {text = "AGPL-3.0"}
