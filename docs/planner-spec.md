@@ -2741,6 +2741,39 @@ not override the current-slot live-price outage gate: if a primary scalar
 entity is unavailable, automatic control still enters the strict price-outage
 hold described below.
 
+### Load-forecast readiness
+
+Historical-average states preserve their availability provenance: `unknown`,
+`unavailable`, unparseable, and non-finite values remain missing instead of
+becoming numeric zero. A genuine finite `0.0` remains a valid measurement.
+
+Before candidate generation, the coordinator validates the populated future
+load profile. Missing or non-finite source averages and malformed future-slot
+values fail closed. A complete identically-zero profile remains valid while
+finite live house demand is at most 50 W. Above 50 W it contradicts live
+telemetry and reports
+`zero_forecast_with_live_demand`.
+
+When the profile is not ready, the coordinator does not run or reuse an
+optimised plan. In automatic mode it publishes a current-slot
+`batteries_wait_mode` with `primary_battery_hold=True`, zero primary storage
+flows, and secondary Utility/zero current. An explicit user force mode remains
+higher authority. The coordinator retries at the one-minute pending-data
+interval.
+
+The accepted-plan load signature contains each future slot's start plus its
+weighted, 1-day, 3-day, 7-day, and 14-day finite load values. Recovery or a
+material load correction therefore forces one fresh solve even within the same
+slot. Only an accepted published plan advances the reuse baseline, preventing a
+rejected or skipped cycle from suppressing that recovery solve.
+
+`DataQuality.load_forecast_ready` and
+`load_forecast_reason` expose the gate; `DataQuality.is_complete` is
+false while availability is false. This gate does not
+change published-price authority, Unagi forecast parsing or haircuts, primary
+terminal-tier construction, or terminal cost-to-go scoring; those semantics
+resume unchanged once the load forecast is ready.
+
 For every day in the horizon the engine detects and surfaces missing price
 and PV data explicitly.  Day-labelled `missing_inputs` entries are emitted
 with the format:
@@ -2810,7 +2843,21 @@ accepted forecast-authority signature includes each future slot's finite PV
 value and availability, so PV publication, withdrawal, or correction cannot
 silently reuse a plan built from stale solar data.
 
-### DataQuality fields for multi-day horizons
+Every registered price, PV, or valuation-source event also increments a
+monotonic forecast-authority generation synchronously, before debounce
+coalescing. An update cycle captures that generation before collecting its
+snapshot. If it changes while the planner is solving, or after asynchronous
+trackers run but before coordinator publication, the entire stale cycle is
+discarded: it publishes no coordinator data, advances no accepted-plan
+signature, and produces no hardware intent. The durable debounce worker then
+runs one fresh coalesced cycle; an event arriving during that refresh marks one
+further pass pending.
+
+This freshness guard changes only which snapshot may publish. It does not alter
+the actionable-price boundary, Unagi valuation inputs, forecast haircuts,
+terminal tiers, or terminal cost-to-go economics.
+
+### DataQuality fields
 
 `DataQuality.horizon_days` counts the distinct local calendar dates touched by
 the physical-time horizon. Ordinary midnight-anchored 24/48/72-hour horizons
@@ -2818,6 +2865,12 @@ cover 1/2/3 dates; across a spring-forward transition the same duration can
 touch one extra local date.
 `DataQuality.day2_price_missing_hours` and `DataQuality.day2_pv_missing_hours`
 carry the day+2 gap lists for 72-hour horizon runs.
+
+`DataQuality.load_forecast_ready` is false when consumption
+provenance or the populated future profile cannot safely support a solve.
+`DataQuality.load_forecast_reason` carries the machine-readable cause
+and is `None` when available. Consumption availability participates in
+`DataQuality.is_complete` alongside price and PV completeness.
 
 ### Discharge concentration across days
 
@@ -2851,7 +2904,8 @@ discharge slots on the same day.
   date and therefore report 2 / 3 / 4 instead.
 - Missing day+2 price data surfaces in `day2_price_missing_hours`.
 - Missing day+2 PV data surfaces in `day2_pv_missing_hours`.
-- `DataQuality.is_complete` is ``False`` when any future-day data is missing.
+- `DataQuality.is_complete` is ``False`` when future-day data is missing or
+  `load_forecast_ready` is false.
 - PV estimate after solar correction is always within `[0.3 × raw_pv, 1.5 × raw_pv]`
   for each hour (clamping enforced).
 - The residual correction decays to ≤0.05× the initial deviation after 4 slots.

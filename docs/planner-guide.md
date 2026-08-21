@@ -1117,6 +1117,20 @@ per-slot availability. Missing prices close the contiguous actionable prefix;
 automatic storage is held beyond it rather than optimized against placeholder
 zeros.
 
+Historical consumption readiness is a separate forecast-safety gate. Unknown,
+unavailable, unparseable, or non-finite average-sensor states remain missing;
+a genuine finite zero remains valid. A complete zero forecast is accepted when
+live house demand is at most 50 W, but rejected as
+`zero_forecast_with_live_demand` above that threshold.
+
+While consumption is unavailable, `data_quality.is_complete` is false and no
+optimized plan is run or reused. Automatic mode publishes a strict current-slot
+battery Hold with zero primary and secondary storage actions; a manual force
+mode remains higher authority. The coordinator retries every minute. When the
+future profile recovers, its accepted-plan signature forces exactly one fresh
+same-slot solve and becomes the new reuse baseline only after successful
+publication.
+
 ### Safety gate behaviour
 
 The write-verify applier (`WriteVerifyApplier`) enforces these gates
@@ -1145,7 +1159,9 @@ The `DataQuality` object on `PlannerOutput` reports completeness of the planning
 | `day2_pv_missing_hours` | `list[int]` | Hours with no PV forecast for day +2 |
 | `horizon_has_tomorrow` | `bool` | `True` when horizon extends beyond 24 h |
 | `horizon_days` | `int` | Distinct local calendar dates covered; normally 1/2/3 for 24/48/72 h, or one extra across spring-forward |
-| `is_complete` | `bool` | `True` when no missing data was detected |
+| `load_forecast_ready` | `bool` | `True` when consumption provenance and every populated future load slot are safe to optimize |
+| `load_forecast_reason` | `str/None` | Machine-readable rejection reason, or `None` when ready |
+| `is_complete` | `bool` | `True` when price/PV inputs are complete and `load_forecast_ready` is true |
 
 ### Home Assistant attribute serialisation
 
@@ -1157,6 +1173,8 @@ directly to a sensor's `extra_state_attributes`:
   "is_complete": true,
   "horizon_has_tomorrow": true,
   "horizon_days": 2,
+  "load_forecast_ready": true,
+  "load_forecast_reason": null,
   "tomorrow_price_missing_hours": [],
   "tomorrow_pv_missing_hours": [],
   "day2_price_missing_hours": [],
@@ -1601,6 +1619,16 @@ prefix and enforces a price-neutral primary Hold plus secondary Utility beyond
 the first gap. Price and Solcast PV publication/withdrawal events wake a
 debounced refresh; an event that arrives during that refresh guarantees one
 coalesced follow-up cycle.
+
+Each registered price, PV, or valuation-source event increments a monotonic
+authority generation before debounce coalescing. A cycle captures that
+generation before its snapshot and checks it after the solve and again
+immediately before publication. If newer authority arrived, the stale cycle
+publishes no coordinator data, accepted-plan signature, or hardware intent; the
+debounce worker runs a fresh coalesced cycle instead. This guard affects solve
+freshness only. It does not change the actionable-price boundary, Unagi
+forecast selection or haircut, terminal-tier construction, or terminal
+cost-to-go scoring.
 
 Optional Unagi valuation is a separate horizon-end channel. After MAE and
 operator-margin haircut, exactly aligned post-boundary demand becomes bounded
