@@ -450,6 +450,7 @@ async def test_powmr_write_observer_wraps_each_verified_operation() -> None:
     live.secondary_storage.load_power_w = 100.0
     observer = MagicMock()
     observer.secondary_control_write_started.side_effect = [11, 12]
+    observer.secondary_control_mode_started.return_value = 10
 
     async def verified(**kwargs: object) -> ApplyResult:
         status = (
@@ -480,6 +481,11 @@ async def test_powmr_write_observer_wraps_each_verified_operation() -> None:
         )
 
     assert summary.overall_status == ApplyStatus.OK
+    observer.secondary_control_mode_started.assert_called_once_with(
+        _NOW,
+        _NOW + timedelta(minutes=15),
+        SECONDARY_MODE_SBU,
+    )
     assert observer.secondary_control_write_started.call_args_list == [
         call(
             cfg.secondary_storage.charger_source_priority_entity,
@@ -506,6 +512,13 @@ async def test_powmr_write_observer_wraps_each_verified_operation() -> None:
             echo_expected=True,
         ),
     ]
+    observer.secondary_control_mode_finished.assert_called_once_with(
+        _NOW,
+        _NOW + timedelta(minutes=15),
+        SECONDARY_MODE_SBU,
+        10,
+        verified=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -517,6 +530,7 @@ async def test_powmr_cancelled_write_resolves_observer_as_unverified() -> None:
     live.secondary_storage.load_power_w = 100.0
     observer = MagicMock()
     observer.secondary_control_write_started.return_value = 42
+    observer.secondary_control_mode_started.return_value = 41
 
     with (
         patch(
@@ -540,6 +554,13 @@ async def test_powmr_cancelled_write_resolves_observer_as_unverified() -> None:
         42,
         verified=False,
         echo_expected=False,
+    )
+    observer.secondary_control_mode_finished.assert_called_once_with(
+        _NOW,
+        _NOW + timedelta(minutes=15),
+        SECONDARY_MODE_SBU,
+        41,
+        verified=False,
     )
 
 

@@ -108,9 +108,9 @@ class CostWeights:
     # the MILP and ``apply_excess_export`` both forbid marking the slot as
     # ``ForceBatteriesDischarge`` — the battery may serve house load but not
     # export to the grid on those slots.  Mirrored in the cost function so that
-    # scored costs match the optimisation assumptions: "battery-destined"
-    # export revenue (discharge loss priced at export) is treated as 0 on
-    # blocked slots because that export can never happen.
+    # scored costs match the optimisation assumptions: battery-origin export
+    # revenue is treated as 0 on blocked slots because that export can never
+    # happen.
     battery_export_min_price: float = 0.0
 
     # Deprecated compatibility fields from the former terminal-SoC charge
@@ -155,7 +155,8 @@ class PlanCostBreakdown:
             exporting costs money).  This value is *subtracted* from
             :attr:`total_cost`, so a negative value increases total cost.
         conversion_loss_cost:
-            Opportunity cost of energy lost in round-trip battery cycles.
+            Compatibility field, always zero. Primary and secondary conversion
+            losses are already physical in grid flows and battery inventory.
         cycle_cost:
             Battery depreciation cost (kWh cycled × cost per kWh).
         soc_penalty:

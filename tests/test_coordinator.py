@@ -68,6 +68,11 @@ from custom_components.hsem.models.planner_input import PlannerInput
 from custom_components.hsem.models.planner_output import PlannerOutput
 from custom_components.hsem.models.sensor_config import SensorConfig
 from custom_components.hsem.models.state_snapshot import StateSnapshot
+from custom_components.hsem.planner.secondary_storage import (
+    SECONDARY_MODE_CHARGE,
+    SECONDARY_MODE_SBU,
+    SECONDARY_MODE_UTILITY,
+)
 from custom_components.hsem.utils.forecast_tracker import ForecastTracker
 from custom_components.hsem.utils.inverter_verify import CycleApplySummary
 from custom_components.hsem.utils.price_forecast import build_price_forecast
@@ -715,6 +720,10 @@ def _make_bare_coordinator() -> HSEMDataUpdateCoordinator:
     coord._secondary_control_write_generation = 0
     coord._secondary_control_write_expectations = {}
     coord._secondary_control_delayed_echoes = {}
+    coord._secondary_control_mode_generation = 0
+    coord._secondary_control_mode_expectation = None
+    coord._secondary_current_slot_mode_lock = None
+    coord._secondary_mode_lock_replan_pending = False
     coord._price_source_update_debounce_task = None
     coord._price_source_update_pending = False
     coord._forecast_authority_generation = 0
@@ -726,6 +735,7 @@ def _make_bare_coordinator() -> HSEMDataUpdateCoordinator:
     coord._last_plan_price_forecast_signature = None
     coord._last_apply_summary = None
     coord._live = None
+    coord._hourly_recommendation = None
     coord._force_discharge_excess_since = None
     coord._force_discharge_excess_slot_start = None
     coord._force_discharge_replanned_slot_start = None
@@ -776,11 +786,358 @@ class TestLightweightSecondaryStorageEvents:
         secondary.output_source_priority_entity = "select.powmr_output"
         secondary.charger_source_priority_entity = "select.powmr_charger"
         secondary.max_charge_current_entity = "number.powmr_current"
+        secondary.min_soc_pct = 20.0
+        secondary.max_soc_pct = 100.0
+        secondary.capacity_kwh = 15.0
+        secondary.nominal_voltage_v = 24.0
+        secondary.min_charge_current_a = 10.0
+        secondary.discharge_efficiency_pct = 93.0
+        secondary.inverter_standby_power_w = 55.0
+        coordinator._cfg.read_only = False
         coordinator._last_plan_secondary_soc_pct = 75.0
         coordinator._last_plan_secondary_load_power_w = 190.0
         hass = MagicMock()
         coordinator.hass = hass
         return hass
+
+    @staticmethod
+    def _configure_lock_snapshot(
+        coordinator: HSEMDataUpdateCoordinator,
+        *,
+        mode: str = SECONDARY_MODE_SBU,
+    ) -> tuple[datetime, datetime]:
+        TestLightweightSecondaryStorageEvents._configure(coordinator)
+        start = datetime(2026, 8, 21, 18, 30, tzinfo=UTC)
+        end = start + timedelta(minutes=15)
+        live = LiveState()
+        live.secondary_storage.soc_pct = 75.0
+        live.secondary_storage.load_power_w = 190.0
+        coordinator._live = live
+        coordinator._hourly_recommendation = cast(
+            Any,
+            SimpleNamespace(
+                start=start,
+                end=end,
+                secondary_storage_mode=mode,
+            ),
+        )
+        return start, end
+
+    def test_mode_locks_only_after_complete_transition_verifies(self) -> None:
+        """Sub-writes cannot lock a mode before the adapter reports completion."""
+        coordinator = _make_bare_coordinator()
+        start, end = self._configure_lock_snapshot(coordinator)
+
+        with patch(
+            "custom_components.hsem.coordinator.hsem_now",
+            return_value=start + timedelta(minutes=1),
+        ):
+            token = coordinator.secondary_control_mode_started(
+                start,
+                end,
+                SECONDARY_MODE_SBU,
+            )
+            assert coordinator._secondary_current_slot_mode_lock is None
+
+            coordinator.secondary_control_mode_finished(
+                start,
+                end,
+                SECONDARY_MODE_SBU,
+                token,
+                verified=True,
+            )
+
+        lock = coordinator._secondary_current_slot_mode_lock
+        assert lock is not None
+        assert lock.mode == SECONDARY_MODE_SBU
+        assert lock.slot_start == start
+        assert lock.slot_end == end
+
+    def test_failed_complete_transition_never_locks(self) -> None:
+        """A failed or unverified ordered transition leaves planning unlocked."""
+        coordinator = _make_bare_coordinator()
+        start, end = self._configure_lock_snapshot(coordinator)
+
+        with patch(
+            "custom_components.hsem.coordinator.hsem_now",
+            return_value=start + timedelta(minutes=1),
+        ):
+            token = coordinator.secondary_control_mode_started(
+                start,
+                end,
+                SECONDARY_MODE_SBU,
+            )
+            coordinator.secondary_control_mode_finished(
+                start,
+                end,
+                SECONDARY_MODE_SBU,
+                token,
+                verified=False,
+            )
+
+        assert coordinator._secondary_current_slot_mode_lock is None
+
+    def test_config_change_invalidates_in_flight_mode_completion(self) -> None:
+        """A transition started under old options cannot install a stale lock."""
+        coordinator = _make_bare_coordinator()
+        start, end = self._configure_lock_snapshot(coordinator)
+        token = coordinator.secondary_control_mode_started(
+            start,
+            end,
+            SECONDARY_MODE_SBU,
+        )
+
+        coordinator._invalidate_secondary_mode_lock(
+            "configuration changed",
+            advance_planning_authority=True,
+        )
+        with patch(
+            "custom_components.hsem.coordinator.hsem_now",
+            return_value=start + timedelta(minutes=1),
+        ):
+            coordinator.secondary_control_mode_finished(
+                start,
+                end,
+                SECONDARY_MODE_SBU,
+                token,
+                verified=True,
+            )
+
+        assert coordinator._secondary_current_slot_mode_lock is None
+        assert coordinator._secondary_mode_lock_replan_pending is True
+
+    def test_external_change_invalidates_an_initially_unlocked_solve(self) -> None:
+        """Manual authority changes stale a solve even before any mode locks."""
+        coordinator = _make_bare_coordinator()
+        assert coordinator._secondary_current_slot_mode_lock is None
+        assert coordinator._secondary_control_mode_expectation is None
+
+        coordinator._invalidate_secondary_mode_lock(
+            "external control change",
+            advance_planning_authority=True,
+        )
+
+        assert coordinator._forecast_authority_generation == 1
+        assert coordinator._secondary_mode_lock_replan_pending is True
+
+    def test_old_slot_completion_cannot_lock_the_new_slot(self) -> None:
+        """A verifier returning after the half-open slot end is ignored."""
+        coordinator = _make_bare_coordinator()
+        start, end = self._configure_lock_snapshot(coordinator)
+        token = coordinator.secondary_control_mode_started(
+            start,
+            end,
+            SECONDARY_MODE_SBU,
+        )
+
+        with patch(
+            "custom_components.hsem.coordinator.hsem_now",
+            return_value=end,
+        ):
+            coordinator.secondary_control_mode_finished(
+                start,
+                end,
+                SECONDARY_MODE_SBU,
+                token,
+                verified=True,
+            )
+
+        assert coordinator._secondary_current_slot_mode_lock is None
+
+    def test_soc_and_global_safety_veto_a_verified_mode_lock(self) -> None:
+        """A held mode never defeats reserve, read-only, or error-mode safety."""
+        coordinator = _make_bare_coordinator()
+        start, end = self._configure_lock_snapshot(coordinator)
+        with patch(
+            "custom_components.hsem.coordinator.hsem_now",
+            return_value=start + timedelta(minutes=1),
+        ):
+            token = coordinator.secondary_control_mode_started(
+                start,
+                end,
+                SECONDARY_MODE_SBU,
+            )
+            coordinator.secondary_control_mode_finished(
+                start,
+                end,
+                SECONDARY_MODE_SBU,
+                token,
+                verified=True,
+            )
+
+        assert coordinator._live is not None
+        coordinator._live.secondary_storage.soc_pct = 20.0
+        assert (
+            coordinator._secondary_mode_lock_for_planner(
+                coordinator._cfg,
+                coordinator._live,
+                start + timedelta(minutes=2),
+            )
+            == SECONDARY_MODE_UTILITY
+        )
+
+        coordinator._cfg.read_only = True
+        assert (
+            coordinator._secondary_mode_lock_for_planner(
+                coordinator._cfg,
+                coordinator._live,
+                start + timedelta(minutes=2),
+            )
+            is None
+        )
+        coordinator._cfg.read_only = False
+        coordinator._live.add_missing_entity("secondary_storage_soc")
+        assert (
+            coordinator._secondary_mode_lock_for_planner(
+                coordinator._cfg,
+                coordinator._live,
+                start + timedelta(minutes=2),
+            )
+            is None
+        )
+
+    def test_charge_lock_escapes_to_utility_at_max_soc(self) -> None:
+        """A verified Charge lock cannot keep charging at the hard ceiling."""
+        coordinator = _make_bare_coordinator()
+        start, end = self._configure_lock_snapshot(
+            coordinator,
+            mode=SECONDARY_MODE_CHARGE,
+        )
+        with patch(
+            "custom_components.hsem.coordinator.hsem_now",
+            return_value=start + timedelta(minutes=1),
+        ):
+            token = coordinator.secondary_control_mode_started(
+                start,
+                end,
+                SECONDARY_MODE_CHARGE,
+            )
+            coordinator.secondary_control_mode_finished(
+                start,
+                end,
+                SECONDARY_MODE_CHARGE,
+                token,
+                verified=True,
+            )
+
+        assert coordinator._live is not None
+        coordinator._live.secondary_storage.soc_pct = 100.0
+        assert (
+            coordinator._secondary_mode_lock_for_planner(
+                coordinator._cfg,
+                coordinator._live,
+                start + timedelta(minutes=2),
+            )
+            == SECONDARY_MODE_UTILITY
+        )
+
+    def test_sbu_lock_escapes_when_remaining_load_would_cross_floor(self) -> None:
+        """Reserve safety uses remaining energy, not only the rounded SoC guard."""
+        coordinator = _make_bare_coordinator()
+        start, end = self._configure_lock_snapshot(coordinator)
+        with patch(
+            "custom_components.hsem.coordinator.hsem_now",
+            return_value=start + timedelta(minutes=1),
+        ):
+            token = coordinator.secondary_control_mode_started(
+                start,
+                end,
+                SECONDARY_MODE_SBU,
+            )
+            coordinator.secondary_control_mode_finished(
+                start,
+                end,
+                SECONDARY_MODE_SBU,
+                token,
+                verified=True,
+            )
+
+        assert coordinator._live is not None
+        # 0.2 % of 15 kWh leaves only 0.030 kWh above reserve, less than
+        # the remaining NAS draw plus the 55 W inverter overhead.
+        coordinator._live.secondary_storage.soc_pct = 20.2
+        assert (
+            coordinator._secondary_mode_lock_for_planner(
+                coordinator._cfg,
+                coordinator._live,
+                start + timedelta(minutes=1),
+            )
+            == SECONDARY_MODE_UTILITY
+        )
+
+    def test_charge_lock_escapes_when_minimum_step_exceeds_headroom(self) -> None:
+        """Charge safety compares remaining 10 A energy with actual headroom."""
+        coordinator = _make_bare_coordinator()
+        start, end = self._configure_lock_snapshot(
+            coordinator,
+            mode=SECONDARY_MODE_CHARGE,
+        )
+        with patch(
+            "custom_components.hsem.coordinator.hsem_now",
+            return_value=start + timedelta(minutes=1),
+        ):
+            token = coordinator.secondary_control_mode_started(
+                start,
+                end,
+                SECONDARY_MODE_CHARGE,
+            )
+            coordinator.secondary_control_mode_finished(
+                start,
+                end,
+                SECONDARY_MODE_CHARGE,
+                token,
+                verified=True,
+            )
+
+        assert coordinator._live is not None
+        # 0.11 % of 15 kWh is 0.0165 kWh headroom; one remaining 10 A
+        # command at 24 V needs 0.056 kWh over fourteen minutes.
+        coordinator._live.secondary_storage.soc_pct = 99.89
+        assert (
+            coordinator._secondary_mode_lock_for_planner(
+                coordinator._cfg,
+                coordinator._live,
+                start + timedelta(minutes=1),
+            )
+            == SECONDARY_MODE_UTILITY
+        )
+
+    @pytest.mark.asyncio
+    async def test_verification_during_solve_invalidates_stale_cycle(self) -> None:
+        """A solve started before verification cannot publish an unlocked mode."""
+        coordinator = _make_bare_coordinator()
+        start, end = self._configure_lock_snapshot(coordinator)
+        hass = cast(MagicMock, coordinator.hass)
+        pending_task = MagicMock()
+        pending_task.done.return_value = False
+        hass.async_create_task.return_value = pending_task
+
+        await coordinator._update_lock.acquire()
+        try:
+            with patch(
+                "custom_components.hsem.coordinator.hsem_now",
+                return_value=start + timedelta(minutes=1),
+            ):
+                token = coordinator.secondary_control_mode_started(
+                    start,
+                    end,
+                    SECONDARY_MODE_SBU,
+                )
+                coordinator.secondary_control_mode_finished(
+                    start,
+                    end,
+                    SECONDARY_MODE_SBU,
+                    token,
+                    verified=True,
+                )
+
+            assert coordinator._forecast_authority_generation == 1
+            assert coordinator._secondary_mode_lock_replan_pending is True
+            assert coordinator._secondary_storage_update_pending is True
+            hass.async_create_task.assert_called_once()
+            hass.async_create_task.call_args.args[0].close()
+        finally:
+            coordinator._update_lock.release()
 
     @pytest.mark.asyncio
     async def test_subthreshold_soc_and_load_events_do_not_schedule_update(

@@ -589,6 +589,36 @@ verifies each write before continuing:
 - utility: first verify charger `Only Solar`, then set output to
   `Utility first`
 
+After the complete ordered transition has verified (every operation is
+`OK` or already at its target), the coordinator locks that discrete PowMr mode
+for the remainder of the active half-open recommendation slot. Individual
+verified sub-writes never create a lock. A subsequent same-slot planner run
+passes the verified mode into the MILP and fixes only the current slot's
+Charge/SBU binaries to that mode; all future slots remain economically
+optimised. A Charge lock still uses the model's physical 10 A current lattice,
+SoC headroom, phase-fuse rows, site balance, and battery-transfer constraints,
+so the current command and every published flow are re-solved consistently
+rather than copied onto an incompatible plan.
+
+The lock is transient control authority, not an economic preference. It resets
+at the exact slot boundary and is invalidated immediately by an explicit config
+change or a non-HSEM control-entity change. Whole-transition tokens prevent a
+late verifier from restoring an invalidated or previous-slot lock. If a lock is
+confirmed while another planner solve is running, that stale solve cannot
+publish; one durable refresh rebuilds the plan with the verified mode.
+
+Safety remains higher authority than the lock. Missing or invalid PowMr
+telemetry, global read-only, or an error degraded mode suppresses the lock and
+retains the existing no-write behavior. The non-actionable-price hold,
+minimum-SoC SBU guard, maximum-SoC Charge guard, and live phase/fuse limiter may
+select Utility. Before a hard lock enters the MILP, SBU also escapes to Utility
+when energy above the reserve cannot cover the remaining dedicated load,
+discharge loss, and standby draw; Charge escapes when remaining headroom cannot
+accept one minimum physical current step through the slot end. If another hard
+constraint still makes a locked mode infeasible, the MILP is rejected and the
+physically valid Utility fallback is used. Once a complete safety-driven Utility
+transition verifies, Utility becomes the mode held for the rest of that slot.
+
 At or below minimum SoC, a stale SBU plan is forced to utility. At maximum SoC,
 a stale charge plan is forced to utility, stopping grid charging with
 `Only Solar` before switching the output to `Utility first`.
@@ -642,6 +672,21 @@ installation, which has no PowMr PV input, it stops PowMr charging completely.
 - a downward live PowMr current retarget verifies `Only Solar` before changing
   the current and never re-enables utility charging after an unconfirmed number
   write
+- no PowMr mode lock exists until every operation in the ordered transition is
+  verified; a failed, unverified, cancelled, stale, or partial transition never
+  installs one
+- a verified mode is a hard MILP constraint only for the active slot; future
+  secondary modes remain free and all locked-slot energy/cost/SoC fields are
+  produced by the same accepted solve
+- slot boundaries and explicit config or external PowMr control changes
+  invalidate the lock and any in-flight whole-transition token
+- a verifier completing during an unlocked solve invalidates that stale solve
+  before publication and causes one durable locked refresh
+- read-only/error gates, invalid telemetry, price-authority holds, min/max SoC,
+  and phase/fuse infeasibility remain able to suppress or escape the lock safely
+- remaining-slot SBU demand and the minimum Charge current step are checked
+  against usable energy above reserve and headroom below maximum before locking
+  either mode into the MILP
 - serialized PlannerOutput slots contain all secondary-storage load, charge,
   discharge, grid-import, capacity, SoC, current, and mode fields
 - successful enabled MILP solves emit one ``secondary_result`` line each
@@ -681,46 +726,43 @@ roundtrip_loss  = 1 − roundtrip_yield
 
 Example (90 % / 90 %): yield = 0.81, loss = 19 %.
 
-### Conversion loss pricing (issue #641)
+### Physical conversion-loss accounting
 
-Each side of the round-trip is priced independently at its own slot's price:
-
-- **Charge-side loss**: Priced at the sanitised import price of the charge
-  slot (`max(import_price, 0)`).  The lost energy was purchased at that
-  price.
-- **Discharge-side loss**: Priced from the MILP's explicit export-source split.
-  Battery-side `bx[t]` is export-destined; `ed[t] - bx[t]` serves local
-  load. Export-destined loss uses sanitised export price (foregone revenue);
-  local-use loss uses sanitised import price (avoided import).
+Primary conversion loss is represented completely by the AC/DC energy
+balance. If `ec[t]` is battery-side stored charge and `ed[t]` is battery-side
+energy removed, the site sees:
 
 ```text
-local_discharge_dc = ed[t] - bx[t]
-battery_export_dc = bx[t]
-discharge_loss_cost[t] =
-    local_discharge_dc * (1 - dis_eff) * max(import_price, 0)
-    + battery_export_dc * (1 - dis_eff) * max(export_price, 0)
+charge_ac_draw[t] = ec[t] / charge_efficiency
+discharge_ac_delivery[t] = ed[t] * discharge_efficiency
 ```
 
-The LP objective, `cost_function.py::score_plan()`, and diagnostics use this
-same split. A slot can export PV while the battery serves local load, so
-`grid_export_kwh > 0` is not sufficient evidence that all discharge is
-export-destined.
+The objective and scorer price the resulting `grid_import_kwh` and
+`grid_export_kwh`. Charging loss therefore appears as additional billable AC
+import (or additional PV opportunity cost), while discharge loss appears as
+less avoided import or less AC export revenue. Adding a separate monetary
+coefficient for `(1-efficiency)` would price the same loss twice.
+
+The public `conversion_loss_cost` and
+`discharge_loss_cost_destination_aware` fields remain for schema compatibility
+and are always `0.0`. The explicit `bx[t]` source split remains authoritative
+for battery-versus-PV export attribution and revenue, not for a second loss
+charge.
 
 ### Invariants for tests
 
 - Charging 10 kWh at 90 % efficiency must draw 10 / 0.9 approx 11.11 kWh from the grid.
 - Charging 10 kWh at 100 % efficiency must draw exactly 10 kWh from the grid.
 - Discharging 10 kWh battery energy at 90 % efficiency must deliver 9 kWh to the house.
-- The round-trip cost term (conversion_loss_cost) must use
-  1 - charge_eff * discharge_eff when explicit efficiencies are set.
-- When both efficiencies are 100 %, the legacy conversion_loss_pct field drives
-  the conversion_loss_cost term (backwards compatibility).
-- Discharge-side conversion loss MUST be destination-aware: `bx[t]` uses the
-  export price and `ed[t]-bx[t]` uses the import price (issue #641).
-- Battery-origin export has a lower loss cost than import-only pricing when
-  export price is lower than import price.
-- A slot with PV export and local battery discharge keeps import-price
-  valuation for the local discharge; net-export status cannot change it.
+- Lower charge efficiency must increase the physical AC draw required to store
+  the same battery-side energy; no separate conversion-loss fee is added.
+- Lower discharge efficiency must reduce AC delivery/export from the same
+  battery-side energy; no separate conversion-loss fee is added.
+- Primary `conversion_loss_cost` and the legacy destination-aware diagnostic
+  remain exactly zero for every efficiency and destination.
+- With 98 % charge and discharge efficiency and zero wear, grid-to-export
+  arbitrage breaks even at a price ratio of `1 / (0.98 * 0.98)`, not at a
+  threshold inflated by another loss term.
 
 ## Live data injection (current slot)
 
@@ -1527,8 +1569,6 @@ how that plays out per slot, from cheapest to most expensive action.
 
 ```text
 Σ_t [ p_imp[t]·gi[t] − p_exp[t]·ge[t] + α·m[t]
-      + (charge_loss·p_imp[t])·ec[t]
-      + discharge_loss·(p_imp[t]·(ed[t]−bx[t]) + p_exp_pos[t]·bx[t])
       + p_soc·(s_max_pen[t] + s_min_pen[t]) ]
 - V_primary(E_final)  # V_primary(E_initial) is a constant
 + ε·Σ_t(ec[t] + ed[t]) − 1.5ε·Σ_t(ed[t] − bx[t])
@@ -1553,7 +1593,7 @@ has zero cost.  The LP always uses available PV to cover house load first.
 
 | Priority | Action | Cost coefficient | When taken |
 |---|---|---|---|
-| 2a | Charge house battery | `charge_loss × p_imp[t]` | Battery below `usable_kwh`, future savings justify the minor conversion loss |
+| 2a | Charge house battery | Physical AC draw `ec/charge_eff` enters `gi` or reduces PV export, plus cycle wear and tiebreak | Battery below `usable_kwh`, future savings justify the real input/opportunity cost |
 | 2b | Charge EV (pre-deadline, below target) | `-ev_penalty_cost` (benefit) + `p_imp[t]` (via grid) or `0` (via surplus) | EV below target, `t ≤ D` — the **deadline benefit** forces charging; PV used first, grid import when PV insufficient |
 | 2c | Charge EV (post-deadline, past target) | **−0.0001 / charger_eff** (benefit) | `t > D`, `charge_past_target=True`. Surplus-only constraint: `ev_c/eff ≤ pv − base_load`. House battery fills first, then export, then EV gets remainder |
 | 2d | Export to grid | **−p_exp[t]** (revenue) | Battery full, EV doesn't want surplus, export price > 0 |
@@ -1563,7 +1603,7 @@ has zero cost.  The LP always uses available PV to cover house load first.
 
 | Priority | Action | Cost coefficient | When taken |
 |---|---|---|---|
-| 3a | Discharge battery | `discharge_loss × p_imp[t] + cycle_cost` | Battery has energy, discharging is cheaper than grid import |
+| 3a | Discharge battery | Physical AC delivery `ed*discharge_eff` reduces `gi` or raises `ge`, plus cycle wear and tiebreak | Battery has energy, discharging is cheaper than grid import |
 | 3b | Import from grid | `p_imp[t]` | Battery empty or discharge not worthwhile (cycle cost > import price spread) |
 
 #### 4. EV deadline charging (hard penalty)
@@ -1717,7 +1757,6 @@ q_i = min(eligible_house_load_ac / discharge_efficiency,
           usable_battery_kwh)
 
 v_i = effective_forecast_price * discharge_efficiency
-      - effective_forecast_price * (1 - discharge_efficiency)
       - cycle_wear_per_kwh
 ```
 
@@ -1985,7 +2024,7 @@ total_cost
 = grid_import_cost
 - export_revenue
 + battery_cycle_cost
-+ conversion_loss_cost
++ conversion_loss_cost  # compatibility field, always 0.0
 ```
 
 ```text
@@ -2237,12 +2276,10 @@ source share, and it never consults recommendation labels or PV forecast.
 
 Import prices are sanitised the same way as the MILP's own objective
 (`imp_price_obj = max(imp_price, 0.0)`) before being used anywhere in
-`score_plan` - including the import-cost term itself.  The charge-side
-conversion loss term also uses `imp_price_obj`.  For the discharge-side
-conversion loss, destination-aware pricing applies (issue #641):
-`battery_export_dc` is priced at the sanitised export price, while
-`local_discharge_dc` uses `imp_price_obj` — see Battery efficiency /
-Conversion loss pricing above. The LP and scorer use the same explicit split.
+`score_plan`, including the import-cost term itself. Primary conversion
+efficiency changes the physical `grid_import_kwh`/`grid_export_kwh` fields and
+is therefore already reflected in import cost and export revenue. The LP and
+scorer add no separate primary loss-price term.
 
 Production primary terminal accounting is active when
 `initial_battery_kwh` and `terminal_cost_to_go` are supplied to
@@ -2259,6 +2296,8 @@ independently defined.
 - `total_cost` must equal
   `import_cost - export_revenue + cycle_cost + conversion_loss_cost`
   exactly.  No synthetic penalty may enter `total_cost`.
+- Primary `conversion_loss_cost` is a compatibility field and must remain
+  exactly zero because physical losses are already present in grid flows.
 - `score` must equal
   `total_cost + soc_penalty + grid_limit_penalty + terminal_soc_value + primary_action_tiebreak`
   exactly.

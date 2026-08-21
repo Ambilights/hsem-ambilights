@@ -88,6 +88,7 @@ from custom_components.hsem.planner.charge_scheduler import apply_window_hystere
 from custom_components.hsem.planner.ev_planner import EVChargingPlan
 from custom_components.hsem.planner.secondary_storage import (
     SECONDARY_MODE_CHARGE,
+    SECONDARY_MODE_SBU,
     SECONDARY_MODE_UTILITY,
 )
 from custom_components.hsem.utils.capacity_learner import CapacityLearner
@@ -99,7 +100,10 @@ from custom_components.hsem.utils.datetime_utils import (
     utc_key,
     utc_now_iso,
 )
-from custom_components.hsem.utils.degraded_mode import DegradedMode
+from custom_components.hsem.utils.degraded_mode import (
+    DegradedMode,
+    hardware_writes_allowed,
+)
 from custom_components.hsem.utils.dynamic_floor import DynamicDischargeFloor
 from custom_components.hsem.utils.forecast_tracker import ForecastTracker
 from custom_components.hsem.utils.ha_helpers import ha_get_entity_state_and_convert
@@ -802,6 +806,25 @@ class _SecondaryControlWriteExpectation:
     suppressed_replan: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _SecondaryControlModeExpectation:
+    """One complete ordered PowMr transition awaiting final verification."""
+
+    token: int
+    slot_start: datetime
+    slot_end: datetime
+    mode: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SecondaryCurrentSlotModeLock:
+    """Verified PowMr mode held until its half-open slot ends."""
+
+    slot_start: datetime
+    slot_end: datetime
+    mode: str
+
+
 @dataclass
 class CoordinatorData:
     """Snapshot of a single HSEM update cycle.
@@ -1102,6 +1125,18 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             str, _SecondaryControlWriteExpectation
         ] = {}
         self._secondary_control_delayed_echoes: dict[str, str | float] = {}
+        # A mode lock is created only after the complete ordered PowMr
+        # transition verifies.  Its separate generation invalidates a stale
+        # completion when a boundary, option update, or external control write
+        # changes authority while hardware I/O is still in flight.
+        self._secondary_control_mode_generation: int = 0
+        self._secondary_control_mode_expectation: (
+            _SecondaryControlModeExpectation | None
+        ) = None
+        self._secondary_current_slot_mode_lock: _SecondaryCurrentSlotModeLock | None = (
+            None
+        )
+        self._secondary_mode_lock_replan_pending: bool = False
 
     @callback
     def async_publish_apply_summary(self, summary: CycleApplySummary) -> None:
@@ -1170,6 +1205,211 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             # was in flight. If verification failed, reconcile that state in
             # a fresh coordinator cycle.
             self._queue_secondary_storage_update()
+
+    @callback
+    def secondary_control_mode_started(
+        self,
+        slot_start: datetime,
+        slot_end: datetime,
+        mode: str,
+    ) -> int:
+        """Register one complete ordered PowMr mode transition."""
+        self._secondary_control_mode_generation = (
+            getattr(self, "_secondary_control_mode_generation", 0) + 1
+        )
+        token = self._secondary_control_mode_generation
+        self._secondary_control_mode_expectation = _SecondaryControlModeExpectation(
+            token=token,
+            slot_start=slot_start,
+            slot_end=slot_end,
+            mode=mode,
+        )
+        return token
+
+    @callback
+    def secondary_control_mode_finished(
+        self,
+        slot_start: datetime,
+        slot_end: datetime,
+        mode: str,
+        token: int,
+        *,
+        verified: bool,
+    ) -> None:
+        """Lock a PowMr mode only after its complete transition verifies."""
+        expectation = getattr(self, "_secondary_control_mode_expectation", None)
+        if (
+            expectation is None
+            or expectation.token != token
+            or utc_key(expectation.slot_start) != utc_key(slot_start)
+            or utc_key(expectation.slot_end) != utc_key(slot_end)
+            or expectation.mode != mode
+        ):
+            return
+        self._secondary_control_mode_expectation = None
+        if not verified or mode not in {
+            SECONDARY_MODE_CHARGE,
+            SECONDARY_MODE_SBU,
+            SECONDARY_MODE_UTILITY,
+        }:
+            return
+
+        now = hsem_now()
+        cfg = self._cfg
+        live = self._live
+        if (
+            self._tearing_down
+            or not slot_contains(slot_start, slot_end, now)
+            or live is None
+            or cfg.read_only
+            or not cfg.secondary_storage.enabled
+            or not cfg.secondary_storage.control_enabled
+            or not hardware_writes_allowed(live.degraded_mode)
+            or live.secondary_storage.soc_pct is None
+            or not 0.0 <= live.secondary_storage.soc_pct <= 100.0
+            or live.secondary_storage.load_power_w is None
+            or live.secondary_storage.load_power_w < 0.0
+        ):
+            return
+
+        new_lock = _SecondaryCurrentSlotModeLock(
+            slot_start=slot_start,
+            slot_end=slot_end,
+            mode=mode,
+        )
+        if getattr(self, "_secondary_current_slot_mode_lock", None) == new_lock:
+            return
+
+        # If a planner cycle began before verification, its model did not see
+        # this lock. Advance authority so that cycle cannot publish a different
+        # current mode, then let the durable PowMr queue rebuild it. The same
+        # refresh is required when a runtime safety limiter applied Utility in
+        # place of the accepted planner mode, so published flows catch up.
+        current_rec = self._hourly_recommendation
+        accepted_mode = (
+            current_rec.secondary_storage_mode
+            if current_rec is not None
+            and utc_key(current_rec.start) == utc_key(slot_start)
+            else None
+        )
+        refresh_required = self._update_lock.locked() or accepted_mode != mode
+        self._secondary_current_slot_mode_lock = new_lock
+        async_log(
+            "debug",
+            "[powmr-lock] Verified %s for slot %s; locked until %s.",
+            mode,
+            slot_start.isoformat(),
+            slot_end.isoformat(),
+        )
+        if refresh_required:
+            self._secondary_mode_lock_replan_pending = True
+            self._forecast_authority_generation = (
+                getattr(self, "_forecast_authority_generation", 0) + 1
+            )
+            self._queue_secondary_storage_update()
+
+    def _invalidate_secondary_mode_lock(
+        self,
+        reason: str,
+        *,
+        advance_planning_authority: bool,
+    ) -> None:
+        """Drop a lock and invalidate any transition still in flight."""
+        had_authority = (
+            getattr(self, "_secondary_current_slot_mode_lock", None) is not None
+            or getattr(self, "_secondary_control_mode_expectation", None) is not None
+        )
+        self._secondary_control_mode_generation = (
+            getattr(self, "_secondary_control_mode_generation", 0) + 1
+        )
+        self._secondary_control_mode_expectation = None
+        self._secondary_current_slot_mode_lock = None
+        if advance_planning_authority:
+            self._secondary_mode_lock_replan_pending = True
+            self._forecast_authority_generation = (
+                getattr(self, "_forecast_authority_generation", 0) + 1
+            )
+        if not had_authority:
+            return
+        async_log("debug", "[powmr-lock] Cleared current-slot lock: %s.", reason)
+
+    def _secondary_mode_lock_for_planner(
+        self,
+        cfg: SensorConfig,
+        live: LiveState,
+        now: datetime,
+    ) -> str | None:
+        """Return the verified active-slot mode after immediate safety vetoes."""
+        lock = self._secondary_current_slot_mode_lock
+        if (
+            lock is None
+            or not slot_contains(lock.slot_start, lock.slot_end, now)
+            or cfg.read_only
+            or not cfg.secondary_storage.enabled
+            or not cfg.secondary_storage.control_enabled
+            or not hardware_writes_allowed(live.degraded_mode)
+            or live.secondary_storage.soc_pct is None
+            or not 0.0 <= live.secondary_storage.soc_pct <= 100.0
+            or live.secondary_storage.load_power_w is None
+            or live.secondary_storage.load_power_w < 0.0
+        ):
+            return None
+
+        soc_pct = live.secondary_storage.soc_pct
+        if (
+            lock.mode == SECONDARY_MODE_SBU
+            and soc_pct <= cfg.secondary_storage.min_soc_pct + 0.1
+        ):
+            return SECONDARY_MODE_UTILITY
+        if (
+            lock.mode == SECONDARY_MODE_CHARGE
+            and soc_pct >= cfg.secondary_storage.max_soc_pct - 0.1
+        ):
+            return SECONDARY_MODE_UTILITY
+
+        remaining_hours = max(
+            (utc_key(lock.slot_end) - utc_key(now)).total_seconds() / 3600.0,
+            0.0,
+        )
+        capacity_kwh = max(cfg.secondary_storage.capacity_kwh, 0.0)
+        if lock.mode == SECONDARY_MODE_SBU:
+            available_kwh = (
+                capacity_kwh
+                * max(
+                    soc_pct - cfg.secondary_storage.min_soc_pct,
+                    0.0,
+                )
+                / 100.0
+            )
+            required_kwh = (
+                live.secondary_storage.load_power_w
+                * remaining_hours
+                / 1000.0
+                / clamp_efficiency(cfg.secondary_storage.discharge_efficiency_pct)
+                + max(cfg.secondary_storage.inverter_standby_power_w, 0.0)
+                * remaining_hours
+                / 1000.0
+            )
+            if available_kwh + 1e-9 < required_kwh:
+                return SECONDARY_MODE_UTILITY
+        elif lock.mode == SECONDARY_MODE_CHARGE:
+            headroom_kwh = (
+                capacity_kwh
+                * max(
+                    cfg.secondary_storage.max_soc_pct - soc_pct,
+                    0.0,
+                )
+                / 100.0
+            )
+            minimum_step_kwh = (
+                max(cfg.secondary_storage.nominal_voltage_v, 0.0)
+                * max(cfg.secondary_storage.min_charge_current_a, 0.0)
+                * remaining_hours
+                / 1000.0
+            )
+            if headroom_kwh + 1e-9 < minimum_step_kwh:
+                return SECONDARY_MODE_UTILITY
+        return lock.mode
 
     def _secondary_control_write_matches(
         self,
@@ -1295,6 +1535,10 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._secondary_storage_update_pending = False
         self._secondary_control_write_expectations = {}
         self._secondary_control_delayed_echoes = {}
+        self._invalidate_secondary_mode_lock(
+            "coordinator teardown",
+            advance_planning_authority=False,
+        )
         price_task = getattr(self, "_price_source_update_debounce_task", None)
         if price_task is not None and not price_task.done():
             price_task.cancel()
@@ -1321,6 +1565,13 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         The background task is created with ``eager_start=False`` so the
         switch service call returns before any setup work begins.
         """
+        # Any explicit config-entry change may alter PowMr control authority,
+        # topology, limits, or slot cadence. It must invalidate both a held
+        # mode and a stale transition that was started under the old options.
+        self._invalidate_secondary_mode_lock(
+            "configuration changed",
+            advance_planning_authority=True,
+        )
         if (
             self._options_update_debounce_task is not None
             and not self._options_update_debounce_task.done()
@@ -1396,6 +1647,10 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 new_state.state, delayed
             ):
                 return
+            self._invalidate_secondary_mode_lock(
+                f"external control change on {entity_id}",
+                advance_planning_authority=True,
+            )
             material = True
 
         if not material:
@@ -2191,6 +2446,9 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                             self, "_capacity_learner", CapacityLearner()
                         ),
                         price_forecast_attributes=price_forecast_attributes,
+                        secondary_current_slot_mode_lock=(
+                            self._secondary_mode_lock_for_planner(cfg, live, now)
+                        ),
                     )
                     # Wire the solar forecast corrector into the planner input so
                     # populate_solcast can apply per-hour accuracy corrections (issue #602).
@@ -2676,6 +2934,10 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._slot_boundary_timer_unsub = None
         if self._tearing_down:
             return
+        self._invalidate_secondary_mode_lock(
+            "slot boundary",
+            advance_planning_authority=False,
+        )
         self._forecast_authority_generation = (
             getattr(self, "_forecast_authority_generation", 0) + 1
         )
@@ -2952,6 +3214,13 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             async_log(
                 "debug",
                 "[replan] Load forecast recovered after a safety hold — re-planning.",
+            )
+            return True
+
+        if getattr(self, "_secondary_mode_lock_replan_pending", False):
+            async_log(
+                "debug",
+                "[replan] PowMr current-slot mode authority changed — re-planning.",
             )
             return True
 
@@ -3264,6 +3533,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 price_forecast_signature=price_forecast_signature,
                 load_forecast_signature=load_forecast_signature,
             )
+            self._secondary_mode_lock_replan_pending = False
 
     def _freeze_ev_charger_power_for_current_slot(
         self, output: PlannerOutput, now: datetime

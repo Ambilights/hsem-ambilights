@@ -47,8 +47,9 @@ from custom_components.hsem.planner.ev_planner import (
 )
 from custom_components.hsem.planner.future_value import build_terminal_cost_to_go
 from custom_components.hsem.planner.secondary_storage import (
+    SecondaryTerminalPriceResolution,
     populate_secondary_storage_load,
-    resolve_secondary_terminal_price,
+    resolve_secondary_terminal_price_details,
 )
 from custom_components.hsem.planner.slot_population import (
     build_slots,
@@ -363,9 +364,10 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
     # Step 1b — inject live solar and consumption into the current slot
     _inject_live_data_into_current_slot(slots, inp, now)
 
+    secondary_terminal_price = SecondaryTerminalPriceResolution(None, "none")
     if inp.secondary_storage.valid:
         populate_secondary_storage_load(slots, inp.secondary_storage, now)
-        secondary_replacement_price = resolve_secondary_terminal_price(
+        secondary_terminal_price = resolve_secondary_terminal_price_details(
             slots,
             inp.secondary_storage,
             now,
@@ -375,21 +377,22 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
             inp,
             secondary_storage=replace(
                 inp.secondary_storage,
-                replacement_price_per_kwh=secondary_replacement_price,
+                replacement_price_per_kwh=secondary_terminal_price.price_per_kwh,
             ),
         )
         log_planner(
             "debug",
             "[core] Secondary storage enabled: capacity=%.3f kWh soc=%.1f%% "
-            "load=%.0f W terminal_value=%s",
+            "load=%.0f W terminal_value=%s terminal_source=%s",
             inp.secondary_storage.capacity_kwh,
             inp.secondary_storage.current_soc_pct,
             inp.secondary_storage.load_power_w,
             (
-                f"{secondary_replacement_price:.6f}"
-                if secondary_replacement_price is not None
+                f"{secondary_terminal_price.price_per_kwh:.6f}"
+                if secondary_terminal_price.price_per_kwh is not None
                 else "None"
             ),
+            secondary_terminal_price.source,
         )
 
     # Step 2 — EV planned load injection
@@ -473,7 +476,7 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
     )
     if rt > 0:
         warnings.append(
-            f"Recommended price threshold: {rt:.4f} (depreciation + conversion loss)."
+            f"Recommended price threshold: {rt:.4f} (battery depreciation)."
         )
 
     # Resolve the effective cycle cost once so the MILP, cost function, and
@@ -799,6 +802,8 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
     expl.terminal_cost_to_go_final_value = terminal_cost_to_go.inventory_value(
         selected_final_inventory_kwh
     )
+    expl.secondary_terminal_price_source = secondary_terminal_price.source
+    expl.secondary_terminal_price_per_kwh = secondary_terminal_price.price_per_kwh
     pc = score_plan(
         slots,
         cw,

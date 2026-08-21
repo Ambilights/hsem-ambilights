@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from functools import partial
 from typing import Any, Protocol
 
@@ -69,12 +70,66 @@ class SecondaryControlWriteObserver(Protocol):
         """Resolve a write token after verification or cancellation."""
         ...
 
+    def secondary_control_mode_started(
+        self,
+        slot_start: datetime,
+        slot_end: datetime,
+        mode: str,
+    ) -> int:
+        """Return a token for one complete ordered mode transition."""
+        ...
+
+    def secondary_control_mode_finished(
+        self,
+        slot_start: datetime,
+        slot_end: datetime,
+        mode: str,
+        token: int,
+        *,
+        verified: bool,
+    ) -> None:
+        """Report whether the complete mode transition verified."""
+        ...
+
 
 def _quantize_current(value: float, minimum: float, maximum: float) -> float:
     """Clamp to PowMr's verified 10 A number step."""
     clamped = min(max(value, minimum), maximum)
     quantized = round(clamped / 10.0) * 10.0
     return min(max(quantized, minimum), maximum)
+
+
+def resolve_secondary_control_mode(
+    cfg: SensorConfig,
+    live: LiveState,
+    rec: HourlyRecommendation,
+) -> str | None:
+    """Resolve planner intent through the immediate PowMr safety guards."""
+    configured = cfg.secondary_storage
+    measured = live.secondary_storage
+    mode = rec.secondary_storage_mode
+    if mode not in {
+        SECONDARY_MODE_CHARGE,
+        SECONDARY_MODE_SBU,
+        SECONDARY_MODE_UTILITY,
+    }:
+        return None
+    if mode == SECONDARY_MODE_SBU and (
+        measured.soc_pct is None or measured.soc_pct <= configured.min_soc_pct + 0.1
+    ):
+        return SECONDARY_MODE_UTILITY
+    if mode == SECONDARY_MODE_CHARGE and (
+        measured.soc_pct is not None
+        and measured.soc_pct >= configured.max_soc_pct - 0.1
+    ):
+        return SECONDARY_MODE_UTILITY
+    if (
+        mode == SECONDARY_MODE_CHARGE
+        and rec.secondary_storage_charge_current_a
+        < configured.min_charge_current_a - 1e-9
+    ):
+        return SECONDARY_MODE_UTILITY
+    return mode
 
 
 def build_secondary_write_plan(
@@ -91,24 +146,14 @@ def build_secondary_write_plan(
     if not output_entity or not charger_entity or not current_entity:
         return []
 
-    mode = rec.secondary_storage_mode
-    max_soc_charge_guard = False
-    if mode == SECONDARY_MODE_SBU and (
-        measured.soc_pct is None or measured.soc_pct <= configured.min_soc_pct + 0.1
-    ):
-        mode = SECONDARY_MODE_UTILITY
-    if mode == SECONDARY_MODE_CHARGE and (
-        measured.soc_pct is not None
+    planned_mode = rec.secondary_storage_mode
+    mode = resolve_secondary_control_mode(cfg, live, rec)
+    max_soc_charge_guard = (
+        planned_mode == SECONDARY_MODE_CHARGE
+        and mode == SECONDARY_MODE_UTILITY
+        and measured.soc_pct is not None
         and measured.soc_pct >= configured.max_soc_pct - 0.1
-    ):
-        mode = SECONDARY_MODE_UTILITY
-        max_soc_charge_guard = True
-    if (
-        mode == SECONDARY_MODE_CHARGE
-        and rec.secondary_storage_charge_current_a
-        < configured.min_charge_current_a - 1e-9
-    ):
-        mode = SECONDARY_MODE_UTILITY
+    )
 
     if mode == SECONDARY_MODE_SBU:
         return [
@@ -297,35 +342,63 @@ async def async_apply_secondary_storage(
         )
         return summary
 
-    charger_safely_disabled = False
-    for operation in operations:
-        result = await _async_apply_secondary_write(
-            sensor,
-            operation,
-            control_write_observer,
+    resolved_mode = resolve_secondary_control_mode(cfg, live, rec)
+    if resolved_mode is None:
+        return summary
+    mode_token = (
+        control_write_observer.secondary_control_mode_started(
+            rec.start,
+            rec.end,
+            resolved_mode,
         )
-        summary.results.append(result)
-        if (
-            operation.entity_id == cfg.secondary_storage.charger_source_priority_entity
-            and operation.desired == POWMR_CHARGER_SOLAR_ONLY
-            and result.status in {ApplyStatus.OK, ApplyStatus.SKIPPED}
-        ):
-            charger_safely_disabled = True
-        if result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
-            if operation.kind == "number" and not charger_safely_disabled:
-                # A current that cannot be verified is unsafe while utility
-                # charging may still be armed.  This installation has no PowMr
-                # PV input, so Only Solar is a complete charging stop.
-                fallback = SecondaryWrite(
-                    "select",
-                    cfg.secondary_storage.charger_source_priority_entity or "",
-                    POWMR_CHARGER_SOLAR_ONLY,
-                )
-                fallback_result = await _async_apply_secondary_write(
-                    sensor,
-                    fallback,
-                    control_write_observer,
-                )
-                summary.results.append(fallback_result)
-            break
+        if control_write_observer is not None
+        else None
+    )
+    mode_verified = False
+    try:
+        charger_safely_disabled = False
+        for operation in operations:
+            result = await _async_apply_secondary_write(
+                sensor,
+                operation,
+                control_write_observer,
+            )
+            summary.results.append(result)
+            if (
+                operation.entity_id
+                == cfg.secondary_storage.charger_source_priority_entity
+                and operation.desired == POWMR_CHARGER_SOLAR_ONLY
+                and result.status in {ApplyStatus.OK, ApplyStatus.SKIPPED}
+            ):
+                charger_safely_disabled = True
+            if result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
+                if operation.kind == "number" and not charger_safely_disabled:
+                    # A current that cannot be verified is unsafe while utility
+                    # charging may still be armed.  This installation has no PowMr
+                    # PV input, so Only Solar is a complete charging stop.
+                    fallback = SecondaryWrite(
+                        "select",
+                        cfg.secondary_storage.charger_source_priority_entity or "",
+                        POWMR_CHARGER_SOLAR_ONLY,
+                    )
+                    fallback_result = await _async_apply_secondary_write(
+                        sensor,
+                        fallback,
+                        control_write_observer,
+                    )
+                    summary.results.append(fallback_result)
+                break
+        mode_verified = len(summary.results) == len(operations) and all(
+            result.status in {ApplyStatus.OK, ApplyStatus.SKIPPED}
+            for result in summary.results
+        )
+    finally:
+        if control_write_observer is not None and mode_token is not None:
+            control_write_observer.secondary_control_mode_finished(
+                rec.start,
+                rec.end,
+                resolved_mode,
+                mode_token,
+                verified=mode_verified,
+            )
     return summary

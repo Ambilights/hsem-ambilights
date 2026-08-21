@@ -74,7 +74,7 @@ def _quarter_hour_slots(prices: list[float]) -> list[PlannedSlot]:
     ]
 
 
-def _powmr(**overrides: float | bool | None) -> SecondaryStorageConfig:
+def _powmr(**overrides: float | bool | str | None) -> SecondaryStorageConfig:
     """Return the reference installation's PowMr/NAS topology."""
     values: dict = {
         "enabled": True,
@@ -158,6 +158,72 @@ def test_secondary_charges_cheap_and_serves_nas_when_expensive() -> None:
         slot.secondary_storage_charge_current_a % 10.0 == pytest.approx(0.0)
         for slot in result
         if slot.secondary_storage_mode == SECONDARY_MODE_CHARGE
+    )
+
+
+def test_verified_utility_lock_holds_only_the_active_slot() -> None:
+    """A same-slot replan must keep Utility while future modes stay economic."""
+    result, _diagnostics = _solve(
+        _slots([1.0, 1.0], house_load_kwh=0.100),
+        _powmr(
+            current_soc_pct=80.0,
+            base_load_includes_dedicated_load=True,
+            replacement_price_per_kwh=0.0,
+            inverter_standby_power_w=0.0,
+            discharge_efficiency_pct=100.0,
+            current_slot_mode_lock=SECONDARY_MODE_UTILITY,
+        ),
+        primary_max_discharge_per_slot=0.0,
+    )
+
+    assert result[0].secondary_storage_mode == SECONDARY_MODE_UTILITY
+    assert result[0].secondary_storage_discharged_kwh == pytest.approx(0.0)
+    assert result[0].grid_import_kwh == pytest.approx(0.100)
+    assert result[1].secondary_storage_mode == SECONDARY_MODE_SBU
+    assert result[1].secondary_storage_discharged_kwh == pytest.approx(0.100)
+
+
+def test_verified_sbu_lock_overrides_a_near_term_inventory_hold() -> None:
+    """The active SBU hardware state remains in the re-solved energy balance."""
+    result, _diagnostics = _solve(
+        _slots([0.10], house_load_kwh=0.100),
+        _powmr(
+            current_soc_pct=80.0,
+            base_load_includes_dedicated_load=True,
+            replacement_price_per_kwh=10.0,
+            inverter_standby_power_w=0.0,
+            discharge_efficiency_pct=100.0,
+            current_slot_mode_lock=SECONDARY_MODE_SBU,
+        ),
+        primary_max_discharge_per_slot=0.0,
+    )
+
+    solved = result[0]
+    assert solved.secondary_storage_mode == SECONDARY_MODE_SBU
+    assert solved.secondary_storage_discharged_kwh == pytest.approx(0.100)
+    assert solved.secondary_storage_grid_import_kwh == pytest.approx(0.0)
+    assert solved.grid_import_kwh == pytest.approx(0.0)
+
+
+def test_verified_charge_lock_uses_a_physical_current_step() -> None:
+    """A locked Charge mode still obeys the PowMr 10 A current lattice."""
+    result, _diagnostics = _solve(
+        _slots([10.0], house_load_kwh=0.100),
+        _powmr(
+            current_soc_pct=20.0,
+            replacement_price_per_kwh=0.0,
+            current_slot_mode_lock=SECONDARY_MODE_CHARGE,
+        ),
+        primary_max_discharge_per_slot=0.0,
+    )
+
+    solved = result[0]
+    assert solved.secondary_storage_mode == SECONDARY_MODE_CHARGE
+    assert solved.secondary_storage_charge_current_a >= 10.0
+    assert solved.secondary_storage_charge_current_a % 10.0 == pytest.approx(0.0)
+    assert solved.secondary_storage_charged_kwh == pytest.approx(
+        24.0 * solved.secondary_storage_charge_current_a / 1000.0,
+        abs=0.001,
     )
 
 

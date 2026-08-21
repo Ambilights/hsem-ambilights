@@ -340,6 +340,10 @@ def make_bare_coordinator(
     coord._secondary_control_write_generation = 0
     coord._secondary_control_write_expectations = {}
     coord._secondary_control_delayed_echoes = {}
+    coord._secondary_control_mode_generation = 0
+    coord._secondary_control_mode_expectation = None
+    coord._secondary_current_slot_mode_lock = None
+    coord._secondary_mode_lock_replan_pending = False
     coord._override_expiry = None
 
     # CoordinatorEntity support — some entity methods call this

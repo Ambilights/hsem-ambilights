@@ -32,6 +32,11 @@ class SecondaryStorageConfig:
     base_load_includes_dedicated_load: bool = False
     allow_primary_battery_transfer: bool = False
     grid_phase: int = 3
+    # Verified hardware mode held for the remainder of the active slot.
+    # ``None`` leaves every slot economically optimisable.  The coordinator
+    # supplies this transient control state only when the lock belongs to the
+    # slot containing ``PlannerInput.now_iso``.
+    current_slot_mode_lock: str | None = None
 
     @property
     def current_usable_kwh(self) -> float:

@@ -267,16 +267,18 @@ def test_grouped_export_reserve_does_not_reclassify_direct_pv_export() -> None:
     not is_scipy_available(), reason="scipy not available in this environment"
 )
 @pytest.mark.parametrize(
-    ("slot_count", "performance_budget_seconds"),
+    ("slot_count", "solver_budget_seconds", "performance_budget_seconds"),
     [
-        pytest.param(96, 5.0, id="96-slots"),
-        pytest.param(192, 15.0, id="192-slots"),
+        pytest.param(96, 4.0, 5.0, id="96-slots"),
+        pytest.param(192, 12.0, 15.0, id="192-slots"),
     ],
 )
 def test_reserve_active_milp_scales_across_supported_horizons(
-    slot_count: int, performance_budget_seconds: float
+    slot_count: int,
+    solver_budget_seconds: float,
+    performance_budget_seconds: float,
 ) -> None:
-    """Reserve-active 15-minute MILPs stay practical at 24 h and 48 h."""
+    """Reserve-active 15-minute MILPs return safely within the wall budget."""
     slots: list[PlannedSlot] = []
     for index in range(slot_count):
         daily_phase = index % 96
@@ -302,12 +304,23 @@ def test_reserve_active_milp_scales_across_supported_horizons(
         max_charge_per_slot=1.25,
         max_discharge_per_slot=1.25,
         excess_export_discharge_buffer_pct=15.0,
+        # Leave wall-clock headroom for model construction, incumbent
+        # validation, and result publication outside HiGHS' own timer.
+        solver_time_limit_seconds=solver_budget_seconds,
     )
     elapsed = time.perf_counter() - started
 
     assert result is not None
     _planned, diagnostics = result
     assert diagnostics["battery_export_reserve_active"] is True
+    assert diagnostics["solver_time_limit_seconds"] == pytest.approx(
+        solver_budget_seconds
+    )
+    assert diagnostics["solver_status"] in {
+        "optimal",
+        "time_limit_feasible_incumbent",
+    }
+    assert diagnostics["incumbent_validation"] == "feasible"
     assert elapsed < performance_budget_seconds, (
         f"reserve-active {slot_count}-slot solve took {elapsed:.3f}s; "
         f"budget is {performance_budget_seconds:.3f}s"

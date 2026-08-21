@@ -250,12 +250,6 @@ $$
     && \text{export revenue} \\
     + & \alpha \cdot m[t]
     && \text{battery cycle cost (depreciation)} \\
-    + & \epsilon_{\mathrm{chg}} \cdot p_{\mathrm{imp}}[t] \cdot ec[t]
-    && \text{charge-side conversion loss cost} \\
-    + & \epsilon_{\mathrm{dis}} \cdot \bigl(
-          p_{\mathrm{imp}}[t](ed[t]-bx[t]) +
-          p^+_{\mathrm{exp}}[t]bx[t]\bigr)
-    && \text{destination-aware discharge loss cost} \\
     + & p_{\mathrm{soc}} \cdot \bigl( \mathrm{s\_max\_pen}[t] + \mathrm{s\_min\_pen}[t] \bigr)
     && \text{SoC soft-constraint penalties} \\
     + & p_{\mathrm{fuse}} \cdot \mathrm{gi\_pen}[t]
@@ -286,12 +280,9 @@ Where:
 | $\delta_t$ | Time discount per slot: $\delta_t = r^{\Delta t}$ where $\Delta t$ is hours from now |
 | $p_{\mathrm{imp}}[t]$ | Grid import price (currency/kWh), sanitised to `max(p_imp_raw[t], 0)` (issue #655). |
 | $p_{\mathrm{exp}}[t]$ | Grid export price (currency/kWh). Before solving, `p_exp` is sanitised: (1) clamped to 0 when below `min_export_price` (physically blocked export), and (2) clamped to `min(p_exp, p_imp)` to prevent an unbounded LP when `p_exp > p_imp` in any slot (issue #635). |
-| $p^+_{\mathrm{exp}}[t]$ | Non-negative sanitised export price used to value conversion loss on battery-origin export. |
 | $\alpha$ | Battery cycle cost per kWh: $\alpha = \frac{P \cdot L_{pct}/100}{2 \cdot N \cdot C_u}$ |
-| $\epsilon_{\mathrm{chg}}$ | Charge-side loss fraction: $\epsilon_{\mathrm{chg}} = 1 - \eta_{\mathrm{chg}}$ |
-| $\epsilon_{\mathrm{dis}}$ | Discharge-side loss fraction: $\epsilon_{\mathrm{dis}} = 1 - \eta_{\mathrm{dis}}$ |
 | $q_i$ | Battery-side quantity of primary terminal tier $i$, capped by aligned post-boundary residual demand and physical limits |
-| $v_i$ | Positive marginal value of primary tier $i$ after Unagi haircut, discharge loss, and cycle wear |
+| $v_i$ | Positive marginal value of primary tier $i$: haircut forecast price × discharge efficiency − cycle wear |
 | $y_i$ | Final primary inventory allocated to tier $i$, with $0\le y_i\le q_i$ |
 | $c_s[t], d_s[t], m_s[t]$ | Secondary stored charge, stored discharge, and wear auxiliary (kWh) |
 | $\eta_{\mathrm{s,chg}}, \eta_{\mathrm{s,dis}}$ | Secondary charge and discharge efficiencies |
@@ -361,8 +352,8 @@ non-actionable Unagi points at or after the end of the contiguous published
 prefix. Published overlap and off-cadence predictions are discarded. Each
 price is reduced by MAE plus operator margin; its quantity is bounded by
 residual house load after PV/accounted EV load, discharge efficiency, per-slot
-power, and usable capacity. Its marginal value subtracts discharge conversion
-loss and cycle wear. Duplicate points use the lower value and non-finite inputs
+power, and usable capacity. Its marginal value multiplies the price by
+discharge efficiency once and subtracts cycle wear. Duplicate points use the lower value and non-finite inputs
 fail closed. If no positive tier survives, `hardware_floor_only` supplies no
 terminal objective variables and the effective hardware floor is the only
 reserve.
@@ -677,23 +668,18 @@ This condition occurs in practice whenever negative import spot prices coincide 
 
 The clamp is economically correct and capping the achievable arbitrage spread removes the unbounded direction without changing any other optimisation behaviour.
 
-### 3. Discharge-side loss pricing: destination-aware valuation (issue #641)
+### 3. Primary conversion loss: physical single-count accounting
 
-The explicit `bx[t]` source split lets both the LP and scorer price
-discharge-side conversion loss by its actual destination:
+The site balance already uses `ec[t] / charge_efficiency` as AC charge draw and
+`ed[t] * discharge_efficiency` as AC discharge delivery. Consequently the
+`gi[t]` and `ge[t]` money coefficients price primary conversion loss exactly
+once. A separate `(1-efficiency)` coefficient on `ec`, `ed`, or `bx` would
+double-count it.
 
-```text
-local_discharge_dc = ed[t] - bx[t]
-battery_export_dc = bx[t]
-discharge_loss_cost =
-    local_discharge_dc * (1 - dis_eff) * max(import_price[t], 0)
-    + battery_export_dc * (1 - dis_eff) * max(export_price[t], 0)
-```
-
-The LP objective, `cost_function.py::score_plan()`, and diagnostics all use
-that same split. A slot may contain PV export and local battery discharge at
-the same time; aggregate `grid_export_kwh > 0` is therefore no longer used as
-a proxy for the destination of all battery discharge.
+The explicit `bx[t]` source split still distinguishes battery-origin export
+from PV export for source conservation and revenue. The retained
+`conversion_loss_cost` and `discharge_loss_cost_destination_aware` diagnostic
+fields are always zero.
 
 ---
 

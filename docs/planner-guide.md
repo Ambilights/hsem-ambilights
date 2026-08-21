@@ -80,7 +80,6 @@ The total number of slots generated is `(interval_length_hours * 60) // interval
 | `battery_max_soc_pct` | `float` | Maximum allowed SoC ceiling (%, default 100) |
 | `battery_max_charge_power_w` | `float` | Maximum charge power in Watts |
 | `battery_max_discharge_power_w` | `float \| None` | Maximum discharge power in Watts (`None` = unlimited). Derived from the rated capacity via `get_max_discharge_power()`, which covers S0/S1 single- and two-stack capacities (5–30 kWh); unknown capacities log a warning and fall back to 2500 W |
-| `battery_conversion_loss_pct` | `float` | Round-trip conversion loss (%) |
 
 The planner converts power limits to per-slot energy limits internally:
 
@@ -99,9 +98,8 @@ max_charge_per_slot_kwh = battery_max_charge_power_w / 1000 * (interval_minutes 
 | `battery_charge_efficiency_pct` | `float` | Charge-side efficiency (%), e.g. 98 |
 | `battery_discharge_efficiency_pct` | `float` | Discharge-side efficiency (%), e.g. 98 |
 
-When `battery_cycle_cost_per_kwh` is `0.0`, the planner auto-derives cycle cost from
-purchase price, rated capacity, expected cycles, capacity loss at EOL, and round-trip
-conversion loss:
+When `battery_cycle_cost_per_kwh` is `0.0`, the planner auto-derives cycle cost
+from purchase price, rated capacity, expected cycles, and capacity loss at EOL:
 
 ```text
 depreciation      = (purchase_price × capacity_loss_pct / 100)
@@ -109,9 +107,11 @@ depreciation      = (purchase_price × capacity_loss_pct / 100)
 threshold         = depreciation
 ```
 
-Conversion (in)efficiency losses are priced per-slot by the MILP objective
-and the cost function's ``conversion_loss_cost`` term, both of which use the
-actual import price of each slot rather than a fixed add-on.  The 2× factor
+Conversion (in)efficiency losses are physical in the site balance: storing
+`x` kWh draws `x / charge_efficiency` AC, while removing `x` kWh delivers
+`x * discharge_efficiency` AC. Grid import cost and export revenue therefore
+price them exactly once. The compatibility ``conversion_loss_cost`` field is
+always zero. The 2× factor
 in the depreciation term accounts for one full cycle (charge + discharge).  The
 ``capacity_loss_pct`` (default 30 %) accounts for the fraction of the battery's
 value that is consumed over its lifetime — typically 20 % physical capacity
@@ -829,7 +829,7 @@ better**.
 total_cost
   = grid_import_cost
   − export_revenue
-  + conversion_loss_cost
+  + conversion_loss_cost  # compatibility field, always 0.0
   + cycle_cost
 
 score
@@ -848,8 +848,8 @@ grid_import_cost = Σ (grid_import_kwh[slot] × import_price[slot])
 
 The cost function prices actual grid energy drawn, not stored energy.
 If the battery stores `x` kWh and charge efficiency is `e`, the grid
-import is `x / e`. This means conversion losses are implicitly included
-in the import cost before the explicit conversion-loss term.
+import is `x / e`. Conversion loss is therefore already included in import
+cost and must not receive an explicit second charge.
 
 ### Export revenue
 
@@ -867,8 +867,8 @@ primary_battery_export_kwh + pv_export_kwh = grid_export_kwh
 
 Both source fields are explicit and non-negative. The raw solver values sum
 within solver tolerance and the public 0.001 kWh fields sum exactly. They are
-used for diagnostics and destination-aware scoring;
-source is not inferred from net export or forecast PV.
+used for diagnostics, revenue, and export-floor accounting; source is not
+inferred from net export or forecast PV.
 The raw source split also satisfies:
 
 ```text
@@ -902,20 +902,19 @@ cost function treat ``export_price`` as 0 for any slot where
 that can never happen.  See *Excess export and grid controls* for the
 configuration fields.
 
-### Conversion loss cost
+### Conversion loss compatibility field
 
-Charge-side loss is priced at the sanitised import price. Discharge-side loss
-uses the explicit destination split:
+Primary efficiency is fully represented in the physical grid flows:
 
 ```text
-charge_loss_cost =
-    batteries_charged_kwh × (1 − charge_eff) × max(import_price, 0)
-battery_export_dc = primary_battery_export_kwh / discharge_eff
-local_discharge_dc = batteries_discharged_kwh − battery_export_dc
-discharge_loss_cost =
-    local_discharge_dc × (1 − discharge_eff) × max(import_price, 0)
-    + battery_export_dc × (1 − discharge_eff) × max(export_price, 0)
+charge_ac_draw = batteries_charged_kwh / charge_efficiency
+discharge_ac_delivery = batteries_discharged_kwh * discharge_efficiency
 ```
+
+The first quantity increases grid import or consumes PV that could have been
+exported; the second reduces grid import or becomes AC export. Those money
+terms price the loss once. `conversion_loss_cost` remains in diagnostics for
+schema compatibility and is always `0.0`.
 
 ### Battery cycle cost
 
@@ -932,18 +931,16 @@ Auto-derived cycle cost (when not explicitly configured):
 cycle_cost_per_kwh = purchase_price / (rated_capacity_kwh × expected_cycles)
 ```
 
-The price threshold used by the profitability guard adds round-trip conversion
-loss on top of depreciation:
+The displayed recommended threshold is the resolved depreciation cost:
 
 ```text
-price_threshold = cycle_cost_per_kwh + conversion_loss
-conversion_loss = 1 / (charge_eff × discharge_eff) − 1
+price_threshold = cycle_cost_per_kwh
 ```
 
 **Depreciation example:** A 10 kWh battery bought for 30 000 DKK with 6 000 expected
 cycles costs `30000 / (10 × 6000) = 0.50 DKK/kWh` of throughput.
-**With 98 % efficiency:** conversion loss adds ~0.042 DKK/kWh, giving a combined
-threshold of ~0.542 DKK/kWh.
+At 98 % charge and discharge efficiency, the MILP separately sees the real
+round-trip yield in its AC grid flows; it does not add another fixed loss fee.
 
 ### SoC penalties
 
@@ -1002,9 +999,9 @@ energy that could serve one exactly aligned, non-actionable house-load slot
 strictly beyond the contiguous published-price prefix. Tier quantity is capped
 by residual house load after PV and accounted EV load, discharge efficiency,
 per-slot discharge power, and usable battery capacity. Its Unagi price is
-reduced by MAE plus operator margin; conversion loss and cycle wear are then
-removed from its marginal value. Duplicate points use the lower prediction,
-and invalid inputs fail closed.
+reduced by MAE plus operator margin, multiplied by discharge efficiency to
+obtain delivered-AC value, and reduced by cycle wear. Duplicate points use the
+lower prediction, and invalid inputs fail closed.
 
 Inventory above the combined tier quantity has no synthetic value. When no
 valid tier exists, diagnostics report `hardware_floor_only`: primary terminal

@@ -111,6 +111,8 @@ def _resolve_live_solar_measurement(
 def _build_secondary_storage_config(
     cfg: SensorConfig,
     live: LiveState,
+    *,
+    current_slot_mode_lock: str | None = None,
 ) -> SecondaryStorageConfig:
     """Build the pure planner model from HA config and live PowMr telemetry."""
     configured = cfg.secondary_storage
@@ -142,6 +144,7 @@ def _build_secondary_storage_config(
         ),
         allow_primary_battery_transfer=configured.allow_primary_battery_transfer,
         grid_phase=configured.grid_phase,
+        current_slot_mode_lock=current_slot_mode_lock,
     )
 
 
@@ -193,6 +196,7 @@ def build_planner_input(
     capacity_learner: CapacityLearner | None = None,
     dynamic_discharge_floor_pct: float | None = None,
     price_forecast_attributes: dict[str, Any] | None = None,
+    secondary_current_slot_mode_lock: str | None = None,
 ) -> PlannerInput:
     """Assemble a :class:`PlannerInput` from the coordinator's current pipeline state.
 
@@ -209,6 +213,9 @@ def build_planner_input(
             valuation sensor, or None when unconfigured or unavailable. Passed
             as the attribute dict rather than the whole snapshot so the builder
             cannot reach any other entity through it.
+        secondary_current_slot_mode_lock: Verified PowMr mode to hold for the
+            slot containing ``now``, or ``None`` when no hardware mode has yet
+            been confirmed for that slot.
 
     Returns:
         A fully populated :class:`PlannerInput` ready for the planner engine.
@@ -336,7 +343,11 @@ def build_planner_input(
     _w7d = convert_to_int(cfg.house_consumption_energy_weight_7d)
     _w14d = convert_to_int(cfg.house_consumption_energy_weight_14d)
 
-    secondary_storage = _build_secondary_storage_config(cfg, live)
+    secondary_storage = _build_secondary_storage_config(
+        cfg,
+        live,
+        current_slot_mode_lock=secondary_current_slot_mode_lock,
+    )
     secondary_delta_w = 0.0
     if secondary_storage.valid:
         secondary_delta_w = secondary_site_power_delta_w(

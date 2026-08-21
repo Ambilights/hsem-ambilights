@@ -6,8 +6,9 @@ and exposes two distinct aggregate numbers:
 
 - :attr:`PlanCostBreakdown.total_cost` — the **real-money outcome** of the
   plan within the horizon.  Sum of grid import cost minus export revenue
-  plus battery cycle (depreciation) cost plus round-trip conversion loss
-  cost.  Auditable; directly comparable to an electricity bill.
+  plus battery cycle (depreciation) cost. The retained conversion-loss field
+  is zero because physical grid flows already include efficiency. Auditable;
+  directly comparable to an electricity bill.
 - :attr:`PlanCostBreakdown.score` — the **selector objective**.  Equals
   ``total_cost`` plus every synthetic penalty (SoC guard and grid limit),
   terminal inventory value, and primary-action tiebreak. The candidate
@@ -25,9 +26,8 @@ Money terms (sum to ``total_cost``):
    negative price is never scored as a profit for importing (issue #655).
 2. **Export revenue** — energy exported to the grid × export price
    (negative contribution, i.e. revenue reduces total cost).
-3. **Battery conversion loss** — energy lost during a charge/discharge cycle,
-   priced at import for local delivery and at export for battery-origin
-   grid export.
+3. **Battery conversion-loss compatibility field** — always zero. Physical
+   charge/discharge efficiency is already present in grid import/export.
 4. **Battery cycle cost** — depreciation per kWh cycled, derived from the
    battery's purchase price, rated capacity, and expected lifetime cycles.
 
@@ -233,12 +233,8 @@ def score_plan(
 
     cycle_cost_kwh = _resolve_cycle_cost(weights)
 
-    # Resolve the effective roundtrip loss fraction.
-    # When separate charge/discharge efficiencies are provided (both non-default),
-    # we compute the roundtrip loss from them:
-    #   roundtrip_loss = 1 - (charge_eff × discharge_eff)
-    # Compute roundtrip loss from charge/discharge efficiencies.
-    charge_eff = clamp_efficiency(weights.charge_efficiency_pct)
+    # Discharge efficiency maps explicit AC battery export back to its
+    # battery-side share for source attribution and the structural tiebreak.
     discharge_eff = clamp_efficiency(weights.discharge_efficiency_pct)
 
     import_cost = 0.0
@@ -318,8 +314,8 @@ def score_plan(
         # Sanitised (non-negative) import price — mirrors milp_optimizer.py's
         # p_imp_obj clamp.  A negative spot price must never be scored as a
         # profit for importing or for lossy conversion: the MILP's own
-        # objective never rewards those events (its gi[t]/ec[t]/ed[t]
-        # coefficients use p_imp_obj = max(p_imp, 0)), so the selector must
+        # objective never rewards grid import at those prices (its gi[t]
+        # coefficient uses p_imp_obj = max(p_imp, 0)), so the selector must
         # value the identical physical decisions the same way, or its score
         # no longer matches what the LP actually optimised for (issue #655).
         # The raw (possibly negative) imp_price is still used for export
@@ -383,23 +379,11 @@ def score_plan(
             export_revenue += rev
             export_revenue_disc += rev * discount
 
-        # 3. Conversion losses use the same source/destination split as MILP:
-        # local discharge loss is valued at import, exported loss at export.
-        charge_loss_fraction = 1.0 - charge_eff
-        discharge_loss_fraction = 1.0 - discharge_eff
-        if slot.batteries_charged_kwh > 1e-9 and charge_loss_fraction > 1e-9:
-            lost_kwh_charge = slot.batteries_charged_kwh * charge_loss_fraction
-            conv = lost_kwh_charge * imp_price_obj
-            conversion_loss_cost += conv
-            conversion_loss_cost_disc += conv * discount
-        if slot.batteries_discharged_kwh > 1e-9 and discharge_loss_fraction > 1e-9:
-            lost_local = local_discharge_dc * discharge_loss_fraction
-            lost_export = primary_export_dc * discharge_loss_fraction
-            conv = lost_local * imp_price_obj + lost_export * max(
-                battery_exp_price, 0.0
-            )
-            conversion_loss_cost += conv
-            conversion_loss_cost_disc += conv * discount
+        # 3. Primary conversion losses are already physical in the published
+        # grid flows: charge import includes stored/charge_eff, while discharge
+        # reduces import or creates export only after discharge_eff.  Import
+        # cost and export revenue therefore price the loss exactly once.  Keep
+        # the compatibility conversion-loss aggregate at zero.
 
         # 4. Battery cycle depreciation
         throughput_kwh = max(slot.batteries_charged_kwh, slot.batteries_discharged_kwh)

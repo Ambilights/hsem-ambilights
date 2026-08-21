@@ -22,6 +22,10 @@ The selector picks the plan with the **lowest score**, not the lowest money cost
 
 $$ C_{total} = C_{import} - R_{export} + C_{cycle} + C_{loss} $$
 
+The public $C_{loss}$ field is retained for schema compatibility and is always
+zero. Charge and discharge efficiencies already change the physical grid flows
+priced by $C_{import}$ and $R_{export}$.
+
 ### Grid import cost
 
 $$ C_{import} = \sum_{t \in slots} gi[t] \cdot p_{imp}[t] $$
@@ -61,20 +65,21 @@ which equals $\frac{purchase\_price \cdot x}{2 \cdot usable \cdot cycles}$ —
 matching the expected wear for moving $x$ kWh through the battery in one
 direction.
 
-### Conversion loss cost
+### Conversion-loss compatibility field
 
-$$ C_{loss} = \sum_{t \in slots} \frac{charge[t] + discharge[t]}{2} \cdot \frac{\eta_{loss}}{100} \cdot \frac{p_{imp}[t] + p_{exp}[t]}{2} $$
+$$ C_{loss} = 0 $$
 
-Where $\eta_{loss}$ is the round-trip conversion loss percentage.
+If $charge[t]$ and $discharge[t]$ are battery-side energy, the physical AC
+flows are:
 
-The conversion loss term prices the energy lost as heat during charge/discharge
-at the average of import and export price — an opportunity-cost proxy.
+$$ charge_{AC}[t] = \frac{charge[t]}{\eta_{chg}} $$
 
-When separate charge/discharge efficiencies are configured:
+$$ discharge_{AC}[t] = discharge[t] \cdot \eta_{dis} $$
 
-$$ \eta_{loss} = (1 - \eta_{chg} \cdot \eta_{dis}) \times 100 $$
-
-Where $\eta_{chg}$ and $\eta_{dis}$ are efficiency fractions (e.g. 0.97).
+The first quantity increases grid import or consumes PV that could otherwise
+be exported. The second reduces grid import or becomes AC export. Import cost
+and export revenue therefore price conversion efficiency exactly once; an
+additional loss-price term would double-count it.
 
 ## Score (selector objective)
 
@@ -168,10 +173,11 @@ q_i = \min\!\left(
 $$
 
 $$
-v_i = p_i^*\eta_{dis}
-      - p_i^*(1-\eta_{dis})
-      - cycle\_wear
+v_i = p_i^*\eta_{dis} - cycle\_wear
 $$
+
+Multiplying by $\eta_{dis}$ already reduces the avoided AC import for energy
+lost during discharge, so the loss is not subtracted a second time.
 
 Only finite positive tiers survive, duplicate points use the lower effective
 price, and total tier quantity is capped by usable capacity. If nothing

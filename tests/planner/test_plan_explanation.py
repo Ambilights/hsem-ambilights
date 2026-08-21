@@ -66,6 +66,8 @@ _EXPECTED_EXPLANATION_KEYS = {
     "terminal_cost_to_go_final_valued_quantity_kwh",
     "terminal_cost_to_go_initial_value",
     "terminal_cost_to_go_final_value",
+    "secondary_terminal_price_source",
+    "secondary_terminal_price_per_kwh",
     "constraints",
     "rejected_plans",
 }
@@ -140,12 +142,19 @@ class TestPlanExplanationDataclass:
             estimated_total_cost=1.23456789,
             price_spread=0.123456789,
             forecast_pv_kwh=5.123456789,
+            secondary_terminal_price_source="forecast",
+            secondary_terminal_price_per_kwh=1.23456789,
         )
         d = exp.as_dict()
         assert d["score"] == pytest.approx(1.2346, abs=1e-4)
         assert d["estimated_total_cost"] == pytest.approx(1.2346, abs=1e-4)
         assert d["price_spread"] == pytest.approx(0.1235, abs=1e-4)
         assert d["forecast_pv_kwh"] == pytest.approx(5.123, abs=1e-3)
+        assert d["secondary_terminal_price_source"] == "forecast"
+        assert d["secondary_terminal_price_per_kwh"] == pytest.approx(
+            1.234568,
+            abs=1e-6,
+        )
 
 
 # ===========================================================================

@@ -506,14 +506,11 @@ def solve_milp(
     export_limit_active, max_grid_export_per_slot_kwh = _resolve_export_cap(
         max_grid_export_power_kw, slots, future_idx
     )
-    # Resolve charge/discharge efficiencies for the energy balance equation.
-    # The MILP must account for real-world conversion losses so its solution
-    # matches the cost function's total_cost (which includes conversion loss
-    # via the conversion_loss_cost term).
+    # Resolve charge/discharge efficiencies for the physical energy balance.
+    # Grid import/export money already prices the resulting AC draw/delivery,
+    # so no separate primary conversion-loss objective term is added.
     charge_eff = clamp_efficiency(charge_efficiency_pct)
     discharge_eff = clamp_efficiency(discharge_efficiency_pct)
-    charge_loss = 1.0 - charge_eff
-    discharge_loss = 1.0 - discharge_eff
     # A non-battery export can use forecast PV plus PV hidden behind a
     # dedicated load that PowMr SBU removes from the metered site load.
     pv_export_ub_per_slot = pv_avail.copy()
