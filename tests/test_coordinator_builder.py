@@ -19,6 +19,7 @@ from custom_components.hsem.models.secondary_storage_config import (
     SecondaryStorageConfig,
 )
 from custom_components.hsem.models.sensor_config import SensorConfig
+from custom_components.hsem.planner.secondary_storage import SECONDARY_MODE_SBU
 from custom_components.hsem.utils.phase_power import (
     POWMR_CHARGER_UTILITY,
     POWMR_OUTPUT_SBU,
@@ -130,6 +131,27 @@ class TestNormalizeLiveHouseForSecondary:
         )
 
         assert planner_input.live_house_consumption_w == pytest.approx(1000.0)
+
+    def test_builder_carries_verified_current_slot_mode_lock(self) -> None:
+        """The coordinator's transient lock reaches the pure MILP input."""
+        cfg = SensorConfig()
+        cfg.secondary_storage.enabled = True
+        live = LiveState()
+        live.secondary_storage.soc_pct = 60.0
+        live.secondary_storage.load_power_w = 200.0
+
+        planner_input = build_planner_input(
+            cfg=cfg,
+            live=live,
+            hourly_recommendations=[],
+            previous_winner_name=None,
+            previous_winner_score=0.0,
+            secondary_current_slot_mode_lock=SECONDARY_MODE_SBU,
+        )
+
+        assert planner_input.secondary_storage.current_slot_mode_lock == (
+            SECONDARY_MODE_SBU
+        )
 
 
 class TestResolveLiveSolarMeasurement:

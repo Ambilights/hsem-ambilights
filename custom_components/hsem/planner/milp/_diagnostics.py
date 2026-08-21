@@ -25,9 +25,6 @@ def _compute_milp_diagnostics(
     gi_off: int,
     gi_pen_off: int,
     replacement_price_per_kwh: float | None,
-    min_export_price: float,
-    p_imp_obj: np.ndarray,  # type: ignore[name-defined]
-    discharge_loss: float,
     fuse_active: bool,
     max_grid_import_per_slot_kwh: float,
     active_evs: list[EVConfig],
@@ -51,9 +48,6 @@ def _compute_milp_diagnostics(
         current_kwh: Battery energy at horizon start (above floor, kWh).
         usable_kwh: Maximum usable energy (kWh).
         replacement_price_per_kwh: Terminal-SoC replacement price.
-        min_export_price: Minimum export price threshold.
-        p_imp_obj: Sanitised import-price array (objective coefficients).
-        discharge_loss: Discharge-side loss fraction (0-1).
         fuse_active: Whether the main-fuse constraint is active.
         max_grid_import_per_slot_kwh: Max grid import per slot (kWh).
         active_evs: List of active EV configs.
@@ -69,8 +63,6 @@ def _compute_milp_diagnostics(
         ``total_curtailment_kwh``, ``discharge_loss_cost_destination_aware``,
         and optionally ``ev``.
     """
-    import numpy as np
-
     from custom_components.hsem.utils.logger import log_planner
     from custom_components.hsem.utils.recommendations import Recommendations
 
@@ -189,29 +181,6 @@ def _compute_milp_diagnostics(
         total_curtailment_kwh,
     )
 
-    # Destination-aware discharge loss, using the explicit AC export source
-    # rather than inferring that every discharge in a net-exporting slot went
-    # to the grid.
-    discharge_loss_dest_aware = 0.0
-    discharge_eff = max(1.0 - discharge_loss, 0.01)
-    for t in range(m):
-        slot_i = future_idx[t]
-        slot = out_slots[slot_i]
-        discharge_dc = max(slot.batteries_discharged_kwh, 0.0)
-        if discharge_dc <= 1e-9:
-            continue
-        battery_export_dc = min(
-            max(slot.primary_battery_export_kwh, 0.0) / discharge_eff,
-            discharge_dc,
-        )
-        local_discharge_dc = max(discharge_dc - battery_export_dc, 0.0)
-        exp_price = slots[slot_i].price.export_price
-        if min_export_price > 1e-9 and exp_price < min_export_price:
-            exp_price = 0.0
-        discharge_loss_dest_aware += discharge_loss * (
-            local_discharge_dc * p_imp_obj[t] + battery_export_dc * max(exp_price, 0.0)
-        )
-
     diagnostics: dict = {
         "s_max_pen": s_max_pen_list,
         "s_min_pen": s_min_pen_list,
@@ -220,7 +189,10 @@ def _compute_milp_diagnostics(
         "total_fuse_violation_kwh": round(total_fuse_violation_kwh, 4),
         "terminal_soc_credit": round(terminal_soc_credit, 4),
         "total_curtailment_kwh": round(total_curtailment_kwh, 4),
-        "discharge_loss_cost_destination_aware": round(discharge_loss_dest_aware, 6),
+        # Compatibility field. Primary conversion loss is already priced by
+        # the physical gi/ge flows, so a separate monetary term would count it
+        # twice.
+        "discharge_loss_cost_destination_aware": 0.0,
     }
 
     # --- EV diagnostics ---

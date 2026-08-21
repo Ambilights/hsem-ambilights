@@ -43,8 +43,6 @@ def _build_objective(
     p_exp: np.ndarray,  # type: ignore[name-defined]
     p_soc: float,
     cycle_cost_per_kwh: float,
-    charge_loss: float,
-    discharge_loss: float,
     time_discount_rate: float,
     replacement_price_per_kwh: float | None,
     fuse_active: bool,
@@ -77,22 +75,16 @@ def _build_objective(
             ha = hours_ahead(now, slot_mid)
             discount = time_discount_rate**ha
 
-        # Charge-side conversion loss: energy lost during charge, priced at
-        # this slot's import price (where the charge occurs).
-        c_obj[ec_off + t] = (charge_loss * p_imp_obj[t]) * discount
-        # Price local discharge losses at avoided import. The explicit
-        # battery-export block corrects just its DC share to foregone export
-        # revenue, making the objective destination-aware before solving.
-        c_obj[ed_off + t] = (discharge_loss * p_imp_obj[t]) * discount
-        c_obj[primary_export_off + t] = (
-            discharge_loss * (max(p_exp[t], 0.0) - p_imp_obj[t]) * discount
-        )
+        # Primary conversion losses are already physical in the site balance:
+        # charging draws ec/charge_eff AC and discharging delivers
+        # ed*discharge_eff AC.  The gi/ge money terms therefore price those
+        # losses exactly once; no separate ec/ed loss coefficient belongs here.
         # A weighted structural tiebreak resolves exact economic ties.
         # eps*(ec+ed)-1.5eps*(ed-bx) favours direct local discharge by
         # 0.5eps/kWh, while charge, export, and cycling remain positive.
-        c_obj[ec_off + t] += PRIMARY_ACTION_TIEBREAK_COST
-        c_obj[ed_off + t] -= 0.5 * PRIMARY_ACTION_TIEBREAK_COST
-        c_obj[primary_export_off + t] += 1.5 * PRIMARY_ACTION_TIEBREAK_COST
+        c_obj[ec_off + t] = PRIMARY_ACTION_TIEBREAK_COST
+        c_obj[ed_off + t] = -0.5 * PRIMARY_ACTION_TIEBREAK_COST
+        c_obj[primary_export_off + t] = 1.5 * PRIMARY_ACTION_TIEBREAK_COST
         # Cycle cost through auxiliary variable m[t] (= max(ec, ed))
         c_obj[m_off + t] = cycle_cost_per_kwh * discount
         c_obj[gi_off + t] = p_imp_obj[t] * discount  # grid import cost

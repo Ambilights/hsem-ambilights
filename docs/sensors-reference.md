@@ -243,6 +243,8 @@ Displays the planner's strategy rationale and per-candidate cost breakdown.
 | `forecast_pv_kwh` | Total PV forecast for the horizon |
 | `forecast_net_consumption_kwh` | Total load minus PV |
 | `battery_soc_pct` / `battery_soc_at_end_pct` | Starting and ending SoC |
+| `secondary_terminal_price_source` | PowMr terminal inventory valuation source: `configured`, `published`, `forecast`, or `none` |
+| `secondary_terminal_price_per_kwh` | Resolved PowMr terminal inventory value in local currency/kWh |
 | `constraints` | Active flags (`winter_month`, `excess_export_enabled`, etc.) |
 | `rejected_plans` | Alternatives with name, reason, and full cost breakdown |
 | `hysteresis_active` | Whether plan-level hysteresis was applied |

@@ -23,7 +23,8 @@ class RejectedPlan:
         export_revenue:
             Grid export revenue (positive = earned).
         conversion_loss:
-            Cost of round-trip conversion losses.
+            Compatibility field, always zero; physical grid flows already
+            include conversion efficiency.
         cycle_cost:
             Battery depreciation cost for cycled kWh.
         score:

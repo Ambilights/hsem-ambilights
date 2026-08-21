@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Literal
 
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.price_forecast import PriceForecast
@@ -18,6 +20,21 @@ from custom_components.hsem.utils.units import slot_duration_hours
 SECONDARY_MODE_CHARGE = "charge"
 SECONDARY_MODE_SBU = "sbu"
 SECONDARY_MODE_UTILITY = "utility"
+
+type SecondaryTerminalPriceSource = Literal[
+    "configured",
+    "published",
+    "forecast",
+    "none",
+]
+
+
+@dataclass(frozen=True)
+class SecondaryTerminalPriceResolution:
+    """Resolved PowMr terminal inventory price and its authoritative source."""
+
+    price_per_kwh: float | None
+    source: SecondaryTerminalPriceSource
 
 
 def secondary_charge_limits_kwh(
@@ -135,10 +152,28 @@ def resolve_secondary_terminal_price(
     primary scalar helper; production primary planning uses bounded
     residual-demand tiers instead.
     """
+    return resolve_secondary_terminal_price_details(
+        slots,
+        config,
+        now,
+        forecast=forecast,
+    ).price_per_kwh
+
+
+def resolve_secondary_terminal_price_details(
+    slots: list[PlannedSlot],
+    config: SecondaryStorageConfig,
+    now: datetime,
+    forecast: PriceForecast | None = None,
+) -> SecondaryTerminalPriceResolution:
+    """Return the PowMr terminal price together with its winning source."""
     if not config.valid:
-        return None
+        return SecondaryTerminalPriceResolution(None, "none")
     if config.replacement_price_per_kwh is not None:
-        return max(config.replacement_price_per_kwh, 0.0)
+        return SecondaryTerminalPriceResolution(
+            max(config.replacement_price_per_kwh, 0.0),
+            "configured",
+        )
 
     discharge_eff = clamp_efficiency(config.discharge_efficiency_pct)
     predicted = forecast_effective_prices(forecast, now, slots)
@@ -147,10 +182,15 @@ def resolve_secondary_terminal_price(
     )
     published_value = _published_secondary_terminal_price(slots, discharge_eff, now)
     if published_value is None:
-        return predicted_value
+        return SecondaryTerminalPriceResolution(
+            predicted_value,
+            "forecast" if predicted_value is not None else "none",
+        )
     if predicted_value is None:
-        return published_value
-    return max(published_value, predicted_value)
+        return SecondaryTerminalPriceResolution(published_value, "published")
+    if predicted_value > published_value:
+        return SecondaryTerminalPriceResolution(predicted_value, "forecast")
+    return SecondaryTerminalPriceResolution(published_value, "published")
 
 
 def _published_secondary_terminal_price(

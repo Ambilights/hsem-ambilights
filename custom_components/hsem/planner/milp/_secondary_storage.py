@@ -20,7 +20,7 @@ from custom_components.hsem.planner.secondary_storage import (
     secondary_site_load_offset_kwh,
     secondary_slot_duration_hours,
 )
-from custom_components.hsem.utils.datetime_utils import utc_key
+from custom_components.hsem.utils.datetime_utils import slot_contains, utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import clamp_efficiency
 from custom_components.hsem.utils.recommendations import Recommendations
@@ -160,6 +160,26 @@ def _extend_secondary_constraints(
     maximum_steps = int(
         max(config.max_charge_current_a, 0.0) // max(config.charge_current_step_a, 1e-9)
     )
+    current_lock = config.current_slot_mode_lock
+    if current_lock not in {
+        None,
+        SECONDARY_MODE_CHARGE,
+        SECONDARY_MODE_SBU,
+        SECONDARY_MODE_UTILITY,
+    }:
+        log_planner(
+            "warning",
+            "[milp] Ignoring invalid secondary current-slot mode lock: %s",
+            current_lock,
+        )
+        current_lock = None
+    lock_t = (
+        0
+        if current_lock is not None
+        and future_idx
+        and slot_contains(slots[future_idx[0]].start, slots[future_idx[0]].end, now)
+        else None
+    )
     row = old_ub_rows
     for t in range(m):
         for k in range(t + 1):
@@ -234,36 +254,44 @@ def _extend_secondary_constraints(
     constraints["b_eq"] = b_eq
     constraints["A_ub"] = a_ub
     constraints["b_ub"] = b_ub
-    bounds_builder.set(
-        "secondary_charge",
-        [
-            ((0.0, charge_limits[t][1]) if bool(price_actionable[t]) else (0.0, 0.0))
-            for t in range(m)
-        ],
-    )
-    bounds_builder.set(
-        "secondary_discharge",
-        [
-            ((0.0, config.usable_kwh) if bool(price_actionable[t]) else (0.0, 0.0))
-            for t in range(m)
-        ],
-    )
+    charge_bounds: list[tuple[float, float | None]] = []
+    discharge_bounds: list[tuple[float, float | None]] = []
+    charge_mode_bounds: list[tuple[float, float | None]] = []
+    sbu_mode_bounds: list[tuple[float, float | None]] = []
+    charge_step_bounds: list[tuple[float, float | None]] = []
+    for t in range(m):
+        actionable = bool(price_actionable[t])
+        mode_lock = current_lock if t == lock_t else None
+        if not actionable or mode_lock == SECONDARY_MODE_UTILITY:
+            charge_bounds.append((0.0, 0.0))
+            discharge_bounds.append((0.0, 0.0))
+            charge_mode_bounds.append((0.0, 0.0))
+            sbu_mode_bounds.append((0.0, 0.0))
+            charge_step_bounds.append((0.0, 0.0))
+            continue
+
+        charge_bounds.append((0.0, charge_limits[t][1]))
+        discharge_bounds.append((0.0, config.usable_kwh))
+        charge_mode_bounds.append(
+            (1.0, 1.0) if mode_lock == SECONDARY_MODE_CHARGE else (0.0, 1.0)
+        )
+        sbu_mode_bounds.append(
+            (1.0, 1.0) if mode_lock == SECONDARY_MODE_SBU else (0.0, 1.0)
+        )
+        charge_step_bounds.append((0.0, float(maximum_steps)))
+        if mode_lock == SECONDARY_MODE_CHARGE:
+            sbu_mode_bounds[-1] = (0.0, 0.0)
+        elif mode_lock == SECONDARY_MODE_SBU:
+            charge_bounds[-1] = (0.0, 0.0)
+            charge_mode_bounds[-1] = (0.0, 0.0)
+            charge_step_bounds[-1] = (0.0, 0.0)
+
+    bounds_builder.set("secondary_charge", charge_bounds)
+    bounds_builder.set("secondary_discharge", discharge_bounds)
     bounds_builder.fill("secondary_throughput", (0.0, None))
-    bounds_builder.set(
-        "secondary_charge_mode",
-        [((0.0, 1.0) if bool(price_actionable[t]) else (0.0, 0.0)) for t in range(m)],
-    )
-    bounds_builder.set(
-        "secondary_sbu_mode",
-        [((0.0, 1.0) if bool(price_actionable[t]) else (0.0, 0.0)) for t in range(m)],
-    )
-    bounds_builder.set(
-        "secondary_charge_steps",
-        [
-            ((0.0, float(maximum_steps)) if bool(price_actionable[t]) else (0.0, 0.0))
-            for t in range(m)
-        ],
-    )
+    bounds_builder.set("secondary_charge_mode", charge_mode_bounds)
+    bounds_builder.set("secondary_sbu_mode", sbu_mode_bounds)
+    bounds_builder.set("secondary_charge_steps", charge_step_bounds)
     return constraints
 
 

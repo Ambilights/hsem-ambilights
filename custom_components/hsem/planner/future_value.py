@@ -119,9 +119,10 @@ def build_terminal_cost_to_go(
     serve, excluding explicitly accounted EV demand and capped by power.
 
     Marginal DC value follows the in-horizon scoring convention: avoided AC
-    import through discharge efficiency, less discharge loss and one resolved
-    cycle-wear charge. With no valid tier, the existing hardware/effective
-    dynamic floor remains the only reserve.
+    import through discharge efficiency, less one resolved cycle-wear charge.
+    The efficiency loss is already represented by the smaller AC delivery and
+    is not subtracted again. With no valid tier, the existing
+    hardware/effective dynamic floor remains the only reserve.
     """
     boundary = published_horizon_end(slots, now)
     empty = TerminalCostToGo(boundary=boundary)
@@ -147,7 +148,6 @@ def build_terminal_cost_to_go(
         return empty
 
     discharge_eff = clamp_efficiency(efficiency_pct)
-    discharge_loss = 1.0 - discharge_eff
     wear = max(wear, 0.0)
     if max_discharge_per_slot is None:
         per_slot_cap = capacity
@@ -203,9 +203,7 @@ def build_terminal_cost_to_go(
             per_slot_cap,
             capacity,
         )
-        marginal_value = (
-            effective_price * discharge_eff - effective_price * discharge_loss - wear
-        )
+        marginal_value = effective_price * discharge_eff - wear
         if quantity_kwh <= 1e-9 or marginal_value <= 1e-9:
             continue
         candidates.append(

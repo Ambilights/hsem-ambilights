@@ -193,11 +193,12 @@ def test_forecast_must_be_unpublished_exactly_aligned_and_haircut() -> None:
 
 
 def test_efficiency_wear_and_power_cap_are_hand_calculable() -> None:
-    """Price 2.0, eta 0.9, and wear 0.1 yield 1.5/DC-kWh.
+    """Price 2.0, eta 0.9, and wear 0.1 yield 1.7/DC-kWh.
 
     The post-boundary load asks for 1.8 AC kWh, or 2.0 DC kWh at 90%, but the
     per-slot discharge cap admits only 1.5 DC kWh. Marginal terminal value is
-    2.0 * (2 * 0.9 - 1) - 0.1 = 1.5 currency per DC kWh.
+    2.0 * 0.9 - 0.1 = 1.7 currency per DC kWh. The undelivered 10% is already
+    represented by multiplying the avoided AC import by efficiency.
     """
     published = _slot(0)
     tail = _slot(1, house_kwh=1.8, actionable=False)
@@ -212,8 +213,8 @@ def test_efficiency_wear_and_power_cap_are_hand_calculable() -> None:
 
     assert model.total_quantity_kwh == pytest.approx(1.5)
     assert model.tiers[0].quantity_kwh == pytest.approx(1.5)
-    assert model.tiers[0].value_per_kwh == pytest.approx(1.5)
-    assert model.inventory_value(1.5) == pytest.approx(2.25)
+    assert model.tiers[0].value_per_kwh == pytest.approx(1.7)
+    assert model.inventory_value(1.5) == pytest.approx(2.55)
 
 
 @pytest.mark.skipif(not is_scipy_available(), reason="scipy not available")

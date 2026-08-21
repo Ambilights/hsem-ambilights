@@ -74,6 +74,8 @@ _EXPECTED_ATTR_KEYS = {
     "terminal_cost_to_go_final_valued_quantity_kwh",
     "terminal_cost_to_go_initial_value",
     "terminal_cost_to_go_final_value",
+    "secondary_terminal_price_source",
+    "secondary_terminal_price_per_kwh",
     "constraints",
     "rejected_plans",
 }

@@ -245,7 +245,7 @@ class TestExportRevenue:
 
 
 class TestConversionLoss:
-    """Verify conversion loss is computed from per-side efficiency losses."""
+    """Verify primary conversion loss is priced once through grid flows."""
 
     def test_no_cycling_no_loss(self):
         """No battery activity → conversion_loss_cost = 0."""
@@ -258,25 +258,25 @@ class TestConversionLoss:
         bd = score_plan([slot], CostWeights())
         assert bd.conversion_loss_cost == pytest.approx(0.0)
 
-    def test_charge_only_loss_computed(self):
-        """1 kWh charged with 90 % efficiency → 0.1 kWh lost @ 0.20 = 0.02."""
+    def test_charge_only_loss_is_in_grid_import(self):
+        """Charging 1 kWh at 90 % prices the 1/0.9 kWh AC draw exactly once."""
         slot = _make_slot(
             import_price=0.20,
             export_price=0.05,
             batteries_charged_kwh=1.0,
             batteries_discharged_kwh=0.0,
+            grid_import_kwh=1.0 / 0.9,
         )
         bd = score_plan(
             [slot],
             CostWeights(charge_efficiency_pct=90.0, discharge_efficiency_pct=100.0),
         )
-        # charge_loss_fraction = 1 - 0.90 = 0.10
-        # lost_kwh = 1.0 × 0.10 = 0.10
-        # cost = 0.10 × 0.20 = 0.02
-        assert bd.conversion_loss_cost == pytest.approx(0.02, rel=1e-5)
+        assert bd.import_cost == pytest.approx((1.0 / 0.9) * 0.20, abs=1e-6)
+        assert bd.conversion_loss_cost == pytest.approx(0.0)
+        assert bd.total_cost == pytest.approx((1.0 / 0.9) * 0.20, abs=1e-6)
 
-    def test_discharge_only_loss_computed(self):
-        """1 kWh discharged with 90 % efficiency → 0.1 kWh lost @ 0.20 = 0.02."""
+    def test_discharge_only_loss_is_in_avoided_grid_import(self):
+        """Discharge delivers only its efficient AC output; no extra fee applies."""
         slot = _make_slot(
             import_price=0.20,
             export_price=0.05,
@@ -287,10 +287,7 @@ class TestConversionLoss:
             [slot],
             CostWeights(charge_efficiency_pct=100.0, discharge_efficiency_pct=90.0),
         )
-        # discharge_loss_fraction = 1 - 0.90 = 0.10
-        # lost_kwh = 1.0 × 0.10 = 0.10
-        # cost = 0.10 × 0.20 = 0.02
-        assert bd.conversion_loss_cost == pytest.approx(0.02, rel=1e-5)
+        assert bd.conversion_loss_cost == pytest.approx(0.0)
 
     def test_full_efficiency_disables_term(self):
         """100 % charge and discharge efficiency → conversion_loss_cost = 0."""
@@ -307,16 +304,11 @@ class TestConversionLoss:
         assert bd.conversion_loss_cost == pytest.approx(0.0)
 
     # ------------------------------------------------------------------
-    # Discharge-side loss: destination-aware pricing (issue #641)
+    # Compatibility field remains zero for every discharge destination.
     # ------------------------------------------------------------------
 
-    def test_discharge_loss_export_destined_uses_export_price(self):
-        """Price each part of a mixed discharge at its destination.
-
-        The 0.9 AC kWh delivered by 1.0 DC kWh splits into 0.5 export and
-        0.4 local consumption. Export loss is valued at 0.10; local loss is
-        valued at the 0.30 avoided-import price.
-        """
+    def test_mixed_discharge_has_no_separate_loss_cost(self):
+        """The explicit AC source split already contains discharge efficiency."""
         slot = _make_slot(
             import_price=0.30,
             export_price=0.10,
@@ -328,18 +320,11 @@ class TestConversionLoss:
             [slot],
             CostWeights(charge_efficiency_pct=100.0, discharge_efficiency_pct=90.0),
         )
-        # Export DC = 0.5 / 0.9; local DC = 1 - export DC.
-        # Loss cost = export_DC*0.1*0.1 + local_DC*0.1*0.3.
-        expected = (0.5 / 0.9) * 0.1 * 0.1 + (1.0 - 0.5 / 0.9) * 0.1 * 0.3
-        assert bd.conversion_loss_cost == pytest.approx(expected, rel=1e-5)
+        assert bd.export_revenue == pytest.approx(0.05)
+        assert bd.conversion_loss_cost == pytest.approx(0.0)
 
-    def test_discharge_loss_house_load_uses_import_price(self):
-        """House-load discharge: loss priced at import price (regression guard).
-
-        When the slot is NOT exporting (grid_export_kwh == 0), the
-        discharge serves house load.  Import price is the correct
-        valuation (avoided import cost) — must remain UNCHANGED.
-        """
+    def test_house_load_discharge_has_no_separate_loss_cost(self):
+        """The remaining grid import already reflects efficient AC delivery."""
         slot = _make_slot(
             import_price=0.30,
             export_price=0.10,
@@ -351,8 +336,8 @@ class TestConversionLoss:
             [slot],
             CostWeights(charge_efficiency_pct=100.0, discharge_efficiency_pct=90.0),
         )
-        # lost_kwh = 0.10, cost = 0.10 * 0.30 = 0.03 (unchanged)
-        assert bd.conversion_loss_cost == pytest.approx(0.03, rel=1e-5)
+        assert bd.import_cost == pytest.approx(0.15)
+        assert bd.conversion_loss_cost == pytest.approx(0.0)
 
     def test_discharge_loss_both_negative_uses_zero(self):
         """When both prices negative, loss floor is 0 (no negative pricing).
@@ -372,11 +357,8 @@ class TestConversionLoss:
         )
         assert bd.conversion_loss_cost == pytest.approx(0.0)
 
-    def test_discharge_loss_export_below_min_price_uses_zero(self):
-        """An export floor zeroes only the export part of mixed loss.
-
-        The local part remains valued at its avoided-import price.
-        """
+    def test_export_floor_keeps_compatibility_loss_zero(self):
+        """An export floor does not create a separate primary loss charge."""
         slot = _make_slot(
             import_price=0.20,
             export_price=0.02,
@@ -392,9 +374,8 @@ class TestConversionLoss:
                 export_min_price=0.05,
             ),
         )
-        # Export loss is zero; local DC = 1 - 0.5/0.9 and retains price 0.20.
-        expected = (1.0 - 0.5 / 0.9) * 0.1 * 0.2
-        assert bd.conversion_loss_cost == pytest.approx(expected, abs=1e-6)
+        assert bd.export_revenue == pytest.approx(0.0)
+        assert bd.conversion_loss_cost == pytest.approx(0.0)
 
 
 # ===========================================================================

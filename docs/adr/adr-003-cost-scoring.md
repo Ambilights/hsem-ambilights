@@ -31,6 +31,9 @@ We split the cost function into **two distinct aggregates** returned for every c
 total_cost = grid_import_cost − export_revenue + cycle_cost + conversion_loss_cost
 ```
 
+`conversion_loss_cost` is retained for schema compatibility and is always
+zero; conversion efficiency is already reflected in the physical grid flows.
+
 - Every term in `total_cost` corresponds to a real monetary flow.
 - **No synthetic penalties** enter this aggregate.
 - Suitable for auditing, bill comparison, and user-facing display.
@@ -88,7 +91,8 @@ demand of one exactly aligned, non-actionable slot beyond the contiguous
 published-price boundary. Quantity is bounded by load after PV/accounted EV,
 discharge efficiency and power, usable capacity, and a global capacity cap.
 Marginal value starts from the Unagi point after MAE and operator-margin
-haircut, then subtracts discharge conversion loss and cycle wear. Duplicate
+haircut, multiplies it by discharge efficiency to obtain delivered-AC value,
+then subtracts cycle wear. Duplicate
 points use the lower value; invalid data creates no tier.
 
 This replaces the old primary `max(published, forecast)` scalar, which could
@@ -106,6 +110,13 @@ inventory. An export discharge followed by equal recharge restores the same
 final inventory and has zero net terminal value; explicit prices,
 efficiencies, wear, capacity, headroom, and power constraints decide the
 cycle.
+
+Primary conversion loss is physical in those grid flows: stored charge draws
+`charge / charge_efficiency` AC and removed energy delivers
+`discharge * discharge_efficiency` AC. Import cost and export revenue therefore
+price the loss once. `conversion_loss_cost` remains in the public breakdown for
+compatibility and is always zero; adding a separate loss-price term would
+double-count the same energy.
 
 ### Primary-action structural tiebreak
 

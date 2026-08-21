@@ -293,8 +293,12 @@ def test_free_pv_refill_allows_export_below_terminal_value() -> None:
 
 @pytest.mark.parametrize(
     ("export_price", "should_cycle"),
-    [(2.0, True), (0.8, False)],
-    ids=("spread-pays-losses-and-wear", "spread-does-not-pay-losses-and-wear"),
+    [(2.0, True), (0.8, True), (0.7, False)],
+    ids=(
+        "wide-spread-pays",
+        "physical-spread-pays",
+        "spread-does-not-pay-physical-losses-and-wear",
+    ),
 )
 def test_grid_refill_only_when_spread_pays_losses_and_wear(
     export_price: float,
@@ -302,12 +306,11 @@ def test_grid_refill_only_when_spread_pays_losses_and_wear(
 ) -> None:
     """Require a profitable 60-minute export/refill round trip.
 
-    One DC kWh at 90% efficiency exports 0.9 AC kWh.  Refilling costs
-    1/0.9 * 0.5 = 0.5556, charge loss costs 0.05, export-side discharge
-    loss costs 0.1 times the export price, and two throughput legs cost
-    2 * 0.05 = 0.10.  Export 2.0 earns 1.8 against 0.9056 of non-revenue
-    cost and cycles; export 0.8 earns 0.72 against 0.7856 and must leave
-    SoC and all flows unchanged.
+    One DC kWh at 90% efficiency exports 0.9 AC kWh. Refilling imports
+    1/0.9 kWh at 0.5, costing 0.5556, and the two throughput legs cost
+    2 * 0.05 = 0.10. Those physical flows already contain both conversion
+    losses. Export 0.8 earns 0.72 against 0.6556 and cycles; export 0.7
+    earns only 0.63 and must leave SoC and all flows unchanged.
     """
     planned, _diagnostics = _solve(
         [

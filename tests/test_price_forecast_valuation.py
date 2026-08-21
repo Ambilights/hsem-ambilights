@@ -49,6 +49,7 @@ from custom_components.hsem.planner.future_value import (
 )
 from custom_components.hsem.planner.secondary_storage import (
     resolve_secondary_terminal_price,
+    resolve_secondary_terminal_price_details,
 )
 from custom_components.hsem.utils.price_forecast import build_price_forecast
 from custom_components.hsem.utils.prices import SlotPrice
@@ -207,6 +208,43 @@ class TestSecondaryValuation:
             )
             is None
         )
+
+    def test_details_report_forecast_when_it_raises_the_value(self) -> None:
+        resolution = resolve_secondary_terminal_price_details(
+            _published_slots(CHEAP_TODAY),
+            _secondary(),
+            NOW,
+            forecast=_forecast(DEAR_TOMORROW),
+        )
+        assert resolution.source == "forecast"
+        assert resolution.price_per_kwh == pytest.approx((DEAR_TOMORROW - MAE) * 0.93)
+
+    def test_details_report_published_when_forecast_is_cheaper(self) -> None:
+        resolution = resolve_secondary_terminal_price_details(
+            _published_slots(DEAR_TOMORROW),
+            _secondary(),
+            NOW,
+            forecast=_forecast(0.10),
+        )
+        assert resolution.source == "published"
+        assert resolution.price_per_kwh == pytest.approx(DEAR_TOMORROW * 0.93)
+
+    def test_details_report_configured_override(self) -> None:
+        cfg = _secondary()
+        cfg.replacement_price_per_kwh = 1.5
+        resolution = resolve_secondary_terminal_price_details(
+            _published_slots(CHEAP_TODAY),
+            cfg,
+            NOW,
+            forecast=_forecast(DEAR_TOMORROW),
+        )
+        assert resolution.source == "configured"
+        assert resolution.price_per_kwh == pytest.approx(1.5)
+
+    def test_details_report_none_without_a_usable_source(self) -> None:
+        resolution = resolve_secondary_terminal_price_details([], _secondary(), NOW)
+        assert resolution.source == "none"
+        assert resolution.price_per_kwh is None
 
 
 class TestHaircut:
@@ -484,6 +522,21 @@ class TestIsolationThroughRunPlanner:
         assert explanation.terminal_cost_to_go_initial_value == pytest.approx(
             model.inventory_value(4.0)
         )
+
+    def test_engine_exposes_secondary_terminal_price_provenance(self) -> None:
+        """The explanation makes a forecast-derived PowMr credit auditable."""
+        planner_input = self._input(with_forecast=True)
+        planner_input.secondary_storage = _secondary()
+
+        output = run_planner(planner_input)
+
+        assert output.explanation.secondary_terminal_price_source == "forecast"
+        assert output.explanation.secondary_terminal_price_per_kwh == pytest.approx(
+            9.99 * 0.93
+        )
+        attributes = output.explanation.as_dict()
+        assert attributes["secondary_terminal_price_source"] == "forecast"
+        assert attributes["secondary_terminal_price_per_kwh"] == pytest.approx(9.2907)
 
     def test_forecast_never_makes_the_tail_actionable(self) -> None:
         result = run_planner(self._input(with_forecast=True))

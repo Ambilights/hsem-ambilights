@@ -79,6 +79,12 @@ class PlanExplanation:
         previous_plan_name:
             Name of the winning plan from the previous planner run, or
             ``""`` on first run.
+        secondary_terminal_price_source:
+            Source of the PowMr terminal inventory price: configured,
+            published, forecast, or none.
+        secondary_terminal_price_per_kwh:
+            Resolved PowMr terminal inventory price in local currency/kWh, or
+            None when no secondary-storage valuation is available.
     """
 
     selected_strategy: str = STATE_UNKNOWN
@@ -117,6 +123,10 @@ class PlanExplanation:
     terminal_cost_to_go_final_valued_quantity_kwh: float = 0.0
     terminal_cost_to_go_initial_value: float = 0.0
     terminal_cost_to_go_final_value: float = 0.0
+    # PowMr terminal inventory valuation provenance.  This is separate from
+    # the primary battery's bounded terminal cost-to-go tiers above.
+    secondary_terminal_price_source: str = "none"
+    secondary_terminal_price_per_kwh: float | None = None
     # Hysteresis fields (issue #372)
     hysteresis_active: bool = False
     hysteresis_reason: str = ""
@@ -184,6 +194,12 @@ class PlanExplanation:
             "terminal_cost_to_go_final_value": round(
                 self.terminal_cost_to_go_final_value,
                 6,
+            ),
+            "secondary_terminal_price_source": self.secondary_terminal_price_source,
+            "secondary_terminal_price_per_kwh": (
+                round(self.secondary_terminal_price_per_kwh, 6)
+                if self.secondary_terminal_price_per_kwh is not None
+                else None
             ),
             "constraints": list(self.constraints),
             "rejected_plans": [
