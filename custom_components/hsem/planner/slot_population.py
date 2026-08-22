@@ -22,6 +22,7 @@ from custom_components.hsem.models.price_point import PricePoint
 from custom_components.hsem.models.solcast_slot import SolcastSlot
 from custom_components.hsem.models.time_series import TimeSeriesIndex
 from custom_components.hsem.planner import consumption_weighting as _weighting
+from custom_components.hsem.planner.cost_helpers import grid_cash_flow_cost
 from custom_components.hsem.utils.datetime_utils import as_tz, slot_contains, utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.prices import SlotPrice
@@ -575,10 +576,11 @@ def populate_estimated_cost(
     *,
     export_min_price: float = 0.0,
 ) -> None:
-    """Populate per-slot ``estimated_cost_currency``.
+    """Populate the pre-flow baseline ``estimated_cost_currency``.
 
-    Net consumption >= 0 → cost = net × import_price.
-    Net consumption < 0  → revenue = net × export_price (negative cost).
+    Positive net consumption is provisional grid import; negative net
+    consumption is provisional grid export. Finite negative prices remain
+    authoritative, so import can be a credit and export can be a cost.
 
     When ``export_min_price > 0``, export prices below the threshold are
     treated as 0 to match the physical inverter behaviour (the applier
@@ -597,20 +599,18 @@ def populate_estimated_cost(
         export_min_price,
     )
     for slot in slots:
-        if not slot.price_actionable:
-            slot.estimated_cost_currency = 0.0
-            continue
         net = slot.estimated_net_consumption_kwh
-        if net >= 0:
-            slot.estimated_cost_currency = round(net * slot.price.import_price, 4)
-        else:
-            exp_price = slot.price.export_price
-            # Clamp to match MILP + cost_function behaviour (issue #483)
-            if exp_price < 0.0:
-                exp_price = 0.0
-            if export_min_price > 1e-9 and exp_price < export_min_price:
-                exp_price = 0.0
-            slot.estimated_cost_currency = round(net * exp_price, 4)
+        slot.estimated_cost_currency = round(
+            grid_cash_flow_cost(
+                max(net, 0.0),
+                max(-net, 0.0),
+                slot.price.import_price,
+                slot.price.export_price,
+                price_actionable=slot.price_actionable,
+                export_min_price=export_min_price,
+            ),
+            4,
+        )
 
 
 def mark_time_passed(slots: list[PlannedSlot], now: datetime) -> None:

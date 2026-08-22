@@ -996,13 +996,15 @@ def test_cycle_cost_obj_coefficients_sum_to_one_cycle_cost():
 
 @_scipy_skip()
 def test_milp_holds_energy_for_expensive_slot_via_terminal_soc() -> None:
-    """Bug B: With replacement_price set to expensive slot price, the MILP
+    """Bug B: With replacement_price just below the expensive slot price, the MILP
     must discharge in the expensive slot, not the cheap one.
 
     6-slot horizon: cheap[0]=0.05, neutral[1-4]=0.30, expensive[5]=2.00.
     Battery starts with enough energy (5 kWh) to serve either cheap or expensive.
-    With replacement_price=2.00, the LP should prefer holding energy for the
-    expensive slot vs. discharging in the cheap one.
+    With replacement_price=1.99, the peak has a genuine 0.01/kWh economic
+    preference.  An exact 2.00 tie is deliberately not used here: the tiny
+    structural action tiebreak is smaller than the configured MIP optimality
+    gap and therefore is not a hard lexicographic guarantee.
     """
     slots: list[PlannedSlot] = []
     for h in range(6):
@@ -1029,7 +1031,7 @@ def test_milp_holds_energy_for_expensive_slot_via_terminal_soc() -> None:
         cycle_cost_per_kwh=0.0,
         charge_efficiency_pct=100.0,
         discharge_efficiency_pct=100.0,
-        replacement_price_per_kwh=2.0,
+        replacement_price_per_kwh=1.99,
     )
     assert milp_result is not None
     milp_slots, _diag = milp_result

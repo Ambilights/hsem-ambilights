@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import datetime, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -15,7 +16,7 @@ from custom_components.hsem.models.secondary_storage_config import (
 )
 from custom_components.hsem.planner import milp_optimizer
 from custom_components.hsem.planner.cost_function import CostWeights, score_plan
-from custom_components.hsem.planner.milp import _secondary_diagnostics
+from custom_components.hsem.planner.milp import _secondary_diagnostics, _write_results
 from custom_components.hsem.planner.milp._secondary_diagnostics import (
     SecondaryResultSummary,
 )
@@ -129,6 +130,43 @@ def _solve(
     )
     assert result is not None
     return result
+
+
+def test_excluded_utility_load_is_reserved_from_ev_pv_headroom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Solver handoff includes a PowMr load omitted from the house baseline."""
+    captured: dict[str, np.ndarray] = {}
+    original = _write_results._write_milp_results_to_slots
+
+    def capture_handoff(*args: Any, **kwargs: Any) -> list[PlannedSlot]:
+        consumption = kwargs["secondary_site_consumption_ac_per_slot"]
+        assert isinstance(consumption, np.ndarray)
+        captured["consumption"] = consumption.copy()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        _write_results,
+        "_write_milp_results_to_slots",
+        capture_handoff,
+    )
+    slots = _slots([0.20])
+    result, _diagnostics = _solve(
+        slots,
+        _powmr(
+            load_power_w=1200.0,
+            current_soc_pct=20.0,
+            replacement_price_per_kwh=0.0,
+            inverter_standby_power_w=0.0,
+            min_charge_current_a=10.0,
+            max_charge_current_a=10.0,
+        ),
+        primary_max_discharge_per_slot=0.0,
+    )
+
+    assert result[0].secondary_storage_mode == SECONDARY_MODE_UTILITY
+    assert result[0].secondary_storage_charged_kwh == pytest.approx(0.0)
+    assert captured["consumption"] == pytest.approx(np.array([1.2]))
 
 
 def test_secondary_charges_cheap_and_serves_nas_when_expensive() -> None:
@@ -346,6 +384,7 @@ def _apply_sbu_to_primary_slot(
     slot: PlannedSlot,
     *,
     battery_export_min_price: float,
+    export_min_price: float = 0.0,
     allow_primary_battery_transfer: bool = False,
     primary_site_discharge_limited: bool = False,
 ) -> dict[str, float | int] | None:
@@ -369,11 +408,41 @@ def _apply_sbu_to_primary_slot(
         future_idx=[0],
         minimum_action_kwh=1e-4,
         now=_NOW,
+        export_min_price=export_min_price,
         battery_export_min_price=battery_export_min_price,
         primary_site_discharge_limited=np.asarray(
             [primary_site_discharge_limited], dtype=bool
         ),
     )
+
+
+def test_secondary_writeback_preserves_signed_import_cash_flow() -> None:
+    """Direct PowMr writeback must value negative import as real income."""
+    slot = _slots([-0.10], house_load_kwh=0.500)[0]
+    slot.grid_import_kwh = 0.500
+
+    result = _apply_sbu_to_primary_slot(slot, battery_export_min_price=0.0)
+
+    assert result is not None
+    assert slot.grid_import_kwh == pytest.approx(0.400)
+    assert slot.estimated_cost_currency == pytest.approx(-0.040)
+
+
+def test_secondary_writeback_applies_site_export_floor() -> None:
+    """Direct PowMr writeback cannot book revenue blocked by the site floor."""
+    slot = _slots([1.0], house_load_kwh=0.100)[0]
+    slot.price = SlotPrice(import_price=1.0, export_price=0.20)
+    slot.grid_import_kwh = 0.0
+
+    result = _apply_sbu_to_primary_slot(
+        slot,
+        battery_export_min_price=0.0,
+        export_min_price=0.50,
+    )
+
+    assert result is not None
+    assert slot.grid_export_kwh == pytest.approx(0.100)
+    assert slot.estimated_cost_currency == pytest.approx(0.0)
 
 
 def test_sbu_rejects_primary_charge_when_transfer_disabled() -> None:

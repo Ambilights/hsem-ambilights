@@ -116,11 +116,22 @@ def _compute_milp_diagnostics(
                 v["kwh"],
             )
 
-    # --- Extract fuse penalty values ---
+    # --- Reconcile fuse diagnostics to the executable published slots ---
+    # EV minimum-power concentration can move or drop a continuous LP
+    # allocation during writeback.  The raw ``gi_pen`` values then describe
+    # the pre-writeback vector, not the plan the coordinator will publish.
+    # Derive the public excess from the same rounded grid-import fields used by
+    # scoring and hardware intent.
     total_fuse_violation_kwh = 0.0
     if fuse_active:
-        gi_pen_sol = result.x[gi_pen_off : gi_pen_off + m]
-        gi_pen_list = [float(v) for v in gi_pen_sol]
+        gi_pen_list = [
+            max(
+                float(out_slots[future_idx[t]].grid_import_kwh)
+                - max_grid_import_per_slot_kwh,
+                0.0,
+            )
+            for t in range(m)
+        ]
         total_fuse_violation_kwh = sum(gi_pen_list)
         if total_fuse_violation_kwh > 1e-6:
             has_violations = True
@@ -128,7 +139,7 @@ def _compute_milp_diagnostics(
                 if gi_pen_list[t] > 1e-6:
                     slot_i = future_idx[t]
                     s_start = slots[slot_i].start.isoformat()
-                    gi_val = float(result.x[gi_off + t])
+                    gi_val = float(out_slots[slot_i].grid_import_kwh)
                     log_planner(
                         "warning",
                         "[milp] Fuse violation slot %d (%s): "

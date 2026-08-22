@@ -13,6 +13,7 @@ import numpy as np
 
 from custom_components.hsem.models.ev_config import EVConfig
 from custom_components.hsem.models.planned_slot import PlannedSlot
+from custom_components.hsem.planner.cost_helpers import slot_grid_cash_flow_cost
 from custom_components.hsem.utils.datetime_utils import slot_contains
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.units import (
@@ -174,6 +175,11 @@ def _write_milp_results_to_slots(
     usable_kwh: float,
     curt_sol_full: np.ndarray,  # type: ignore[name-defined]
     *,
+    gi_off: int | None = None,
+    grid_import_cap_per_slot_kwh: np.ndarray | None = None,  # type: ignore[name-defined]
+    phase_extra_ac_per_slot_kwh: np.ndarray | None = None,  # type: ignore[name-defined]
+    secondary_site_consumption_ac_per_slot: np.ndarray | None = None,  # type: ignore[name-defined]
+    ev_writeback_diagnostics: dict[str, dict[str, object]] | None = None,
     session_ev_indices: list[int] | None = None,
     _min_action_kwh: float = 1e-4,
 ) -> list[PlannedSlot]:
@@ -205,6 +211,23 @@ def _write_milp_results_to_slots(
         current_kwh: Battery energy at horizon start (above floor, kWh).
         usable_kwh: Maximum usable energy (kWh).
         curt_sol_full: Solved curtailment per LP slot (kWh).
+        gi_off: Offset of ``gi[t]`` variables in *result_x*. Direct helper
+            callers may omit it; production supplies it so redistribution can
+            use the exact solved import as its headroom baseline.
+        grid_import_cap_per_slot_kwh: Finite physical/fuse import cap for each
+            LP slot. EV concentration may absorb unused PV and only this much
+            additional grid headroom.
+        phase_extra_ac_per_slot_kwh: Additional EV AC load each LP slot can
+            accept under the conservative unknown-phase envelope without
+            exceeding any hard phase-import row. When the phase model is
+            active, both PV and grid-funded concentration are capped by this
+            stricter headroom.
+        secondary_site_consumption_ac_per_slot: Incremental PowMr AC demand
+            not already present in ``base_load``: charging plus its dedicated
+            load while Utility supplies that load. It consumes the same PV
+            headroom as EV charging.
+        ev_writeback_diagnostics: Optional mutable mapping populated from the
+            executable, post-redistribution EV allocation.
         _min_action_kwh: Minimum kWh threshold for action slots.
         Recommendations: The canonical Recommendations enum.
 
@@ -276,22 +299,75 @@ def _write_milp_results_to_slots(
                 if dc >= _min_action_kwh:
                     ev_ac_solved[lp_t] += ev_dc_to_ac_kwh(dc, ev.charger_efficiency)
 
-        headroom_ac_by_slot: dict[int, float] = {}
+        unused_pv_ac_by_slot: dict[int, float] = {}
+        total_extra_ac_by_slot: dict[int, float] = {}
         for lp_t, slot_i in enumerate(future_idx):
-            net_flow = (
-                base_load[lp_t]
-                + float(ec_sol[lp_t]) / charge_eff
-                - float(ed_sol[lp_t]) * discharge_eff
-                + float(curt_sol_full[lp_t])
-                + ev_ac_solved[lp_t]
-                - pv_avail[lp_t]
+            partial_current_slot = hours_by_slot[slot_i] < full_slot_hours - 1e-9
+            if phase_extra_ac_per_slot_kwh is None:
+                phase_extra_ac = math.inf
+            else:
+                phase_extra_ac = float(phase_extra_ac_per_slot_kwh[lp_t])
+                if not math.isfinite(phase_extra_ac):
+                    phase_extra_ac = 0.0
+                phase_extra_ac = max(phase_extra_ac, 0.0)
+            # Only unused PV is source-safe headroom. Aggregate export is not:
+            # part of it may be battery-origin, and moving EV energy into that
+            # slot would silently make the house battery feed the car.
+            unused_pv_ac = (
+                0.0
+                if partial_current_slot
+                else max(
+                    float(pv_avail[lp_t])
+                    - float(ec_sol[lp_t]) / charge_eff
+                    - (
+                        float(secondary_site_consumption_ac_per_slot[lp_t])
+                        if secondary_site_consumption_ac_per_slot is not None
+                        else 0.0
+                    )
+                    - float(curt_sol_full[lp_t])
+                    - ev_ac_solved[lp_t],
+                    0.0,
+                )
             )
-            # An importing slot has *no* unused PV surplus.  Granting it
-            # unlimited headroom contradicted the surplus-only rows the LP
-            # carries for charge_past_target: energy concentrated there would
-            # be funded by grid import, which is exactly what those rows
-            # forbid.  Only genuinely unused surplus counts.
-            headroom_ac_by_slot[slot_i] = max(-net_flow, 0.0)
+            unused_pv_ac = min(unused_pv_ac, phase_extra_ac)
+            unused_pv_ac_by_slot[slot_i] = unused_pv_ac
+
+            # Grid headroom is safe only when the recipient is not already a
+            # discharge/export slot.  Otherwise an added EV load consumes the
+            # solved battery-origin flow before it creates any new import,
+            # silently turning a grid/house-battery export into battery-to-EV
+            # transfer.  Genuinely unused PV remains available through the
+            # separate source-safe pool above.
+            storage_or_export_active = (
+                float(ed_sol[lp_t]) > _min_action_kwh
+                or float(result_x[ge_off + lp_t]) > _min_action_kwh
+            )
+            if storage_or_export_active or partial_current_slot:
+                grid_headroom_ac = 0.0
+            elif grid_import_cap_per_slot_kwh is None:
+                grid_headroom_ac = math.inf
+            else:
+                solved_grid_import = (
+                    max(float(result_x[gi_off + lp_t]), 0.0)
+                    if gi_off is not None
+                    else max(
+                        float(base_load[lp_t])
+                        + float(ec_sol[lp_t]) / charge_eff
+                        - float(ed_sol[lp_t]) * discharge_eff
+                        + float(curt_sol_full[lp_t])
+                        + ev_ac_solved[lp_t]
+                        - float(pv_avail[lp_t]),
+                        0.0,
+                    )
+                )
+                grid_headroom_ac = max(
+                    float(grid_import_cap_per_slot_kwh[lp_t]) - solved_grid_import,
+                    0.0,
+                )
+            total_extra_ac_by_slot[slot_i] = min(
+                unused_pv_ac + grid_headroom_ac,
+                phase_extra_ac,
+            )
 
         session_evs = set(session_ev_indices or [])
         for ev_idx, ev in enumerate(active_evs):
@@ -335,12 +411,16 @@ def _write_milp_results_to_slots(
                 # it would drop the charge rather than concentrate it.
                 max_extra_dc=(
                     {
-                        slot_i: headroom_ac_by_slot.get(slot_i, 0.0)
+                        slot_i: unused_pv_ac_by_slot.get(slot_i, 0.0)
                         * ev.charger_efficiency
                         for slot_i in solved_dc
                     }
                     if ev.charge_past_target
-                    else None
+                    else {
+                        slot_i: total_extra_ac_by_slot.get(slot_i, 0.0)
+                        * ev.charger_efficiency
+                        for slot_i in solved_dc
+                    }
                 ),
             )
             if unplaceable_dc > 1e-6:
@@ -352,20 +432,62 @@ def _write_milp_results_to_slots(
                     unplaceable_dc,
                     ev.charger_min_power_w,
                 )
-            if ev.charge_past_target:
-                # The surplus is one pool, not one per EV.  Without spending it
-                # down, two surplus-only EVs could each claim the same kWh and
-                # together pull the slot into import.
-                for slot_i, dc in placed_dc.items():
-                    claimed_ac = max((dc - solved_dc.get(slot_i, 0.0)), 0.0) / max(
-                        ev.charger_efficiency, 1e-9
-                    )
-                    headroom_ac_by_slot[slot_i] = max(
-                        headroom_ac_by_slot.get(slot_i, 0.0) - claimed_ac, 0.0
-                    )
+            # PV and import headroom are shared across EVs. Spend only the
+            # amount added beyond this EV's solved slot allocation; energy
+            # removed from a donor slot is deliberately not reused, keeping
+            # the writeback conservative and independent of EV iteration.
+            for slot_i, dc in placed_dc.items():
+                claimed_ac = max((dc - solved_dc.get(slot_i, 0.0)), 0.0) / max(
+                    ev.charger_efficiency, 1e-9
+                )
+                pv_claim = min(
+                    claimed_ac,
+                    unused_pv_ac_by_slot.get(slot_i, 0.0),
+                )
+                unused_pv_ac_by_slot[slot_i] = max(
+                    unused_pv_ac_by_slot.get(slot_i, 0.0) - pv_claim,
+                    0.0,
+                )
+                total_extra_ac_by_slot[slot_i] = max(
+                    total_extra_ac_by_slot.get(slot_i, 0.0) - claimed_ac,
+                    0.0,
+                )
 
             placed_dc_by_ev.append(placed_dc)
             session_dc_by_ev.append(session_dc)
+
+            if ev_writeback_diagnostics is not None:
+                published_dc = sum(placed_dc.values()) + sum(session_dc.values())
+                deadline_penalty = 0.0
+                if (
+                    ev.deadline_slot is not None
+                    and ev.target_kwh > ev.initial_soc_kwh + 1e-9
+                ):
+                    deadline_lp = max(0, min(ev.deadline_slot, m - 1))
+                    lp_by_slot = {
+                        output_slot: lp_index
+                        for lp_index, output_slot in enumerate(future_idx)
+                    }
+                    delivered_by_deadline = sum(
+                        dc
+                        for output_slot, dc in {**session_dc, **placed_dc}.items()
+                        if lp_by_slot[output_slot] <= deadline_lp
+                    )
+                    deadline_penalty = max(
+                        ev.target_kwh - ev.initial_soc_kwh - delivered_by_deadline,
+                        0.0,
+                    )
+                    # Executable slot energies publish at millikWh precision.
+                    # Treat sub-5 Wh reconciliation residue as met rather than
+                    # exposing a false deadline failure after safe writeback.
+                    if deadline_penalty < 0.005:
+                        deadline_penalty = 0.0
+                ev_writeback_diagnostics[f"ev{ev_idx}"] = {
+                    "total_dc_kwh": round(published_dc, 4),
+                    "deadline_penalty_kwh": round(deadline_penalty, 4),
+                    "deadline_met": deadline_penalty < 1e-6,
+                    "unplaceable_dc_kwh": round(unplaceable_dc, 4),
+                }
 
             # Build the AC load map from the *placed* allocation so grid
             # import/export, PV attribution and cost all derive from the
@@ -395,6 +517,8 @@ def _write_milp_results_to_slots(
     # value from the recommendation label and net_demand.
     # ------------------------------------------------------------------
     running_soc = current_kwh
+    published_soc_floor = min(current_kwh, 0.0)
+    published_soc_ceiling = max(current_kwh, usable_kwh)
     for lp_t, slot_i in enumerate(future_idx):
         ec_kwh = float(ec_sol[lp_t])
         ed_kwh = float(ed_sol[lp_t])
@@ -453,10 +577,32 @@ def _write_milp_results_to_slots(
         resolved_charge = round(max(ec_kwh, 0.0), 3)
         resolved_discharge = round(max(ed_kwh, 0.0), 3)
 
+        # Reconcile publication rounding against the cumulative executable
+        # inventory, not only the raw solver trajectory. Independent 3-decimal
+        # rounding can otherwise accumulate across a long horizon and publish
+        # a few Wh below the floor or above the ceiling even though the raw
+        # variables satisfy every SoC row. Round the final admissible fragment
+        # down to millikWh precision so writeback itself remains physical.
         if resolved_charge > 0.0:
-            # Primary charge is battery-side DC energy; PV surplus and EV load
-            # are AC-side.  Subtract co-optimised EV demand (fixed EV demand is
-            # already included in pv_avail), then require the remaining PV to
+            charge_headroom = max(published_soc_ceiling - running_soc, 0.0)
+            if resolved_charge > charge_headroom:
+                resolved_charge = max(
+                    math.floor((charge_headroom + 1e-12) * 1000.0) / 1000.0,
+                    0.0,
+                )
+        if resolved_discharge > 0.0:
+            discharge_headroom = max(running_soc - published_soc_floor, 0.0)
+            if resolved_discharge > discharge_headroom:
+                resolved_discharge = max(
+                    math.floor((discharge_headroom + 1e-12) * 1000.0) / 1000.0,
+                    0.0,
+                )
+
+        if resolved_charge > 0.0:
+            # Primary charge is battery-side DC energy; PV surplus, EV load,
+            # and incremental PowMr consumption are AC-side. Subtract both
+            # co-optimised consumers (fixed EV demand is already included in
+            # pv_avail), then require the remaining PV to
             # cover the complete rounded battery allocation after losses.
             # Raw EV AC is deliberately conservative if a later minimum-power
             # guard suppresses a tiny EV allocation: it may choose grid mode,
@@ -464,6 +610,11 @@ def _write_milp_results_to_slots(
             available_primary_pv_ac_kwh = max(
                 float(pv_avail[lp_t])
                 - ev_ac_load_by_slot.get(lp_t, 0.0)
+                - (
+                    float(secondary_site_consumption_ac_per_slot[lp_t])
+                    if secondary_site_consumption_ac_per_slot is not None
+                    else 0.0
+                )
                 - max(float(curt_sol_full[lp_t]), 0.0),
                 0.0,
             )
@@ -588,11 +739,23 @@ def _write_milp_results_to_slots(
 
             for slot_i in sorted({**session_dc, **placed_dc}):
                 ev_dc_kwh = placed_dc.get(slot_i, session_dc.get(slot_i, 0.0))
-                is_session_slot = slot_i in session_dc
                 # AC load = DC / charger_eff (grid/PV draw)
                 ac_load = round(ev_dc_to_ac_kwh(ev_dc_kwh, ev.charger_efficiency), 3)
-                # Accumulate into slot EV fields (additive for multiple EVs)
-                if ev.base_load_includes_ev:
+                # Accumulate into slot EV fields (additive for multiple EVs).
+                # Live current-slot injection leaves a pure-house baseline when
+                # this measured session was removed, so its AC demand must be
+                # added back as planned load even if historical house data
+                # normally includes the EV. Future forecast slots remain
+                # accounted in the usual base-includes topology.
+                current_pure_house = (
+                    ev.current_session_removed_from_base
+                    and slot_contains(
+                        out_slots[slot_i].start,
+                        out_slots[slot_i].end,
+                        now,
+                    )
+                )
+                if ev.base_load_includes_ev and not current_pure_house:
                     out_slots[slot_i].ev_accounted_load_kwh += ac_load
                 else:
                     out_slots[slot_i].ev_planned_load_kwh += ac_load
@@ -607,21 +770,16 @@ def _write_milp_results_to_slots(
                 )
                 ac_power_w = min(ac_power_w, rated_ac_power_w)
 
-                # Schedulable slots need no minimum-power zeroing: the
-                # redistribution has already removed every slot below the
-                # charger's minimum and moved its energy to a slot that can
-                # deliver it.  Zeroing the command alone would drop the energy
-                # from the schedule while leaving it in the plan's accounting.
-                #
-                # Session slots keep the original guard: their energy is fixed
-                # observed demand that cannot be moved, so an unreachable
-                # target power is still better left uncommanded.
-                if (
-                    is_session_slot
-                    and ev.charger_min_power_w > 1e-9
-                    and ac_power_w < ev.charger_min_power_w
-                ):
-                    ac_power_w = 0
+                # Flexible allocations have already been concentrated above
+                # the configured minimum. A live session is observed demand
+                # from a charger that is already running, so its measured power
+                # remains authoritative even when below the startup minimum.
+
+                if ev.fixed_session_only:
+                    # Observed external demand is modeled for energy/fuse safety,
+                    # but disabled/ineligible smart planning must not emit an
+                    # HSEM charger command.
+                    continue
 
                 # Write to the correct charger power field by EV identity
                 # (is_second), NOT by list position (ev_idx).  When the
@@ -638,8 +796,7 @@ def _write_milp_results_to_slots(
                     out_slots[slot_i].ev_charger_calculated_power = max(
                         ac_power_w, out_slots[slot_i].ev_charger_calculated_power
                     )
-        # Recompute estimated_net_consumption_kwh and estimated_cost_currency
-        # to reflect new EV loads
+        # Recompute the display net-load forecast to reflect new EV loads.
         for i in future_idx:
             s = out_slots[i]
             s.estimated_net_consumption_kwh = (
@@ -647,12 +804,15 @@ def _write_milp_results_to_slots(
                 + s.ev_planned_load_kwh
                 - s.solcast_pv_estimate_kwh
             )
-            net = s.estimated_net_consumption_kwh
-            if not s.price_actionable:
-                s.estimated_cost_currency = 0.0
-            elif net > 0:
-                s.estimated_cost_currency = round(net * s.price.import_price, 4)
-            else:
-                s.estimated_cost_currency = round(net * s.price.export_price, 4)
+
+    # Meter cash flow must follow the final published grid flows, including
+    # signed actionable prices. This also refreshes no-EV direct solves whose
+    # baseline slot cost may otherwise be stale.
+    for i in future_idx:
+        s = out_slots[i]
+        s.estimated_cost_currency = round(
+            slot_grid_cash_flow_cost(s, export_min_price=min_export_price),
+            4,
+        )
 
     return out_slots

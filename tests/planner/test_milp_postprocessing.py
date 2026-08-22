@@ -21,6 +21,9 @@ from custom_components.hsem.planner.candidate_generator import (
 )
 from custom_components.hsem.planner.candidate_selector import select_best_candidate
 from custom_components.hsem.planner.cost_function import CostWeights
+from custom_components.hsem.planner.milp._solver_execution import (
+    _validate_primary_postwrite_inventory,
+)
 from custom_components.hsem.planner.milp._write_results import (
     _write_milp_results_to_slots,
 )
@@ -100,6 +103,25 @@ def _primary_flows(slot: PlannedSlot) -> tuple[float, float, float, float]:
         slot.grid_import_kwh,
         slot.grid_export_kwh,
     )
+
+
+def test_postwrite_inventory_validation_is_cumulative() -> None:
+    """Individually plausible slot discharges cannot overdraw the horizon."""
+    slots = [
+        _slot(8, house=0.0, pv=0.0, discharge=0.6),
+        _slot(9, house=0.0, pv=0.0, discharge=0.6),
+    ]
+
+    validation = _validate_primary_postwrite_inventory(
+        slots,
+        [0, 1],
+        current_kwh=1.0,
+        usable_kwh=1.0,
+    )
+
+    assert validation["valid"] is False
+    assert validation["reason"] == "primary_inventory_below_floor"
+    assert validation["slot"] == 1
 
 
 def _write_milp(

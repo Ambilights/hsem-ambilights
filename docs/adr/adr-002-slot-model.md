@@ -24,7 +24,7 @@ The slot model must satisfy several conflicting requirements:
    EV labelling, runtime resolver) may assign or override a slot's recommendation.
    The slot must preserve this provenance.
 
-4. **Multi-day horizon** — Horizons span up to 48 hours (192 × 15-min slots). The
+4. **Multi-day horizon** — Horizons span up to 72 hours (288 × 15-min slots). The
    slot model must handle missing future-day data gracefully without crashing.
 
 5. **Planner independence** — The slot model lives in the pure-Python planner layer
@@ -144,12 +144,12 @@ numeric offset alone cannot describe a future timezone transition.
    serialisation volume.
 
 2. **Population cost** — Building the full slot array requires iterating all fields
-   for every slot. For 192 × 15-min slots this is negligible (< 1 ms), but the
+   for every slot. For 288 × 15-min slots this is negligible (< 1 ms), but the
    code is more verbose than a lazy-evaluation approach.
 
 3. **Duplication of time series** — Several fields (price, PV, load) are repeated
    per slot instead of stored once in a shared time series. This is acceptable for
-   n ≤ 192 slots but would not scale to thousands.
+   n ≤ 288 slots but would not scale to thousands.
 
 4. **Mutation risk** — Because slots are mutable, a bug in one pipeline step can
    corrupt fields that other steps depend on. We mitigate this by strictly ordering
@@ -175,7 +175,7 @@ Model the battery as a state machine and slots as transitions. Reconstruct the
 slot array from the transition log.
 
 **Rejected because:**
-- Over-engineered for the current requirements. The slot count (≤ 192) makes
+- Over-engineered for the current requirements. The slot count (≤ 288) makes
   reconstruction overhead irrelevant.
 - Auditability suffers — there is no single "slot n" object to inspect in
   a debugger or log.

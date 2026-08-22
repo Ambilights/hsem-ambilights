@@ -5,14 +5,132 @@ Extracted from ``solve_milp`` so the orchestrator remains under 30 KB.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from custom_components.hsem.planner.milp._layout import MilpBoundsBuilder
+from custom_components.hsem.planner.secondary_storage import (
+    secondary_site_load_offset_kwh,
+)
+from custom_components.hsem.utils.misc import clamp_efficiency
 
 if TYPE_CHECKING:
     from custom_components.hsem.models.ev_config import EVConfig
+    from custom_components.hsem.models.planned_slot import PlannedSlot
+    from custom_components.hsem.models.secondary_storage_config import (
+        SecondaryStorageConfig,
+    )
+
+
+def _add_hard_aggregate_fuse_constraints(
+    constraints: dict[str, Any],
+    *,
+    n_vars: int,
+    m: int,
+    slots: list[PlannedSlot],
+    future_idx: list[int],
+    base_load: np.ndarray,  # type: ignore[name-defined]
+    pv_avail: np.ndarray,  # type: ignore[name-defined]
+    gi_off: int,
+    max_grid_import_per_slot_kwh: float,
+    active_evs: list[EVConfig],
+    session_ev_indices: list[int],
+    slot_hours: float,
+    available_slot_hours: np.ndarray,  # type: ignore[name-defined]
+    session_slot_hours: np.ndarray,  # type: ignore[name-defined]
+    ev_var_offsets: list[int],
+    secondary_layout: dict[str, int] | None,
+    secondary_storage: SecondaryStorageConfig | None,
+) -> dict[str, Any]:
+    """Prevent controllable charging from worsening an aggregate fuse overload.
+
+    The existing aggregate fuse row is intentionally soft so an unavoidable
+    household, live-session, or dedicated-load overload cannot make the whole
+    model infeasible.  Its penalty alone is not a physical guard, however: a
+    larger EV deadline or terminal-inventory benefit can rationally pay that
+    penalty and schedule still more controllable import.
+
+    These companion hard rows cap grid import at the larger of the configured
+    fuse limit and the fixed no-action site demand.  Fixed demand already above
+    the fuse therefore remains feasible and visible through ``gi_pen``, while
+    Huawei, flexible EV, and PowMr charging can never make it worse.
+    """
+    old_a_ub = constraints["A_ub"]
+    old_b_ub = constraints["b_ub"]
+    old_rows = old_a_ub.shape[0]
+    a_ub = np.zeros((old_rows + m, n_vars))
+    b_ub = np.zeros(old_rows + m)
+    a_ub[:old_rows, : old_a_ub.shape[1]] = old_a_ub
+    b_ub[:old_rows] = old_b_ub
+
+    session_evs = set(session_ev_indices)
+    hard_caps = np.zeros(m)
+    secondary_charge_eff = (
+        clamp_efficiency(secondary_storage.charge_efficiency_pct)
+        if secondary_storage is not None and secondary_storage.valid
+        else 1.0
+    )
+    for t, slot_i in enumerate(future_idx):
+        available_hours = max(float(available_slot_hours[t]), 1e-9)
+        full_slot_scale = max(slot_hours / available_hours, 1.0)
+        fixed_session_ac_kwh = sum(
+            max(ev.session_charge_kw or 0.0, 0.0)
+            * float(session_slot_hours[t])
+            * full_slot_scale
+            for ev_idx, ev in enumerate(active_evs)
+            if ev_idx in session_evs
+        )
+        fixed_secondary_load_kwh = 0.0
+        if (
+            secondary_storage is not None
+            and secondary_storage.valid
+            and not secondary_storage.base_load_includes_dedicated_load
+        ):
+            fixed_secondary_load_kwh = max(
+                slots[slot_i].secondary_storage_load_kwh,
+                0.0,
+            )
+
+        fixed_site_import_kwh = max(
+            float(base_load[t] - pv_avail[t])
+            + fixed_session_ac_kwh
+            + fixed_secondary_load_kwh * full_slot_scale,
+            0.0,
+        )
+        allowed_import_kwh = max(
+            max_grid_import_per_slot_kwh,
+            fixed_site_import_kwh,
+        )
+        hard_caps[t] = allowed_import_kwh
+        row = old_rows + t
+        a_ub[row, gi_off + t] = 1.0
+
+        # gi mixes full-slot primary/house projections with current-slot EV
+        # and PowMr energy. Normalize only those partial-duration terms back to
+        # their power-equivalent full-slot frame for the fuse comparison.
+        duration_correction = full_slot_scale - 1.0
+        if duration_correction > 1e-9:
+            for ev_idx, ev in enumerate(active_evs):
+                a_ub[row, ev_var_offsets[ev_idx] + t] += (
+                    duration_correction / ev.charger_efficiency
+                )
+            if secondary_layout is not None and secondary_storage is not None:
+                a_ub[row, secondary_layout["charge"] + t] += (
+                    duration_correction / secondary_charge_eff
+                )
+                a_ub[row, secondary_layout["sbu_mode"] + t] -= (
+                    duration_correction
+                    * secondary_site_load_offset_kwh(slots[slot_i], secondary_storage)
+                )
+        # A dedicated load excluded from the house baseline is a constant term
+        # already present once in gi; move only its scale correction to RHS.
+        b_ub[row] = allowed_import_kwh - duration_correction * fixed_secondary_load_kwh
+
+    constraints["A_ub"] = a_ub
+    constraints["b_ub"] = b_ub
+    constraints["hard_grid_import_cap_per_slot_kwh"] = hard_caps
+    return constraints
 
 
 def _build_constraints(
@@ -48,6 +166,8 @@ def _build_constraints(
     session_ev_indices: list[int],
     session_slots: int,
     slot_hours: float,
+    available_slot_hours: np.ndarray,  # type: ignore[name-defined]
+    session_slot_hours: np.ndarray,  # type: ignore[name-defined]
     _has_session_demand: bool,
     bounds_builder: MilpBoundsBuilder,
     max_grid_export_per_slot_kwh: float = 0.0,
@@ -212,6 +332,7 @@ def _build_constraints(
     # EV constraints (only when active_evs is non-empty)
     # ------------------------------------------------------------------
     # Row counts for EV constraints
+    session_evs = set(session_ev_indices)
     num_evs = len(active_evs)
     ev_soc_rows = num_evs * m  # cumulative SOC upper bound per EV
     ev_deadline_rows = sum(
@@ -262,14 +383,23 @@ def _build_constraints(
         ev_row = existing_rows
         for ev_idx, ev in enumerate(active_evs):
             ev_off = ev_var_offsets[ev_idx]
+            is_session_ev = ev_idx in session_evs
             # EV SOC upper bound per slot: Σ_{k≤t} ev_c[k] ≤ cap − init
             #   For each t in 0..m-1:
             #   Σ_{k=0..t} ev_c[k] ≤ ev.capacity_kwh - ev.initial_soc_kwh
             headroom = max(ev.capacity_kwh - ev.initial_soc_kwh, 0.0)
             for t in range(m):
+                fixed_session_dc = 0.0
                 for k in range(t + 1):
-                    A_ub[ev_row + t, ev_off + k] = 1.0
-                b_ub[ev_row + t] = headroom
+                    if is_session_ev and k in session_slots_set:
+                        fixed_session_dc += (
+                            max(ev.session_charge_kw or 0.0, 0.0)
+                            * float(session_slot_hours[k])
+                            * ev.charger_efficiency
+                        )
+                    else:
+                        A_ub[ev_row + t, ev_off + k] = 1.0
+                b_ub[ev_row + t] = max(headroom - fixed_session_dc, 0.0)
             ev_row += m
 
             # EV deadline soft constraint:
@@ -305,9 +435,17 @@ def _build_constraints(
                 shortfall = ev.target_kwh - ev.initial_soc_kwh
                 d = ev.deadline_slot
                 d = max(0, min(d, m - 1))
+                fixed_session_dc = 0.0
                 for k in range(d + 1):
-                    A_ub[ev_row, ev_off + k] = 1.0
-                b_ub[ev_row] = shortfall
+                    if is_session_ev and k in session_slots_set:
+                        fixed_session_dc += (
+                            max(ev.session_charge_kw or 0.0, 0.0)
+                            * float(session_slot_hours[k])
+                            * ev.charger_efficiency
+                        )
+                    else:
+                        A_ub[ev_row, ev_off + k] = 1.0
+                b_ub[ev_row] = max(shortfall - fixed_session_dc, 0.0)
                 ev_row += 1
 
             # Post-deadline zero-charge constraint:
@@ -323,7 +461,8 @@ def _build_constraints(
                 d = ev.deadline_slot
                 d = max(0, min(d, m - 1))
                 for t in range(d + 1, m):
-                    A_ub[ev_row, ev_off + t] = 1.0
+                    if not (is_session_ev and t in session_slots_set):
+                        A_ub[ev_row, ev_off + t] = 1.0
                     b_ub[ev_row] = 0.0
                     ev_row += 1
 
@@ -333,9 +472,10 @@ def _build_constraints(
             # surplus — never battery discharge or grid import.
             if ev.charge_past_target:
                 for t in range(m):
-                    surplus_kwh = max(pv_avail[t] - base_load[t], 0.0)
-                    A_ub[ev_row + t, ev_off + t] = 1.0 / ev.charger_efficiency
-                    b_ub[ev_row + t] = surplus_kwh
+                    if not (is_session_ev and t in session_slots_set):
+                        surplus_kwh = max(pv_avail[t] - base_load[t], 0.0)
+                        A_ub[ev_row + t, ev_off + t] = 1.0 / ev.charger_efficiency
+                        b_ub[ev_row + t] = surplus_kwh
                 ev_row += m
 
     # ------------------------------------------------------------------
@@ -356,8 +496,8 @@ def _build_constraints(
             # AC-side session load per slot (kW × hours).  The DC/AC
             # efficiency conversion cancels out by definition, so this is
             # simply the AC power multiplied by the slot duration.
-            session_ac = skw * slot_hours
             for t in session_slots_set:
+                session_ac = skw * float(session_slot_hours[t])
                 session_ac_by_slot[t] = session_ac_by_slot.get(t, 0.0) + session_ac
 
         session_t_list = sorted(session_slots_set)
@@ -396,8 +536,10 @@ def _build_constraints(
 
     # ------------------------------------------------------------------
     # Variable bounds: all ≥ 0, charge/discharge capped by power limits.
-    # Penalty variables are unbounded above (can absorb arbitrary
-    # violations) and non-negative (violations cannot be negative).
+    # SoC slacks may preserve only an already-invalid initial reading.  A
+    # valid initial SoC therefore has hard physical bounds, while an
+    # out-of-range reading can recover but can never move farther out of
+    # range.  Other penalty variables remain unbounded above.
     # ------------------------------------------------------------------
     unbounded: tuple[float, float | None] = (0.0, None)
     if grid_import_ub_per_slot is None:
@@ -442,8 +584,14 @@ def _build_constraints(
         [(pv_avail[t], pv_avail[t]) for t in range(m)],
     )
     bounds_builder.fill("primary_throughput", unbounded)
-    bounds_builder.fill("soc_max_penalty", unbounded)
-    bounds_builder.fill("soc_min_penalty", unbounded)
+    bounds_builder.fill(
+        "soc_max_penalty",
+        (0.0, max(float(current_kwh - usable_kwh), 0.0)),
+    )
+    bounds_builder.fill(
+        "soc_min_penalty",
+        (0.0, max(float(-current_kwh), 0.0)),
+    )
     bounds_builder.set(
         "curtailment",
         [(0.0, float(pv_avail[t])) for t in range(m)],
@@ -455,15 +603,25 @@ def _build_constraints(
         for t in range(m):
             if is_session_ev and t < session_slots and ev.session_charge_kw is not None:
                 # Fixed bound: session demand (DC-side kWh per slot)
-                session_dc = ev.session_charge_kw * slot_hours * ev.charger_efficiency
+                session_dc = (
+                    ev.session_charge_kw
+                    * float(session_slot_hours[t])
+                    * ev.charger_efficiency
+                )
                 session_dc = min(session_dc, ev.max_charge_per_slot)
                 ev_bounds.append((session_dc, session_dc))
+            elif ev.fixed_session_only:
+                ev_bounds.append((0.0, 0.0))
             elif not bool(price_actionable[t]):
                 # Optional smart charging must not treat an unpublished price
                 # as free. A live session remains fixed by the branch above.
                 ev_bounds.append((0.0, 0.0))
             else:
-                ev_bounds.append((0.0, ev.max_charge_per_slot))
+                duration_scale = min(
+                    max(float(available_slot_hours[t]) / max(slot_hours, 1e-9), 0.0),
+                    1.0,
+                )
+                ev_bounds.append((0.0, ev.max_charge_per_slot * duration_scale))
         bounds_builder.set(f"ev_{ev_idx}_charge", ev_bounds)
         # ev deadline penalty: [0, unbounded)
         bounds_builder.fill(f"ev_{ev_idx}_target_penalty", unbounded)

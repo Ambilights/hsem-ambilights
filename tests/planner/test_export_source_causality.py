@@ -254,3 +254,40 @@ def test_fixed_ev_load_has_no_raw_grid_import_export_overlap() -> None:
         abs=1e-9,
     )
     assert "grid_flow_mode" in diagnostics["model_integral_blocks"]
+
+
+def test_site_export_floor_blocks_direct_pv_export() -> None:
+    """The hardware-wide floor suppresses PV export as well as battery export."""
+    solved = solve_milp(
+        [_slot(0, import_price=0.20, export_price=0.10, pv_kwh=1.0)],
+        _NOW,
+        current_kwh=1.0,
+        usable_kwh=1.0,
+        max_charge_per_slot=1.0,
+        max_discharge_per_slot=0.0,
+        min_export_price=0.15,
+        battery_export_min_price=0.0,
+    )
+    assert solved is not None
+    planned, _diagnostics = solved
+    assert planned[0].grid_export_kwh == pytest.approx(0.0)
+    assert planned[0].pv_export_kwh == pytest.approx(0.0)
+
+
+def test_battery_only_export_floor_does_not_block_direct_pv_export() -> None:
+    """The battery floor remains source-specific when the site floor is off."""
+    solved = solve_milp(
+        [_slot(0, import_price=0.20, export_price=0.10, pv_kwh=1.0)],
+        _NOW,
+        current_kwh=1.0,
+        usable_kwh=1.0,
+        max_charge_per_slot=1.0,
+        max_discharge_per_slot=0.0,
+        min_export_price=0.0,
+        battery_export_min_price=0.15,
+    )
+    assert solved is not None
+    planned, _diagnostics = solved
+    assert planned[0].grid_export_kwh == pytest.approx(1.0)
+    assert planned[0].primary_battery_export_kwh == pytest.approx(0.0)
+    assert planned[0].pv_export_kwh == pytest.approx(1.0)

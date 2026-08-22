@@ -172,20 +172,15 @@ class TestImportCost:
         bd = score_plan([slot], CostWeights())
         assert bd.import_cost == pytest.approx(0.0)
 
-    def test_negative_import_price_clamped_to_zero_cost(self):
-        """Negative import price is sanitised to zero, not treated as profit.
+    def test_negative_import_price_is_preserved_as_credit(self):
+        """Finite negative import prices credit actual metered consumption.
 
-        Mirrors ``milp_optimizer.py``'s ``p_imp_obj = max(p_imp, 0.0)``
-        clamp (issue #635/#657): the LP never earns a synthetic profit from
-        importing during a negative-price slot, so ``score_plan`` must not
-        either, or the selector's score would diverge from what the LP
-        actually optimised for.
+        The scorer and MILP both preserve the authoritative signed rate.
         """
         slot = _make_slot(import_price=-0.05, grid_import_kwh=2.0)
         bd = score_plan([slot], CostWeights())
-        # import_cost = 2.0 × max(−0.05, 0.0) = 0.0
-        assert bd.import_cost == pytest.approx(0.0)
-        assert bd.total == pytest.approx(0.0)
+        assert bd.import_cost == pytest.approx(-0.10)
+        assert bd.total == pytest.approx(-0.10)
 
     def test_multiple_slots_summed(self):
         """Import cost is accumulated across all slots."""

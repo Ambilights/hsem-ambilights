@@ -147,7 +147,8 @@ class PlanCostBreakdown:
 
     Attributes:
         import_cost:
-            Total cost of grid imports across all slots (≥ 0).
+            Total cost of grid imports across all slots. This is negative
+            when finite negative prices pay the site to consume.
         export_revenue:
             Total revenue from grid exports across all slots.
             Positive when export prices are positive (money earned);

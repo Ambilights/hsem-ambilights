@@ -1,13 +1,84 @@
-"""Cost-function helpers for cycle cost and terminal inventory valuation."""
+"""Cost-function helpers for grid cash flow and battery valuation."""
 
 from __future__ import annotations
 
+import math
+
+from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.planner.cost_types import CostWeights
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import resolve_cycle_cost
 from custom_components.hsem.utils.units import usable_kwh_from_rated
 
 PRIMARY_ACTION_TIEBREAK_COST = 1e-5
+
+
+def resolve_slot_money_prices(
+    import_price: float,
+    export_price: float,
+    *,
+    price_actionable: bool,
+    export_min_price: float = 0.0,
+) -> tuple[float, float]:
+    """Return finite authoritative import/export rates for money accounting.
+
+    Finite negative prices are real market signals and are preserved. A
+    non-actionable slot has no price authority, while the configured site
+    export floor values physically blocked export at zero without changing
+    the raw diagnostic price stored on the slot.
+    """
+    if not price_actionable:
+        return (0.0, 0.0)
+
+    effective_import = import_price if math.isfinite(import_price) else 0.0
+    effective_export = export_price if math.isfinite(export_price) else 0.0
+    if export_min_price > 1e-9 and effective_export < export_min_price:
+        effective_export = 0.0
+    return (effective_import, effective_export)
+
+
+def grid_cash_flow_cost(
+    grid_import_kwh: float,
+    grid_export_kwh: float,
+    import_price: float,
+    export_price: float,
+    *,
+    price_actionable: bool,
+    export_min_price: float = 0.0,
+) -> float:
+    """Return auditable meter cash flow; positive is cost, negative income."""
+    effective_import, effective_export = resolve_slot_money_prices(
+        import_price,
+        export_price,
+        price_actionable=price_actionable,
+        export_min_price=export_min_price,
+    )
+    return (
+        max(grid_import_kwh, 0.0) * effective_import
+        - max(grid_export_kwh, 0.0) * effective_export
+    )
+
+
+def slot_grid_cash_flow_cost(
+    slot: PlannedSlot,
+    *,
+    export_min_price: float = 0.0,
+) -> float:
+    """Return one slot's auditable meter cash flow from published grid flows.
+
+    Positive values are a net cost and negative values are net income. This
+    deliberately excludes battery wear and every selector-only term; those
+    remain separately itemised by :func:`score_plan`.
+    """
+    return grid_cash_flow_cost(
+        slot.grid_import_kwh,
+        slot.grid_export_kwh,
+        slot.price.import_price,
+        slot.price.export_price,
+        price_actionable=slot.price_actionable,
+        export_min_price=export_min_price,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Cycle cost helper

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -86,6 +86,41 @@ class TestFinancialTrackerAccumulation:
         # Export: (55 - 50) * 1.5 = 7.5
         assert tracker.export_income_total == pytest.approx(7.5)
 
+    def test_timed_interval_uses_left_endpoint_price_at_tariff_boundary(self) -> None:
+        """A boundary sample closes the old tariff before starting the new one."""
+        start = datetime(2026, 8, 22, 12, 55, tzinfo=UTC)
+        tracker = FinancialTracker()
+        tracker.accumulate(
+            100.0,
+            50.0,
+            import_price=2.0,
+            export_price=1.0,
+            sample_time=start,
+            max_gap_seconds=600.0,
+        )
+
+        tracker.accumulate(
+            101.0,
+            51.0,
+            import_price=5.0,
+            export_price=4.0,
+            sample_time=start + timedelta(minutes=5),
+            max_gap_seconds=600.0,
+        )
+        assert tracker.import_cost_total == pytest.approx(2.0)
+        assert tracker.export_income_total == pytest.approx(1.0)
+
+        tracker.accumulate(
+            102.0,
+            52.0,
+            import_price=6.0,
+            export_price=3.0,
+            sample_time=start + timedelta(minutes=10),
+            max_gap_seconds=600.0,
+        )
+        assert tracker.import_cost_total == pytest.approx(7.0)
+        assert tracker.export_income_total == pytest.approx(5.0)
+
     def test_accumulate_ignores_negative_delta(self) -> None:
         """Negative delta (meter reset) is ignored."""
         tracker = FinancialTracker()
@@ -159,6 +194,133 @@ class TestFinancialTrackerAccumulation:
         tracker.accumulate(106.0, 56.0, import_price=3.0, export_price=2.0)
 
         assert tracker.import_cost_total == pytest.approx(3.0)
+        assert tracker.export_income_total == pytest.approx(2.0)
+
+    def test_stale_persisted_sample_rebaselines_without_replay(self) -> None:
+        """A long outage must not price its whole meter delta at one price."""
+        start = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+        resumed = datetime(2026, 8, 22, 10, 0, tzinfo=UTC)
+        tracker = FinancialTracker()
+
+        assert (
+            tracker.accumulate(
+                100.0,
+                50.0,
+                sample_time=start,
+                max_gap_seconds=600.0,
+            )
+            is False
+        )
+        assert (
+            tracker.accumulate(
+                500.0,
+                250.0,
+                import_price=3.0,
+                export_price=2.0,
+                sample_time=resumed,
+                max_gap_seconds=600.0,
+            )
+            is False
+        )
+        assert tracker.import_cost_total == pytest.approx(0.0)
+        assert tracker.export_income_total == pytest.approx(0.0)
+
+        assert (
+            tracker.accumulate(
+                501.0,
+                251.0,
+                import_price=3.0,
+                export_price=2.0,
+                sample_time=resumed + timedelta(minutes=5),
+                max_gap_seconds=600.0,
+            )
+            is True
+        )
+        assert tracker.import_cost_total == pytest.approx(3.0)
+        assert tracker.export_income_total == pytest.approx(2.0)
+
+    def test_meter_continuity_is_independent_when_export_recovers(self) -> None:
+        """A missing export meter cannot hide its gap behind fresh import samples."""
+        start = datetime(2026, 8, 22, 10, 0, tzinfo=UTC)
+        tracker = FinancialTracker()
+        tracker.accumulate(
+            100.0,
+            50.0,
+            import_price=2.0,
+            export_price=1.0,
+            sample_time=start,
+            max_gap_seconds=600.0,
+        )
+
+        for minute, import_energy in ((5, 101.0), (10, 102.0), (15, 103.0)):
+            assert tracker.accumulate(
+                import_energy,
+                None,
+                import_price=2.0,
+                export_price=1.0,
+                sample_time=start + timedelta(minutes=minute),
+                max_gap_seconds=600.0,
+            )
+
+        # Import is still contiguous and is priced; the returning export
+        # channel is stale and must only establish a new baseline.
+        assert (
+            tracker.accumulate(
+                104.0,
+                52.0,
+                import_price=2.0,
+                export_price=1.0,
+                sample_time=start + timedelta(minutes=20),
+                max_gap_seconds=600.0,
+            )
+            is False
+        )
+        assert tracker.import_cost_total == pytest.approx(8.0)
+        assert tracker.export_income_total == pytest.approx(0.0)
+
+        assert tracker.accumulate(
+            105.0,
+            53.0,
+            import_price=2.0,
+            export_price=1.0,
+            sample_time=start + timedelta(minutes=25),
+            max_gap_seconds=600.0,
+        )
+        assert tracker.import_cost_total == pytest.approx(10.0)
+        assert tracker.export_income_total == pytest.approx(1.0)
+
+    def test_missing_export_sample_does_not_take_import_channels_new_price(
+        self,
+    ) -> None:
+        """Each meter retains its own endpoint tariff while the other advances."""
+        start = datetime(2026, 8, 22, 10, 0, tzinfo=UTC)
+        tracker = FinancialTracker()
+        tracker.accumulate(
+            100.0,
+            50.0,
+            import_price=2.0,
+            export_price=1.0,
+            sample_time=start,
+            max_gap_seconds=600.0,
+        )
+        tracker.accumulate(
+            101.0,
+            None,
+            import_price=4.0,
+            export_price=9.0,
+            sample_time=start + timedelta(minutes=5),
+            max_gap_seconds=600.0,
+        )
+        tracker.accumulate(
+            102.0,
+            52.0,
+            import_price=5.0,
+            export_price=8.0,
+            sample_time=start + timedelta(minutes=10),
+            max_gap_seconds=600.0,
+        )
+
+        assert tracker.import_cost_total == pytest.approx(6.0)
         assert tracker.export_income_total == pytest.approx(2.0)
 
 
@@ -255,8 +417,12 @@ class TestFinancialTrackerPeriodRollups:
 
     def _make_tracker_with_history(self) -> FinancialTracker:
         """Create a tracker with known daily_log entries."""
-        tracker = FinancialTracker()
-        today = date.today()
+        tracker = FinancialTracker(
+            import_cost_total=10.0,
+            export_income_total=5.0,
+            today="2035-06-15",
+        )
+        today = date.fromisoformat(tracker.today)
 
         # Add entries for the last 35 days.
         for offset in range(35):
@@ -286,8 +452,8 @@ class TestFinancialTrackerPeriodRollups:
 
     def test_sum_month(self) -> None:
         """_sum_month sums entries in the current month."""
-        tracker = FinancialTracker()
-        today = date.today()
+        tracker = FinancialTracker(today="2035-06-15")
+        today = date.fromisoformat(tracker.today)
         month_key = today.strftime("%Y-%m")
         tracker.daily_log[f"{month_key}-01"] = FinancialDayEntry(
             date=f"{month_key}-01", import_cost=10.0, export_income=5.0
@@ -307,8 +473,8 @@ class TestFinancialTrackerPeriodRollups:
 
     def test_sum_year(self) -> None:
         """_sum_year sums entries in the current year."""
-        tracker = FinancialTracker()
-        today = date.today()
+        tracker = FinancialTracker(today="2035-08-22")
+        today = date.fromisoformat(tracker.today)
         year_key = today.strftime("%Y")
         tracker.daily_log[f"{year_key}-01-01"] = FinancialDayEntry(
             date=f"{year_key}-01-01", import_cost=10.0, export_income=5.0
@@ -324,6 +490,54 @@ class TestFinancialTrackerPeriodRollups:
         result = tracker._sum_year()
         assert result["import_cost"] == pytest.approx(30.0)
         assert result["export_income"] == pytest.approx(15.0)
+
+    def test_rollups_include_open_today_once(self) -> None:
+        """Live current-day totals replace any stale same-day log entry."""
+        tracker = FinancialTracker(
+            import_cost_total=103.0,
+            export_income_total=52.0,
+            _today_start_import_cost=100.0,
+            _today_start_export_income=50.0,
+            today="2035-06-15",
+        )
+        tracker.daily_log["2035-06-14"] = FinancialDayEntry(
+            date="2035-06-14",
+            import_cost=10.0,
+            export_income=5.0,
+        )
+        tracker.daily_log[tracker.today] = FinancialDayEntry(
+            date=tracker.today,
+            import_cost=999.0,
+            export_income=999.0,
+        )
+
+        for result in (
+            tracker._sum_period(7),
+            tracker._sum_period(30),
+            tracker._sum_month(),
+            tracker._sum_year(),
+        ):
+            assert result["import_cost"] == pytest.approx(13.0)
+            assert result["export_income"] == pytest.approx(7.0)
+            assert result["net_balance"] == pytest.approx(-6.0)
+
+    def test_rollups_follow_tracking_day_not_host_day(self) -> None:
+        """The HA-local coordinator date is authoritative for every period."""
+        tracker = FinancialTracker(today="2035-01-02")
+        tracker.daily_log["2035-01-01"] = FinancialDayEntry(
+            date="2035-01-01",
+            import_cost=4.0,
+            export_income=2.0,
+        )
+        tracker.daily_log["2026-08-22"] = FinancialDayEntry(
+            date="2026-08-22",
+            import_cost=1000.0,
+            export_income=1000.0,
+        )
+
+        assert tracker._sum_period(2)["import_cost"] == pytest.approx(4.0)
+        assert tracker._sum_month()["export_income"] == pytest.approx(2.0)
+        assert tracker._sum_year()["net_balance"] == pytest.approx(-2.0)
 
 
 class TestFinancialTrackerPersistence:
@@ -379,6 +593,108 @@ class TestFinancialTrackerPersistence:
         restored = FinancialTracker.from_dict(d)
         assert restored._last_import_energy_kwh is None
         assert restored._last_export_energy_kwh is None
+
+    def test_roundtrip_preserves_per_meter_sample_timestamps(self) -> None:
+        """Persistence retains independent meter interval timestamps."""
+        sample_time = datetime(2026, 8, 22, 10, 5, tzinfo=UTC)
+        original = FinancialTracker()
+        original.accumulate(
+            100.0,
+            50.0,
+            sample_time=sample_time,
+            max_gap_seconds=600.0,
+        )
+
+        restored = FinancialTracker.from_dict(original.as_dict())
+
+        assert restored._last_import_sample_at == sample_time
+        assert restored._last_export_sample_at == sample_time
+
+    def test_roundtrip_preserves_independent_endpoint_price_authority(self) -> None:
+        """Restarted timed accumulation uses each persisted left endpoint."""
+        sample_time = datetime(2026, 8, 22, 10, 5, tzinfo=UTC)
+        original = FinancialTracker()
+        original.accumulate(
+            100.0,
+            50.0,
+            import_price=-0.25,
+            export_price=4.1234567,
+            import_price_available=True,
+            export_price_available=False,
+            sample_time=sample_time,
+            max_gap_seconds=600.0,
+        )
+
+        restored = FinancialTracker.from_dict(original.as_dict())
+        assert restored._last_import_price == pytest.approx(-0.25)
+        assert restored._last_export_price == pytest.approx(4.123457)
+        assert restored._last_import_price_available is True
+        assert restored._last_export_price_available is False
+
+        restored.accumulate(
+            101.0,
+            51.0,
+            import_price=9.0,
+            export_price=8.0,
+            import_price_available=True,
+            export_price_available=True,
+            sample_time=sample_time + timedelta(minutes=5),
+            max_gap_seconds=600.0,
+        )
+        assert restored.import_cost_total == pytest.approx(-0.25)
+        assert restored.export_income_total == pytest.approx(0.0)
+
+    def test_legacy_shared_sample_timestamp_migrates_per_meter(self) -> None:
+        """An early v7.1.10 payload remains readable during rolling updates."""
+        sample_time = datetime(2026, 8, 22, 10, 5, tzinfo=UTC)
+        restored = FinancialTracker.from_dict(
+            {
+                "_last_import_energy_kwh": 100.0,
+                "_last_export_energy_kwh": 50.0,
+                "_last_sample_at": sample_time.isoformat(),
+            }
+        )
+
+        assert restored._last_import_sample_at == sample_time
+        assert restored._last_export_sample_at == sample_time
+        assert restored._last_import_price is None
+        assert restored._last_export_price is None
+        assert restored._last_import_price_available is False
+        assert restored._last_export_price_available is False
+
+    def test_legacy_payload_skips_one_interval_before_pricing(self) -> None:
+        """A pre-price payload cannot charge its old delta at the restart tariff."""
+        sample_time = datetime(2026, 8, 22, 10, 5, tzinfo=UTC)
+        restored = FinancialTracker.from_dict(
+            {
+                "_last_import_energy_kwh": 100.0,
+                "_last_export_energy_kwh": 50.0,
+                "_last_import_sample_at": sample_time.isoformat(),
+                "_last_export_sample_at": sample_time.isoformat(),
+            }
+        )
+
+        restored.accumulate(
+            101.0,
+            51.0,
+            import_price=9.0,
+            export_price=8.0,
+            sample_time=sample_time + timedelta(minutes=5),
+            max_gap_seconds=600.0,
+        )
+        assert restored.import_cost_total == pytest.approx(0.0)
+        assert restored.export_income_total == pytest.approx(0.0)
+
+        restored.accumulate(
+            102.0,
+            52.0,
+            import_price=7.0,
+            export_price=6.0,
+            sample_time=sample_time + timedelta(minutes=10),
+            max_gap_seconds=600.0,
+        )
+        assert restored.import_cost_total == pytest.approx(9.0)
+        assert restored.export_income_total == pytest.approx(8.0)
 
 
 class TestFinancialTrackerSensorAttributes:

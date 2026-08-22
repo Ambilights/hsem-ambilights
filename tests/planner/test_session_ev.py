@@ -17,6 +17,8 @@ import pytest
 
 from custom_components.hsem.models.ev_config import EVConfig
 from custom_components.hsem.models.planned_slot import PlannedSlot
+from custom_components.hsem.models.planner_input import PlannerInput
+from custom_components.hsem.planner.engine_ev_milp import _build_ev_configs_for_milp
 from custom_components.hsem.planner.milp_optimizer import is_scipy_available, solve_milp
 from custom_components.hsem.utils.prices import SlotPrice
 
@@ -423,3 +425,203 @@ def test_session_slots_at_60min_resolution():
             f"Slot at {slot.start} (LP {lp_idx}): expected {session_ac_per_slot} kWh AC, "
             f"got {slot.ev_total_planned_load_kwh}"
         )
+
+
+@_pytestmark_scipy
+def test_partial_current_live_session_preserves_observed_power() -> None:
+    """Session energy uses executable minutes and maps back to observed watts."""
+    now = _NOW + timedelta(minutes=50)
+    slots = _build_slots(5, start_hour=14, import_price=0.20, interval_minutes=60)
+    ev = EVConfig(
+        enabled=True,
+        initial_soc_kwh=0.0,
+        target_kwh=30.0,
+        capacity_kwh=50.0,
+        max_charge_per_slot=10.0,
+        charger_efficiency=1.0,
+        charger_min_power_w=1000.0,
+        deadline_slot=4,
+        session_charge_kw=6.0,
+    )
+
+    result = solve_milp(
+        slots,
+        now,
+        current_kwh=0.0,
+        usable_kwh=10.0,
+        max_charge_per_slot=1.0,
+        max_discharge_per_slot=0.0,
+        ev_configs=[ev],
+    )
+
+    assert result is not None
+    out, _diagnostics = result
+    assert out[0].ev_total_planned_load_kwh == pytest.approx(1.0)
+    assert out[0].ev_charger_calculated_power == pytest.approx(6000.0)
+    # Slot-constant commands cover whole slots until at least two hours of
+    # certain demand have been represented: 10 min + 1 h + 1 h.
+    assert [slot.ev_charger_calculated_power for slot in out[:3]] == pytest.approx(
+        [6000, 6000, 6000]
+    )
+
+
+@_pytestmark_scipy
+def test_live_session_below_startup_minimum_keeps_observed_command() -> None:
+    """Startup minimum cannot erase an already-running measured session."""
+    slots = _build_slots(4, start_hour=14, import_price=0.20, interval_minutes=60)
+    ev = EVConfig(
+        enabled=True,
+        initial_soc_kwh=0.0,
+        target_kwh=4.0,
+        capacity_kwh=10.0,
+        max_charge_per_slot=2.0,
+        charger_efficiency=1.0,
+        charger_min_power_w=1000.0,
+        deadline_slot=3,
+        session_charge_kw=0.5,
+    )
+
+    result = solve_milp(
+        slots,
+        _NOW,
+        current_kwh=0.0,
+        usable_kwh=10.0,
+        max_charge_per_slot=1.0,
+        max_discharge_per_slot=0.0,
+        ev_configs=[ev],
+    )
+
+    assert result is not None
+    out, _diagnostics = result
+    assert out[0].ev_total_planned_load_kwh == pytest.approx(0.5)
+    assert out[0].grid_import_kwh == pytest.approx(1.0)
+    assert out[0].ev_charger_calculated_power == pytest.approx(500.0)
+
+
+@_pytestmark_scipy
+@pytest.mark.parametrize(
+    ("initial_kwh", "target_kwh"),
+    [(20.0, 20.0), (19.0, 20.0)],
+)
+def test_fixed_session_remains_feasible_at_or_near_target(
+    initial_kwh: float, target_kwh: float
+) -> None:
+    """Observed two-hour demand is not rejected by stale target/capacity SoC."""
+    slots = _build_slots(4, start_hour=14, import_price=0.20, interval_minutes=60)
+    ev = EVConfig(
+        enabled=True,
+        initial_soc_kwh=initial_kwh,
+        target_kwh=target_kwh,
+        capacity_kwh=20.0,
+        max_charge_per_slot=6.0,
+        charger_efficiency=1.0,
+        deadline_slot=(None if initial_kwh >= target_kwh else 3),
+        session_charge_kw=6.0,
+    )
+
+    result = solve_milp(
+        slots,
+        _NOW,
+        current_kwh=0.0,
+        usable_kwh=10.0,
+        max_charge_per_slot=1.0,
+        max_discharge_per_slot=0.0,
+        ev_configs=[ev],
+    )
+
+    assert result is not None
+    out, _diagnostics = result
+    assert [slot.ev_charger_calculated_power for slot in out[:2]] == pytest.approx(
+        [6000, 6000]
+    )
+    assert sum(slot.ev_total_planned_load_kwh for slot in out[:2]) == pytest.approx(
+        12.0
+    )
+
+
+def test_at_target_live_session_is_admitted_by_engine_config_builder() -> None:
+    """A measured charging session remains modeled after target completion."""
+    slots = _build_slots(4, start_hour=14, import_price=0.20, interval_minutes=60)
+    inp = PlannerInput(
+        now_iso=_NOW.isoformat(),
+        interval_minutes=60,
+        ev_planned_load_enabled=True,
+        ev_planned_load_connected=True,
+        ev_planned_load_smart_charging_enabled=True,
+        ev_planned_load_current_soc_pct=80.0,
+        ev_planned_load_target_soc_pct=80.0,
+        ev_planned_load_battery_capacity_kwh=50.0,
+        ev_planned_load_charger_power_kw=6.0,
+        ev_planned_load_charger_efficiency_pct=100.0,
+        ev_session_charge_kw=6.0,
+    )
+
+    configs = _build_ev_configs_for_milp(inp, slots, _NOW)
+
+    assert configs is not None
+    assert len(configs) == 1
+    assert configs[0].session_charge_kw == pytest.approx(6.0)
+    assert configs[0].initial_soc_kwh == pytest.approx(configs[0].target_kwh)
+    assert configs[0].deadline_slot is None
+    assert configs[0].charge_past_target is False
+    assert configs[0].fixed_session_only is True
+
+
+@_pytestmark_scipy
+def test_disabled_unconfigured_live_session_remains_fixed_uncontrollable_load() -> None:
+    """Observed demand survives zero smart-planning config without a command."""
+    slots = _build_slots(4, start_hour=14, import_price=-1.0, interval_minutes=60)
+    slots[0].avg_house_consumption_kwh = 1.0
+    slots[0].estimated_net_consumption_kwh = 1.0
+    slots[1].avg_house_consumption_kwh = 0.0
+    slots[1].estimated_net_consumption_kwh = 0.0
+    inp = PlannerInput(
+        now_iso=_NOW.isoformat(),
+        interval_minutes=60,
+        ev_planned_load_enabled=False,
+        ev_planned_load_connected=False,
+        ev_planned_load_smart_charging_enabled=False,
+        ev_planned_load_battery_capacity_kwh=0.0,
+        ev_planned_load_charger_power_kw=0.0,
+        ev_planned_load_charger_efficiency_pct=100.0,
+        ev_planned_load_base_load_includes_ev=True,
+        house_power_includes_ev=True,
+        live_house_consumption_w=7000.0,
+        ev_session_charge_kw=6.0,
+    )
+
+    configs = _build_ev_configs_for_milp(inp, slots, _NOW)
+
+    assert configs is not None
+    assert len(configs) == 1
+    ev = configs[0]
+    assert ev.fixed_session_only is True
+    assert ev.capacity_kwh == pytest.approx(12.0)
+    assert ev.max_charge_per_slot == pytest.approx(6.0)
+    assert ev.current_session_removed_from_base is True
+
+    result = solve_milp(
+        slots,
+        _NOW,
+        current_kwh=0.0,
+        usable_kwh=10.0,
+        max_charge_per_slot=1.0,
+        max_discharge_per_slot=0.0,
+        ev_configs=configs,
+        main_fuse_amps=1.0,
+        main_fuse_phases=3,
+    )
+
+    assert result is not None
+    out, _diagnostics = result
+    assert out[0].grid_import_kwh == pytest.approx(7.0)
+    assert out[1].grid_import_kwh == pytest.approx(6.0)
+    assert out[0].ev_planned_load_kwh == pytest.approx(6.0)
+    assert out[0].ev_accounted_load_kwh == pytest.approx(0.0)
+    assert out[1].ev_accounted_load_kwh == pytest.approx(6.0)
+    assert out[1].ev_planned_load_kwh == pytest.approx(0.0)
+    assert out[2].ev_total_planned_load_kwh == pytest.approx(0.0)
+    assert out[0].batteries_charged_kwh == pytest.approx(0.0)
+    assert out[1].batteries_charged_kwh == pytest.approx(0.0)
+    assert out[0].ev_charger_calculated_power == pytest.approx(0.0)
+    assert out[1].ev_charger_calculated_power == pytest.approx(0.0)

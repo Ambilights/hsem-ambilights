@@ -110,6 +110,7 @@ async def get_init_step_schema(
                             "24",
                             "36",
                             "48",
+                            "72",
                         ],
                     }
                 }

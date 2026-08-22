@@ -237,6 +237,18 @@ def generate_candidates(
             user_margin=inp.battery_cycle_cost_per_kwh,
         )
 
+        # Depreciation is a battery-throughput concern, not a site-export
+        # concern. Keep the configured inverter/site floor independent so
+        # direct PV export remains eligible below the battery wear threshold.
+        depreciation_export_floor = calculate_recommended_threshold(
+            purchase_price=inp.battery_purchase_price,
+            expected_cycles=inp.battery_expected_cycles,
+            usable_capacity=usable_kwh,
+            capacity_loss_pct=inp.battery_capacity_loss_pct,
+        )
+        effective_battery_export_floor = max(
+            inp.battery_export_min_price, depreciation_export_floor
+        )
         milp_attempt: dict = {}
         milp_result = solve_milp(
             baseline_slots,
@@ -251,15 +263,7 @@ def generate_candidates(
             time_discount_rate=inp.time_discount_rate,
             replacement_price_per_kwh=replacement_price_per_kwh,
             terminal_cost_to_go=terminal_cost_to_go,
-            min_export_price=max(
-                inp.export_min_price,
-                calculate_recommended_threshold(
-                    purchase_price=inp.battery_purchase_price,
-                    expected_cycles=inp.battery_expected_cycles,
-                    usable_capacity=usable_kwh,
-                    capacity_loss_pct=inp.battery_capacity_loss_pct,
-                ),
-            ),
+            min_export_price=inp.export_min_price,
             ev_configs=ev_configs,
             no_export=not inp.excess_export_enabled,
             main_fuse_amps=inp.main_fuse_amps,
@@ -271,7 +275,7 @@ def generate_candidates(
             ),
             max_grid_export_power_kw=inp.max_grid_export_power_kw,
             secondary_storage=inp.secondary_storage,
-            battery_export_min_price=inp.battery_export_min_price,
+            battery_export_min_price=effective_battery_export_floor,
             excess_export_discharge_buffer_pct=(inp.excess_export_discharge_buffer_pct),
             solver_time_limit_seconds=inp.milp_solver_timeout_seconds,
             attempt_diagnostics=milp_attempt,
@@ -279,21 +283,15 @@ def generate_candidates(
         log_planner(
             "debug",
             "[gen] MILP solve called  cycle_cost=%.6f  no_export=%s  "
-            "excess_export_enabled=%s  min_export_price=%.4f  "
-            "battery_export_min_price=%.4f  ev_configs=%d",
+            "excess_export_enabled=%s  site_export_min_price=%.4f  "
+            "battery_export_min_price=%.4f  depreciation_floor=%.4f  "
+            "ev_configs=%d",
             effective_cycle_cost,
             not inp.excess_export_enabled,
             inp.excess_export_enabled,
-            max(
-                inp.export_min_price,
-                calculate_recommended_threshold(
-                    purchase_price=inp.battery_purchase_price,
-                    expected_cycles=inp.battery_expected_cycles,
-                    usable_capacity=usable_kwh,
-                    capacity_loss_pct=inp.battery_capacity_loss_pct,
-                ),
-            ),
-            inp.battery_export_min_price,
+            inp.export_min_price,
+            effective_battery_export_floor,
+            depreciation_export_floor,
             len(ev_configs) if ev_configs else 0,
         )
         if milp_result is not None:

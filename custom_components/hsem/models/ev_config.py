@@ -74,3 +74,11 @@ class EVConfig:
     #: certain demand at this power level instead of using the probabilistic
     #: planned-load model.
     session_charge_kw: float | None = None
+    #: True when the charger is physically drawing power but smart planning is
+    #: unavailable or ineligible. The session window remains a fixed site load;
+    #: all other EV slots are zero and HSEM publishes no charger command.
+    fixed_session_only: bool = False
+    #: True when the live current-slot house projection excludes this session,
+    #: either because the sensor itself excludes EV load or because injection
+    #: removed the known session. Prevents treating it as already accounted.
+    current_session_removed_from_base: bool = False

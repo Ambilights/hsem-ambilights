@@ -20,12 +20,14 @@ consistent with the schedule that is actually commanded.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from custom_components.hsem.models.ev_config import EVConfig
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.planner.milp._write_results import (
     _redistribute_below_minimum_power,
+    _write_milp_results_to_slots,
 )
 from custom_components.hsem.planner.milp_optimizer import (
     is_scipy_available,
@@ -311,6 +313,210 @@ class TestThroughTheSolver:
                 f"slot {slot.start}: supply {supply:.3f} != demand {demand:.3f}"
             )
 
+    def test_phase_limited_fragments_are_dropped_not_concentrated(self) -> None:
+        """Minimum-power writeback may not escape the solved phase ceiling.
+
+        L1 has only 0.28 kWh of phase headroom in each one-hour slot. Because
+        charger topology is unknown, the raw model may place only 0.28 kWh per
+        slot: it assumes either slot could land entirely on L1. Both fragments
+        are below the charger's 1.38 kWh minimum, and combining them would
+        exceed L1. The executable writer must drop the solved fragments and
+        report them as unplaceable.
+        """
+        slots = _build_slots(
+            2,
+            start_hour=15,
+            import_price=0.20,
+            consumption_kwh=0.0,
+            interval_minutes=60,
+        )
+        ev = EVConfig(
+            enabled=True,
+            initial_soc_kwh=0.0,
+            target_kwh=1.68,
+            capacity_kwh=10.0,
+            max_charge_per_slot=3.6,
+            charger_efficiency=1.0,
+            charger_min_power_w=1380.0,
+            deadline_slot=1,
+        )
+
+        result = solve_milp(
+            slots,
+            _NOW,
+            current_kwh=0.0,
+            usable_kwh=10.0,
+            max_charge_per_slot=1.0,
+            max_discharge_per_slot=0.0,
+            charge_efficiency_pct=100.0,
+            discharge_efficiency_pct=100.0,
+            ev_configs=[ev],
+            main_fuse_amps=16.0,
+            main_fuse_phases=3,
+            phase_power_imbalance_w=(3400.0, -1700.0, -1700.0),
+            no_export=True,
+        )
+
+        assert result is not None
+        planned, diagnostics = result
+        assert diagnostics["max_phase_import_kwh"] == pytest.approx(3.68)
+        assert diagnostics["published_max_phase_import_kwh"] == pytest.approx(3.4)
+        assert diagnostics["phase_postwrite_max_violation_kwh"] == pytest.approx(0.0)
+        assert diagnostics["phase_postwrite_validation"]["valid"] is True
+        assert sum(slot.ev_total_planned_load_kwh for slot in planned) == pytest.approx(
+            0.0
+        )
+        assert diagnostics["ev"]["ev0"]["unplaceable_dc_kwh"] == pytest.approx(0.56)
+        assert diagnostics["ev"]["ev0"]["deadline_met"] is False
+
+    def test_postwrite_phase_gate_rejects_an_unexpected_flow_escape(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Final executable fields are independently checked after writing."""
+        from custom_components.hsem.planner.milp import _write_results
+
+        original_writer = _write_results._write_milp_results_to_slots
+
+        def unsafe_writer(*args: object, **kwargs: object) -> list[PlannedSlot]:
+            planned = original_writer(*args, **kwargs)  # type: ignore[arg-type]
+            planned[0].grid_import_kwh += 1.0
+            return planned
+
+        monkeypatch.setattr(
+            _write_results,
+            "_write_milp_results_to_slots",
+            unsafe_writer,
+        )
+        attempt: dict[str, object] = {}
+        result = solve_milp(
+            _build_slots(
+                1,
+                start_hour=15,
+                import_price=0.20,
+                consumption_kwh=0.0,
+                interval_minutes=60,
+            ),
+            _NOW,
+            current_kwh=0.0,
+            usable_kwh=10.0,
+            max_charge_per_slot=1.0,
+            max_discharge_per_slot=0.0,
+            charge_efficiency_pct=100.0,
+            discharge_efficiency_pct=100.0,
+            main_fuse_amps=16.0,
+            main_fuse_phases=3,
+            phase_power_imbalance_w=(3400.0, -1700.0, -1700.0),
+            no_export=True,
+            attempt_diagnostics=attempt,
+        )
+
+        assert result is None
+        assert attempt["fallback_reason"] == "phase_postwrite_invariant_failed"
+        validation = attempt["phase_postwrite_validation"]
+        assert isinstance(validation, dict)
+        assert validation["valid"] is False
+        assert validation["max_violation_kwh"] == pytest.approx(0.053333, abs=1e-6)
+
+    def test_partial_current_slot_uses_unknown_phase_instantaneous_power(self) -> None:
+        """A 15-minute EV command is safe for an unknown single-phase charger.
+
+        L1 already carries 100 W of imbalance, leaving 3580 W of phase
+        headroom. The current slot has only 15 minutes left, but the phase row
+        must still cap the whole charger at 3580 W rather than average its
+        remaining-slot energy over the full hour or assume a balanced charger.
+        """
+        partial_now = _NOW.replace(minute=45)
+        ev = EVConfig(
+            enabled=True,
+            initial_soc_kwh=0.0,
+            target_kwh=2.75,
+            capacity_kwh=10.0,
+            max_charge_per_slot=11.0,
+            charger_efficiency=1.0,
+            charger_min_power_w=0.0,
+            deadline_slot=0,
+        )
+
+        result = solve_milp(
+            _build_slots(
+                1,
+                start_hour=14,
+                import_price=0.20,
+                consumption_kwh=0.0,
+                interval_minutes=60,
+            ),
+            partial_now,
+            current_kwh=0.0,
+            usable_kwh=10.0,
+            max_charge_per_slot=1.0,
+            max_discharge_per_slot=0.0,
+            charge_efficiency_pct=100.0,
+            discharge_efficiency_pct=100.0,
+            ev_configs=[ev],
+            main_fuse_amps=16.0,
+            main_fuse_phases=3,
+            phase_power_imbalance_w=(100.0, -50.0, -50.0),
+            no_export=True,
+        )
+
+        assert result is not None
+        planned, diagnostics = result
+        current = planned[0]
+        assert current.ev_charger_calculated_power == pytest.approx(3580.0)
+        assert current.ev_total_planned_load_kwh == pytest.approx(0.895)
+        assert diagnostics["max_phase_import_kwh"] == pytest.approx(3.68)
+        assert diagnostics["published_max_phase_import_kwh"] == pytest.approx(3.68)
+        assert diagnostics["phase_postwrite_validation"]["valid"] is True
+
+    def test_future_slot_treats_unknown_ev_as_single_phase(self) -> None:
+        """A scheduled EV receives only the tightest per-phase headroom.
+
+        There is no configured charger topology, so an 11 kW request cannot
+        borrow three times L1's 3580 W headroom merely because the site has a
+        three-phase fuse.
+        """
+        ev = EVConfig(
+            enabled=True,
+            initial_soc_kwh=0.0,
+            target_kwh=11.0,
+            capacity_kwh=20.0,
+            max_charge_per_slot=11.0,
+            charger_efficiency=1.0,
+            charger_min_power_w=0.0,
+            deadline_slot=0,
+        )
+
+        result = solve_milp(
+            _build_slots(
+                1,
+                start_hour=15,
+                import_price=0.20,
+                consumption_kwh=0.0,
+                interval_minutes=60,
+            ),
+            _NOW,
+            current_kwh=0.0,
+            usable_kwh=10.0,
+            max_charge_per_slot=1.0,
+            max_discharge_per_slot=0.0,
+            charge_efficiency_pct=100.0,
+            discharge_efficiency_pct=100.0,
+            ev_configs=[ev],
+            main_fuse_amps=16.0,
+            main_fuse_phases=3,
+            phase_power_imbalance_w=(100.0, -50.0, -50.0),
+            no_export=True,
+        )
+
+        assert result is not None
+        planned, diagnostics = result
+        assert planned[0].ev_charger_calculated_power == pytest.approx(3580.0)
+        assert planned[0].ev_total_planned_load_kwh == pytest.approx(3.58)
+        assert diagnostics["max_phase_import_kwh"] == pytest.approx(3.68)
+        assert diagnostics["published_max_phase_import_kwh"] == pytest.approx(3.68)
+        assert diagnostics["phase_postwrite_validation"]["valid"] is True
+
 
 class TestSurplusOnlyHeadroom:
     """Surplus-only EVs may use unused PV, never grid import."""
@@ -340,3 +546,125 @@ class TestSurplusOnlyHeadroom:
         )
 
         assert placed[0] == pytest.approx(0.90)
+
+
+class TestSourceSafeHeadroom:
+    """Redistribution must not turn battery export into EV supply."""
+
+    def test_battery_export_is_not_grid_headroom_for_concentration(self) -> None:
+        """Only the solved PV-fed EV fragment may precede battery export.
+
+        Slot 0 has 0.8 kWh PV serving its solved 0.8 kWh EV fragment while a
+        separate 1.0 kWh battery discharge is exported.  Moving slot 1's 0.8
+        kWh fragment into slot 0 would make the commandable 1.6 kWh allocation
+        by consuming 0.8 kWh of battery export, not by importing from grid.
+        """
+        slots = _build_slots(
+            2,
+            start_hour=15,
+            import_price=0.20,
+            consumption_kwh=0.0,
+            interval_minutes=60,
+        )
+        slots[0].solcast_pv_estimate_kwh = 0.8
+        ev = EVConfig(
+            enabled=True,
+            initial_soc_kwh=0.0,
+            target_kwh=1.6,
+            capacity_kwh=10.0,
+            max_charge_per_slot=2.0,
+            charger_efficiency=1.0,
+            charger_min_power_w=1380.0,
+            deadline_slot=1,
+        )
+        # [ge0, ge1, gi0, gi1, ev0, ev1]
+        result_x = np.array([1.0, 0.0, 0.0, 0.8, 0.8, 0.8])
+        ev_diagnostics: dict[str, dict[str, object]] = {}
+
+        out = _write_milp_results_to_slots(
+            slots=slots,
+            future_idx=[0, 1],
+            now=_NOW,
+            ec_sol=np.zeros(2),
+            ed_sol=np.array([1.0, 0.0]),
+            result_x=result_x,
+            m=2,
+            ge_off=0,
+            active_evs=[ev],
+            ev_var_offsets=[4],
+            pv_avail=np.array([0.8, 0.0]),
+            base_load=np.zeros(2),
+            charge_eff=1.0,
+            discharge_eff=1.0,
+            p_exp=np.array([0.16, 0.16]),
+            min_export_price=0.0,
+            _has_session_demand=False,
+            session_slots_set=set(),
+            current_kwh=5.0,
+            usable_kwh=10.0,
+            curt_sol_full=np.zeros(2),
+            gi_off=2,
+            grid_import_cap_per_slot_kwh=np.array([2.0, 0.8]),
+            ev_writeback_diagnostics=ev_diagnostics,
+        )
+
+        assert sum(slot.ev_total_planned_load_kwh for slot in out) == pytest.approx(0.0)
+        assert out[0].grid_export_kwh == pytest.approx(1.8)
+        assert ev_diagnostics["ev0"]["unplaceable_dc_kwh"] == pytest.approx(1.6)
+
+    def test_powmr_site_consumption_uses_shared_pv_headroom(self) -> None:
+        """EV concentration cannot claim PV serving PowMr charge or Utility load."""
+        slots = _build_slots(
+            2,
+            start_hour=15,
+            import_price=0.20,
+            consumption_kwh=0.0,
+            interval_minutes=60,
+        )
+        slots[0].solcast_pv_estimate_kwh = 2.0
+        ev = EVConfig(
+            enabled=True,
+            initial_soc_kwh=0.0,
+            target_kwh=1.6,
+            capacity_kwh=10.0,
+            max_charge_per_slot=2.0,
+            charger_efficiency=1.0,
+            charger_min_power_w=1380.0,
+            deadline_slot=1,
+        )
+        # [ge0, ge1, gi0, gi1, ev0, ev1]. PowMr already consumes 1.2
+        # kWh of slot-0 PV (charge or excluded dedicated Utility load),
+        # leaving exactly the solved 0.8 kWh EV fragment.
+        result_x = np.array([0.0, 0.0, 0.0, 0.8, 0.8, 0.8])
+        diagnostics: dict[str, dict[str, object]] = {}
+
+        out = _write_milp_results_to_slots(
+            slots=slots,
+            future_idx=[0, 1],
+            now=_NOW,
+            ec_sol=np.zeros(2),
+            ed_sol=np.zeros(2),
+            result_x=result_x,
+            m=2,
+            ge_off=0,
+            active_evs=[ev],
+            ev_var_offsets=[4],
+            pv_avail=np.array([2.0, 0.0]),
+            base_load=np.zeros(2),
+            charge_eff=1.0,
+            discharge_eff=1.0,
+            p_exp=np.array([0.16, 0.16]),
+            min_export_price=0.0,
+            _has_session_demand=False,
+            session_slots_set=set(),
+            current_kwh=5.0,
+            usable_kwh=10.0,
+            curt_sol_full=np.zeros(2),
+            gi_off=2,
+            grid_import_cap_per_slot_kwh=np.array([0.0, 0.8]),
+            secondary_site_consumption_ac_per_slot=np.array([1.2, 0.0]),
+            ev_writeback_diagnostics=diagnostics,
+        )
+
+        assert sum(slot.ev_total_planned_load_kwh for slot in out) == pytest.approx(0.0)
+        assert diagnostics["ev0"]["unplaceable_dc_kwh"] == pytest.approx(1.6)

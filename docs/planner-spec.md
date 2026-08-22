@@ -300,8 +300,10 @@ net_load_kwh = house_load_kwh + ev_planned_load_kwh - pv_kwh
 portion not already captured in `house_load_kwh`.  See the EV load semantics section
 for the three-field breakdown.
 
-When EV integration is disabled, `ev_planned_load_kwh` is `0.0` for every slot
-and the formula is identical to the non-EV case.
+When EV integration is disabled and no live charging session is observed,
+`ev_planned_load_kwh` is `0.0` for every slot and the formula is identical to
+the non-EV case. A measured live session remains an uncontrollable site load
+even while smart planning is disabled.
 
 Positive `net_load_kwh` means the house (plus any extra EV load) needs energy.
 
@@ -618,6 +620,9 @@ accept one minimum physical current step through the slot end. If another hard
 constraint still makes a locked mode infeasible, the MILP is rejected and the
 physically valid Utility fallback is used. Once a complete safety-driven Utility
 transition verifies, Utility becomes the mode held for the rest of that slot.
+An unavailable, unknown, malformed, NaN, or infinite SoC/load state event also
+revokes an in-flight Charge/SBU transition synchronously; it cannot be ignored
+until the later debounced snapshot.
 
 At or below minimum SoC, a stale SBU plan is forced to utility. At maximum SoC,
 a stale charge plan is forced to utility, stopping grid charging with
@@ -627,9 +632,12 @@ A failed or unverified preceding Huawei write blocks PowMr-enabling Charge and
 SBU transitions, but must not block the independent fail-closed utility plan:
 charger `Only Solar`, then output `Utility first`. The adapter revalidates
 that the restricted plan contains only those two safe select targets before
-writing. If the charger stop fails or cannot be verified, the output write is
-blocked rather than adding the dedicated load to L3 while charging may remain
-armed.
+writing. The two risk-reducing writes are attempted in that order and verified
+independently even if one cannot be read back; a failed charger stop therefore
+cannot suppress the attempt to stop SBU reserve drain, and a failed output
+write cannot suppress the attempt to disarm grid charging. A cancelled or
+superseded enabling worker completes this verified stop sequence under shielded
+cleanup authority before it exits.
 
 An already-active utility charge is disarmed with a verified `Only Solar`
 selection before a downward current change. If a current write in any charge
@@ -668,7 +676,6 @@ installation, which has no PowMr PV input, it stops PowMr charging completely.
 - global read-only and the feature control switch each independently block writes
 - failed or unverified Huawei writes continue to block PowMr Charge/SBU enables
   but cannot suppress the charger-first utility/`Only Solar` stop
-- an unconfirmed `Only Solar` stop blocks the subsequent utility-output write
 - a downward live PowMr current retarget verifies `Only Solar` before changing
   the current and never re-enables utility charging after an unconfirmed number
   write
@@ -891,6 +898,11 @@ sample; only a slot newly finalised from the current live process enters the
 prediction tracker. Its warm-up/deduplication identity is the unique UTC slot
 start, not the number of coordinator polls.
 
+The bounded prediction-record history is persisted atomically after every
+successful append, including once pruning keeps its length constant. A valid
+non-empty restore rebuilds metrics and avoids a second warm-up window; an empty
+or malformed restore follows the normal cold-start warm-up path.
+
 Restored legacy forecast records may deserialize, but records missing the
 raw/frozen schema are permanently ineligible for summary metrics and learning.
 Solar-corrector state is versioned: pre-v3 factors, history, and residuals
@@ -943,6 +955,12 @@ uncovered physical time.
 energy is never added repeatedly per coordinator poll. Automatic operation
 records the result as actual savings, other modes as missed savings, and the
 injected HA-local date anchors today/7-day/30-day rollups.
+
+The cumulative financial sensors persist their money totals, meter baselines,
+and per-meter UTC sample timestamps on every coordinator sample. Import and
+export continuity are evaluated independently: a missing channel is
+re-baselined on recovery instead of pricing its whole gap at the current rate,
+while the other channel may continue accumulating normally.
 
 ### Invariants for historical and accounting tests
 
@@ -1173,7 +1191,10 @@ Solver outcomes follow three explicit tiers:
    candidate.
 3. **Explicit passive fallback** — no incumbent exists, validation fails, or
    another solver failure prevents a safe MILP candidate.  The passive
-   candidate remains available and the failure reason is surfaced.
+   candidate remains available and the failure reason is surfaced. It clears
+   every flexible EV schedule. A measured live session modeled as fixed,
+   uncontrollable demand remains in site load, grid-flow, and cost accounting
+   for its two-hour certainty window, but emits no EV command.
 
 A time-limited incumbent must pass all of these checks against the final model:
 
@@ -1367,12 +1388,11 @@ bounds** on the discharge variable `ed[t]` (implemented as variable bounds in
    This is the per-slot, soft-switch companion to the global `no_export`
    cap: instead of blocking battery export everywhere, the floor blocks
    it only on slots whose raw export price is below the user's explicit
-   guard.  The mask is evaluated on the RAW `p_exp` (before the
-   `export_min_price` and export-≤-import clamps) so the user's explicit
-   price signal is honoured even when the recommended threshold or
-   inverter physical floor are lower.  Above the floor the optimiser is
-   free to decide whether exporting is worthwhile — reaching the
-   threshold does NOT auto-trigger export.  The guard applies only to
+   guard. The mask is evaluated on the raw `p_exp` before the site
+   `export_min_price` floor, so the battery-specific signal is honoured even
+   when the recommended depreciation threshold or inverter physical floor is
+   lower. Above the floor the optimiser is free to decide whether exporting is
+   worthwhile — reaching the threshold does NOT auto-trigger export. The guard applies only to
    intentional battery-to-grid export (`ForceBatteriesDischarge`); it
    does NOT restrict normal battery self-consumption, battery discharge
    for house load, direct PV export, or PV charging of the battery.  The
@@ -1875,6 +1895,24 @@ This assumes balanced load at 230 V phase-to-neutral per phase.
 - The solver only exceeds the fuse limit when physically unavoidable
   (e.g., house base load alone exceeds the fuse rating).
 
+The soft row has a hard no-worsening companion:
+
+```text
+gi[t] <= max(max_grid_import_per_slot_kwh, fixed_site_import[t])
+```
+
+`fixed_site_import` contains the no-action household demand plus any fixed
+live EV session and dedicated PowMr load not already present in house history,
+net of available PV. This keeps an unavoidable baseline overload feasible and
+visible through `gi_pen`, but prevents Huawei charging, flexible EV charging,
+or PowMr charging from paying the penalty to make that overload worse.
+
+MILP EV minimum-power concentration uses the same hard cap together with the
+finite physical import bound. It may absorb genuinely unused PV, but aggregate
+export is not treated as source headroom because it may be battery-origin.
+Fuse and EV diagnostics are recomputed from the executable, rounded writeback
+rather than the pre-concentration solver vector.
+
 **Diagnostics**:
 - `total_fuse_violation_kwh` in the returned diagnostics dict.
 - `has_violations` set to `True` when any fuse violation exists.
@@ -1896,17 +1934,22 @@ three hard rows per future slot.
 The latest meter snapshot is reduced to a zero-sum fixed-load imbalance after
 removing the currently observed PowMr site delta. The same imbalance is projected
 across the planning horizon. Let $G_t=gi_t-ge_t$ be total signed grid energy,
-$D_t$ the PowMr site delta, $p$ its configured phase, and $\Delta_{i,t}$ the
-fixed phase-imbalance energy. Planned phase flow is:
+$D_t$ the PowMr site delta, $p$ its configured phase, $E_t$ total planned EV AC
+energy, and $\Delta_{i,t}$ the fixed phase-imbalance energy. The conservative
+phase envelope is:
 
 $$
 F_{i,t}=\frac{G_t}{3}+\Delta_{i,t}
        +\left(\mathbf{1}_{i=p}-\frac{1}{3}\right)D_t
+       +\left(1-\frac{1}{3}\right)E_t
 $$
 
 This makes Huawei battery charge/discharge and Huawei PV balanced while placing
-all PowMr charge, utility bypass, and SBU load removal on one phase. Each phase
-has the hard target:
+all PowMr charge, utility bypass, and SBU load removal on one phase. Charger
+phase topology is not configured, so every phase is independently checked as if
+it carries the whole EV command. The three $F_{i,t}$ values therefore form a
+worst-case safety envelope rather than a physical phase-flow sum. Each phase has
+the hard target:
 
 $$
 F_{i,t}\leq\max\left(
@@ -1946,13 +1989,20 @@ sustained overload.
   slots.
 - When house load alone exceeds the fuse limit, `gi_pen[t] > 0` absorbs
   the excess — the MILP never becomes infeasible due to fuse constraints.
+- Controllable battery, flexible EV, and secondary charging never increase an
+  already-unavoidable aggregate overload.
 - When battery + EV + house load would exceed the fuse, the MILP
   throttles charging to stay within the limit.
+- EV minimum-power concentration never exceeds unused source energy, the
+  finite grid-import bound, or the aggregate hard fuse cap.
 - With phase-aware charging disabled, results remain identical to the aggregate
   fuse model.
 - With phase-aware charging enabled, planned controllable charging never raises
   any phase above the configured target (or above an already-unavoidable
   baseline overload).
+- With phase-aware charging enabled and EV phase topology unknown, the entire
+  EV command is limited by the least-free phase; no three-phase multiplier is
+  applied to EV headroom.
 - Huawei is allocated live charge headroom before PowMr; PowMr is constrained to
   its configured single phase.
 
@@ -2067,6 +2117,11 @@ grid_import_for_battery_kwh = x / e
 
 Do not price stored energy as if it was grid energy.
 
+A finite negative import price is authoritative: ``import_cost`` becomes
+negative when the site is paid to consume. The MILP and scorer use the same
+signed rate; neither may clamp it to zero. Non-finite or non-actionable prices
+remain neutral rather than becoming economic signals.
+
 ### Export revenue
 
 Export revenue is:
@@ -2129,6 +2184,14 @@ revenue as 0 in both optimisation and scoring.
 #752):** When ``battery_export_min_price > 0`` and a slot's raw
 ``export_price`` is strictly below this floor, the MILP forbids
 intentional battery-to-grid discharge in that slot by fixing ``bx[t] = 0``.
+The production battery-origin floor is:
+
+```text
+effective_battery_export_floor = max(
+    configured_battery_export_min_price,
+    recommended_battery_depreciation_threshold,
+)
+```
 Normal discharge into eligible local load remains available through
 ``ed[t] - bx[t]``. To keep cost-function scores consistent with the
 optimisation assumptions:
@@ -2148,29 +2211,22 @@ Invariant: ``battery_export_min_price > 0`` AND ``export_price <
 battery_export_min_price`` → ``primary_battery_export_kwh == 0`` while
 ``pv_export_kwh`` remains eligible for normal export revenue.
 
-**Export-≤-import clamp (MILP unbounded-LP fix, issue #635):**
-Before solving, the MILP also clamps ``export_price[t]`` to never
-exceed ``import_price[t]`` for the same slot:
+**Signed-price boundedness:** Every finite actionable import and export rate is
+preserved in the objective. In particular, negative import prices retain their
+consumption credit and an export price above import is not reduced.
 
-```text
-export_price[t] = min(export_price[t], import_price[t])
-```
+The model remains finite without distorting either rate:
 
-Without this, slots where ``export_price > import_price`` create an
-**unbounded LP** (HiGHS status=3).  ``gi[t]`` and ``ge[t]`` are both
-``[0, ∞)`` and linked only through the energy-balance equality, so the
-LP can drive both to infinity (import cheap, export expensive) while
-the terms cancel.  A single such slot in the horizon causes
-``solve_milp()`` to return ``None`` for the entire cycle.
+- ``gi[t]`` is bounded by physically reachable site load and charging sinks;
+- ``ge[t]`` is bounded by forecast PV/non-battery export plus battery delivery;
+- ``grid_flow_mode[t]`` makes import and export mutually exclusive;
+- ``curt[t]`` is bounded by available PV, so grid energy cannot be invented as
+  curtailment.
 
-This condition occurs whenever negative import spot prices coincide
-with positive export tariffs (DK/DE/NL markets), or when asymmetric
-import/export grid fees create an apparent price spread.  The clamp is
-economically correct — no rational agent imports and exports
-simultaneously for profit — and removes the unbounded direction
-without changing any other optimisation behaviour.
-
-This clamp is applied **after** the ``min_export_price`` clamp.
+These constraints remove both former unbounded directions and prohibit a
+same-slot import/export wash flow. The solver may therefore capture the real
+benefit of bounded consumption at a negative price and the real value of
+export at a higher rate.
 
 ### Battery cycle cost
 
@@ -2274,12 +2330,11 @@ Production plans must use explicit `primary_battery_export_kwh`. Only the
 bounded aggregate-only compatibility path described above may reconstruct a
 source share, and it never consults recommendation labels or PV forecast.
 
-Import prices are sanitised the same way as the MILP's own objective
-(`imp_price_obj = max(imp_price, 0.0)`) before being used anywhere in
-`score_plan`, including the import-cost term itself. Primary conversion
-efficiency changes the physical `grid_import_kwh`/`grid_export_kwh` fields and
-is therefore already reflected in import cost and export revenue. The LP and
-scorer add no separate primary loss-price term.
+Finite actionable import/export rates retain their sign in ``score_plan`` and
+the MILP objective. Primary conversion efficiency changes the physical
+`grid_import_kwh`/`grid_export_kwh` fields and is therefore already reflected
+in import cost and export revenue. The LP and scorer add no separate primary
+loss-price term.
 
 Production primary terminal accounting is active when
 `initial_battery_kwh` and `terminal_cost_to_go` are supplied to
@@ -2298,6 +2353,13 @@ independently defined.
   exactly.  No synthetic penalty may enter `total_cost`.
 - Primary `conversion_loss_cost` is a compatibility field and must remain
   exactly zero because physical losses are already present in grid flows.
+- A finite negative import price produces negative ``import_cost`` for actual
+  ``grid_import_kwh`` in both MILP optimisation and auditable scoring.
+- An export price above import remains unchanged; finite direction bounds and
+  ``grid_flow_mode`` prevent simultaneous import/export instead of a price
+  clamp.
+- A depreciation-derived battery export floor never suppresses direct PV
+  export or its revenue.
 - `score` must equal
   `total_cost + soc_penalty + grid_limit_penalty + terminal_soc_value + primary_action_tiebreak`
   exactly.
@@ -2484,12 +2546,22 @@ actionable window, the rejected `do_nothing` reason may report the measured
 charging overhead or retained post-boundary inventory, but must not promise
 that discharge savings occur inside a window containing no discharge.
 
-`estimated_total_cost` and the idle comparator use only actionable slot money.
-The explanation's legacy `score` is their signed difference (positive means
-the selected plan is cheaper), not the candidate selector's lower-is-better
-`PlanCostBreakdown.score`. Terminal cost-to-go may explain why retaining energy
-changes selection, but forecast value must never be presented as realised
-within-window revenue or savings.
+Each slot's `estimated_cost_currency` and the explanation's
+`estimated_total_cost` are the auditable meter cash flow computed from the
+final published fields:
+
+```text
+grid_import_kwh * import_price - grid_export_kwh * export_price
+```
+
+They equal `PlanCost.import_cost - PlanCost.export_revenue`; battery cycle wear
+is itemised separately in `PlanCost.total_cost`, while terminal value, guard
+penalties, and the structural tiebreak exist only in `PlanCost.score`. The idle
+comparator uses the same actionable signed prices and includes direct-PV export
+revenue. The explanation's legacy `score` is the idle cash flow minus selected
+cash flow (positive means selected is cheaper), not the candidate selector's
+lower-is-better score. Terminal cost-to-go may explain selection but is never
+presented as realised within-window revenue or savings.
 
 ### Plan-level hysteresis (anti-flapping, issue #372)
 
@@ -2578,7 +2650,8 @@ failed expiry cycle leaves the forced-replan request pending until recovery.
 - First run (no previous state) always accepts the new recommendation.
 - Only command-equivalent ``batteries_charge_solar`` ↔ unrestricted
   ``batteries_discharge_mode`` changes may keep the previous label.
-- Every hardware-semantic transition and partial BDM allocation is immediate.
+- Every command-changing transition, including wait/discharge, forced actions,
+  price-authority changes, and partial BDM allocations, is immediate.
 - Changes after the hold time expires switch to the new recommendation.
 - Neutral recommendations never trigger hold behaviour.
 - Feature disabled (hold minutes = 0) always allows the switch.
@@ -2696,10 +2769,10 @@ Add tests for these invariants:
 
 ## Multi-day planning horizon
 
-The planner supports configurable planning horizons: 24, 48, and 72 hours.
+The planner supports configurable planning horizons: 12, 24, 36, 48, and 72 hours.
 
 The horizon is controlled by `interval_length_hours` in `PlannerInput` (and
-`recommendation_interval_length` in `SensorConfig`).  All three values are
+`recommendation_interval_length` in `SensorConfig`). All five values are
 accepted without special-casing in the engine.
 
 ### Slot count
@@ -2710,7 +2783,9 @@ total_slots = (interval_length_hours * 60) // interval_minutes
 
 | Horizon | 15-min slots | 60-min slots |
 |---|---|---|
+| 12 h | 48 | 12 |
 | 24 h | 96 | 24 |
+| 36 h | 144 | 36 |
 | 48 h | 192 | 48 |
 | 72 h | 288 | 72 |
 
@@ -2932,8 +3007,8 @@ terminal tiers, or terminal cost-to-go economics.
 ### DataQuality fields
 
 `DataQuality.horizon_days` counts the distinct local calendar dates touched by
-the physical-time horizon. Ordinary midnight-anchored 24/48/72-hour horizons
-cover 1/2/3 dates; across a spring-forward transition the same duration can
+the physical-time horizon. Ordinary midnight-anchored 12/24/36/48/72-hour horizons
+cover 1/1/2/2/3 dates; across a spring-forward transition the same duration can
 touch one extra local date.
 `DataQuality.day2_price_missing_hours` and `DataQuality.day2_pv_missing_hours`
 carry the day+2 gap lists for 72-hour horizon runs.
@@ -2964,16 +3039,18 @@ discharge slots on the same day.
 
 ### Invariants for multi-day horizon tests
 
+- A 12-hour horizon produces exactly `(12 * 60) // interval_minutes` slots.
 - A 24-hour horizon produces exactly `(24 * 60) // interval_minutes` slots.
+- A 36-hour horizon produces exactly `(36 * 60) // interval_minutes` slots.
 - A 48-hour horizon produces exactly `(48 * 60) // interval_minutes` slots.
 - A 72-hour horizon produces exactly `(72 * 60) // interval_minutes` slots.
 - All slots have a non-``None`` recommendation regardless of horizon.
 - Day+1 PV estimates are ≤ day+0 estimates for the same hour when both have
   the same raw input (confidence decay applied).
 - Day+2 PV estimates are ≤ day+1 estimates for the same raw input.
-- On ordinary dates, `DataQuality.horizon_days` equals 1 / 2 / 3 for 24 h /
-  48 h / 72 h. A spring-forward physical horizon can touch one extra local
-  date and therefore report 2 / 3 / 4 instead.
+- On ordinary dates, `DataQuality.horizon_days` equals 1 / 1 / 2 / 2 / 3
+  for 12 h / 24 h / 36 h / 48 h / 72 h. A spring-forward physical horizon can
+  touch one extra local date.
 - Missing day+2 price data surfaces in `day2_price_missing_hours`.
 - Missing day+2 PV data surfaces in `day2_pv_missing_hours`.
 - `DataQuality.is_complete` is ``False`` when future-day data is missing or
@@ -3007,21 +3084,24 @@ effective_floor_pct ≤ 1.50 × bridge_reserve_raw  (after learning period)
 ### Session EV invariant
 
 When an active charging session is detected (`session_charge_kw > 0`), the
-MILP treats the next 2 hours as **fixed EV demand** with enforced lower
-bounds.  The number of slots covered is derived from the configured slot
-interval: `round(2 / slot_hours)`, which yields 8 slots at 15-minute
-resolution, 4 slots at 30-minute resolution, and 2 slots at 60-minute
-resolution.
+MILP treats at least the next 2 executable hours as **fixed EV demand**. It
+accumulates actual available duration, so a partially elapsed current slot uses
+only its remaining minutes and whole subsequent command slots are included until
+the two-hour certainty boundary is crossed.
 
 ```text
-For t = 1 … SESSION_SLOTS (first 2 hours of future slots):
-    ev_c[t] ≥ min(session_charge_kw × slot_duration_hours, ev_max_charge_per_slot)
+For every fixed session slot t:
+    ev_c[t] = session_charge_kw × executable_slot_hours[t] × charger_efficiency
 ```
 
-These bound constraints prevent the MILP from re-allocating demand away from
-a live charging session.  Slots beyond the 2-hour window are unconstrained
-and optimised freely.  When `session_charge_kw == 0` (no active session),
-no bounds are applied and the entire EV demand is MILP-determined.
+The fixed load is admitted even when smart planning is disabled, the connection
+flag is stale, the EV is already at target, or configured EV capacity/nameplate
+power is zero. In the zero-config case a non-flexible physical envelope is
+derived from observed session power. Its energy and grid flow remain visible,
+but HSEM emits no charger command. All slots outside the session window are
+fixed to zero for this `fixed_session_only` case. An otherwise eligible smart EV
+with target shortfall may still be optimised flexibly after the fixed window.
+When `session_charge_kw == 0`, no fixed-session bounds are applied.
 
 ## EV planned load integration
 
@@ -3121,8 +3201,8 @@ The EV planner (`planner/ev_planner.py`) MUST satisfy these invariants:
 
 8. **One-midnight-crossing horizon cap** (issue #413): The EV charging
    window may extend into tomorrow but must NEVER reach into the day after
-   tomorrow, regardless of the planner's overall slot horizon (which may be
-   48 h or 72 h).
+   tomorrow, regardless of the configured overall slot horizon
+   (12 h, 24 h, 36 h, 48 h, or 72 h).
 
    Define:
 
@@ -3149,9 +3229,12 @@ The EV planner (`planner/ev_planner.py`) MUST satisfy these invariants:
    an appropriate `state` string in all edge cases (disabled, not connected,
    smart charging off, fully charged, no slots before deadline, invalid config).
 
-10. **Disabled EV is zero-cost**: When `ev_planned_load_enabled = False`, all
+10. **Disabled EV without a live session is zero-cost**: When
+    `ev_planned_load_enabled = False` and no charging session is measured, all
     three EV load fields must be `0.0` and the home battery planner output
-    must be identical to the non-EV case.
+    must be identical to the non-EV case. A measured session is the sole
+    exception: it is fixed uncontrollable demand for energy and fuse safety,
+    never a flexible smart-charging allocation.
 
 11. **Charge past target SoC (MILP only)**: When `allow_charge_past_target_soc`
     is enabled and the EV has reached its target SoC but is below 100 %, the
@@ -3184,15 +3267,14 @@ The EV planner (`planner/ev_planner.py`) MUST satisfy these invariants:
     by `_compute_ev_charger_power()` (for non-MILP candidates) or directly by
     the MILP's EV power computation (for MILP candidates).
 
-    The per-EV power fields are set **before** candidate selection and
-    correctly adjusted by the main-fuse throttling block (per-field loop).
-
-    After candidate selection, a per-EV minimum-power floor check runs:
-    each EV's power field is compared against **its own**
-    `charger_min_power_w`.  If the power fell below that EV's own minimum
-    (due to fuse throttling), only that EV's power field is zeroed, and
-    its energy contribution is reverse-engineered from the power value and
-    subtracted from the combined slot energy totals.
+    The per-EV power fields are finalised **before** candidate selection. For
+    MILP candidates, continuous allocations below the charger's minimum are
+    concentrated into commandable slots by the result writer. Added energy is
+    bounded by unused PV plus the slot's remaining physical and aggregate-fuse
+    import headroom; charge-past-target energy may use unused PV only. Any
+    energy that cannot be placed safely is removed from the executable plan
+    and reported as unmet in the EV diagnostics. No post-selection fuse or
+    minimum-power pass may mutate the winner.
 
     **Important**: per-EV power fields MUST NOT be recomputed from the
     combined `ev_planned_load_kwh + ev_accounted_load_kwh` totals, because
@@ -3203,18 +3285,16 @@ The EV planner (`planner/ev_planner.py`) MUST satisfy these invariants:
     The fields are purely planner outputs — the applier must read them to
     throttle the go-e charger; the planner does not control hardware directly.
 
-13. **Slot-stable EV charger power (issue #738)**: Once the current slot has
-    started, its per-EV `ev_charger_calculated_power` values must remain
-    constant for the remainder of the slot. Replanning inside the same slot
-    (triggered, for example, by the EV charging state toggling) must not
-    recompute the current slot's charger power from freshly injected live
-    PV/consumption data, because that makes the charger command oscillate.
+13. **Executable EV command coherence**: The EV charger power command must
+    remain part of the same accepted plan as its EV energy, grid-flow, SoC,
+    and cost fields. The coordinator must not freeze or rewrite charger watts
+    after solving, because doing so can apply a command whose energy was never
+    reserved by the optimizer and can bypass aggregate-fuse accounting.
 
-    The coordinator freezes the values computed at slot start and restores
-    them to the current slot on every subsequent replan. Explicit runtime
-    overrides — force-charge-now and auto-full-EV on negative price — are
-    still allowed to replace the frozen value for as long as they are active;
-    when the override ends, the frozen slot-start value is restored.
+    Replans may change the current-slot command when live conditions change,
+    but each published command must come from the newly validated plan as a
+    coherent whole. Runtime overrides must update the corresponding executable
+    slot accounting rather than restoring an older command in isolation.
 
 ### Invariants for tests
 
@@ -3240,7 +3320,7 @@ The EV planner (`planner/ev_planner.py`) MUST satisfy these invariants:
 - Partial slot: current slot load ≤ `charger_power_kw × remaining_minutes / 60`.
 - When EV consumes all net surplus, home battery `batteries_charged == 0.0` in that slot.
 - `winner.cost == final_output.cost` still holds when EV load is active (no post-selection mutation).
-- Both `ev_charging_plan` and `ev_second_charging_plan` on `PlannerOutput` are `None` when disabled.
+- Both EV plan sensors are `None` when disabled; a measured disabled-session load may still be present in slots for physical accounting.
 - Enabling only the second EV does not affect primary EV fields and vice versa.
 - Two EVs charging in the same slot: `ev_total_planned_load_kwh == primary_ac + second_ac`.
 - One EV with zero load does not clear the other EV's load.

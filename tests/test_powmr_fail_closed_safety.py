@@ -267,6 +267,8 @@ async def test_failed_current_down_throttle_disables_powmr_grid_charge(
         _CHARGER_ENTITY,
         _OUTPUT_ENTITY,
         _CURRENT_ENTITY,
+        _CHARGER_ENTITY,
+        _OUTPUT_ENTITY,
     ]
     assert calls[0][1] == POWMR_CHARGER_SOLAR_ONLY
     assert calls[1][1] == POWMR_OUTPUT_UTILITY
@@ -276,6 +278,8 @@ async def test_failed_current_down_throttle_disables_powmr_grid_charge(
         ApplyStatus.OK,
         ApplyStatus.SKIPPED,
         status,
+        ApplyStatus.OK,
+        ApplyStatus.SKIPPED,
     ]
     assert summary.overall_status == status
 
@@ -325,15 +329,10 @@ async def test_utility_stop_is_charger_first_and_fail_closed(
             _recommendation(SECONDARY_MODE_UTILITY),
         )
 
-    expected_calls = (
-        [(_CHARGER_ENTITY, POWMR_CHARGER_SOLAR_ONLY)]
-        if failed_entity == _CHARGER_ENTITY
-        else [
-            (_CHARGER_ENTITY, POWMR_CHARGER_SOLAR_ONLY),
-            (_OUTPUT_ENTITY, POWMR_OUTPUT_UTILITY),
-        ]
-    )
-    assert calls == expected_calls
+    assert calls == [
+        (_CHARGER_ENTITY, POWMR_CHARGER_SOLAR_ONLY),
+        (_OUTPUT_ENTITY, POWMR_OUTPUT_UTILITY),
+    ]
     assert summary.overall_status == status
 
 
@@ -395,5 +394,70 @@ async def test_other_failed_current_write_attempts_only_solar_fallback(
         (_OUTPUT_ENTITY, POWMR_OUTPUT_UTILITY),
         (_CURRENT_ENTITY, 20.0),
         (_CHARGER_ENTITY, POWMR_CHARGER_SOLAR_ONLY),
+        (_OUTPUT_ENTITY, POWMR_OUTPUT_UTILITY),
     ]
     assert summary.overall_status == status
+
+
+@pytest.mark.asyncio
+async def test_stale_charge_lease_never_reenables_utility_charging() -> None:
+    """A mismatch during current verification aborts the final enabling write."""
+    cfg = _config()
+    live = _live()
+    calls: list[tuple[str, str | float]] = []
+    observer = MagicMock()
+    observer.secondary_control_mode_started.side_effect = [100, 200]
+    observer.secondary_control_mode_is_valid.side_effect = [
+        True,
+        True,
+        True,
+        True,
+        True,
+        False,
+    ]
+    observer.secondary_control_write_started.side_effect = [1, 2, 3, 4, 5]
+
+    async def _verify(**kwargs: object) -> ApplyResult:
+        entity_id = str(kwargs["entity_id"])
+        desired = kwargs["desired"]
+        assert isinstance(desired, (str, float))
+        calls.append((entity_id, desired))
+        return ApplyResult(
+            entity_id=entity_id,
+            desired=desired,
+            actual=desired,
+            status=ApplyStatus.OK,
+            attempts=1,
+        )
+
+    with patch(
+        "custom_components.hsem.custom_sensors.secondary_storage_applier.async_write_and_verify",
+        new_callable=AsyncMock,
+        side_effect=_verify,
+    ):
+        summary = await async_apply_secondary_storage(
+            MagicMock(),
+            cfg,
+            live,
+            _recommendation(SECONDARY_MODE_CHARGE, 20.0),
+            control_write_observer=observer,
+        )
+
+    assert calls == [
+        (_CHARGER_ENTITY, POWMR_CHARGER_SOLAR_ONLY),
+        (_OUTPUT_ENTITY, POWMR_OUTPUT_UTILITY),
+        (_CURRENT_ENTITY, 20.0),
+        (_CHARGER_ENTITY, POWMR_CHARGER_SOLAR_ONLY),
+        (_OUTPUT_ENTITY, POWMR_OUTPUT_UTILITY),
+    ]
+    assert all(desired != POWMR_CHARGER_UTILITY for _entity, desired in calls)
+    assert summary.overall_status == ApplyStatus.UNVERIFIED
+    revoked = [
+        result
+        for result in summary.results
+        if result.error_message == "PowMr mode transition lease was superseded"
+    ]
+    assert len(revoked) == 1
+    assert observer.secondary_control_mode_finished.call_args_list[-1].kwargs == {
+        "verified": False
+    }

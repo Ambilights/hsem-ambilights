@@ -295,6 +295,7 @@ def select_best_candidate(  # NOSONAR
             milp_prepopulated=(candidate.name == CANDIDATE_MILP),
             wait_mode_behavior=wait_mode_behavior,
             required_capacity_kwh=required_capacity,
+            export_min_price=export_min_price,
         )
         if (
             secondary_storage is not None
@@ -305,6 +306,7 @@ def select_best_candidate(  # NOSONAR
                 candidate.slots,
                 secondary_storage,
                 now,
+                export_min_price=export_min_price,
             )
         candidate.is_valid, candidate.rejection_reason = _validate_candidate(
             candidate,
@@ -329,9 +331,22 @@ def select_best_candidate(  # NOSONAR
     )
 
     # --- Step 4: pick winner (lowest cost) among eligible candidates ------
-    # Exclude no_action from winner selection — it is a diagnostic floor
-    # only and must never win.
-    eligible = [c for c in valid if c.name != CANDIDATE_NO_ACTION]
+    # A successful validated solve is the sole executable authority. Passive
+    # remains scored for diagnostics but is eligible only when MILP is absent
+    # or invalid; otherwise it could bypass hard fuse/source constraints.
+    valid_milp = [c for c in valid if c.name == CANDIDATE_MILP]
+    production_fallback_set = bool(
+        _find_by_name(candidates, CANDIDATE_NO_ACTION)
+        and _find_by_name(candidates, CANDIDATE_PASSIVE)
+    )
+    if valid_milp:
+        eligible = valid_milp
+    elif production_fallback_set:
+        eligible = [c for c in valid if c.name == CANDIDATE_PASSIVE]
+    else:
+        # Keep the selector reusable for focused custom candidate sets. The
+        # generator contract above is what identifies production fallback.
+        eligible = valid
 
     if not eligible:
         # Passive is always generated and is the only fail-closed executable
@@ -443,7 +458,11 @@ def select_best_candidate(  # NOSONAR
     ):
         # Find the previous winner's candidate in the current candidate list
         prev_candidate = _find_by_name(candidates, previous_winner_name)
-        if prev_candidate is not None and prev_candidate is not winner:
+        if (
+            prev_candidate is not None
+            and prev_candidate is not winner
+            and prev_candidate in eligible
+        ):
             prev_score = getattr(getattr(prev_candidate, "_cost", None), "score", None)
             new_score = winner_cost.score
             if prev_score is not None:

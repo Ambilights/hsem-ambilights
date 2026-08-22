@@ -38,7 +38,7 @@ The HSEM planner is a forward-looking, cost-minimising battery scheduler.
 Every time the coordinator runs (typically every minute) the planner:
 
 1. Reads the current battery state, electricity prices, and PV forecast.
-2. Generates a time grid of **slots** covering the planning horizon (24, 48, or 72 hours).
+2. Generates a time grid of **slots** covering the planning horizon (12, 24, 36, 48, or 72 hours).
 3. Populates each slot with expected house load, PV production, and prices.
 4. Evaluates several candidate strategies (charge from grid, discharge only, solar only, etc.).
 5. Scores every candidate with the cost function.
@@ -60,13 +60,15 @@ All inputs are collected in the `PlannerInput` dataclass
 |---|---|---|
 | `now_iso` | `str` | ISO-8601 timezone-aware timestamp of the planning moment (e.g. `"2024-06-15T14:00:00+02:00"`) |
 | `interval_minutes` | `int` | Slot width in minutes — `15` or `60` |
-| `interval_length_hours` | `int` | Planning horizon length — `24`, `48`, or `72` hours |
+| `interval_length_hours` | `int` | Planning horizon length — `12`, `24`, `36`, `48`, or `72` hours |
 
 The total number of slots generated is `(interval_length_hours * 60) // interval_minutes`.
 
 | Horizon | 15-min slots | 60-min slots |
 |---|---|---|
+| 12 h | 48 | 12 |
 | 24 h | 96 | 24 |
+| 36 h | 144 | 36 |
 | 48 h | 192 | 48 |
 | 72 h | 288 | 72 |
 
@@ -288,17 +290,20 @@ unversioned learned factors and residuals; the confidence value is retained.
 |---|---|---|
 | `main_fuse_amps` | `0` (disabled) | Main fuse/breaker rating in amps (e.g., 25, 35). When set, the MILP optimizer respects this limit as a soft constraint on total grid import power per slot. Set to 0 to disable. |
 
-The MILP uses a **soft** (penalty-based) constraint so the solver never becomes
-infeasible — if house base load alone exceeds the fuse rating, the plan is still
-returned with the violation flagged.  The formula for converting amps to kWh/slot is:
+The MILP retains a **soft** violation variable for observability and adds a hard
+companion cap that controllable battery, EV, and PowMr charging cannot worsen.
+If unavoidable house or live-session load alone exceeds the fuse rating, the
+plan remains feasible and the excess is flagged. The formula for converting
+amps to kWh/slot is:
 
 ```text
 max_grid_import_per_slot_kwh = main_fuse_amps × 230 V × 3 phases / 1000 × (interval_minutes / 60)
 ```
 
-This assumes balanced three-phase load at 230 V phase-to-neutral.  When the
-constraint is active, the MILP will throttle battery and EV charging to stay
-within the fuse limit whenever possible.
+This aggregate formula assumes balanced three-phase load at 230 V
+phase-to-neutral. When optional per-phase protection is enabled, Huawei remains
+balanced, PowMr is assigned to its configured phase, and EV commands use the
+least-free phase's headroom because charger phase topology is not configured.
 
 ### Grid export power cap (issue #726)
 
@@ -1156,7 +1161,7 @@ The `DataQuality` object on `PlannerOutput` reports completeness of the planning
 | `day2_price_missing_hours` | `list[int]` | Hours with no price data for day +2 (72-h horizon only) |
 | `day2_pv_missing_hours` | `list[int]` | Hours with no PV forecast for day +2 |
 | `horizon_has_tomorrow` | `bool` | `True` when horizon extends beyond 24 h |
-| `horizon_days` | `int` | Distinct local calendar dates covered; normally 1/2/3 for 24/48/72 h, or one extra across spring-forward |
+| `horizon_days` | `int` | Distinct local calendar dates covered; normally 1/1/2/2/3 for 12/24/36/48/72 h, or one extra across spring-forward |
 | `load_forecast_ready` | `bool` | `True` when consumption provenance and every populated future load slot are safe to optimize |
 | `load_forecast_reason` | `str/None` | Machine-readable rejection reason, or `None` when ready |
 | `is_complete` | `bool` | `True` when price/PV inputs are complete and `load_forecast_ready` is true |

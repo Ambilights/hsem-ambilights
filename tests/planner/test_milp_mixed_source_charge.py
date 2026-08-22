@@ -26,6 +26,7 @@ def _write_charge(
     ev_charge_kwh: float = 0.0,
     session_slot: bool = False,
     curtailed_kwh: float = 0.0,
+    secondary_site_consumption_kwh: float = 0.0,
 ) -> PlannedSlot:
     """Return one MILP slot after writing the requested charge allocation."""
     slot = PlannedSlot(
@@ -71,6 +72,9 @@ def _write_charge(
         current_kwh=10.0,
         usable_kwh=28.5,
         curt_sol_full=np.array([curtailed_kwh]),
+        secondary_site_consumption_ac_per_slot=np.array(
+            [secondary_site_consumption_kwh]
+        ),
     )
     return result[0]
 
@@ -180,6 +184,17 @@ def test_grid_funded_session_charge_fails_closed() -> None:
     assert slot.primary_battery_hold is True
     assert slot.batteries_charged_kwh == 0.0
     assert slot.grid_import_kwh == 0.0
+
+
+def test_powmr_consumption_cannot_fund_a_huawei_solar_charge_label() -> None:
+    """PV committed to PowMr must not conceal grid-funded Huawei charging."""
+    slot = _write_charge(
+        charge_kwh=0.45,
+        solar_surplus_kwh=1.0,
+        secondary_site_consumption_kwh=0.6,
+    )
+
+    assert slot.recommendation == Recommendations.BatteriesChargeGrid.value
 
 
 def test_curtailed_pv_cannot_fund_a_solar_charge_label() -> None:

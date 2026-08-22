@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
+
+from custom_components.hsem.utils.persistence import (
+    aware_datetime_from_iso,
+    finite_float,
+)
 
 
 @dataclass
@@ -38,3 +45,57 @@ class PredictionRecord:
     predicted_load_kwh: float
     actual_load_kwh: float
     action: str
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe representation."""
+        return {
+            "slot_start": self.slot_start.isoformat(),
+            "predicted_soc_pct": self.predicted_soc_pct,
+            "actual_soc_pct": self.actual_soc_pct,
+            "predicted_pv_kwh": self.predicted_pv_kwh,
+            "actual_pv_kwh": self.actual_pv_kwh,
+            "predicted_load_kwh": self.predicted_load_kwh,
+            "actual_load_kwh": self.actual_load_kwh,
+            "action": self.action,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PredictionRecord | None:
+        """Restore one validated record, or return None for malformed data."""
+        slot_start = aware_datetime_from_iso(data.get("slot_start"))
+        predicted_soc = finite_float(
+            data.get("predicted_soc_pct"),
+            minimum=0.0,
+            maximum=100.0,
+        )
+        actual_soc = finite_float(
+            data.get("actual_soc_pct"),
+            minimum=0.0,
+            maximum=100.0,
+        )
+        predicted_pv = finite_float(data.get("predicted_pv_kwh"), minimum=0.0)
+        actual_pv = finite_float(data.get("actual_pv_kwh"), minimum=0.0)
+        predicted_load = finite_float(data.get("predicted_load_kwh"), minimum=0.0)
+        actual_load = finite_float(data.get("actual_load_kwh"), minimum=0.0)
+        action = data.get("action")
+        if (
+            slot_start is None
+            or predicted_soc is None
+            or actual_soc is None
+            or predicted_pv is None
+            or actual_pv is None
+            or predicted_load is None
+            or actual_load is None
+            or action not in {"charge", "discharge", "idle"}
+        ):
+            return None
+        return cls(
+            slot_start=slot_start,
+            predicted_soc_pct=predicted_soc,
+            actual_soc_pct=actual_soc,
+            predicted_pv_kwh=predicted_pv,
+            actual_pv_kwh=actual_pv,
+            predicted_load_kwh=predicted_load,
+            actual_load_kwh=actual_load,
+            action=action,
+        )

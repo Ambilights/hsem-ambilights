@@ -213,12 +213,12 @@ def test_sbu_transition_frees_l3_headroom_for_huawei() -> None:
     assert max(commands.limits.predicted_phase_power_w) <= 16.0 * 230.0 + 1e-6
 
 
-def test_disabled_feature_leaves_recommendation_untouched() -> None:
-    """The opt-in default preserves legacy commands exactly."""
+def test_disabled_phase_feature_still_carries_plan_derived_huawei_cap() -> None:
+    """Aggregate-fuse users execute the selected Huawei energy allocation."""
     cfg = _config()
     cfg.phase_aware_charging_enabled = False
     rec = _rec(
-        primary_charge_kwh=2.5,
+        primary_charge_kwh=0.4,
         secondary_mode=SECONDARY_MODE_CHARGE,
         secondary_current_a=60.0,
     )
@@ -226,7 +226,25 @@ def test_disabled_feature_leaves_recommendation_untouched() -> None:
     commands = build_phase_aware_charge_commands(cfg, LiveState(), rec)
 
     assert commands.recommendation is rec
-    assert commands.primary_grid_charge_power_w is None
+    assert commands.primary_grid_charge_power_w == pytest.approx(1600.0)
+    assert commands.limits is None
+
+
+def test_plan_derived_huawei_cap_stays_in_full_slot_dc_frame() -> None:
+    """A late replan cannot compress full-slot stored energy above the fuse."""
+    cfg = _config()
+    cfg.phase_aware_charging_enabled = False
+    cfg.main_fuse_amps = 1
+    cfg.batteries_charge_efficiency = 90.0
+    rec = _rec(primary_charge_kwh=0.1725)
+    live = LiveState()
+    live.huawei_batteries_max_charge_power_w = 10000.0
+
+    commands = build_phase_aware_charge_commands(cfg, live, rec)
+
+    # 0.1725 kWh DC over the 15-minute projection is 690 W DC. Neither a
+    # ten-minute-late call nor charge efficiency may inflate this actuator cap.
+    assert commands.primary_grid_charge_power_w == pytest.approx(690.0)
     assert commands.limits is None
 
 

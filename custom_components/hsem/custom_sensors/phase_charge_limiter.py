@@ -128,10 +128,35 @@ def build_phase_aware_charge_commands(
     the newest meter snapshot immediately before writes and therefore protects
     against appliance changes since the plan was solved.
     """
+    primary_grid_charge = (
+        rec.recommendation == Recommendations.BatteriesChargeGrid.value
+    )
+    planned_primary_w: float | None = None
+    if primary_grid_charge and cfg.main_fuse_amps > 0:
+        effective_hours = slot_duration_hours(rec.start, rec.end)
+        if effective_hours > 1e-9:
+            # batteries_charged_kwh and Huawei's grid-charge maximum
+            # power entity are both battery-side. Preserve that DC convention
+            # and the primary model's full-slot projection frame; the phase
+            # limiter converts DC to AC exactly once for fuse headroom.
+            planned_primary_w = (
+                max(rec.batteries_charged_kwh, 0.0) * 1000.0 / effective_hours
+            )
+            if live.huawei_batteries_max_charge_power_w is not None:
+                planned_primary_w = min(
+                    planned_primary_w,
+                    max(live.huawei_batteries_max_charge_power_w, 0.0),
+                )
+
     live_phase_power_w = live.grid_phase_power_w
     if not cfg.phase_aware_charging_enabled:
-        # Never opted in; the plan's own figures are all there is.
-        return PhaseAwareChargeCommands(recommendation=rec)
+        # Aggregate fuse protection still requires execution to honour the
+        # solver's stored-energy allocation. Returning this planned DC cap
+        # also replaces a stale positive Huawei limit from an earlier slot.
+        return PhaseAwareChargeCommands(
+            recommendation=rec,
+            primary_grid_charge_power_w=planned_primary_w,
+        )
 
     charging = (
         rec.recommendation == Recommendations.BatteriesChargeGrid.value
@@ -168,19 +193,8 @@ def build_phase_aware_charge_commands(
             "per-phase headroom cannot be computed",
         )
 
-    primary_grid_charge = (
-        rec.recommendation == Recommendations.BatteriesChargeGrid.value
-    )
     measured_phase_power_w = live_phase_power_w
-    slot_hours = slot_duration_hours(rec.start, rec.end)
-    desired_primary_w = 0.0
-    if primary_grid_charge and slot_hours > 1e-9:
-        desired_primary_w = max(rec.batteries_charged_kwh, 0.0) * 1000.0 / slot_hours
-        if live.huawei_batteries_max_charge_power_w is not None:
-            desired_primary_w = min(
-                desired_primary_w,
-                max(live.huawei_batteries_max_charge_power_w, 0.0),
-            )
+    desired_primary_w = planned_primary_w or 0.0
 
     secondary_charge = rec.secondary_storage_mode == SECONDARY_MODE_CHARGE
     desired_secondary_a = (

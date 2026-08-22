@@ -12,6 +12,7 @@ from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.secondary_storage_config import (
     SecondaryStorageConfig,
 )
+from custom_components.hsem.planner.cost_helpers import slot_grid_cash_flow_cost
 from custom_components.hsem.planner.secondary_storage import (
     SECONDARY_MODE_CHARGE,
     SECONDARY_MODE_SBU,
@@ -359,6 +360,7 @@ def _write_secondary_results(
     future_idx: list[int],
     minimum_action_kwh: float,
     now: datetime,
+    export_min_price: float = 0.0,
     battery_export_min_price: float = 0.0,
     primary_site_discharge_limited: np.ndarray | None = None,  # type: ignore[name-defined]
 ) -> dict[str, float | int] | None:
@@ -435,14 +437,12 @@ def _write_secondary_results(
         # Apply the secondary branch once to that reconstructed base flow.
         slot.grid_import_kwh = round(max(net_grid, 0.0), 3)
         slot.grid_export_kwh = round(max(-net_grid, 0.0), 3)
-        slot.estimated_cost_currency = (
-            round(
-                slot.grid_import_kwh * max(slot.price.import_price, 0.0)
-                - slot.grid_export_kwh * slot.price.export_price,
-                4,
-            )
-            if slot.price_actionable
-            else 0.0
+        slot.estimated_cost_currency = round(
+            slot_grid_cash_flow_cost(
+                slot,
+                export_min_price=export_min_price,
+            ),
+            4,
         )
 
         if (

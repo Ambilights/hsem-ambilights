@@ -145,17 +145,21 @@ The penalty uses the same high coefficient as SoC penalties (`max(p_imp) × 100`
 When optional phase-aware charging is enabled on a three-phase installation,
 three additional hard inequality rows are added per slot without adding
 variables. With total signed site flow $G_t=gi_t-ge_t$, fixed live imbalance
-$\Delta_{i,t}$, PowMr site delta $D_t$, and configured PowMr phase $p$:
+$\Delta_{i,t}$, PowMr site delta $D_t$, configured PowMr phase $p$, and total
+EV AC load $E_t$:
 
 $$
-F_{i,t}=G_t/3+\Delta_{i,t}+(\mathbf{1}_{i=p}-1/3)D_t
+F_{i,t}=G_t/3+\Delta_{i,t}+(\mathbf{1}_{i=p}-1/3)D_t+(1-1/3)E_t
 $$
 
-Each $F_{i,t}$ is capped at the 230 V per-phase fuse target. If uncontrollable
-base load already exceeds that target, the row permits exactly that baseline so
-the model remains feasible while forbidding controllable charge from worsening
-it. Huawei charge is balanced by construction; PowMr charge and Utility/SBU
-load switching affect only its configured phase.
+Each $F_{i,t}$ is a conservative phase envelope capped at the 230 V per-phase
+fuse target. EV charger phase topology is not configured, so every phase is
+checked as if it carries the whole EV command; this intentionally does not sum
+to physical site flow. If uncontrollable base load or a fixed live EV session
+already exceeds the target, the row permits exactly that conservative baseline
+so the model remains feasible while forbidding controllable charge from
+worsening it. Huawei charge is balanced by construction; PowMr charge and
+Utility/SBU load switching affect only its configured phase.
 
 ### Primary export-source, action-mode, and grid-flow extension
 

@@ -133,6 +133,7 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         self._update_task: asyncio.Task | None = None
         self._pending_update_data: CoordinatorData | None = None
         self._active_hardware_intent: tuple[Any, ...] | None = None
+        self._active_secondary_hardware_intent: tuple[Any, ...] | None = None
         # Number real coordinator listener generations locally, so a refresh
         # can prove it produced a post-transaction snapshot.
         self._coordinator_update_generation = 0
@@ -411,7 +412,13 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         self._fully_fed_discharge_state.reset()
         self._resolved_data = None
         self._resolved_source_data = None
+        self.coordinator.secondary_control_mode_superseded(
+            "working-mode entity unloading"
+        )
+        task = self._update_task
         self._cancel_update_task()
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
         await super().async_will_remove_from_hass()
 
     def _cancel_update_task(self) -> None:
@@ -438,6 +445,7 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         if is_current_task:
             self._update_task = None
             self._active_hardware_intent = None
+            self._active_secondary_hardware_intent = None
 
         if task.cancelled():
             exc = None
@@ -536,10 +544,24 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
 
         self._pending_update_data = data
         next_intent = self._hardware_intent(data)
+        next_secondary_intent = self._secondary_hardware_intent(data)
         if self._update_task is not None and not self._update_task.done():
+            if (
+                self._active_secondary_hardware_intent is not None
+                and next_secondary_intent != self._active_secondary_hardware_intent
+            ):
+                # Revoke the complete PowMr lease synchronously. The applier
+                # checks it after every awaited write, so a stale Charge/SBU
+                # transaction can only proceed into verified fail-close.
+                self.coordinator.secondary_control_mode_superseded(
+                    "newer PowMr hardware intent published"
+                )
             if self._hard_no_write_gate(data) and not self._refresh_in_progress:
                 # Explicit safety gates may interrupt a transaction. Safe
                 # intent changes wait for a coherent post-write refresh.
+                self.coordinator.secondary_control_mode_superseded(
+                    "hardware writes blocked by a safety gate"
+                )
                 self._post_write_refresh_needed = False
                 self._update_task.cancel()
             elif (
@@ -578,6 +600,54 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         self._update_task.add_done_callback(self._on_update_task_done)
 
     @staticmethod
+    def _secondary_write_intent(
+        cfg: Any,
+        live: Any,
+        rec: Any,
+    ) -> tuple[Any, ...]:
+        """Return the ordered PowMr commands represented by one snapshot."""
+        secondary_operations = (
+            build_secondary_write_plan(cfg, live, rec)
+            if rec is not None
+            and cfg.secondary_storage.enabled
+            and cfg.secondary_storage.control_enabled
+            else []
+        )
+        return tuple(
+            (
+                operation.kind,
+                operation.entity_id,
+                (
+                    _intent_scaled_int(operation.desired, 1000.0)
+                    if isinstance(operation.desired, (int, float))
+                    else operation.desired
+                ),
+            )
+            for operation in secondary_operations
+        )
+
+    @classmethod
+    def _secondary_hardware_intent(
+        cls,
+        data: CoordinatorData,
+    ) -> tuple[Any, ...]:
+        """Resolve the phase-safe PowMr intent used to supersede stale leases."""
+        cfg = data.cfg
+        live = data.live
+        rec = data.hourly_recommendation
+        if cfg is None or live is None:
+            return ()
+        phase_commands = (
+            build_phase_aware_charge_commands(cfg, live, rec)
+            if rec is not None
+            else None
+        )
+        effective_rec = (
+            phase_commands.recommendation if phase_commands is not None else rec
+        )
+        return cls._secondary_write_intent(cfg, live, effective_rec)
+
+    @staticmethod
     def _hardware_intent(data: CoordinatorData) -> tuple[Any, ...]:
         """Return fields whose change makes an in-flight command obsolete."""
         cfg = data.cfg
@@ -593,24 +663,10 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
         effective_rec = (
             phase_commands.recommendation if phase_commands is not None else rec
         )
-        secondary_operations = (
-            build_secondary_write_plan(cfg, live, effective_rec)
-            if effective_rec is not None
-            and cfg.secondary_storage.enabled
-            and cfg.secondary_storage.control_enabled
-            else []
-        )
-        secondary_intent = tuple(
-            (
-                operation.kind,
-                operation.entity_id,
-                (
-                    _intent_scaled_int(operation.desired, 1000.0)
-                    if isinstance(operation.desired, (int, float))
-                    else operation.desired
-                ),
-            )
-            for operation in secondary_operations
+        secondary_intent = HSEMWorkingModeSensor._secondary_write_intent(
+            cfg,
+            live,
+            effective_rec,
         )
         phase_intent = (
             (
@@ -709,6 +765,9 @@ class HSEMWorkingModeSensor(HSEMCoordinatorEntity, SensorEntity, HSEMEntity):
                 self._pending_update_data = None
                 intent = self._hardware_intent(data)
                 self._active_hardware_intent = intent
+                self._active_secondary_hardware_intent = (
+                    self._secondary_hardware_intent(data)
+                )
 
                 await self._async_apply_hardware_writes(data)
 

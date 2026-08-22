@@ -417,6 +417,41 @@ async def test_missing_live_telemetry_blocks_adapter() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("soc_pct", "load_power_w"),
+    [
+        (float("nan"), 100.0),
+        (float("inf"), 100.0),
+        (50.0, float("nan")),
+        (50.0, float("inf")),
+    ],
+)
+async def test_non_finite_live_telemetry_blocks_adapter(
+    soc_pct: float,
+    load_power_w: float,
+) -> None:
+    """NaN/inf telemetry cannot pass numeric range comparisons silently."""
+    cfg = _config(read_only=False, control=True)
+    live = LiveState()
+    live.secondary_storage.soc_pct = soc_pct
+    live.secondary_storage.load_power_w = load_power_w
+
+    with patch(
+        "custom_components.hsem.custom_sensors.secondary_storage_applier.async_write_and_verify",
+        new_callable=AsyncMock,
+    ) as verifier:
+        summary = await async_apply_secondary_storage(
+            MagicMock(),
+            cfg,
+            live,
+            _rec(SECONDARY_MODE_CHARGE, current_a=40.0),
+        )
+
+    assert summary.results == []
+    verifier.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_error_degraded_mode_blocks_adapter() -> None:
     """Critical degraded mode remains an independent PowMr write gate."""
     cfg = _config(read_only=False, control=True)
@@ -451,6 +486,7 @@ async def test_powmr_write_observer_wraps_each_verified_operation() -> None:
     observer = MagicMock()
     observer.secondary_control_write_started.side_effect = [11, 12]
     observer.secondary_control_mode_started.return_value = 10
+    observer.secondary_control_mode_is_valid.return_value = True
 
     async def verified(**kwargs: object) -> ApplyResult:
         status = (
@@ -523,20 +559,35 @@ async def test_powmr_write_observer_wraps_each_verified_operation() -> None:
 
 @pytest.mark.asyncio
 async def test_powmr_cancelled_write_resolves_observer_as_unverified() -> None:
-    """Cancellation cannot leave an in-flight echo suppression token behind."""
+    """Cancellation resolves echoes and verifies Only Solar then Utility."""
     cfg = _config(read_only=False, control=True)
     live = LiveState()
     live.secondary_storage.soc_pct = 50.0
     live.secondary_storage.load_power_w = 100.0
     observer = MagicMock()
-    observer.secondary_control_write_started.return_value = 42
-    observer.secondary_control_mode_started.return_value = 41
+    observer.secondary_control_write_started.side_effect = [42, 44, 45]
+    observer.secondary_control_mode_started.side_effect = [41, 43]
+    observer.secondary_control_mode_is_valid.return_value = True
+    verify_calls = 0
+
+    async def cancelled_then_verified(**kwargs: object) -> ApplyResult:
+        nonlocal verify_calls
+        verify_calls += 1
+        if verify_calls == 1:
+            raise asyncio.CancelledError
+        return ApplyResult(
+            entity_id=str(kwargs["entity_id"]),
+            desired=kwargs["desired"],
+            actual=kwargs["desired"],
+            status=ApplyStatus.OK,
+            attempts=1,
+        )
 
     with (
         patch(
             "custom_components.hsem.custom_sensors.secondary_storage_applier.async_write_and_verify",
             new_callable=AsyncMock,
-            side_effect=asyncio.CancelledError,
+            side_effect=cancelled_then_verified,
         ),
         pytest.raises(asyncio.CancelledError),
     ):
@@ -548,20 +599,132 @@ async def test_powmr_cancelled_write_resolves_observer_as_unverified() -> None:
             control_write_observer=observer,
         )
 
-    observer.secondary_control_write_finished.assert_called_once_with(
-        cfg.secondary_storage.charger_source_priority_entity,
-        POWMR_CHARGER_SOLAR_ONLY,
-        42,
-        verified=False,
-        echo_expected=False,
-    )
-    observer.secondary_control_mode_finished.assert_called_once_with(
-        _NOW,
-        _NOW + timedelta(minutes=15),
-        SECONDARY_MODE_SBU,
-        41,
-        verified=False,
-    )
+    assert observer.secondary_control_write_finished.call_args_list == [
+        call(
+            cfg.secondary_storage.charger_source_priority_entity,
+            POWMR_CHARGER_SOLAR_ONLY,
+            42,
+            verified=False,
+            echo_expected=False,
+        ),
+        call(
+            cfg.secondary_storage.charger_source_priority_entity,
+            POWMR_CHARGER_SOLAR_ONLY,
+            44,
+            verified=True,
+            echo_expected=True,
+        ),
+        call(
+            cfg.secondary_storage.output_source_priority_entity,
+            POWMR_OUTPUT_UTILITY,
+            45,
+            verified=True,
+            echo_expected=True,
+        ),
+    ]
+    assert observer.secondary_control_mode_finished.call_args_list == [
+        call(
+            _NOW,
+            _NOW + timedelta(minutes=15),
+            SECONDARY_MODE_UTILITY,
+            43,
+            verified=True,
+        ),
+        call(
+            _NOW,
+            _NOW + timedelta(minutes=15),
+            SECONDARY_MODE_SBU,
+            41,
+            verified=False,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_cannot_abort_powmr_safety_stop() -> None:
+    """Every worker cancellation leaves the independent stop task shielded."""
+    cfg = _config(read_only=False, control=True)
+    live = LiveState()
+    live.secondary_storage.soc_pct = 50.0
+    live.secondary_storage.load_power_w = 100.0
+    observer = MagicMock()
+    observer.secondary_control_write_started.side_effect = [42, 44, 45]
+    observer.secondary_control_mode_started.side_effect = [41, 43]
+    observer.secondary_control_mode_is_valid.return_value = True
+
+    enabling_write_started = asyncio.Event()
+    recovery_write_started = asyncio.Event()
+    release_recovery_write = asyncio.Event()
+    recovery_write_cancelled = asyncio.Event()
+    calls: list[tuple[str, object]] = []
+
+    async def block_enabling_then_recovery(**kwargs: object) -> ApplyResult:
+        entity_id = str(kwargs["entity_id"])
+        desired = kwargs["desired"]
+        calls.append((entity_id, desired))
+        if len(calls) == 1:
+            enabling_write_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("cancelled enabling write unexpectedly resumed")
+        if len(calls) == 2:
+            recovery_write_started.set()
+            try:
+                await release_recovery_write.wait()
+            except asyncio.CancelledError:
+                recovery_write_cancelled.set()
+                raise
+        return ApplyResult(
+            entity_id=entity_id,
+            desired=desired,
+            actual=desired,
+            status=ApplyStatus.OK,
+            attempts=1,
+        )
+
+    with patch(
+        "custom_components.hsem.custom_sensors.secondary_storage_applier.async_write_and_verify",
+        new_callable=AsyncMock,
+        side_effect=block_enabling_then_recovery,
+    ):
+        worker = asyncio.create_task(
+            async_apply_secondary_storage(
+                MagicMock(),
+                cfg,
+                live,
+                _rec(SECONDARY_MODE_SBU),
+                control_write_observer=observer,
+            )
+        )
+        await asyncio.wait_for(enabling_write_started.wait(), timeout=1.0)
+        worker.cancel()
+        await asyncio.wait_for(recovery_write_started.wait(), timeout=1.0)
+
+        # A second hard-gate/unload cancellation used to propagate into the
+        # now-directly-awaited child and terminate the safety stop mid-write.
+        worker.cancel()
+        await asyncio.sleep(0)
+        assert not recovery_write_cancelled.is_set()
+
+        release_recovery_write.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(worker, timeout=1.0)
+        assert worker.cancelled()
+
+    assert calls == [
+        (
+            cfg.secondary_storage.charger_source_priority_entity,
+            POWMR_CHARGER_SOLAR_ONLY,
+        ),
+        (
+            cfg.secondary_storage.charger_source_priority_entity,
+            POWMR_CHARGER_SOLAR_ONLY,
+        ),
+        (
+            cfg.secondary_storage.output_source_priority_entity,
+            POWMR_OUTPUT_UTILITY,
+        ),
+    ]
+    assert not recovery_write_cancelled.is_set()
 
 
 @pytest.mark.asyncio
@@ -569,7 +732,7 @@ async def test_powmr_cancelled_write_resolves_observer_as_unverified() -> None:
 async def test_unconfirmed_write_blocks_remaining_powmr_transition(
     status: ApplyStatus,
 ) -> None:
-    """A failed or unreadable first operation must block every later command."""
+    """An unconfirmed enabling operation triggers a complete safety stop."""
     cfg = _config(read_only=False, control=True)
     live = LiveState()
     live.secondary_storage.soc_pct = 60.0
@@ -595,7 +758,11 @@ async def test_unconfirmed_write_blocks_remaining_powmr_transition(
             _rec(SECONDARY_MODE_SBU),
         )
 
-    assert verifier.await_count == 1
+    assert [awaited.kwargs["desired"] for awaited in verifier.await_args_list] == [
+        POWMR_CHARGER_SOLAR_ONLY,
+        POWMR_CHARGER_SOLAR_ONLY,
+        POWMR_OUTPUT_UTILITY,
+    ]
     assert summary.overall_status == status
 
 

@@ -68,6 +68,9 @@ _EXPECTED_EXPLANATION_KEYS = {
     "terminal_cost_to_go_final_value",
     "secondary_terminal_price_source",
     "secondary_terminal_price_per_kwh",
+    "hysteresis_active",
+    "hysteresis_reason",
+    "previous_plan_name",
     "constraints",
     "rejected_plans",
 }

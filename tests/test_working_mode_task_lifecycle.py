@@ -19,6 +19,7 @@ import asyncio
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -33,6 +34,10 @@ from custom_components.hsem.models.live_state import LiveState
 from custom_components.hsem.models.sensor_config import SensorConfig
 from custom_components.hsem.utils.degraded_mode import DegradedMode
 from custom_components.hsem.utils.inverter_verify import CycleApplySummary
+from custom_components.hsem.utils.phase_power import (
+    POWMR_CHARGER_SOLAR_ONLY,
+    POWMR_OUTPUT_UTILITY,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -636,6 +641,62 @@ class TestSingleTaskInFlight:
         new_data.live.secondary_storage.soc_pct = 20.0
 
         await _assert_changed_snapshot_marks_refresh(old_data, new_data)
+
+    @pytest.mark.asyncio
+    async def test_phase_safety_utility_revokes_active_powmr_charge_lease(
+        self,
+    ) -> None:
+        """Lost L3 headroom supersedes Charge before its final enabling write."""
+        sensor = _make_sensor()
+        old_data = _make_data(secondary_mode="charge")
+        assert old_data.cfg is not None and old_data.live is not None
+        assert old_data.hourly_recommendation is not None
+        old_data.cfg.secondary_storage.output_source_priority_entity = (
+            "select.powmr_output"
+        )
+        old_data.cfg.secondary_storage.charger_source_priority_entity = (
+            "select.powmr_charger"
+        )
+        old_data.cfg.secondary_storage.max_charge_current_entity = (
+            "number.powmr_current"
+        )
+        old_data.live.secondary_storage.soc_pct = 50.0
+        old_data.live.secondary_storage.load_power_w = 200.0
+        old_data.live.secondary_storage.output_source_priority = POWMR_OUTPUT_UTILITY
+        old_data.live.secondary_storage.charger_source_priority = (
+            POWMR_CHARGER_SOLAR_ONLY
+        )
+        old_data.live.secondary_storage.max_charge_current_a = 10.0
+        old_data.live.grid_phase_power_w = (0.0, 0.0, 0.0)
+        old_data.hourly_recommendation.secondary_storage_charge_current_a = 20.0
+        new_data = deepcopy(old_data)
+        assert new_data.live is not None
+        new_data.live.grid_phase_power_w = (0.0, 0.0, 3680.0)
+
+        release = asyncio.Event()
+
+        async def _hanging_coro() -> None:
+            await release.wait()
+
+        first_task = asyncio.create_task(_hanging_coro())
+        sensor._update_task = first_task
+        sensor._active_hardware_intent = sensor._hardware_intent(old_data)
+        sensor._active_secondary_hardware_intent = sensor._secondary_hardware_intent(
+            old_data
+        )
+        await asyncio.sleep(0)
+
+        sensor.coordinator.data = new_data
+        sensor._handle_coordinator_update()
+        await asyncio.sleep(0)
+
+        cast(
+            MagicMock, sensor.coordinator.secondary_control_mode_superseded
+        ).assert_called_with("newer PowMr hardware intent published")
+        assert not first_task.cancelled()
+        assert sensor._post_write_refresh_needed
+        first_task.cancel()
+        await asyncio.gather(first_task, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_hardware_target_change_requests_post_write_refresh(self) -> None:
