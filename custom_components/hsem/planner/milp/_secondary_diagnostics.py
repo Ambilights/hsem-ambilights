@@ -50,11 +50,11 @@ class SecondaryResultSummary:
 
 
 def _sanitised_import_price(slot: PlannedSlot) -> float:
-    """Return the non-negative import price used by the scorer."""
+    """Return the finite signed import price used by the scorer."""
     if not slot.price_actionable:
         return 0.0
     price = slot.price.import_price
-    return 0.0 if not math.isfinite(price) else max(price, 0.0)
+    return price if math.isfinite(price) else 0.0
 
 
 def _sanitised_prices(slot: PlannedSlot) -> tuple[float, float]:

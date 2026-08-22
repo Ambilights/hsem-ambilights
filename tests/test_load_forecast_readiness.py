@@ -144,9 +144,20 @@ class TestLoadForecastHold:
         current.secondary_storage_charged_kwh = 1.0
         current.secondary_storage_discharged_kwh = 1.0
         current.secondary_storage_grid_import_kwh = 1.0
+        current.grid_import_kwh = 3.0
+        current.grid_export_kwh = 4.0
+        current.estimated_cost_currency = -12.0
+        current.estimated_net_consumption_kwh = 5.0
+        current.ev_planned_load_kwh = 1.0
+        current.ev_accounted_load_kwh = 2.0
+        current.ev_total_planned_load_kwh = 3.0
+        current.ev_charger_calculated_power = 7000.0
+        current.ev_second_charger_calculated_power = 11000.0
+        live = LiveState(force_working_mode_state="auto")
+        live.secondary_storage.soc_pct = 47.0
         held = _apply_load_forecast_hold(
             [current],
-            LiveState(force_working_mode_state="auto"),
+            live,
             now,
             load_forecast_ready=False,
         )
@@ -160,6 +171,16 @@ class TestLoadForecastHold:
         assert current.secondary_storage_charged_kwh == pytest.approx(0.0)
         assert current.secondary_storage_discharged_kwh == pytest.approx(0.0)
         assert current.secondary_storage_grid_import_kwh == pytest.approx(0.0)
+        assert current.secondary_storage_estimated_soc_pct == pytest.approx(47.0)
+        assert current.grid_import_kwh == pytest.approx(0.0)
+        assert current.grid_export_kwh == pytest.approx(0.0)
+        assert current.estimated_cost_currency == pytest.approx(0.0)
+        assert current.estimated_net_consumption_kwh == pytest.approx(0.0)
+        assert current.ev_planned_load_kwh == pytest.approx(0.0)
+        assert current.ev_accounted_load_kwh == pytest.approx(0.0)
+        assert current.ev_total_planned_load_kwh == pytest.approx(0.0)
+        assert current.ev_charger_calculated_power == pytest.approx(0.0)
+        assert current.ev_second_charger_calculated_power == pytest.approx(0.0)
 
     def test_manual_force_remains_higher_authority(self) -> None:
         now = datetime(2026, 8, 21, 12, 5, tzinfo=UTC)

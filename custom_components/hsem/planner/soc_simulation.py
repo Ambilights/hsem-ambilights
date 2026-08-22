@@ -34,6 +34,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from custom_components.hsem.models.planned_slot import PlannedSlot
+from custom_components.hsem.planner.cost_helpers import slot_grid_cash_flow_cost
 from custom_components.hsem.utils.datetime_utils import slot_contains, utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import clamp_efficiency
@@ -59,6 +60,7 @@ def simulate_soc(
     milp_prepopulated: bool = False,
     wait_mode_behavior: str = "strict",
     required_capacity_kwh: float = 0.0,
+    export_min_price: float = 0.0,
 ) -> None:
     """Forward-simulate battery SoC through all planning slots.
 
@@ -75,6 +77,9 @@ def simulate_soc(
     - ``batteries_discharged`` — energy *removed from the battery* (pre
       discharge-side loss), clamped to the discharge power limit and available
       capacity.  The house actually receives
+    - ``estimated_cost_currency`` — auditable meter cash flow from the final
+      published grid import/export fields. Battery wear and selector-only
+      terms remain itemised in ``PlanCostBreakdown``.
       ``batteries_discharged × (discharge_efficiency_pct / 100)``.
     - ``grid_import_kwh`` — energy imported from the grid this slot.
     - ``grid_export_kwh`` — energy exported to the grid this slot.
@@ -135,6 +140,9 @@ def simulate_soc(
             The simulation skips the greedy derivation and tracks SoC from
             the pre-populated values.  Defaults to ``False`` (unchanged
             behaviour for non-MILP candidates).
+        export_min_price: Site export floor used for cash accounting. Export
+            below this physically blocked rate is valued at zero; finite
+            negative import prices remain authoritative.
     """
     # Clamp efficiencies to a valid range to avoid division by zero or nonsense.
     charge_eff = clamp_efficiency(charge_efficiency_pct)
@@ -459,6 +467,9 @@ def simulate_soc(
                 3,
             )
 
+        slot.estimated_cost_currency = round(
+            slot_grid_cash_flow_cost(slot, export_min_price=export_min_price), 4
+        )
         # If the slot has a FORCE discharge/export recommendation but
         # no discharge actually happened (battery empty or PV surplus),
         # clear it to wait_mode. Normal BatteriesDischargeMode recommendations

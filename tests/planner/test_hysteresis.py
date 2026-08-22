@@ -466,6 +466,10 @@ class TestHysteresis:
         # On first run with no previous plan, hysteresis should be inactive
         assert output.explanation.hysteresis_active is False
         assert output.explanation.previous_plan_name == ""
+        attributes = output.explanation.as_dict()
+        assert attributes["hysteresis_active"] is False
+        assert attributes["hysteresis_reason"] == output.explanation.hysteresis_reason
+        assert attributes["previous_plan_name"] == ""
 
 
 class TestHysteresisResultDataclass:

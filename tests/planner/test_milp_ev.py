@@ -1078,3 +1078,84 @@ def test_ev_discharge_guard_partial_pv_slot_is_exact_not_over_conservative():
         f"discharge={s0.batteries_discharged_kwh:.3f} kWh, "
         f"expected ≈ 1.03 kWh DC for the 1.0 kWh AC non-EV unmet load"
     )
+
+
+@_pytestmark_scipy
+def test_active_ev_rebuild_removes_accounted_future_load_once() -> None:
+    """MILP replaces, rather than stacks on, EV load embedded in forecast."""
+    slots = _build_slots(4, start_hour=14, import_price=0.20, consumption_kwh=0.0)
+    slots[0].avg_house_consumption_kwh = 3.0
+    slots[0].ev_accounted_load_kwh = 3.0
+    slots[0].ev_total_planned_load_kwh = 3.0
+    slots[0].estimated_net_consumption_kwh = 3.0
+    ev = EVConfig(
+        enabled=True,
+        initial_soc_kwh=0.0,
+        target_kwh=2.0,
+        capacity_kwh=10.0,
+        max_charge_per_slot=2.0,
+        charger_efficiency=1.0,
+        charger_min_power_w=0.0,
+        deadline_slot=0,
+        base_load_includes_ev=True,
+    )
+
+    result = solve_milp(
+        slots,
+        _NOW,
+        current_kwh=0.0,
+        usable_kwh=10.0,
+        max_charge_per_slot=1.0,
+        max_discharge_per_slot=0.0,
+        ev_configs=[ev],
+    )
+
+    assert result is not None
+    out, _diagnostics = result
+    assert out[0].ev_accounted_load_kwh == pytest.approx(2.0)
+    assert out[0].grid_import_kwh == pytest.approx(2.0)
+
+
+@_pytestmark_scipy
+def test_live_session_removed_from_base_is_not_subtracted_twice() -> None:
+    """Pure-house live projection plus fixed session remains fuse-feasible."""
+    slots = _build_slots(4, start_hour=14, import_price=0.20, consumption_kwh=0.0)
+    # Live injection already removed the observed 6 kW session, leaving 1 kWh
+    # pure house. The older heuristic still advertises 11 kWh accounted EV.
+    slots[0].avg_house_consumption_kwh = 1.0
+    slots[0].ev_accounted_load_kwh = 11.0
+    slots[0].ev_total_planned_load_kwh = 11.0
+    slots[0].estimated_net_consumption_kwh = 1.0
+    ev = EVConfig(
+        enabled=True,
+        initial_soc_kwh=0.0,
+        target_kwh=1.0,
+        capacity_kwh=10.0,
+        max_charge_per_slot=6.0,
+        charger_efficiency=1.0,
+        charger_min_power_w=0.0,
+        deadline_slot=3,
+        base_load_includes_ev=True,
+        session_charge_kw=6.0,
+        current_session_removed_from_base=True,
+    )
+
+    result = solve_milp(
+        slots,
+        _NOW,
+        current_kwh=0.0,
+        usable_kwh=10.0,
+        max_charge_per_slot=1.0,
+        max_discharge_per_slot=0.0,
+        ev_configs=[ev],
+        main_fuse_amps=1.0,
+        main_fuse_phases=3,
+    )
+
+    assert result is not None
+    out, diagnostics = result
+    assert out[0].ev_planned_load_kwh == pytest.approx(6.0)
+    assert out[0].ev_accounted_load_kwh == pytest.approx(0.0)
+    assert out[0].grid_import_kwh == pytest.approx(7.0)
+    assert out[1].grid_import_kwh == pytest.approx(6.0)
+    assert diagnostics["total_fuse_violation_kwh"] == pytest.approx(11.62)

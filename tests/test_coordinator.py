@@ -41,6 +41,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from custom_components.hsem.coordinator import (
+    SECONDARY_STORAGE_SOC_REPLAN_DELTA_PCT,
     CoordinatorData,
     HSEMDataUpdateCoordinator,
     _accumulate_plan_for_slots,
@@ -332,6 +333,15 @@ class TestPriceForecastAuthority:
         current.secondary_storage_charge_current_a = 30.0
         current.secondary_storage_charged_kwh = 1.0
         current.secondary_storage_discharged_kwh = 1.0
+        current.grid_import_kwh = 3.0
+        current.grid_export_kwh = 4.0
+        current.estimated_cost_currency = -12.0
+        current.estimated_net_consumption_kwh = 5.0
+        current.ev_planned_load_kwh = 1.0
+        current.ev_accounted_load_kwh = 2.0
+        current.ev_total_planned_load_kwh = 3.0
+        current.ev_charger_calculated_power = 7000.0
+        current.ev_second_charger_calculated_power = 11000.0
         current.price_actionable = False
         live = LiveState()
         live.force_working_mode_state = "auto"
@@ -347,6 +357,15 @@ class TestPriceForecastAuthority:
         assert current.secondary_storage_charge_current_a == 0.0
         assert current.secondary_storage_charged_kwh == 0.0
         assert current.secondary_storage_discharged_kwh == 0.0
+        assert current.grid_import_kwh == pytest.approx(0.0)
+        assert current.grid_export_kwh == pytest.approx(0.0)
+        assert current.estimated_cost_currency == pytest.approx(0.0)
+        assert current.estimated_net_consumption_kwh == pytest.approx(0.0)
+        assert current.ev_planned_load_kwh == pytest.approx(0.0)
+        assert current.ev_accounted_load_kwh == pytest.approx(0.0)
+        assert current.ev_total_planned_load_kwh == pytest.approx(0.0)
+        assert current.ev_charger_calculated_power == pytest.approx(0.0)
+        assert current.ev_second_charger_calculated_power == pytest.approx(0.0)
 
     def test_primary_current_outage_holds_entsoe_labelled_current_slot(self) -> None:
         now = datetime(2026, 8, 14, 12, 5, tzinfo=UTC)
@@ -727,10 +746,6 @@ def _make_bare_coordinator() -> HSEMDataUpdateCoordinator:
     coord._price_source_update_debounce_task = None
     coord._price_source_update_pending = False
     coord._forecast_authority_generation = 0
-    coord._current_slot_start = None
-    coord._current_slot_price_actionable = None
-    coord._current_slot_ev_power_w = 0.0
-    coord._current_slot_ev_second_power_w = 0.0
     coord._last_planner_output = None
     coord._last_plan_price_forecast_signature = None
     coord._last_apply_summary = None
@@ -837,6 +852,7 @@ class TestLightweightSecondaryStorageEvents:
                 end,
                 SECONDARY_MODE_SBU,
             )
+            assert token is not None
             assert coordinator._secondary_current_slot_mode_lock is None
 
             coordinator.secondary_control_mode_finished(
@@ -867,6 +883,7 @@ class TestLightweightSecondaryStorageEvents:
                 end,
                 SECONDARY_MODE_SBU,
             )
+            assert token is not None
             coordinator.secondary_control_mode_finished(
                 start,
                 end,
@@ -881,11 +898,16 @@ class TestLightweightSecondaryStorageEvents:
         """A transition started under old options cannot install a stale lock."""
         coordinator = _make_bare_coordinator()
         start, end = self._configure_lock_snapshot(coordinator)
-        token = coordinator.secondary_control_mode_started(
-            start,
-            end,
-            SECONDARY_MODE_SBU,
-        )
+        with patch(
+            "custom_components.hsem.coordinator.hsem_now",
+            return_value=start + timedelta(minutes=1),
+        ):
+            token = coordinator.secondary_control_mode_started(
+                start,
+                end,
+                SECONDARY_MODE_SBU,
+            )
+        assert token is not None
 
         coordinator._invalidate_secondary_mode_lock(
             "configuration changed",
@@ -906,6 +928,276 @@ class TestLightweightSecondaryStorageEvents:
         assert coordinator._secondary_current_slot_mode_lock is None
         assert coordinator._secondary_mode_lock_replan_pending is True
 
+    def test_newer_utility_plan_revokes_an_old_charge_lease(self) -> None:
+        """Published Utility authority blocks every later old Charge write."""
+        coordinator = _make_bare_coordinator()
+        start, end = self._configure_lock_snapshot(
+            coordinator,
+            mode=SECONDARY_MODE_CHARGE,
+        )
+
+        with patch(
+            "custom_components.hsem.coordinator.hsem_now",
+            return_value=start + timedelta(minutes=1),
+        ):
+            token = coordinator.secondary_control_mode_started(
+                start,
+                end,
+                SECONDARY_MODE_CHARGE,
+            )
+            assert token is not None
+            assert coordinator.secondary_control_mode_is_valid(
+                start,
+                end,
+                SECONDARY_MODE_CHARGE,
+                token,
+            )
+
+            coordinator._hourly_recommendation = cast(
+                Any,
+                SimpleNamespace(
+                    start=start,
+                    end=end,
+                    secondary_storage_mode=SECONDARY_MODE_UTILITY,
+                ),
+            )
+
+            assert not coordinator.secondary_control_mode_is_valid(
+                start,
+                end,
+                SECONDARY_MODE_CHARGE,
+                token,
+            )
+            assert (
+                coordinator.secondary_control_mode_started(
+                    start,
+                    end,
+                    SECONDARY_MODE_CHARGE,
+                )
+                is None
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("entity_id", "state"),
+        [
+            ("sensor.powmr_soc", "20.0"),
+            ("sensor.powmr_load_avg", "100000.0"),
+            ("sensor.powmr_soc", "unavailable"),
+            ("sensor.powmr_load_avg", "unknown"),
+        ],
+    )
+    async def test_any_safety_telemetry_change_revokes_enabling_lease(
+        self,
+        entity_id: str,
+        state: str,
+    ) -> None:
+        """A reserve-unsafe SoC/load change immediately revokes SBU."""
+        coordinator = _make_bare_coordinator()
+        start, end = self._configure_lock_snapshot(coordinator)
+        hass = cast(MagicMock, coordinator.hass)
+        pending_task = MagicMock()
+        pending_task.done.return_value = False
+        hass.async_create_task.return_value = pending_task
+
+        with patch(
+            "custom_components.hsem.coordinator.hsem_now",
+            return_value=start + timedelta(minutes=1),
+        ):
+            token = coordinator.secondary_control_mode_started(
+                start,
+                end,
+                SECONDARY_MODE_SBU,
+            )
+            assert token is not None
+            await coordinator._async_handle_secondary_storage_change(
+                cast(
+                    Any,
+                    SimpleNamespace(
+                        data={
+                            "entity_id": entity_id,
+                            "new_state": SimpleNamespace(state=state),
+                        }
+                    ),
+                )
+            )
+
+        assert coordinator._secondary_control_mode_expectation is None
+        assert coordinator._secondary_mode_lock_replan_pending is True
+        assert coordinator._secondary_storage_update_pending is True
+        hass.async_create_task.call_args.args[0].close()
+
+    @pytest.mark.asyncio
+    async def test_harmless_soc_noise_preserves_enabling_lease(self) -> None:
+        """A safe sub-threshold echo does not make SBU impossible to enter."""
+        coordinator = _make_bare_coordinator()
+        start, end = self._configure_lock_snapshot(coordinator)
+        hass = cast(MagicMock, coordinator.hass)
+
+        with patch(
+            "custom_components.hsem.coordinator.hsem_now",
+            return_value=start + timedelta(minutes=1),
+        ):
+            token = coordinator.secondary_control_mode_started(
+                start,
+                end,
+                SECONDARY_MODE_SBU,
+            )
+            assert token is not None
+            await coordinator._async_handle_secondary_storage_change(
+                cast(
+                    Any,
+                    SimpleNamespace(
+                        data={
+                            "entity_id": "sensor.powmr_soc",
+                            "new_state": SimpleNamespace(state="75.1"),
+                        }
+                    ),
+                )
+            )
+            assert coordinator.secondary_control_mode_is_valid(
+                start,
+                end,
+                SECONDARY_MODE_SBU,
+                token,
+            )
+
+        hass.async_create_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("mode", "safe_soc", "unsafe_soc"),
+        [
+            (SECONDARY_MODE_SBU, 20.9, 20.1),
+            (SECONDARY_MODE_CHARGE, 99.5, 99.9),
+        ],
+    )
+    async def test_subthreshold_soc_crossing_revokes_verified_mode_lock(
+        self,
+        mode: str,
+        safe_soc: float,
+        unsafe_soc: float,
+    ) -> None:
+        """A verified lock cannot hide a reserve/headroom safety crossing."""
+        coordinator = _make_bare_coordinator()
+        start, end = self._configure_lock_snapshot(coordinator, mode=mode)
+        hass = cast(MagicMock, coordinator.hass)
+        pending_task = MagicMock()
+        pending_task.done.return_value = False
+        hass.async_create_task.return_value = pending_task
+        assert coordinator._live is not None
+        coordinator._live.secondary_storage.soc_pct = safe_soc
+        coordinator._last_plan_secondary_soc_pct = safe_soc
+
+        with patch(
+            "custom_components.hsem.coordinator.hsem_now",
+            return_value=start + timedelta(minutes=1),
+        ):
+            token = coordinator.secondary_control_mode_started(start, end, mode)
+            assert token is not None
+            coordinator.secondary_control_mode_finished(
+                start,
+                end,
+                mode,
+                token,
+                verified=True,
+            )
+            assert coordinator._secondary_current_slot_mode_lock is not None
+
+            await coordinator._async_handle_secondary_storage_change(
+                cast(
+                    Any,
+                    SimpleNamespace(
+                        data={
+                            "entity_id": "sensor.powmr_soc",
+                            "new_state": SimpleNamespace(state=str(unsafe_soc)),
+                        }
+                    ),
+                )
+            )
+
+        assert abs(unsafe_soc - safe_soc) < SECONDARY_STORAGE_SOC_REPLAN_DELTA_PCT
+        assert coordinator._secondary_current_slot_mode_lock is None
+        assert coordinator._secondary_mode_lock_replan_pending is True
+        assert coordinator._secondary_storage_update_pending is True
+        hass.async_create_task.assert_called_once()
+        hass.async_create_task.call_args.args[0].close()
+
+    def test_repeated_dst_slots_use_distinct_utc_lock_identity(self) -> None:
+        """The two local 02:00 slots on DST fallback cannot alias each other."""
+        coordinator = _make_bare_coordinator()
+        self._configure(coordinator)
+        timezone = ZoneInfo("Europe/Stockholm")
+        first_start = datetime(2026, 10, 25, 2, 0, tzinfo=timezone, fold=0)
+        first_end = datetime(2026, 10, 25, 2, 15, tzinfo=timezone, fold=0)
+        second_start = datetime(2026, 10, 25, 2, 0, tzinfo=timezone, fold=1)
+        second_end = datetime(2026, 10, 25, 2, 15, tzinfo=timezone, fold=1)
+        live = LiveState()
+        live.secondary_storage.soc_pct = 75.0
+        live.secondary_storage.load_power_w = 190.0
+        coordinator._live = live
+
+        coordinator._hourly_recommendation = cast(
+            Any,
+            SimpleNamespace(
+                start=first_start,
+                end=first_end,
+                secondary_storage_mode=SECONDARY_MODE_SBU,
+            ),
+        )
+        with patch(
+            "custom_components.hsem.coordinator.hsem_now",
+            return_value=datetime(2026, 10, 25, 0, 5, tzinfo=UTC),
+        ):
+            first_token = coordinator.secondary_control_mode_started(
+                first_start,
+                first_end,
+                SECONDARY_MODE_SBU,
+            )
+            assert first_token is not None
+            coordinator.secondary_control_mode_finished(
+                first_start,
+                first_end,
+                SECONDARY_MODE_SBU,
+                first_token,
+                verified=True,
+            )
+
+        first_lock = coordinator._secondary_current_slot_mode_lock
+        assert first_lock is not None
+        assert first_lock.slot_start == datetime(2026, 10, 25, 0, 0, tzinfo=UTC)
+
+        coordinator._hourly_recommendation = cast(
+            Any,
+            SimpleNamespace(
+                start=second_start,
+                end=second_end,
+                secondary_storage_mode=SECONDARY_MODE_SBU,
+            ),
+        )
+        with patch(
+            "custom_components.hsem.coordinator.hsem_now",
+            return_value=datetime(2026, 10, 25, 1, 5, tzinfo=UTC),
+        ):
+            second_token = coordinator.secondary_control_mode_started(
+                second_start,
+                second_end,
+                SECONDARY_MODE_SBU,
+            )
+            assert second_token is not None
+            coordinator.secondary_control_mode_finished(
+                second_start,
+                second_end,
+                SECONDARY_MODE_SBU,
+                second_token,
+                verified=True,
+            )
+
+        second_lock = coordinator._secondary_current_slot_mode_lock
+        assert second_lock is not None
+        assert second_lock.slot_start == datetime(2026, 10, 25, 1, 0, tzinfo=UTC)
+        assert second_lock != first_lock
+
     def test_external_change_invalidates_an_initially_unlocked_solve(self) -> None:
         """Manual authority changes stale a solve even before any mode locks."""
         coordinator = _make_bare_coordinator()
@@ -924,11 +1216,16 @@ class TestLightweightSecondaryStorageEvents:
         """A verifier returning after the half-open slot end is ignored."""
         coordinator = _make_bare_coordinator()
         start, end = self._configure_lock_snapshot(coordinator)
-        token = coordinator.secondary_control_mode_started(
-            start,
-            end,
-            SECONDARY_MODE_SBU,
-        )
+        with patch(
+            "custom_components.hsem.coordinator.hsem_now",
+            return_value=start + timedelta(minutes=1),
+        ):
+            token = coordinator.secondary_control_mode_started(
+                start,
+                end,
+                SECONDARY_MODE_SBU,
+            )
+        assert token is not None
 
         with patch(
             "custom_components.hsem.coordinator.hsem_now",
@@ -957,6 +1254,7 @@ class TestLightweightSecondaryStorageEvents:
                 end,
                 SECONDARY_MODE_SBU,
             )
+            assert token is not None
             coordinator.secondary_control_mode_finished(
                 start,
                 end,
@@ -1012,6 +1310,7 @@ class TestLightweightSecondaryStorageEvents:
                 end,
                 SECONDARY_MODE_CHARGE,
             )
+            assert token is not None
             coordinator.secondary_control_mode_finished(
                 start,
                 end,
@@ -1044,6 +1343,7 @@ class TestLightweightSecondaryStorageEvents:
                 end,
                 SECONDARY_MODE_SBU,
             )
+            assert token is not None
             coordinator.secondary_control_mode_finished(
                 start,
                 end,
@@ -1081,6 +1381,7 @@ class TestLightweightSecondaryStorageEvents:
                 end,
                 SECONDARY_MODE_CHARGE,
             )
+            assert token is not None
             coordinator.secondary_control_mode_finished(
                 start,
                 end,
@@ -1123,6 +1424,7 @@ class TestLightweightSecondaryStorageEvents:
                     end,
                     SECONDARY_MODE_SBU,
                 )
+                assert token is not None
                 coordinator.secondary_control_mode_finished(
                     start,
                     end,
@@ -1339,6 +1641,48 @@ class TestLightweightSecondaryStorageEvents:
             "select.powmr_output"
         ]
         assert expectation.suppressed_replan is False
+        hass.async_create_task.call_args.args[0].close()
+
+    @pytest.mark.asyncio
+    async def test_mismatching_control_echo_revokes_complete_mode_lease(self) -> None:
+        """A stale rebound cannot leave the rest of an SBU transition armed."""
+        coordinator = _make_bare_coordinator()
+        start, end = self._configure_lock_snapshot(coordinator)
+        hass = cast(MagicMock, coordinator.hass)
+        pending_task = MagicMock()
+        pending_task.done.return_value = False
+        hass.async_create_task.return_value = pending_task
+
+        with patch(
+            "custom_components.hsem.coordinator.hsem_now",
+            return_value=start + timedelta(minutes=1),
+        ):
+            mode_token = coordinator.secondary_control_mode_started(
+                start,
+                end,
+                SECONDARY_MODE_SBU,
+            )
+        assert mode_token is not None
+        coordinator.secondary_control_write_started(
+            "select.powmr_output",
+            "sbu",
+        )
+
+        await coordinator._async_handle_secondary_storage_change(
+            cast(
+                Any,
+                SimpleNamespace(
+                    data={
+                        "entity_id": "select.powmr_output",
+                        "old_state": SimpleNamespace(state="sbu"),
+                        "new_state": SimpleNamespace(state="utility"),
+                    }
+                ),
+            )
+        )
+
+        assert coordinator._secondary_control_mode_expectation is None
+        assert coordinator._secondary_mode_lock_replan_pending is True
         hass.async_create_task.call_args.args[0].close()
 
     @pytest.mark.asyncio

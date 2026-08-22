@@ -256,6 +256,8 @@ Displays the planner's strategy rationale and per-candidate cost breakdown.
 ## Financial sensors
 
 Cumulative monetary sensors that track grid import cost and export revenue.
+All three use the `total` state class because signed prices can make their
+values decrease as well as increase.
 
 **Entities:**
 - `sensor.hsem_export_income` — Cumulative export revenue
@@ -267,7 +269,7 @@ Cumulative monetary sensors that track grid import cost and export revenue.
 | Property | Value |
 |---|---|
 | **Type** | `sensor` |
-| **State class** | `total_increasing` |
+| **State class** | `total` |
 | **State** | Cumulative export revenue (local currency) |
 | **Device class** | `monetary` |
 
@@ -276,7 +278,7 @@ Cumulative monetary sensors that track grid import cost and export revenue.
 | Property | Value |
 |---|---|
 | **Type** | `sensor` |
-| **State class** | `total_increasing` |
+| **State class** | `total` |
 | **State** | Cumulative import cost (local currency) |
 | **Device class** | `monetary` |
 
@@ -285,7 +287,7 @@ Cumulative monetary sensors that track grid import cost and export revenue.
 | Property | Value |
 |---|---|
 | **Type** | `sensor` |
-| **State class** | `measurement` |
+| **State class** | `total` |
 | **State** | Net grid balance (`export_income − import_cost`, local currency) |
 | **Device class** | `monetary` |
 
@@ -598,9 +600,9 @@ Detects when the inverter is actively curtailing PV production.
 | `sensor.hsem_recommendation_interval_sensor` | Recommendation Interval | Slot width and horizon info | Minutes |
 | `sensor.hsem_update_interval_sensor` | Update Interval | Current polling interval | Minutes |
 | `sensor.hsem_working_mode` | Working Mode | Active battery recommendation | Working mode state |
-| `sensor.hsem_export_income` | Export Income | Cumulative export revenue | Monetary (total_increasing) |
-| `sensor.hsem_import_cost` | Import Cost | Cumulative import cost | Monetary (total_increasing) |
-| `sensor.hsem_net_grid_balance` | Net Grid Balance | Export income minus import cost | Monetary (measurement) |
+| `sensor.hsem_export_income` | Export Income | Cumulative export revenue | Monetary (total) |
+| `sensor.hsem_import_cost` | Import Cost | Cumulative import cost | Monetary (total) |
+| `sensor.hsem_net_grid_balance` | Net Grid Balance | Export income minus import cost | Monetary (total) |
 | `sensor.hsem_effective_discharge_floor` | Effective Discharge Floor | Current effective floor SoC | Percentage |
 | `sensor.hsem_savings_tracker_sensor` | Savings Tracker | Actual vs missed savings (90-day) | Monetary |
 | `sensor.hsem_pv_curtailment_sensor` | PV Curtailment | PV curtailment detection | `curtailed` / `normal` |

@@ -23,6 +23,10 @@ from custom_components.hsem.models.plan_explanation import PlanExplanation
 from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.planner_input import PlannerInput
 from custom_components.hsem.models.rejected_plan import RejectedPlan
+from custom_components.hsem.planner.cost_helpers import (
+    grid_cash_flow_cost,
+    slot_grid_cash_flow_cost,
+)
 from custom_components.hsem.utils.datetime_utils import utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import calculate_recommended_threshold
@@ -191,22 +195,41 @@ def _build_explanation(
     forecast_net = round(sum(s.estimated_net_consumption_kwh for s in future_slots), 3)
     forecast_usable = any(s.solcast_pv_estimate_kwh > 0.0 for s in future_slots)
 
-    # --- Cost of the selected plan ---------------------------------------
+    # --- Auditable grid cash flow of the selected plan -------------------
+    # This is the meter-money portion of PlanCost: import cost minus export
+    # revenue. Battery wear remains separately itemised in PlanCost.total_cost;
+    # terminal value, safeguards, and tiebreaks exist only in PlanCost.score.
     selected_cost = round(
-        sum(s.estimated_cost_currency for s in future_slots if s.price_actionable),
-        4,
-    )
-
-    # --- Do-nothing baseline cost (battery fully idle, pay import for all load) ---
-    # Computed here so strategy detection can use it in summaries.
-    do_nothing_cost = round(
         sum(
-            max(s.estimated_net_consumption_kwh, 0.0) * s.price.import_price
+            slot_grid_cash_flow_cost(s, export_min_price=inp.export_min_price)
             for s in future_slots
-            if s.price_actionable
         ),
         4,
     )
+
+    # --- Do-nothing baseline cash flow (battery fully idle) ---------------
+    # Preserve both import cost and direct-PV export revenue at the same
+    # authoritative prices/site floor used for the selected plan.
+    do_nothing_cost_raw = 0.0
+    for slot in future_slots:
+        idle_net_kwh = slot.estimated_net_consumption_kwh
+        if (
+            inp.secondary_storage.valid
+            and not inp.secondary_storage.base_load_includes_dedicated_load
+        ):
+            # Idle PowMr means Utility bypass. When its dedicated load is not
+            # part of the house forecast, that live load still belongs on the
+            # site meter and cannot disappear from the idle comparator.
+            idle_net_kwh += max(slot.secondary_storage_load_kwh, 0.0)
+        do_nothing_cost_raw += grid_cash_flow_cost(
+            max(idle_net_kwh, 0.0),
+            max(-idle_net_kwh, 0.0),
+            slot.price.import_price,
+            slot.price.export_price,
+            price_actionable=slot.price_actionable,
+            export_min_price=inp.export_min_price,
+        )
+    do_nothing_cost = round(do_nothing_cost_raw, 4)
 
     # --- Strategy detection ----------------------------------------------
     has_grid_charge = any(

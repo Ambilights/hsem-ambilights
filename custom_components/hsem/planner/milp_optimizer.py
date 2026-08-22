@@ -12,7 +12,7 @@ from custom_components.hsem.const import (
     MILP_SOLVER_TIMEOUT_MIN_SECONDS,
 )
 from custom_components.hsem.models.ev_config import EVConfig
-from custom_components.hsem.utils.datetime_utils import utc_key
+from custom_components.hsem.utils.datetime_utils import slot_contains, utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import clamp_efficiency
 from custom_components.hsem.utils.phase_power import PhasePowers
@@ -261,8 +261,8 @@ def solve_milp(
     # for these slots, blocking export entirely.  The LP must not optimise
     # around a price signal that will never be realised.
     #
-    # Negative export prices are NOT clamped — the LP has a curt[t]
-    # variable with zero objective cost that naturally handles them:
+    # With the site export floor disabled, negative export prices remain signed;
+    # the LP has a curt[t] variable with zero objective cost that handles them:
     # when p_exp < 0, export costs money (p_exp is negative, so
     # -p_exp·ge becomes a positive cost), and the LP prefers curtailment
     # (cost 0) over export (cost > 0).
@@ -294,44 +294,13 @@ def solve_milp(
     if min_export_price > 1e-9:
         p_exp = np.where(min_export_blocked, 0.0, p_exp)
 
-    # Clamp export price to never exceed import price for the same slot.
-    # Without this, slots where p_exp[t] > p_imp[t] create an unbounded LP
-    # (HiGHS status=3): both gi[t] and ge[t] are [0, ∞) and linked only
-    # through the energy-balance equality, so the LP can drive both to
-    # infinity (import cheap, export expensive) while the terms cancel in
-    # the balance equation.  This is economically correct — no rational
-    # agent imports and exports the same commodity in the same instant for
-    # profit — and capping the achievable arbitrage spread removes the
-    # unbounded direction without changing any other behavior.
-    export_exceeds_import = p_exp > p_imp
-    n_clamped = int(np.sum(export_exceeds_import))
-    if n_clamped > 0:
-        deltas = p_exp[export_exceeds_import] - p_imp[export_exceeds_import]
-        log_planner(
-            "debug",
-            "[milp] Clamping %d export prices that exceed import price "
-            "(max delta=%.4f)",
-            n_clamped,
-            float(np.max(deltas)),
-        )
-        p_exp = np.minimum(p_exp, p_imp)
-
-    # Clamp negative import prices to 0 for objective coefficients.
-    # When p_imp[t] < 0, the gi[t] objective coefficient becomes
-    # negative, incentivising the LP to import infinite energy
-    # (HiGHS status=3, unbounded LP).  curt[t] has zero objective
-    # cost but participates in the energy balance, so the LP can
-    # import-and-curtail for unbounded profit even without p_exp>p_imp.
-    #
-    # Clamping to 0 here removes that unbounded direction while
-    # Raw finite arrays are retained separately only for physical export
-    # masks and diagnostics; objective and penalty scaling use the economic
-    # arrays whose nonactionable tail is neutral.
-    #
-    # This is the companion to the export-≤-import clamp above:
-    # together they close both unbounded-LP directions identified in
-    # issue #635.
-    p_imp_obj = np.maximum(p_imp, 0.0)
+    # Preserve every finite actionable market rate in the objective. Grid
+    # import/export have finite physical upper bounds and ``grid_flow_mode``
+    # makes their directions mutually exclusive, so negative imports and
+    # export rates above import can no longer create an unbounded wash flow.
+    # ``p_imp_obj`` remains as a compatibility name consumed by the extracted
+    # objective builder; it now carries the authoritative signed rate.
+    p_imp_obj = p_imp.copy()
 
     # Net load = house consumption + EV extra load − PV estimate.
     # A positive value means the battery/grid must supply extra energy.
@@ -384,21 +353,34 @@ def solve_milp(
             if ev.enabled and ev.capacity_kwh > 1e-9 and ev.max_charge_per_slot > 1e-9:
                 active_evs.append(ev)
         if active_evs:
-            # Recompute net_load without EV planned loads
-            net_load = np.array(
-                [
-                    slots[i].avg_house_consumption_kwh
-                    - slots[i].solcast_pv_estimate_kwh
-                    for i in future_idx
-                ],
-                dtype=float,
-            )
+            # Recompute the pure-house baseline before adding the MILP's EV
+            # variables. Accounted heuristic EV load is already embedded in
+            # the house forecast and must be removed, except for a known live
+            # session that current-slot injection already subtracted.
+            active_net_load: list[float] = []
+            for slot_i in future_idx:
+                slot = slots[slot_i]
+                accounted_to_remove = max(slot.ev_accounted_load_kwh, 0.0)
+                if slot_contains(slot.start, slot.end, now) and any(
+                    ev.current_session_removed_from_base for ev in active_evs
+                ):
+                    # Live injection already turned avg_house into a pure-house
+                    # current-slot projection by subtracting every known session.
+                    # The heuristic accounted value may use a different power,
+                    # so subtracting any of it again would invent PV headroom.
+                    accounted_to_remove = 0.0
+                active_net_load.append(
+                    slot.avg_house_consumption_kwh
+                    - accounted_to_remove
+                    - slot.solcast_pv_estimate_kwh
+                )
+            net_load = np.asarray(active_net_load, dtype=float)
             pv_avail = np.maximum(-net_load, 0.0)
             base_load = np.maximum(net_load, 0.0)
             log_planner(
                 "debug",
                 "[milp] EV co-optimisation enabled: %d active EV(s), "
-                "net_load rebuilt without pre-computed EV loads",
+                "net_load rebuilt without double-counted EV loads",
                 len(active_evs),
             )
         else:
@@ -527,6 +509,14 @@ def solve_milp(
                     for i in future_idx
                 ]
             )
+
+    # export_min_price is a site-wide hardware export gate. Unlike the
+    # battery-only floor, it must suppress direct PV/non-battery export too.
+    pv_export_ub_per_slot = np.where(
+        min_export_blocked,
+        0.0,
+        pv_export_ub_per_slot,
+    )
 
     # Finite physical bounds make exact grid import/export direction possible.
     grid_import_ub_per_slot = base_load + max_charge_per_slot / charge_eff

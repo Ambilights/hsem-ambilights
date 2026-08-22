@@ -38,6 +38,9 @@ every step in order so individual entities can be customised.
 |---|---|---|---|
 | Device name | `device_name` | `"Huawei Solar Energy Management"` | Friendly name for the integration |
 | Update interval | `hsem_update_interval` | 5 minutes | Coordinator polling interval |
+| MILP solver time limit | `hsem_milp_solver_timeout_seconds` | 15 seconds | Maximum solve time before a validated feasible incumbent or passive fallback is used |
+| Recommendation interval | `hsem_recommendation_interval_minutes` | 15 minutes | Planner slot resolution (15 or 60 minutes) |
+| Planning horizon | `hsem_recommendation_interval_length` | 48 hours | Physical planning horizon (12, 24, 36, 48, or 72 hours) |
 | Read-only mode | `hsem_read_only` | `False` | Block all hardware writes when enabled |
 | Verbose logging | `hsem_verbose_logging` | `False` | Enable debug-level planner logging |
 
@@ -142,7 +145,7 @@ Power sensor configuration.
 | House includes EV | `hsem_house_power_includes_ev_charger_power` | `True` | Whether house sensor already includes EV charger |
 | Main fuse amps | `hsem_main_fuse_amps` | 25 | Main fuse/breaker rating in amps. Set to 0 to disable. The MILP optimizer will respect this limit when scheduling battery and EV charging |
 | Main fuse phases | `hsem_main_fuse_phases` | 3 | Electrical phase count (1 or 3). Single-phase installations MUST set this to 1 — setting 3 on a single-phase install makes the fuse constraint 3× too permissive |
-| Phase-aware charging | `hsem_phase_aware_charging_enabled` | `False` | Hard per-phase planner limits plus live Huawei-first/PowMr-second charging. Requires the extra Huawei phase and battery entities |
+| Phase-aware charging | `hsem_phase_aware_charging_enabled` | `False` | Hard per-phase planner limits plus live Huawei-first/PowMr-second charging. EV commands conservatively use the least-free single-phase headroom because charger phase topology is not configured. Requires the extra Huawei phase and battery entities |
 | Max grid export power | `hsem_max_grid_export_power_kw` | 0 | DNO/inverter grid export cap in kW for export-limited connections (issue #726). The MILP planner never schedules export above this limit. Set to 0 to disable |
 
 ### Step: `secondary_storage`

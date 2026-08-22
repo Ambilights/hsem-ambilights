@@ -12,6 +12,7 @@ from custom_components.hsem.models.price_forecast import PriceForecast
 from custom_components.hsem.models.secondary_storage_config import (
     SecondaryStorageConfig,
 )
+from custom_components.hsem.planner.cost_helpers import slot_grid_cash_flow_cost
 from custom_components.hsem.planner.future_value import forecast_effective_prices
 from custom_components.hsem.utils.datetime_utils import utc_key
 from custom_components.hsem.utils.misc import clamp_efficiency
@@ -91,6 +92,8 @@ def apply_secondary_utility_bypass(
     slots: list[PlannedSlot],
     config: SecondaryStorageConfig,
     now: datetime,
+    *,
+    export_min_price: float = 0.0,
 ) -> None:
     """Apply a physically valid utility-bypass fallback to non-MILP plans."""
     if not config.valid:
@@ -118,14 +121,8 @@ def apply_secondary_utility_bypass(
         net_grid = slot.grid_import_kwh - slot.grid_export_kwh + site_delta
         slot.grid_import_kwh = round(max(net_grid, 0.0), 3)
         slot.grid_export_kwh = round(max(-net_grid, 0.0), 3)
-        slot.estimated_cost_currency = (
-            round(
-                slot.grid_import_kwh * max(slot.price.import_price, 0.0)
-                - slot.grid_export_kwh * slot.price.export_price,
-                4,
-            )
-            if slot.price_actionable
-            else 0.0
+        slot.estimated_cost_currency = round(
+            slot_grid_cash_flow_cost(slot, export_min_price=export_min_price), 4
         )
 
 

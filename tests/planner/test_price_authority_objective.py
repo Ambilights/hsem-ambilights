@@ -228,6 +228,8 @@ def test_curtailment_variable_is_bounded_by_available_pv() -> None:
         [],
         0,
         1.0,
+        np.ones(2),
+        np.zeros(2),
         False,
         bounds_builder,
     )

@@ -45,7 +45,11 @@ def rebuild_ev_plan_from_slots(
         if power_w < 1e-9:
             continue
 
-        slot_hours = slot_duration_hours(slot.start, slot.end)
+        slot_hours = (
+            max(slot_duration_hours(max(now, slot.start), slot.end), 0.0)
+            if slot_contains(slot.start, slot.end, now)
+            else slot_duration_hours(slot.start, slot.end)
+        )
         ac_load = power_w * slot_hours / 1000.0
         dc_kwh = ac_load * eff
         total_charged_kwh += dc_kwh
@@ -56,7 +60,11 @@ def rebuild_ev_plan_from_slots(
         solar_used_ac = min(ac_load, surplus_kwh)
         solar_used_dc = solar_used_ac * eff
         import_needed = max(dc_kwh - solar_used_dc, 0.0)
-        raw_import_price = getattr(getattr(slot, "price", None), "import_price", 0.0)
+        raw_import_price = getattr(
+            getattr(slot, "price", None),
+            "import_price",
+            getattr(slot, "import_price", 0.0),
+        )
         import_price = (
             float(raw_import_price)
             if getattr(slot, "price_actionable", True)
@@ -73,7 +81,7 @@ def rebuild_ev_plan_from_slots(
                 solar_surplus_kwh=round(solar_used_dc, 3),
                 import_needed_kwh=round(import_needed, 3),
                 import_price=import_price,
-                estimated_cost=round(ac_load * import_price, 4),
+                estimated_cost=round((import_needed / eff) * import_price, 4),
             )
         )
         planned_load_by_slot[slot.start.isoformat()] = dc_kwh
@@ -85,8 +93,20 @@ def rebuild_ev_plan_from_slots(
         state = "charging" if current_slot_planned_load_kwh > 1e-9 else "waiting"
     elif original_plan.state == "fully_charged":
         state = "fully_charged"
-    else:
+    elif original_plan.state in {
+        "not_connected",
+        "smart_charging_disabled",
+        "unavailable",
+        "unknown",
+    }:
+        # Guard states describe the EV/configuration rather than a schedule.
         state = original_plan.state
+    else:
+        # The MILP writeback is authoritative.  If minimum-power or fuse
+        # headroom made every continuous allocation uncommandable, retaining
+        # the greedy pre-MILP ``charging`` state would tell the sensor that the
+        # car is charging while every published command is zero.
+        state = "waiting"
 
     data_quality = dict(original_plan.data_quality)
     unmet_target_kwh = max(original_plan.total_kwh_needed - total_charged_kwh, 0.0)

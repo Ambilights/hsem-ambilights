@@ -201,6 +201,9 @@ class PlanExplanation:
                 if self.secondary_terminal_price_per_kwh is not None
                 else None
             ),
+            "hysteresis_active": self.hysteresis_active,
+            "hysteresis_reason": self.hysteresis_reason,
+            "previous_plan_name": self.previous_plan_name,
             "constraints": list(self.constraints),
             "rejected_plans": [
                 {

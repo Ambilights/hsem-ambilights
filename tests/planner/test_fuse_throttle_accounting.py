@@ -1,112 +1,449 @@
-"""The published plan must agree with what the fuse throttle will command.
-
-``run_planner``'s post-hoc main-fuse check lowers EV charger power and battery
-charge energy when a slot would exceed the fuse.  It previously left every
-*derived* field at its pre-throttle value, so the slot went on advertising the
-original grid import, EV load, net consumption and cost while the hardware was
-about to be driven at less — the plan and the command disagreed.
-
-Battery state of charge is deliberately still not re-simulated: ``simulate_soc``
-runs inside the candidate selector so a winner's score matches its slots, and
-re-running it afterwards would decouple the two.  A throttled slot therefore
-still reports the SoC the unthrottled plan would have reached.
-"""
+"""End-to-end regressions for fuse-safe, selection-stable plan publication."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 
-from custom_components.hsem.models.planned_slot import PlannedSlot
+from custom_components.hsem.models.hourly_consumption_average import (
+    HourlyConsumptionAverage,
+)
 from custom_components.hsem.models.planner_input import PlannerInput
-from custom_components.hsem.planner.engine_core import _apply_main_fuse_throttle
-from custom_components.hsem.utils.prices import SlotPrice
+from custom_components.hsem.models.price_forecast import (
+    ForecastPricePoint,
+    PriceForecast,
+)
+from custom_components.hsem.models.price_point import PricePoint
+from custom_components.hsem.models.solcast_slot import SolcastSlot
+from custom_components.hsem.planner import run_planner
+from custom_components.hsem.planner.candidate_generator import CANDIDATE_PASSIVE
+from custom_components.hsem.planner.milp_optimizer import (
+    CANDIDATE_MILP,
+    is_scipy_available,
+)
 
-# 16 A three-phase = 11040 W = 2.76 kWh per 15-minute slot.
-FUSE_A = 16
-SLOT_MIN = 15
-SLOT_H = SLOT_MIN / 60.0
-FUSE_KWH = FUSE_A * 3 * 230.0 * SLOT_H / 1000.0
+_NOW = datetime(2026, 8, 20, tzinfo=UTC)
+_FUSE_AMPS = 2.0
+_FUSE_KWH = _FUSE_AMPS * 3 * 230.0 / 1000.0
+
+pytestmark = pytest.mark.skipif(
+    not is_scipy_available(), reason="scipy not available in this environment"
+)
 
 
-def _slot(start: datetime, *, ev_w: float, import_kwh: float) -> PlannedSlot:
-    """A slot already over the fuse, driven by EV charging."""
-    slot = PlannedSlot(
-        start=start,
-        end=start + timedelta(minutes=SLOT_MIN),
-        price=SlotPrice(import_price=1.0, export_price=0.1),
-        solcast_pv_estimate_kwh=0.0,
-        avg_house_consumption_kwh=0.5,
-        estimated_net_consumption_kwh=0.5,
-        recommendation="batteries_wait_mode",
+def _averages(
+    *, default: float, overrides: dict[int, float] | None = None
+) -> list[HourlyConsumptionAverage]:
+    values = overrides or {}
+    return [
+        HourlyConsumptionAverage(
+            hour=hour,
+            avg_1d=values.get(hour, default),
+            avg_3d=values.get(hour, default),
+            avg_7d=values.get(hour, default),
+            avg_14d=values.get(hour, default),
+        )
+        for hour in range(24)
+    ]
+
+
+def _prices(*, hours: range, import_price: float) -> list[PricePoint]:
+    return [
+        PricePoint(hour=hour, import_price=import_price, export_price=0.0)
+        for hour in hours
+    ]
+
+
+def _base_input(**overrides: Any) -> PlannerInput:
+    values: dict[str, Any] = {
+        "now_iso": _NOW.isoformat(),
+        "interval_minutes": 60,
+        "interval_length_hours": 24,
+        "battery_soc_pct": 0.0,
+        "battery_rated_capacity_kwh": 10.0,
+        "battery_end_of_discharge_soc_pct": 0.0,
+        "battery_max_soc_pct": 100.0,
+        "battery_max_charge_power_w": 1000.0,
+        "battery_max_discharge_power_w": 1000.0,
+        "battery_charge_efficiency_pct": 100.0,
+        "battery_discharge_efficiency_pct": 100.0,
+        "battery_purchase_price": 0.0,
+        "battery_cycle_cost_per_kwh": 0.0,
+        "consumption_averages": _averages(default=0.0),
+        "price_points": _prices(hours=range(24), import_price=0.10),
+        "solcast_slots": [SolcastSlot(hour=hour) for hour in range(24)],
+        "main_fuse_amps": _FUSE_AMPS,
+        "main_fuse_phases": 3,
+        "planner_hysteresis_enabled": False,
+        "is_read_only": True,
+    }
+    values.update(overrides)
+    return PlannerInput(**values)
+
+
+def _winner(output):
+    winner = next(c for c in output.candidates if c.name == output.winner_name)
+    assert winner.name == CANDIDATE_MILP
+    assert winner.slots is output.slots
+    assert winner._cost == output.plan_cost
+    return winner
+
+
+def test_ev_minimum_power_cannot_reintroduce_a_fuse_violation() -> None:
+    """Sub-minimum continuous EV allocations are dropped, not over-fused.
+
+    House demand consumes 1.0 kWh of a 1.38 kWh hourly fuse allowance.  The
+    remaining 380 W cannot start a 1380 W charger in any deadline slot.
+    """
+    output = run_planner(
+        _base_input(
+            consumption_averages=_averages(default=1.0),
+            ev_planned_load_enabled=True,
+            ev_planned_load_connected=True,
+            ev_planned_load_smart_charging_enabled=True,
+            ev_planned_load_current_soc_pct=0.0,
+            ev_planned_load_target_soc_pct=20.0,
+            ev_planned_load_battery_capacity_kwh=10.0,
+            ev_planned_load_charger_power_kw=2.0,
+            ev_planned_load_charger_efficiency_pct=100.0,
+            ev_planned_load_charger_min_power_w=1380.0,
+            ev_planned_load_deadline=_NOW + timedelta(hours=4),
+            ev_planned_load_base_load_includes_ev=False,
+        )
     )
-    slot.ev_charger_calculated_power = ev_w
-    ev_kwh = ev_w / 1000.0 * SLOT_H
-    slot.ev_planned_load_kwh = ev_kwh
-    slot.ev_accounted_load_kwh = 0.0
-    slot.ev_total_planned_load_kwh = ev_kwh
-    slot.estimated_net_consumption_kwh = 0.5 + ev_kwh
-    slot.estimated_cost_currency = round(slot.estimated_net_consumption_kwh * 1.0, 4)
-    slot.grid_import_kwh = import_kwh
-    slot.price_actionable = True
-    return slot
+
+    winner = _winner(output)
+    assert output.ev_charging_plan is not None
+    assert output.ev_charging_plan.state == "waiting"
+    assert output.ev_charging_plan.charging_slots == []
+    assert output.ev_charging_plan.data_quality["unmet_target_kwh"] == pytest.approx(
+        2.0
+    )
+
+    for slot in output.slots:
+        assert slot.grid_import_kwh <= _FUSE_KWH + 1e-9
+        assert slot.ev_charger_calculated_power == pytest.approx(0.0)
+        assert slot.ev_total_planned_load_kwh == pytest.approx(0.0)
+
+    ev_diagnostics = winner.diagnostics["ev"]["ev0"]
+    assert ev_diagnostics["total_dc_kwh"] == pytest.approx(0.0)
+    assert ev_diagnostics["deadline_penalty_kwh"] == pytest.approx(2.0)
+    assert ev_diagnostics["deadline_met"] is False
+    assert ev_diagnostics["unplaceable_dc_kwh"] > 0.0
+    assert winner.diagnostics["total_fuse_violation_kwh"] == pytest.approx(0.0)
 
 
-class TestThrottledSlotAccounting:
-    """Every derived field must follow the command down."""
+def test_terminal_inventory_cannot_charge_past_the_fuse_or_stale_soc() -> None:
+    """A high terminal value is bounded in-model and SoC follows the charge.
 
-    @staticmethod
-    def _throttle(ev_w: float, import_kwh: float) -> PlannedSlot:
-        """Run only the fuse block over one over-limit slot."""
-        start = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
-        slot = _slot(start, ev_w=ev_w, import_kwh=import_kwh)
-        inp = PlannerInput(
-            now_iso=start.isoformat(),
-            main_fuse_amps=float(FUSE_A),
-            main_fuse_phases=3,
-            interval_minutes=SLOT_MIN,
+    Only the first price is published.  The next slot contains a forecast-valued
+    10 kWh load, making retained battery energy extremely valuable.  A 1 A
+    three-phase fuse still limits the only actionable charge to 0.69 kWh.
+    """
+    one_amp_kwh = 3 * 230.0 / 1000.0
+    output = run_planner(
+        _base_input(
+            battery_max_charge_power_w=10_000.0,
+            battery_max_discharge_power_w=10_000.0,
+            consumption_averages=_averages(default=0.0, overrides={1: 10.0}),
+            price_points=_prices(hours=range(1), import_price=0.01),
+            price_forecast=PriceForecast(
+                points=(
+                    ForecastPricePoint(start=_NOW + timedelta(hours=1), value=100.0),
+                ),
+                enabled=True,
+            ),
+            main_fuse_amps=1.0,
         )
-        _apply_main_fuse_throttle([slot], inp, [])
-        return slot
+    )
 
-    def test_grid_import_follows_the_throttle_down(self) -> None:
-        """4 kWh import against a 2.76 kWh fuse: 1.24 kWh must come off."""
-        slot = self._throttle(ev_w=11000.0, import_kwh=4.0)
+    winner = _winner(output)
+    first = output.slots[0]
+    assert first.batteries_charged_kwh == pytest.approx(one_amp_kwh, abs=0.001)
+    assert first.grid_import_kwh == pytest.approx(one_amp_kwh, abs=0.001)
+    assert first.estimated_battery_capacity_kwh == pytest.approx(one_amp_kwh, abs=0.001)
+    assert first.estimated_battery_soc_pct == pytest.approx(6.9, abs=0.02)
+    assert all(
+        slot.batteries_discharged_kwh == pytest.approx(0.0) for slot in output.slots
+    )
+    assert all(
+        slot.estimated_battery_capacity_kwh == pytest.approx(one_amp_kwh, abs=0.001)
+        for slot in output.slots
+    )
+    # The 10 kWh non-actionable house load is unavoidably above the fuse.  It
+    # remains feasible and visible, but controllable charge never worsens it.
+    assert winner.diagnostics["total_fuse_violation_kwh"] == pytest.approx(9.31)
+    assert all(
+        slot.grid_import_kwh <= max(one_amp_kwh, slot.avg_house_consumption_kwh) + 1e-9
+        for slot in output.slots
+    )
+    assert (
+        output.explanation.terminal_cost_to_go_final_valued_quantity_kwh
+        == pytest.approx(one_amp_kwh, abs=0.001)
+    )
 
-        assert slot.grid_import_kwh == pytest.approx(FUSE_KWH, abs=0.01)
 
-    def test_ev_energy_follows_the_command(self) -> None:
-        slot = self._throttle(ev_w=11000.0, import_kwh=4.0)
-        commanded_kwh = slot.ev_charger_calculated_power / 1000.0 * SLOT_H
+def test_valid_milp_is_the_only_executable_candidate_under_signed_prices() -> None:
+    """A valid MILP exclusively owns EV output under signed prices."""
+    prices = [
+        PricePoint(
+            hour=hour,
+            import_price=-1.0 if hour == 0 else 1.0,
+            export_price=0.0,
+        )
+        for hour in range(24)
+    ]
+    output = run_planner(
+        _base_input(
+            battery_soc_pct=100.0,
+            price_points=prices,
+            ev_planned_load_enabled=True,
+            ev_planned_load_connected=True,
+            ev_planned_load_smart_charging_enabled=True,
+            ev_planned_load_current_soc_pct=0.0,
+            ev_planned_load_target_soc_pct=20.0,
+            ev_planned_load_battery_capacity_kwh=10.0,
+            ev_planned_load_charger_power_kw=2.0,
+            ev_planned_load_charger_efficiency_pct=100.0,
+            ev_planned_load_charger_min_power_w=0.0,
+            ev_planned_load_deadline=_NOW + timedelta(hours=2),
+            ev_planned_load_base_load_includes_ev=False,
+        )
+    )
 
-        assert slot.ev_total_planned_load_kwh == pytest.approx(commanded_kwh, abs=0.01)
+    winner = _winner(output)
+    passive = next(
+        candidate
+        for candidate in output.candidates
+        if candidate.name == CANDIDATE_PASSIVE
+    )
+    assert passive._cost is not None
+    assert winner._cost is not None
+    assert all(
+        slot.ev_total_planned_load_kwh == pytest.approx(0.0) for slot in passive.slots
+    )
+    assert output.slots[0].ev_charger_calculated_power <= 1380.0 + 1e-9
+    assert sum(
+        slot.ev_total_planned_load_kwh for slot in output.slots
+    ) == pytest.approx(
+        2.0,
+        abs=0.001,
+    )
+    assert all(slot.grid_import_kwh <= _FUSE_KWH + 1e-9 for slot in output.slots)
+    assert winner.slots is output.slots
+    assert winner._cost == output.plan_cost
 
-    def test_net_consumption_and_cost_are_recomputed(self) -> None:
-        slot = self._throttle(ev_w=11000.0, import_kwh=4.0)
-        expected_net = 0.5 + slot.ev_planned_load_kwh
 
-        assert slot.estimated_net_consumption_kwh == pytest.approx(expected_net)
+def test_solver_failure_fallback_disables_unconstrained_ev_demand(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Passive fallback turns EVs off before scoring when MILP has no result."""
+    monkeypatch.setattr(
+        "custom_components.hsem.planner.candidate_generator.solve_milp",
+        lambda *args, **kwargs: None,
+    )
+    output = run_planner(
+        _base_input(
+            consumption_averages=_averages(default=1.0),
+            ev_planned_load_enabled=True,
+            ev_planned_load_connected=True,
+            ev_planned_load_smart_charging_enabled=True,
+            ev_planned_load_current_soc_pct=0.0,
+            ev_planned_load_target_soc_pct=20.0,
+            ev_planned_load_battery_capacity_kwh=10.0,
+            ev_planned_load_charger_power_kw=2.0,
+            ev_planned_load_charger_efficiency_pct=100.0,
+            ev_planned_load_charger_min_power_w=1380.0,
+            ev_planned_load_deadline=_NOW + timedelta(hours=4),
+            ev_planned_load_base_load_includes_ev=False,
+        )
+    )
+
+    assert output.winner_name == CANDIDATE_PASSIVE
+    winner = next(
+        candidate
+        for candidate in output.candidates
+        if candidate.name == output.winner_name
+    )
+    assert winner.slots is output.slots
+    assert winner._cost == output.plan_cost
+    assert output.ev_charging_plan is not None
+    assert output.ev_charging_plan.state == "waiting"
+    assert output.ev_charging_plan.charging_slots == []
+    assert output.ev_charging_plan.data_quality["unmet_target_kwh"] == pytest.approx(
+        2.0
+    )
+    for slot in output.slots:
+        assert slot.grid_import_kwh <= _FUSE_KWH + 1e-9
+        assert slot.ev_charger_calculated_power == pytest.approx(0.0)
+        assert slot.ev_total_planned_load_kwh == pytest.approx(0.0)
+
+
+def test_invalid_milp_fallback_disables_unconstrained_ev_demand(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected solver candidate cannot expose passive greedy EV demand."""
+    from custom_components.hsem.planner.candidate_validation import validate_candidate
+    from custom_components.hsem.planner.cost_helpers import (
+        slot_grid_cash_flow_cost,
+    )
+
+    def _reject_milp(candidate, floor, *, secondary_storage=None):  # noqa: ANN001, ANN202
+        if candidate.name == CANDIDATE_MILP:
+            return False, "synthetic post-solve validation failure"
+        return validate_candidate(
+            candidate,
+            floor,
+            secondary_storage=secondary_storage,
+        )
+
+    monkeypatch.setattr(
+        "custom_components.hsem.planner.candidate_selector._validate_candidate",
+        _reject_milp,
+    )
+    output = run_planner(
+        _base_input(
+            battery_soc_pct=50.0,
+            battery_end_of_discharge_soc_pct=20.0,
+            consumption_averages=_averages(default=1.0),
+            ev_planned_load_enabled=True,
+            ev_planned_load_connected=True,
+            ev_planned_load_smart_charging_enabled=True,
+            ev_planned_load_current_soc_pct=0.0,
+            ev_planned_load_target_soc_pct=20.0,
+            ev_planned_load_battery_capacity_kwh=10.0,
+            ev_planned_load_charger_power_kw=2.0,
+            ev_planned_load_charger_efficiency_pct=100.0,
+            ev_planned_load_charger_min_power_w=1380.0,
+            ev_planned_load_deadline=_NOW + timedelta(hours=4),
+            ev_planned_load_base_load_includes_ev=False,
+        )
+    )
+
+    assert output.winner_name == CANDIDATE_PASSIVE
+    winner = next(
+        candidate
+        for candidate in output.candidates
+        if candidate.name == output.winner_name
+    )
+    assert winner.slots is output.slots
+    assert winner._cost == output.plan_cost
+    assert output.ev_charging_plan is not None
+    assert output.ev_charging_plan.state == "waiting"
+    for slot in output.slots:
+        assert slot.grid_import_kwh <= _FUSE_KWH + 1e-9
+        assert slot.ev_charger_calculated_power == pytest.approx(0.0)
+        assert slot.ev_total_planned_load_kwh == pytest.approx(0.0)
         assert slot.estimated_cost_currency == pytest.approx(
-            round(expected_net * 1.0, 4)
+            slot_grid_cash_flow_cost(slot)
         )
 
-    def test_the_plan_and_the_command_agree(self) -> None:
-        """The invariant the defect broke."""
-        slot = self._throttle(ev_w=11000.0, import_kwh=4.0)
-        commanded_kwh = slot.ev_charger_calculated_power / 1000.0 * SLOT_H
 
-        assert slot.grid_import_kwh <= FUSE_KWH + 1e-9
-        assert slot.ev_total_planned_load_kwh == pytest.approx(commanded_kwh, abs=0.01)
-        assert slot.estimated_net_consumption_kwh == pytest.approx(
-            0.5 + commanded_kwh, abs=0.01
+@pytest.mark.parametrize("fallback_mode", ["no_result", "rejected"])
+def test_passive_fallback_preserves_uncontrollable_live_session(
+    monkeypatch: pytest.MonkeyPatch,
+    fallback_mode: str,
+) -> None:
+    """Solver fallback keeps physical session load but emits no EV command."""
+    if fallback_mode == "no_result":
+        monkeypatch.setattr(
+            "custom_components.hsem.planner.candidate_generator.solve_milp",
+            lambda *args, **kwargs: None,
+        )
+    else:
+        from custom_components.hsem.planner.candidate_validation import (
+            validate_candidate,
         )
 
-    def test_a_slot_inside_the_fuse_is_untouched(self) -> None:
-        slot = self._throttle(ev_w=2000.0, import_kwh=1.0)
+        def _reject_milp(candidate, floor, *, secondary_storage=None):  # noqa: ANN001, ANN202
+            if candidate.name == CANDIDATE_MILP:
+                return False, "synthetic post-solve validation failure"
+            return validate_candidate(
+                candidate,
+                floor,
+                secondary_storage=secondary_storage,
+            )
 
-        assert slot.ev_charger_calculated_power == pytest.approx(2000.0)
-        assert slot.grid_import_kwh == pytest.approx(1.0)
-        assert slot.estimated_cost_currency == pytest.approx(
-            round((0.5 + 2000.0 / 1000.0 * SLOT_H) * 1.0, 4)
+        monkeypatch.setattr(
+            "custom_components.hsem.planner.candidate_selector._validate_candidate",
+            _reject_milp,
         )
+
+    output = run_planner(
+        _base_input(
+            consumption_averages=_averages(default=1.0),
+            main_fuse_amps=1.0,
+            ev_planned_load_enabled=False,
+            ev_planned_load_connected=False,
+            ev_planned_load_smart_charging_enabled=False,
+            ev_planned_load_battery_capacity_kwh=0.0,
+            ev_planned_load_charger_power_kw=0.0,
+            ev_planned_load_charger_efficiency_pct=100.0,
+            ev_planned_load_base_load_includes_ev=False,
+            ev_session_charge_kw=6.0,
+        )
+    )
+
+    assert output.winner_name == CANDIDATE_PASSIVE
+    winner = next(
+        candidate
+        for candidate in output.candidates
+        if candidate.name == output.winner_name
+    )
+    assert winner.slots is output.slots
+    assert winner._cost == output.plan_cost
+    assert output.ev_charging_plan is None
+
+    for slot in output.slots[:2]:
+        assert slot.ev_total_planned_load_kwh == pytest.approx(6.0)
+        assert slot.ev_planned_load_kwh == pytest.approx(6.0)
+        assert slot.ev_accounted_load_kwh == pytest.approx(0.0)
+        assert slot.ev_charger_calculated_power == pytest.approx(0.0)
+        assert slot.ev_second_charger_calculated_power == pytest.approx(0.0)
+        assert slot.batteries_charged_kwh == pytest.approx(0.0)
+        assert slot.batteries_discharged_kwh == pytest.approx(0.0)
+        assert slot.grid_import_kwh == pytest.approx(7.0)
+        assert slot.estimated_cost_currency == pytest.approx(0.7)
+
+    assert output.slots[2].ev_total_planned_load_kwh == pytest.approx(0.0)
+    assert output.slots[2].grid_import_kwh == pytest.approx(1.0)
+
+
+def test_passive_fixed_session_uses_pure_live_base_then_accounted_forecast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Current live pure-house data injects EV; future inclusive forecast accounts it."""
+    monkeypatch.setattr(
+        "custom_components.hsem.planner.candidate_generator.solve_milp",
+        lambda *args, **kwargs: None,
+    )
+    output = run_planner(
+        _base_input(
+            consumption_averages=_averages(default=7.0),
+            live_house_consumption_w=1000.0,
+            house_power_includes_ev=False,
+            ev_planned_load_enabled=False,
+            ev_planned_load_connected=False,
+            ev_planned_load_smart_charging_enabled=False,
+            ev_planned_load_battery_capacity_kwh=0.0,
+            ev_planned_load_charger_power_kw=0.0,
+            ev_planned_load_charger_efficiency_pct=100.0,
+            ev_planned_load_base_load_includes_ev=True,
+            ev_session_charge_kw=6.0,
+        )
+    )
+
+    assert output.winner_name == CANDIDATE_PASSIVE
+    current, future = output.slots[:2]
+    assert current.avg_house_consumption_kwh == pytest.approx(1.0)
+    assert current.ev_planned_load_kwh == pytest.approx(6.0)
+    assert current.ev_accounted_load_kwh == pytest.approx(0.0)
+    assert current.grid_import_kwh == pytest.approx(7.0)
+    assert future.avg_house_consumption_kwh == pytest.approx(7.0)
+    assert future.ev_planned_load_kwh == pytest.approx(0.0)
+    assert future.ev_accounted_load_kwh == pytest.approx(6.0)
+    assert future.grid_import_kwh == pytest.approx(7.0)
+    assert current.ev_charger_calculated_power == pytest.approx(0.0)
+    assert future.ev_charger_calculated_power == pytest.approx(0.0)

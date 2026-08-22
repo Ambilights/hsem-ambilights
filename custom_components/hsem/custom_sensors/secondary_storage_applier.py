@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
@@ -75,8 +77,18 @@ class SecondaryControlWriteObserver(Protocol):
         slot_start: datetime,
         slot_end: datetime,
         mode: str,
-    ) -> int:
-        """Return a token for one complete ordered mode transition."""
+    ) -> int | None:
+        """Return a lease token for one complete ordered mode transition."""
+        ...
+
+    def secondary_control_mode_is_valid(
+        self,
+        slot_start: datetime,
+        slot_end: datetime,
+        mode: str,
+        token: int,
+    ) -> bool:
+        """Return whether an in-flight transition still owns its lease."""
         ...
 
     def secondary_control_mode_finished(
@@ -115,12 +127,15 @@ def resolve_secondary_control_mode(
     }:
         return None
     if mode == SECONDARY_MODE_SBU and (
-        measured.soc_pct is None or measured.soc_pct <= configured.min_soc_pct + 0.1
+        measured.soc_pct is None
+        or not math.isfinite(measured.soc_pct)
+        or measured.soc_pct <= configured.min_soc_pct + 0.1
     ):
         return SECONDARY_MODE_UTILITY
     if mode == SECONDARY_MODE_CHARGE and (
-        measured.soc_pct is not None
-        and measured.soc_pct >= configured.max_soc_pct - 0.1
+        measured.soc_pct is None
+        or not math.isfinite(measured.soc_pct)
+        or measured.soc_pct >= configured.max_soc_pct - 0.1
     ):
         return SECONDARY_MODE_UTILITY
     if (
@@ -257,6 +272,8 @@ async def _async_apply_secondary_write(
     sensor: Any,
     operation: SecondaryWrite,
     observer: SecondaryControlWriteObserver | None,
+    *,
+    use_backoff: bool = True,
 ) -> ApplyResult:
     """Write and verify one PowMr control while acknowledging its state echo."""
     numeric = operation.kind == "number"
@@ -276,7 +293,7 @@ async def _async_apply_secondary_write(
             desired=operation.desired,
             writer=partial(_execute_write, sensor, operation),
             reader=partial(_read_entity, sensor, operation.entity_id, numeric),
-            backoff=get_write_failure_backoff(sensor),
+            backoff=get_write_failure_backoff(sensor) if use_backoff else None,
         )
         verified = result.status in {ApplyStatus.OK, ApplyStatus.SKIPPED}
         echo_expected = result.status == ApplyStatus.OK
@@ -290,6 +307,137 @@ async def _async_apply_secondary_write(
                 verified=verified,
                 echo_expected=echo_expected,
             )
+
+
+def _mode_lease_is_valid(
+    observer: SecondaryControlWriteObserver | None,
+    slot_start: datetime,
+    slot_end: datetime,
+    mode: str,
+    token: int | None,
+) -> bool:
+    """Return whether the complete transition still owns hardware authority."""
+    if observer is None:
+        return True
+    if token is None:
+        return False
+    return observer.secondary_control_mode_is_valid(
+        slot_start,
+        slot_end,
+        mode,
+        token,
+    )
+
+
+def _revoked_mode_lease_result(
+    cfg: SensorConfig,
+    mode: str,
+) -> ApplyResult:
+    """Represent a superseded whole transition in the published diagnostics."""
+    configured = cfg.secondary_storage
+    if mode == SECONDARY_MODE_CHARGE:
+        entity_id = configured.charger_source_priority_entity or ""
+        desired: str = POWMR_CHARGER_UTILITY
+        actual: str = POWMR_CHARGER_SOLAR_ONLY
+    else:
+        entity_id = configured.output_source_priority_entity or ""
+        desired = POWMR_OUTPUT_SBU
+        actual = POWMR_OUTPUT_UTILITY
+    return ApplyResult(
+        entity_id=entity_id,
+        desired=desired,
+        actual=actual,
+        status=ApplyStatus.UNVERIFIED,
+        error_message="PowMr mode transition lease was superseded",
+    )
+
+
+async def _async_apply_fail_closed_secondary(
+    sensor: Any,
+    cfg: SensorConfig,
+    rec: HourlyRecommendation,
+    observer: SecondaryControlWriteObserver | None,
+) -> list[ApplyResult]:
+    """Verify the complete PowMr stop sequence under independent authority.
+
+    A stale enabling write may already have reached the inverter even when its
+    verifier was cancelled or its state echo contradicted the requested value.
+    Always disarm grid charging first, then return the dedicated load to
+    Utility. Both safe commands are attempted even if the first read-back is
+    unavailable, and failure backoff never delays a safety stop.
+    """
+    configured = cfg.secondary_storage
+    charger_entity = configured.charger_source_priority_entity
+    output_entity = configured.output_source_priority_entity
+    if not charger_entity or not output_entity:
+        return []
+
+    recovery_token = (
+        observer.secondary_control_mode_started(
+            rec.start,
+            rec.end,
+            SECONDARY_MODE_UTILITY,
+        )
+        if observer is not None
+        else None
+    )
+    results: list[ApplyResult] = []
+    try:
+        for operation in (
+            SecondaryWrite("select", charger_entity, POWMR_CHARGER_SOLAR_ONLY),
+            SecondaryWrite("select", output_entity, POWMR_OUTPUT_UTILITY),
+        ):
+            result = await _async_apply_secondary_write(
+                sensor,
+                operation,
+                observer,
+                use_backoff=False,
+            )
+            results.append(result)
+    finally:
+        if observer is not None and recovery_token is not None:
+            observer.secondary_control_mode_finished(
+                rec.start,
+                rec.end,
+                SECONDARY_MODE_UTILITY,
+                recovery_token,
+                verified=len(results) == 2
+                and all(
+                    result.status in {ApplyStatus.OK, ApplyStatus.SKIPPED}
+                    for result in results
+                ),
+            )
+    return results
+
+
+async def _async_complete_fail_closed_secondary(
+    sensor: Any,
+    cfg: SensorConfig,
+    rec: HourlyRecommendation,
+    observer: SecondaryControlWriteObserver | None,
+) -> list[ApplyResult]:
+    """Finish a safety stop despite repeated obsolete-worker cancellations."""
+    cleanup_task = asyncio.create_task(
+        _async_apply_fail_closed_secondary(sensor, cfg, rec, observer),
+        name="hsem_powmr_fail_closed_recovery",
+    )
+    cancellation_received = False
+    while True:
+        try:
+            # Keep every await shielded. A hard-gate update and subsequent
+            # unload may each cancel the obsolete worker while this stop is in
+            # progress; awaiting the child directly after the first
+            # cancellation would let the second cancellation abort it.
+            results = await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError:
+            if cleanup_task.cancelled():
+                return cleanup_task.result()
+            cancellation_received = True
+
+    if cancellation_received:
+        raise asyncio.CancelledError
+    return results
 
 
 async def async_apply_secondary_storage(
@@ -324,8 +472,10 @@ async def async_apply_secondary_storage(
     measured = live.secondary_storage
     if (
         measured.soc_pct is None
+        or not math.isfinite(measured.soc_pct)
         or not 0.0 <= measured.soc_pct <= 100.0
         or measured.load_power_w is None
+        or not math.isfinite(measured.load_power_w)
         or measured.load_power_w < 0.0
     ):
         _LOGGER.warning("PowMr writes blocked — required live telemetry is invalid")
@@ -354,44 +504,119 @@ async def async_apply_secondary_storage(
         if control_write_observer is not None
         else None
     )
+    enabling_transition = resolved_mode in {
+        SECONDARY_MODE_CHARGE,
+        SECONDARY_MODE_SBU,
+    }
+    if (
+        enabling_transition
+        and control_write_observer is not None
+        and mode_token is None
+    ):
+        _LOGGER.warning(
+            "PowMr %s transition skipped because its hardware lease is stale",
+            resolved_mode,
+        )
+        return summary
+
     mode_verified = False
+    operation_started = False
+    fail_close_attempted = False
+    original_results: list[ApplyResult] = []
     try:
-        charger_safely_disabled = False
         for operation in operations:
+            if enabling_transition and not _mode_lease_is_valid(
+                control_write_observer,
+                rec.start,
+                rec.end,
+                resolved_mode,
+                mode_token,
+            ):
+                summary.results.append(_revoked_mode_lease_result(cfg, resolved_mode))
+                fail_close_attempted = True
+                summary.results.extend(
+                    await _async_complete_fail_closed_secondary(
+                        sensor,
+                        cfg,
+                        rec,
+                        control_write_observer,
+                    )
+                )
+                break
+
+            operation_started = True
             result = await _async_apply_secondary_write(
                 sensor,
                 operation,
                 control_write_observer,
+                use_backoff=resolved_mode != SECONDARY_MODE_UTILITY,
             )
             summary.results.append(result)
+            original_results.append(result)
+            lease_valid = not enabling_transition or _mode_lease_is_valid(
+                control_write_observer,
+                rec.start,
+                rec.end,
+                resolved_mode,
+                mode_token,
+            )
             if (
-                operation.entity_id
-                == cfg.secondary_storage.charger_source_priority_entity
-                and operation.desired == POWMR_CHARGER_SOLAR_ONLY
-                and result.status in {ApplyStatus.OK, ApplyStatus.SKIPPED}
+                result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}
+                or not lease_valid
             ):
-                charger_safely_disabled = True
-            if result.status not in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
-                if operation.kind == "number" and not charger_safely_disabled:
-                    # A current that cannot be verified is unsafe while utility
-                    # charging may still be armed.  This installation has no PowMr
-                    # PV input, so Only Solar is a complete charging stop.
-                    fallback = SecondaryWrite(
-                        "select",
-                        cfg.secondary_storage.charger_source_priority_entity or "",
-                        POWMR_CHARGER_SOLAR_ONLY,
+                if enabling_transition:
+                    # The operation may have reached PowMr even if its read-back
+                    # failed, was cancelled, or was contradicted by a state
+                    # event. Establish a fully verified safe state before the
+                    # obsolete worker can finish or a newer plan can enable it.
+                    if result.status in {ApplyStatus.OK, ApplyStatus.SKIPPED}:
+                        summary.results.append(
+                            _revoked_mode_lease_result(cfg, resolved_mode)
+                        )
+                    fail_close_attempted = True
+                    summary.results.extend(
+                        await _async_complete_fail_closed_secondary(
+                            sensor,
+                            cfg,
+                            rec,
+                            control_write_observer,
+                        )
                     )
-                    fallback_result = await _async_apply_secondary_write(
-                        sensor,
-                        fallback,
-                        control_write_observer,
-                    )
-                    summary.results.append(fallback_result)
+                elif resolved_mode == SECONDARY_MODE_UTILITY:
+                    # Both Utility operations reduce risk independently. An
+                    # unreadable charger stop must not suppress routing the
+                    # dedicated load back to Utility.
+                    continue
                 break
-        mode_verified = len(summary.results) == len(operations) and all(
-            result.status in {ApplyStatus.OK, ApplyStatus.SKIPPED}
-            for result in summary.results
+        mode_verified = (
+            len(original_results) == len(operations)
+            and (
+                not enabling_transition
+                or _mode_lease_is_valid(
+                    control_write_observer,
+                    rec.start,
+                    rec.end,
+                    resolved_mode,
+                    mode_token,
+                )
+            )
+            and all(
+                result.status in {ApplyStatus.OK, ApplyStatus.SKIPPED}
+                for result in original_results
+            )
         )
+    except asyncio.CancelledError:
+        if enabling_transition and operation_started and not fail_close_attempted:
+            fail_close_attempted = True
+            summary.results.extend(
+                await _async_complete_fail_closed_secondary(
+                    sensor,
+                    cfg,
+                    rec,
+                    control_write_observer,
+                )
+            )
+        raise
     finally:
         if control_write_observer is not None and mode_token is not None:
             control_write_observer.secondary_control_mode_finished(

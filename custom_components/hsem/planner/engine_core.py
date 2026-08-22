@@ -12,18 +12,19 @@ from dataclasses import replace
 from datetime import datetime
 
 from custom_components.hsem.models.ev_config import EVConfig
-from custom_components.hsem.models.planned_slot import PlannedSlot
 from custom_components.hsem.models.planner_input import PlannerInput
 from custom_components.hsem.models.planner_output import PlannerOutput
 from custom_components.hsem.models.terminal_cost_to_go import TerminalCostToGo
 from custom_components.hsem.planner.candidate_generator import (
     CANDIDATE_MILP,
+    CANDIDATE_PASSIVE,
     generate_candidates,
 )
 from custom_components.hsem.planner.candidate_selector import (
     select_best_candidate,
 )
 from custom_components.hsem.planner.cost_function import CostWeights, score_plan
+from custom_components.hsem.planner.cost_helpers import slot_grid_cash_flow_cost
 from custom_components.hsem.planner.engine_ev import (
     _build_and_inject_for_ev,
     _compute_ev_charger_power,
@@ -66,14 +67,72 @@ from custom_components.hsem.utils.datetime_utils import slot_contains, utc_key
 from custom_components.hsem.utils.logger import log_planner
 from custom_components.hsem.utils.misc import (
     calculate_recommended_threshold,
-    clamp_efficiency,
     resolve_cycle_cost,
 )
 from custom_components.hsem.utils.recommendations import Recommendations
-from custom_components.hsem.utils.units import (
-    fuse_max_energy_per_slot_kwh,
-    hours_ahead,
-)
+from custom_components.hsem.utils.units import slot_duration_hours
+
+
+def _restore_uncontrollable_sessions_to_passive(
+    slots: list,
+    ev_configs: list[EVConfig] | None,
+    now: datetime,
+) -> None:
+    """Keep observed session-only demand visible in the fail-closed fallback."""
+    fixed_sessions = [
+        ev
+        for ev in (ev_configs or [])
+        if ev.fixed_session_only
+        and ev.session_charge_kw is not None
+        and ev.session_charge_kw > 1e-9
+    ]
+    for ev in fixed_sessions:
+        session_charge_kw = ev.session_charge_kw
+        assert session_charge_kw is not None
+        hours_left = 2.0
+        for slot in slots:
+            if hours_left <= 1e-9:
+                break
+            if utc_key(slot.end) <= utc_key(now):
+                continue
+            available_hours = (
+                slot_duration_hours(max(now, slot.start), slot.end)
+                if slot_contains(slot.start, slot.end, now)
+                else slot_duration_hours(slot.start, slot.end)
+            )
+            if available_hours <= 1e-9:
+                continue
+            # Commands are slot-constant, so include the whole slot that
+            # crosses the two-hour certainty boundary, matching the MILP.
+            session_ac_kwh = float(session_charge_kw) * available_hours
+            slot.ev_total_planned_load_kwh = round(
+                slot.ev_total_planned_load_kwh + session_ac_kwh,
+                3,
+            )
+            current_was_removed = (
+                ev.current_session_removed_from_base
+                and slot_contains(slot.start, slot.end, now)
+            )
+            if ev.base_load_includes_ev and not current_was_removed:
+                slot.ev_accounted_load_kwh = round(
+                    slot.ev_accounted_load_kwh + session_ac_kwh,
+                    3,
+                )
+            else:
+                slot.ev_planned_load_kwh = round(
+                    slot.ev_planned_load_kwh + session_ac_kwh,
+                    3,
+                )
+            slot.batteries_charged_kwh = 0.0
+            slot.batteries_discharged_kwh = 0.0
+            slot.primary_battery_hold = True
+            slot.recommendation = Recommendations.EVSmartCharging.value
+            slot.estimated_net_consumption_kwh = (
+                slot.avg_house_consumption_kwh
+                + slot.ev_planned_load_kwh
+                - slot.solcast_pv_estimate_kwh
+            )
+            hours_left -= available_hours
 
 
 def _select_candidate(
@@ -103,6 +162,27 @@ def _select_candidate(
         terminal_cost_to_go=terminal_cost_to_go,
         ev_configs=ev_configs,
     )
+    # Passive is the only executable fallback when the MILP is unavailable or
+    # later rejected. Its baseline EV schedule has no hard fuse/source model,
+    # so keep it EV-empty unconditionally before simulation and scoring.
+    for candidate in candidates:
+        if candidate.name != CANDIDATE_PASSIVE:
+            continue
+        for slot in candidate.slots:
+            if utc_key(slot.end) <= utc_key(now):
+                continue
+            slot.ev_planned_load_kwh = 0.0
+            slot.ev_accounted_load_kwh = 0.0
+            slot.ev_total_planned_load_kwh = 0.0
+            slot.ev_charger_calculated_power = 0.0
+            slot.ev_second_charger_calculated_power = 0.0
+            slot.estimated_net_consumption_kwh = (
+                slot.avg_house_consumption_kwh - slot.solcast_pv_estimate_kwh
+            )
+            if slot.recommendation == Recommendations.EVSmartCharging.value:
+                slot.recommendation = Recommendations.BatteriesWaitMode.value
+        _restore_uncontrollable_sessions_to_passive(candidate.slots, ev_configs, now)
+
     winner, rejected, hyst = select_best_candidate(
         candidates,
         now=now,
@@ -139,156 +219,6 @@ def _select_candidate(
         f"applied={hyst.applied}" if hyst.applied else "inactive",
     )
     return candidates, winner, rejected, hyst
-
-
-def _apply_main_fuse_throttle(
-    slots: list[PlannedSlot],
-    inp: PlannerInput,
-    warnings: list[str],
-) -> None:
-    """Throttle EV and battery charging in slots that exceed the main fuse.
-
-    Runs after candidate selection, regardless of which candidate won, and
-    lowers the *commands* for an over-limit slot: EV charger power first, then
-    battery charge energy.  The slot's own grid import, EV energy, net
-    consumption and cost are then brought back in step.
-
-    Battery state of charge is **not** among them, so the plan is not fully
-    consistent after a battery throttle: simulate_soc runs inside candidate
-    selection so a winner's score matches its slots, and re-running it here
-    would decouple the two.  A throttled slot keeps the SoC the unthrottled
-    plan would have reached, which is optimistic for the rest of the horizon.
-
-    Args:
-        slots: Winner slots, modified in place.
-        inp: Planner input, for the fuse rating and slot width.
-        warnings: Mutable list for any excess that throttling cannot resolve.
-    """
-    # Post-hoc main fuse check — runs regardless of which candidate won.
-    # If any slot exceeds the fuse rating, throttle EV charger power and
-    # battery charge energy to bring total grid import within the limit.
-    if inp.main_fuse_amps is not None and inp.main_fuse_amps > 0:
-        slot_hours = inp.interval_minutes / 60.0
-        max_per_slot_kwh = fuse_max_energy_per_slot_kwh(
-            inp.main_fuse_amps,
-            inp.main_fuse_phases,
-            slot_hours,
-        )
-
-        for s in slots:
-            if s.grid_import_kwh <= max_per_slot_kwh + 1e-9:
-                continue
-
-            excess_kwh = s.grid_import_kwh - max_per_slot_kwh
-            excess_power_w = round((excess_kwh / slot_hours) * 1000.0)
-            # AC energy actually removed from the slot, accumulated so the
-            # published flows can be brought back in step with the commands.
-            removed_ac_kwh = 0.0
-            ev_removed_ac_kwh = 0.0
-
-            # Step 1 — throttle EV charger power first.
-            for attr in (
-                "ev_charger_calculated_power",
-                "ev_second_charger_calculated_power",
-            ):
-                ev_w = round(getattr(s, attr))
-                if ev_w > 0 and excess_power_w > 0:
-                    cut = min(ev_w, excess_power_w)
-                    setattr(s, attr, ev_w - cut)
-                    excess_power_w -= cut
-                    ev_removed_ac_kwh += (cut / 1000.0) * slot_hours
-
-            removed_ac_kwh += ev_removed_ac_kwh
-
-            # Step 2 — throttle battery charging with remaining excess.
-            if excess_power_w > 0 and s.batteries_charged_kwh > 1e-9:
-                chg_eff = clamp_efficiency(inp.battery_charge_efficiency_pct)
-                excess_ac_kwh = (excess_power_w / 1000.0) * slot_hours
-                dc_cut = excess_ac_kwh * chg_eff
-                before_dc = s.batteries_charged_kwh
-                s.batteries_charged_kwh = round(
-                    max(0.0, s.batteries_charged_kwh - dc_cut), 3
-                )
-                battery_ac_removed = (before_dc - s.batteries_charged_kwh) / chg_eff
-                removed_ac_kwh += battery_ac_removed
-
-                # If we zeroed battery charging, clear the recommendation
-                # so the applier does not enable TOU charge for this slot.
-                if s.batteries_charged_kwh < 1e-6:
-                    s.recommendation = None
-
-                # Report what is genuinely left.  Forcing this to zero hid the
-                # warning whenever the battery held less charge than the excess
-                # required, so a slot could still exceed the fuse silently.
-                excess_power_w = max(
-                    0,
-                    excess_power_w - round((battery_ac_removed / slot_hours) * 1000.0),
-                )
-
-            # Bring the published plan back in step with what will be
-            # commanded.  Throttling only lowered the power and energy
-            # *commands*; without this the slot still advertised the original
-            # grid import, EV load and cost, so the plan disagreed with the
-            # hardware it was about to drive.
-            #
-            # Battery state of charge is deliberately not re-simulated here.
-            # simulate_soc() runs inside the candidate selector so the winner's
-            # score matches its slots (see step 5 above); re-running it after
-            # the fact would decouple the two.  A throttled slot therefore
-            # still reports the SoC the untrottled plan would have reached,
-            # which is optimistic for the remainder of the horizon.
-            if removed_ac_kwh > 1e-9:
-                s.grid_import_kwh = round(
-                    max(0.0, s.grid_import_kwh - removed_ac_kwh), 3
-                )
-                if ev_removed_ac_kwh > 1e-9:
-                    # Take it out of the bucket that feeds net consumption
-                    # first, then the one already inside the house baseline.
-                    from_planned = min(s.ev_planned_load_kwh, ev_removed_ac_kwh)
-                    s.ev_planned_load_kwh = round(
-                        max(0.0, s.ev_planned_load_kwh - from_planned), 3
-                    )
-                    s.ev_accounted_load_kwh = round(
-                        max(
-                            0.0,
-                            s.ev_accounted_load_kwh
-                            - (ev_removed_ac_kwh - from_planned),
-                        ),
-                        3,
-                    )
-                    s.ev_total_planned_load_kwh = round(
-                        s.ev_planned_load_kwh + s.ev_accounted_load_kwh, 3
-                    )
-                s.estimated_net_consumption_kwh = (
-                    s.avg_house_consumption_kwh
-                    + s.ev_planned_load_kwh
-                    - s.solcast_pv_estimate_kwh
-                )
-                net = s.estimated_net_consumption_kwh
-                if not s.price_actionable:
-                    s.estimated_cost_currency = 0.0
-                elif net > 0:
-                    s.estimated_cost_currency = round(net * s.price.import_price, 4)
-                else:
-                    s.estimated_cost_currency = round(net * s.price.export_price, 4)
-
-            if excess_power_w > 0:
-                log_planner(
-                    "warning",
-                    "[core] Main fuse violation in slot %s: "
-                    "grid_import=%.3f kWh  limit=%.3f kWh  "
-                    "unresolved_excess=%d W",
-                    s.start.isoformat(),
-                    s.grid_import_kwh,
-                    max_per_slot_kwh,
-                    excess_power_w,
-                )
-                warnings.append(
-                    f"Main fuse ({inp.main_fuse_amps:.0f} A) exceeded in slot "
-                    f"{s.start.isoformat()}: "
-                    f"{excess_kwh:.3f} kWh above limit "
-                    f"(EV/battery throttling insufficient)."
-                )
 
 
 def run_planner(inp: PlannerInput) -> PlannerOutput:
@@ -619,111 +549,6 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
     # drift and to ensure the final score matches the selector's score.
     slots = winner.slots
 
-    _apply_main_fuse_throttle(slots, inp, warnings)
-
-    # Re-apply per-EV minimum-power floor after MILP and fuse throttling.
-    #
-    # Both _compute_ev_charger_power() (for non-MILP candidates) and the
-    # MILP's own EV power computation already set ev_charger_calculated_power
-    # and ev_second_charger_calculated_power correctly per-EV, and the
-    # main-fuse throttling block above correctly adjusts them per-field.
-    #
-    # This block checks whether any power field fell below its OWN charger's
-    # minimum operating power due to fuse throttling, and zeroes it if so.
-    # The energy contribution is reverse-engineered from the power field and
-    # subtracted from the combined slot energy totals so net consumption and
-    # cost remain consistent.
-    #
-    # IMPORTANT: This block MUST NOT recompute per-EV power from the combined
-    # ev_planned_load_kwh / ev_accounted_load_kwh totals.  Those fields are
-    # the SUM across both EVs; deriving a per-EV power from them would
-    # corrupt the per-EV output field with the combined total.
-    _slot_hours = inp.interval_minutes / 60.0
-    _ev_power_checks: list[tuple[str, float, bool]] = []
-    if inp.ev_planned_load_enabled:
-        _ev_power_checks.append(
-            (
-                "ev_charger_calculated_power",
-                inp.ev_planned_load_charger_min_power_w,
-                inp.ev_planned_load_base_load_includes_ev,
-            )
-        )
-    if inp.ev_second_planned_load_enabled:
-        _ev_power_checks.append(
-            (
-                "ev_second_charger_calculated_power",
-                inp.ev_second_planned_load_charger_min_power_w,
-                inp.ev_second_planned_load_base_load_includes_ev,
-            )
-        )
-
-    for s in slots:
-        for attr, min_pwr_w, base_includes in _ev_power_checks:
-            ev_w = round(getattr(s, attr))
-            if ev_w <= 0:
-                continue
-            if min_pwr_w > 1e-9 and ev_w < min_pwr_w:
-                # Below this EV's own minimum — charger won't start.
-                # Reverse-engineer the energy contribution from the
-                # power field to subtract from combined slot totals.
-                if slot_contains(s.start, s.end, now):
-                    remaining_h = max(
-                        hours_ahead(now, s.end),
-                        1.0 / 3600.0,
-                    )
-                    ev_energy = round((ev_w / 1000.0) * remaining_h, 3)
-                else:
-                    ev_energy = round((ev_w / 1000.0) * _slot_hours, 3)
-
-                log_planner(
-                    "debug",
-                    "[core] EV power below %s minimum (%d < %d), "
-                    "zeroing field and subtracting %.3f kWh",
-                    attr,
-                    ev_w,
-                    min_pwr_w,
-                    ev_energy,
-                )
-
-                # Zero this EV's power field only (not the other EV's).
-                setattr(s, attr, 0)
-
-                # Remove this EV's energy contribution from the combined
-                # slot energy fields.  The energy bucket depends on whether
-                # base load already includes EV consumption.
-                if base_includes:
-                    s.ev_accounted_load_kwh = round(
-                        max(0.0, s.ev_accounted_load_kwh - ev_energy), 3
-                    )
-                else:
-                    s.ev_planned_load_kwh = round(
-                        max(0.0, s.ev_planned_load_kwh - ev_energy), 3
-                    )
-                s.ev_total_planned_load_kwh = round(
-                    s.ev_planned_load_kwh + s.ev_accounted_load_kwh, 3
-                )
-
-                # The load is gone from the slot, so the import that funded it
-                # must go too.  This block runs *after* the main-fuse throttle,
-                # so a slot throttled below the charger minimum lands here and
-                # would otherwise keep publishing the import for energy no
-                # longer commanded — undoing the throttle's own correction.
-                s.grid_import_kwh = round(max(0.0, s.grid_import_kwh - ev_energy), 3)
-
-                # Recompute net consumption and cost with the reduced EV load.
-                s.estimated_net_consumption_kwh = (
-                    s.avg_house_consumption_kwh
-                    + s.ev_planned_load_kwh
-                    - s.solcast_pv_estimate_kwh
-                )
-                net = s.estimated_net_consumption_kwh
-                if not s.price_actionable:
-                    s.estimated_cost_currency = 0.0
-                elif net > 0:
-                    s.estimated_cost_currency = round(net * s.price.import_price, 4)
-                else:
-                    s.estimated_cost_currency = round(net * s.price.export_price, 4)
-
     # Spec (planner-spec.md, Layer 2): slots with ev_total_planned_load_kwh > 0
     # are relabelled ev_smart_charging UNLESS the recommendation is one of the
     # protected set below.  batteries_charge_solar and batteries_wait_mode are
@@ -741,6 +566,13 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
     for s in slots:
         if abs(s.ev_total_planned_load_kwh) > 1e-9 and s.recommendation not in _EV_KEEP:
             s.recommendation = Recommendations.EVSmartCharging.value
+        s.estimated_cost_currency = round(
+            slot_grid_cash_flow_cost(
+                s,
+                export_min_price=inp.export_min_price,
+            ),
+            4,
+        )
     cur_rec: str | None = None
     for s in slots:
         if slot_contains(s.start, s.end, now):
@@ -832,26 +664,24 @@ def run_planner(inp: PlannerInput) -> PlannerOutput:
         len(dw_out),
     )
 
-    # When the MILP wins, rebuild the EV charging plans from the MILP's
-    # slot decisions so the sensor reflects what the system *actually*
-    # plans to do, not the EV planner's pre-MILP estimate.
-    if winner.name == CANDIDATE_MILP:
-        if ev_cp is not None:
-            ev_cp = rebuild_ev_plan_from_slots(
-                ev_cp,
-                slots,
-                now,
-                charger_efficiency_pct=inp.ev_planned_load_charger_efficiency_pct,
-                is_second=False,
-            )
-        if ev2_cp is not None:
-            ev2_cp = rebuild_ev_plan_from_slots(
-                ev2_cp,
-                slots,
-                now,
-                charger_efficiency_pct=inp.ev_second_planned_load_charger_efficiency_pct,
-                is_second=True,
-            )
+    # Rebuild the EV sensor plans from the selected executable slots. This is
+    # required both for MILP writeback and for the fail-closed passive fallback.
+    if ev_cp is not None:
+        ev_cp = rebuild_ev_plan_from_slots(
+            ev_cp,
+            slots,
+            now,
+            charger_efficiency_pct=inp.ev_planned_load_charger_efficiency_pct,
+            is_second=False,
+        )
+    if ev2_cp is not None:
+        ev2_cp = rebuild_ev_plan_from_slots(
+            ev2_cp,
+            slots,
+            now,
+            charger_efficiency_pct=inp.ev_second_planned_load_charger_efficiency_pct,
+            is_second=True,
+        )
 
     return PlannerOutput(
         slots=slots,

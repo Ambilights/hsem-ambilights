@@ -36,7 +36,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, override
+from typing import TYPE_CHECKING, Any, cast, override
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, HomeAssistant, callback
@@ -85,7 +85,11 @@ from custom_components.hsem.models.sensor_config import SensorConfig
 from custom_components.hsem.models.state_snapshot import StateSnapshot
 from custom_components.hsem.planner import run_planner
 from custom_components.hsem.planner.charge_scheduler import apply_window_hysteresis
-from custom_components.hsem.planner.ev_planner import EVChargingPlan
+from custom_components.hsem.planner.cost_helpers import grid_cash_flow_cost
+from custom_components.hsem.planner.ev_planner import (
+    EVChargingPlan,
+    rebuild_ev_plan_from_slots,
+)
 from custom_components.hsem.planner.secondary_storage import (
     SECONDARY_MODE_CHARGE,
     SECONDARY_MODE_SBU,
@@ -121,6 +125,7 @@ from custom_components.hsem.utils.misc import (
     ema_filter,
     get_config_value,
 )
+from custom_components.hsem.utils.phase_power import phase_powers_valid
 from custom_components.hsem.utils.prediction_tracker import (
     PredictionTracker,
     _action_label,
@@ -170,6 +175,62 @@ def _secondary_control_values_match(actual: object, desired: object) -> bool:
             and abs(actual_number - desired_number) <= DEFAULT_NUMERIC_TOLERANCE
         )
     return str(actual).strip().casefold() == str(desired).strip().casefold()
+
+
+def _secondary_runtime_safe_mode(
+    cfg: SensorConfig,
+    mode: str,
+    slot_end: datetime,
+    now: datetime,
+    *,
+    soc_pct: float | None,
+    load_power_w: float | None,
+) -> str | None:
+    """Resolve one PowMr mode against immediate reserve/headroom safety."""
+    if (
+        soc_pct is None
+        or not math.isfinite(soc_pct)
+        or not 0.0 <= soc_pct <= 100.0
+        or load_power_w is None
+        or not math.isfinite(load_power_w)
+        or load_power_w < 0.0
+    ):
+        return None
+
+    configured = cfg.secondary_storage
+    remaining_hours = max(
+        (utc_key(slot_end) - utc_key(now)).total_seconds() / 3600.0,
+        0.0,
+    )
+    capacity_kwh = max(configured.capacity_kwh, 0.0)
+    if mode == SECONDARY_MODE_SBU:
+        if soc_pct <= configured.min_soc_pct + 0.1:
+            return SECONDARY_MODE_UTILITY
+        available_kwh = (
+            capacity_kwh * max(soc_pct - configured.min_soc_pct, 0.0) / 100.0
+        )
+        required_kwh = (
+            load_power_w
+            * remaining_hours
+            / 1000.0
+            / clamp_efficiency(configured.discharge_efficiency_pct)
+            + max(configured.inverter_standby_power_w, 0.0) * remaining_hours / 1000.0
+        )
+        if available_kwh + 1e-9 < required_kwh:
+            return SECONDARY_MODE_UTILITY
+    elif mode == SECONDARY_MODE_CHARGE:
+        if soc_pct >= configured.max_soc_pct - 0.1:
+            return SECONDARY_MODE_UTILITY
+        headroom_kwh = capacity_kwh * max(configured.max_soc_pct - soc_pct, 0.0) / 100.0
+        minimum_step_kwh = (
+            max(configured.nominal_voltage_v, 0.0)
+            * max(configured.min_charge_current_a, 0.0)
+            * remaining_hours
+            / 1000.0
+        )
+        if headroom_kwh + 1e-9 < minimum_step_kwh:
+            return SECONDARY_MODE_UTILITY
+    return mode
 
 
 PRICE_SOURCE_UPDATE_DEBOUNCE_SECONDS = 0.25
@@ -233,10 +294,6 @@ class _ForecastAuthorityPlanState:
     window_hys_previous_rec: str | None
     window_hys_previous_slot_start: datetime | None
     window_hysteresis_expiry: datetime | None
-    current_slot_start: datetime | None
-    current_slot_price_actionable: bool | None
-    current_slot_ev_power_w: float
-    current_slot_ev_second_power_w: float
     current_required_battery: float
     plan_explanation: PlanExplanation
     data_quality: DataQuality
@@ -481,17 +538,40 @@ def _apply_live_current_price_availability(
 
 def _set_strict_storage_hold(
     current: HourlyRecommendation,
+    live: LiveState,
 ) -> HourlyRecommendation:
-    """Clear plan-derived storage motion and publish explicit hold intent."""
+    """Publish Hold/Utility and discard superseded current-slot diagnostics.
+
+    The authority failure that calls this helper means HSEM cannot rebuild a
+    trustworthy physical or financial current-slot projection. Zeroed grid,
+    cost, net-load, and EV fields therefore mean "not authoritative", not a
+    prediction that the site will exchange no energy with the grid.
+    """
     current.recommendation = Recommendations.BatteriesWaitMode.value
     current.primary_battery_hold = True
     current.batteries_charged_kwh = 0.0
     current.batteries_discharged_kwh = 0.0
+    current.grid_import_kwh = 0.0
+    current.grid_export_kwh = 0.0
+    current.estimated_cost_currency = 0.0
+    current.estimated_net_consumption_kwh = 0.0
+    current.ev_planned_load_kwh = 0.0
+    current.ev_accounted_load_kwh = 0.0
+    current.ev_total_planned_load_kwh = 0.0
+    current.ev_charger_calculated_power = 0.0
+    current.ev_second_charger_calculated_power = 0.0
     current.secondary_storage_mode = SECONDARY_MODE_UTILITY
     current.secondary_storage_charge_current_a = 0.0
     current.secondary_storage_charged_kwh = 0.0
     current.secondary_storage_discharged_kwh = 0.0
     current.secondary_storage_grid_import_kwh = 0.0
+    secondary_soc = live.secondary_storage.soc_pct
+    if (
+        secondary_soc is not None
+        and math.isfinite(secondary_soc)
+        and 0.0 <= secondary_soc <= 100.0
+    ):
+        current.secondary_storage_estimated_soc_pct = secondary_soc
     return current
 
 
@@ -509,7 +589,7 @@ def _apply_current_price_outage_hold(
     )
     if current is None or current.price_actionable:
         return None
-    return _set_strict_storage_hold(current)
+    return _set_strict_storage_hold(current, live)
 
 
 def _apply_load_forecast_hold(
@@ -530,7 +610,7 @@ def _apply_load_forecast_hold(
     )
     if current is None:
         return None
-    return _set_strict_storage_hold(current)
+    return _set_strict_storage_hold(current, live)
 
 
 def _next_slot_boundary_utc(now: datetime, interval_minutes: int) -> datetime:
@@ -679,21 +759,318 @@ class _SimpleSlot:
 # ---------------------------------------------------------------------------
 
 
-_EV_FORCE_CHARGE_RESCUED_STATES: frozenset[str] = frozenset(
-    {
-        "smart_charging_disabled",
-        "waiting",
-        "not_connected",
-        "fully_charged",
-    }
-)
-"""Plan states a forced charge overrides.
+def _apply_current_ev_power_override(
+    *,
+    config_entry: ConfigEntry,
+    hourly_recommendations: list[HourlyRecommendation],
+    ev_plan: EVChargingPlan | None,
+    ev_second_plan: EVChargingPlan | None,
+    now: datetime,
+    override_primary: bool,
+    override_second: bool,
+    live: LiveState | None = None,
+    reason: str,
+) -> None:
+    """Apply a current-slot EV request without breaking plan accounting.
 
-Every state except ``charging`` itself: the user has explicitly asked for
-power now, so neither a deferred schedule ("waiting"), a disabled feature, a
-connection the integration has not noticed, nor a target already believed met
-should keep the charger off.
-"""
+    Runtime switches are intentionally evaluated after the economic plan, but
+    their actuator command is still bounded by aggregate and per-phase fuse
+    headroom and represented by the same EV-energy, grid-flow, cost, and plan-sensor fields
+    that the charger automation consumes. Increasing EV demand is suppressed
+    in a battery-discharge/export slot so the override cannot turn exported or
+    discharged battery energy into EV supply.
+    """
+    if not override_primary and not override_second:
+        return
+
+    slot = next(
+        (
+            item
+            for item in hourly_recommendations
+            if slot_contains(item.start, item.end, now)
+        ),
+        None,
+    )
+    if slot is None:
+        return
+
+    remaining_hours = max(slot_duration_hours(max(now, slot.start), slot.end), 0.0)
+    if remaining_hours <= 1e-9:
+        return
+
+    old_primary_w = max(float(slot.ev_charger_calculated_power), 0.0)
+    old_second_w = max(float(slot.ev_second_charger_calculated_power), 0.0)
+    old_ev_ac_kwh = max(float(slot.ev_total_planned_load_kwh), 0.0)
+    # EV load without a matching HSEM command is an unmanaged/fixed live
+    # session. Preserve it in meter and cost accounting when overriding the
+    # other charger; it consumes fuse headroom but must not become a command.
+    old_commanded_ev_ac_kwh = (old_primary_w + old_second_w) * remaining_hours / 1000.0
+    unmanaged_ev_ac_kwh = max(old_ev_ac_kwh - old_commanded_ev_ac_kwh, 0.0)
+
+    primary_max_w = max(
+        float(
+            get_config_value(config_entry, "hsem_ev_planned_load_charger_power_kw")
+            or 0.0
+        )
+        * 1000.0,
+        0.0,
+    )
+    second_max_w = max(
+        float(
+            get_config_value(
+                config_entry,
+                "hsem_ev_second_planned_load_charger_power_kw",
+            )
+            or 0.0
+        )
+        * 1000.0,
+        0.0,
+    )
+    primary_min_w = max(
+        float(
+            get_config_value(
+                config_entry,
+                "hsem_ev_planned_load_charger_min_power_w",
+            )
+            or 0.0
+        ),
+        0.0,
+    )
+    second_min_w = max(
+        float(
+            get_config_value(
+                config_entry,
+                "hsem_ev_second_planned_load_charger_min_power_w",
+            )
+            or 0.0
+        ),
+        0.0,
+    )
+    # A force/Auto-Full request may override smart scheduling, but it must
+    # never energise a charger whose connection sensor explicitly says that
+    # no vehicle is present. Keep unknown (`None`) permissive for installations
+    # without a connection sensor. Leaving the override active with a zero cap
+    # also clears any stale planned command for a newly disconnected vehicle.
+    if live is not None:
+        if override_primary and live.ev.is_connected is False:
+            primary_max_w = 0.0
+        if override_second and live.ev_second.is_connected is False:
+            second_max_w = 0.0
+
+    # A larger command in these slots would consume solved export/discharge
+    # before it created new grid import, making a house battery feed the EV.
+    source_blocked = bool(
+        is_material_planned_energy_kwh(slot.batteries_discharged_kwh)
+        or is_material_planned_energy_kwh(slot.grid_export_kwh)
+    )
+    if source_blocked:
+        if override_primary:
+            primary_max_w = min(primary_max_w, old_primary_w)
+        if override_second:
+            second_max_w = min(second_max_w, old_second_w)
+
+    # Derive conservative aggregate headroom from both the selected plan and
+    # live site telemetry. The current-slot plan mixes full-slot house energy
+    # with remaining-slot EV energy, so dividing its non-EV remainder by the
+    # remaining duration deliberately errs on the safe side late in a slot.
+    fuse_amps = max(
+        float(get_config_value(config_entry, "hsem_main_fuse_amps") or 0.0),
+        0.0,
+    )
+    fuse_phases = int(get_config_value(config_entry, "hsem_main_fuse_phases") or 3)
+    if fuse_amps > 1e-9:
+        fuse_power_w = fuse_amps * max(fuse_phases, 1) * 230.0
+        planned_non_ev_w = max(
+            (float(slot.grid_import_kwh) - float(slot.grid_export_kwh) - old_ev_ac_kwh)
+            / remaining_hours
+            * 1000.0,
+            0.0,
+        )
+        live_non_ev_w = 0.0
+        if live is not None and live.house_consumption_power_w is not None:
+            house_w = max(float(live.house_consumption_power_w), 0.0)
+            if bool(
+                get_config_value(
+                    config_entry,
+                    "hsem_house_power_includes_ev_charger_power",
+                )
+            ):
+                house_w = max(
+                    house_w
+                    - max(float(live.ev.power_w or 0.0), 0.0)
+                    - max(float(live.ev_second.power_w or 0.0), 0.0),
+                    0.0,
+                )
+            live_non_ev_w = max(
+                house_w - max(float(live.solar_production_power_w), 0.0),
+                0.0,
+            )
+        ev_power_budget_w = max(
+            fuse_power_w - max(planned_non_ev_w, live_non_ev_w),
+            0.0,
+        )
+    else:
+        ev_power_budget_w = math.inf
+    # Runtime overrides do not know each charger phase topology. When per-phase
+    # protection is enabled, treat every added watt as if it landed on the
+    # phase with the least live headroom. A charger may retain only its own
+    # measured baseline; another charger live draw is reserved, never exposed
+    # as transferable headroom. Invalid telemetry permits no increase.
+    phase_guard_active = fuse_amps > 1e-9 and bool(
+        get_config_value(config_entry, "hsem_phase_aware_charging_enabled")
+    )
+    live_primary_w = (
+        max(float(live.ev.power_w or 0.0), 0.0) if live is not None else 0.0
+    )
+    live_second_w = (
+        max(float(live.ev_second.power_w or 0.0), 0.0) if live is not None else 0.0
+    )
+    phase_increment_headroom_w = math.inf
+    if phase_guard_active:
+        phase_increment_headroom_w = 0.0
+        if live is not None and phase_powers_valid(live.grid_phase_power_w):
+            phase_limit_w = fuse_amps * 230.0
+            phase_increment_headroom_w = max(
+                min(
+                    phase_limit_w - float(phase_power_w)
+                    for phase_power_w in live.grid_phase_power_w
+                ),
+                0.0,
+            )
+
+    # Preserve a non-overridden planned command, while reserving any larger
+    # measured draw so an externally controlled charger cannot lend its fuse
+    # allowance to the charger being overridden.
+    new_primary_w = old_primary_w if not override_primary else 0.0
+    new_second_w = old_second_w if not override_second else 0.0
+    non_override_reservation_w = (
+        max(old_primary_w, live_primary_w) if not override_primary else 0.0
+    ) + (max(old_second_w, live_second_w) if not override_second else 0.0)
+    # Live phase powers already include each measured charger draw. Reserve
+    # only the unpublished remainder of a non-overridden planned command from
+    # tightest-phase headroom so it cannot start after this override and create
+    # an overload on an otherwise unknown charger topology.
+    non_override_phase_reservation_w = (
+        max(old_primary_w - live_primary_w, 0.0) if not override_primary else 0.0
+    ) + (max(old_second_w - live_second_w, 0.0) if not override_second else 0.0)
+    remaining_budget_w = max(
+        ev_power_budget_w - non_override_reservation_w,
+        0.0,
+    )
+
+    if phase_guard_active:
+        # First reserve the observed baseline of each overridden charger. This
+        # prevents primary-first allocation from consuming EV2 baseline.
+        if override_primary:
+            new_primary_w = min(primary_max_w, live_primary_w, remaining_budget_w)
+            remaining_budget_w -= new_primary_w
+        if override_second:
+            new_second_w = min(second_max_w, live_second_w, remaining_budget_w)
+            remaining_budget_w -= new_second_w
+        remaining_budget_w = min(
+            max(remaining_budget_w, 0.0),
+            max(
+                phase_increment_headroom_w - non_override_phase_reservation_w,
+                0.0,
+            ),
+        )
+
+    if override_primary:
+        proposed = min(primary_max_w, new_primary_w + remaining_budget_w)
+        if new_primary_w > 1e-9 or proposed + 1e-9 >= primary_min_w:
+            used_w = max(proposed - new_primary_w, 0.0)
+            new_primary_w = proposed
+            remaining_budget_w = max(remaining_budget_w - used_w, 0.0)
+    if override_second:
+        proposed = min(second_max_w, new_second_w + remaining_budget_w)
+        if new_second_w > 1e-9 or proposed + 1e-9 >= second_min_w:
+            new_second_w = proposed
+
+    new_primary_w = round(new_primary_w)
+    new_second_w = round(new_second_w)
+    new_ev_ac_kwh = round(
+        unmanaged_ev_ac_kwh + (new_primary_w + new_second_w) * remaining_hours / 1000.0,
+        3,
+    )
+    slot.ev_charger_calculated_power = new_primary_w
+    slot.ev_second_charger_calculated_power = new_second_w
+    slot.ev_total_planned_load_kwh = new_ev_ac_kwh
+    base_includes_ev = bool(
+        get_config_value(
+            config_entry,
+            "hsem_house_power_includes_ev_charger_power",
+        )
+    )
+    slot.ev_accounted_load_kwh = new_ev_ac_kwh if base_includes_ev else 0.0
+    slot.ev_planned_load_kwh = 0.0 if base_includes_ev else new_ev_ac_kwh
+    slot.estimated_net_consumption_kwh = round(
+        float(slot.avg_house_consumption_kwh)
+        + float(slot.ev_planned_load_kwh)
+        - float(slot.solcast_pv_estimate_kwh),
+        3,
+    )
+
+    net_grid_kwh = (
+        float(slot.grid_import_kwh)
+        - float(slot.grid_export_kwh)
+        + new_ev_ac_kwh
+        - old_ev_ac_kwh
+    )
+    slot.grid_import_kwh = round(max(net_grid_kwh, 0.0), 3)
+    slot.grid_export_kwh = round(max(-net_grid_kwh, 0.0), 3)
+    slot.estimated_cost_currency = round(
+        grid_cash_flow_cost(
+            slot.grid_import_kwh,
+            slot.grid_export_kwh,
+            slot.import_price,
+            slot.export_price,
+            price_actionable=slot.price_actionable,
+            export_min_price=float(
+                get_config_value(config_entry, "hsem_export_electricity_min_price")
+                or 0.0
+            ),
+        ),
+        4,
+    )
+    if new_primary_w > 0.0 or new_second_w > 0.0:
+        slot.recommendation = Recommendations.EVSmartCharging.value
+
+    for plan, is_second, efficiency_key in (
+        (
+            ev_plan,
+            False,
+            "hsem_ev_planned_load_charger_efficiency",
+        ),
+        (
+            ev_second_plan,
+            True,
+            "hsem_ev_second_planned_load_charger_efficiency",
+        ),
+    ):
+        if plan is None:
+            continue
+        rebuilt = rebuild_ev_plan_from_slots(
+            plan,
+            hourly_recommendations,
+            now,
+            float(get_config_value(config_entry, efficiency_key) or 100.0),
+            is_second=is_second,
+        )
+        plan.__dict__.update(rebuilt.__dict__)
+
+    async_log(
+        "debug",
+        "[coordinator] %s: current EV command primary=%dW second=%dW "
+        "load=%.3fkWh grid_import=%.3fkWh fuse_budget=%sW",
+        reason,
+        new_primary_w,
+        new_second_w,
+        new_ev_ac_kwh,
+        slot.grid_import_kwh,
+        "unlimited"
+        if not math.isfinite(ev_power_budget_w)
+        else f"{ev_power_budget_w:.0f}",
+    )
 
 
 def _apply_force_charge_now(
@@ -703,93 +1080,24 @@ def _apply_force_charge_now(
     ev_plan: EVChargingPlan | None,
     ev_second_plan: EVChargingPlan | None,
     now: datetime,
+    live: LiveState | None = None,
 ) -> None:
-    """Apply the force-charge-now override to the current slot.
-
-    When the user toggles ``hsem_ev_force_charge_now`` (or the second-EV
-    equivalent), the current slot's recommendation is overridden to
-    ``ev_smart_charging`` and the calculated charger power is set to the
-    charger's maximum AC power.
-
-    Crucially, force-charge works **even when smart charging is disabled**.
-    The EV planner returns ``smart_charging_disabled`` with zero allocated
-    power in that case, so this function also flips the plan state to
-    ``charging`` so the plan sensor reflects the forced charge.
-
-    Args:
-        config_entry: The HSEM config entry (to read the force-charge switches).
-        hourly_recommendations: The list of hourly recommendations to modify.
-        ev_plan: The primary EV charging plan (may be ``None``).
-        ev_second_plan: The second EV charging plan (may be ``None``).
-        now: Current time (timezone-aware), used to locate the current slot.
-    """
+    """Apply force-current requests through coherent, fuse-safe accounting."""
     force_primary = bool(get_config_value(config_entry, "hsem_ev_force_charge_now"))
     force_second = bool(
         get_config_value(config_entry, "hsem_ev_second_force_charge_now")
     )
-    if not force_primary and not force_second:
-        return
-
-    now_slot = next(
-        (r for r in hourly_recommendations if slot_contains(r.start, r.end, now)),
-        None,
+    _apply_current_ev_power_override(
+        config_entry=config_entry,
+        hourly_recommendations=hourly_recommendations,
+        ev_plan=ev_plan,
+        ev_second_plan=ev_second_plan,
+        now=now,
+        override_primary=force_primary,
+        override_second=force_second,
+        live=live,
+        reason="Force-Charge-Now",
     )
-    if now_slot is None:
-        return
-
-    if force_primary:
-        now_slot.recommendation = Recommendations.EVSmartCharging.value
-        pwr_kw = float(
-            get_config_value(
-                config_entry,
-                "hsem_ev_planned_load_charger_power_kw",
-            )
-            or 0.0
-        )
-        now_slot.ev_charger_calculated_power = (
-            round(pwr_kw * 1000) if pwr_kw > 0 else 0.0
-        )
-        # Flip the plan state so the sensor reports "charging" whenever the
-        # user forces a charge.  Automations gate on this state, so any
-        # non-charging state must be rescued — not just
-        # "smart_charging_disabled".  "waiting" is the common case: the
-        # planner has scheduled the charge for a later slot, and a forced
-        # charge must override that, which is the whole point of the switch.
-        if ev_plan is not None and ev_plan.state in _EV_FORCE_CHARGE_RESCUED_STATES:
-            ev_plan.state = "charging"
-        async_log(
-            "debug",
-            "[coordinator] Force-Charge-Now: primary EV "
-            "→ overriding current slot to ev_smart_charging at %dW",
-            now_slot.ev_charger_calculated_power,
-        )
-
-    if force_second:
-        now_slot.recommendation = Recommendations.EVSmartCharging.value
-        pwr_kw = float(
-            get_config_value(
-                config_entry,
-                "hsem_ev_second_planned_load_charger_power_kw",
-            )
-            or 0.0
-        )
-        now_slot.ev_second_charger_calculated_power = (
-            round(pwr_kw * 1000) if pwr_kw > 0 else 0.0
-        )
-        # Flip the plan state so the sensor reports "charging" (see the
-        # primary-EV branch above for why every non-charging state is
-        # rescued, not only "smart_charging_disabled").
-        if (
-            ev_second_plan is not None
-            and ev_second_plan.state in _EV_FORCE_CHARGE_RESCUED_STATES
-        ):
-            ev_second_plan.state = "charging"
-        async_log(
-            "debug",
-            "[coordinator] Force-Charge-Now: second EV "
-            "→ overriding current slot to ev_smart_charging at %dW",
-            now_slot.ev_second_charger_calculated_power,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -1005,18 +1313,6 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         self._window_hys_previous_rec: str | None = None
         self._window_hys_previous_slot_start: datetime | None = None
 
-        # Per-slot EV charger power freeze (issue #738).
-        # The EV planner recomputes ev_charger_calculated_power whenever the
-        # planner reruns, mixing live PV/consumption data into the current
-        # slot. That makes the charger command oscillate inside a 15-minute
-        # slot. We freeze the value at slot start and reuse it across replans
-        # until the next slot begins. Explicit overrides (force-charge-now,
-        # auto-full-EV) are applied on top of the frozen value each cycle.
-        self._current_slot_start: datetime | None = None
-        self._current_slot_price_actionable: bool | None = None
-        self._current_slot_ev_power_w: float = 0.0
-        self._current_slot_ev_second_power_w: float = 0.0
-
         # Event-driven re-planning — track state at last plan to avoid
         # re-solving the MILP when nothing material has changed.
         self._last_plan_ev_connected: bool | None = False
@@ -1212,19 +1508,137 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         slot_start: datetime,
         slot_end: datetime,
         mode: str,
-    ) -> int:
-        """Register one complete ordered PowMr mode transition."""
+    ) -> int | None:
+        """Register one complete ordered PowMr mode transition lease."""
+        slot_start_key = utc_key(slot_start)
+        slot_end_key = utc_key(slot_end)
+        now = hsem_now()
+        cfg = self._cfg
+        live = self._live
+        if (
+            self._tearing_down
+            or not slot_contains(slot_start_key, slot_end_key, now)
+            or cfg.read_only
+            or not cfg.secondary_storage.enabled
+            or not cfg.secondary_storage.control_enabled
+            or live is None
+            or not hardware_writes_allowed(live.degraded_mode)
+            or live.secondary_storage.soc_pct is None
+            or not math.isfinite(live.secondary_storage.soc_pct)
+            or not 0.0 <= live.secondary_storage.soc_pct <= 100.0
+            or live.secondary_storage.load_power_w is None
+            or not math.isfinite(live.secondary_storage.load_power_w)
+            or live.secondary_storage.load_power_w < 0.0
+        ):
+            return None
+
+        if mode in {SECONDARY_MODE_CHARGE, SECONDARY_MODE_SBU}:
+            current_rec = self._hourly_recommendation
+            if (
+                current_rec is None
+                or utc_key(current_rec.start) != slot_start_key
+                or utc_key(current_rec.end) != slot_end_key
+                or current_rec.secondary_storage_mode != mode
+                or _secondary_runtime_safe_mode(
+                    cfg,
+                    mode,
+                    slot_end_key,
+                    now,
+                    soc_pct=live.secondary_storage.soc_pct,
+                    load_power_w=live.secondary_storage.load_power_w,
+                )
+                != mode
+            ):
+                return None
+
         self._secondary_control_mode_generation = (
             getattr(self, "_secondary_control_mode_generation", 0) + 1
         )
         token = self._secondary_control_mode_generation
         self._secondary_control_mode_expectation = _SecondaryControlModeExpectation(
             token=token,
-            slot_start=slot_start,
-            slot_end=slot_end,
+            slot_start=slot_start_key,
+            slot_end=slot_end_key,
             mode=mode,
         )
         return token
+
+    @callback
+    def secondary_control_mode_is_valid(
+        self,
+        slot_start: datetime,
+        slot_end: datetime,
+        mode: str,
+        token: int,
+    ) -> bool:
+        """Return whether an in-flight PowMr transition still owns authority."""
+        expectation = getattr(self, "_secondary_control_mode_expectation", None)
+        now = hsem_now()
+        if (
+            expectation is None
+            or expectation.token != token
+            or expectation.slot_start != utc_key(slot_start)
+            or expectation.slot_end != utc_key(slot_end)
+            or expectation.mode != mode
+            or self._tearing_down
+            or not slot_contains(
+                expectation.slot_start,
+                expectation.slot_end,
+                now,
+            )
+        ):
+            return False
+
+        cfg = self._cfg
+        live = self._live
+        if (
+            cfg.read_only
+            or not cfg.secondary_storage.enabled
+            or not cfg.secondary_storage.control_enabled
+            or live is None
+            or not hardware_writes_allowed(live.degraded_mode)
+            or live.secondary_storage.soc_pct is None
+            or not math.isfinite(live.secondary_storage.soc_pct)
+            or not 0.0 <= live.secondary_storage.soc_pct <= 100.0
+            or live.secondary_storage.load_power_w is None
+            or not math.isfinite(live.secondary_storage.load_power_w)
+            or live.secondary_storage.load_power_w < 0.0
+        ):
+            return False
+
+        if mode in {SECONDARY_MODE_CHARGE, SECONDARY_MODE_SBU}:
+            current_rec = self._hourly_recommendation
+            if (
+                current_rec is None
+                or utc_key(current_rec.start) != expectation.slot_start
+                or utc_key(current_rec.end) != expectation.slot_end
+                or current_rec.secondary_storage_mode != mode
+                or _secondary_runtime_safe_mode(
+                    cfg,
+                    mode,
+                    expectation.slot_end,
+                    now,
+                    soc_pct=live.secondary_storage.soc_pct,
+                    load_power_w=live.secondary_storage.load_power_w,
+                )
+                != mode
+            ):
+                return False
+        return True
+
+    @callback
+    def secondary_control_mode_superseded(self, reason: str) -> None:
+        """Invalidate an enabling PowMr transaction after newer safety intent."""
+        expectation = getattr(self, "_secondary_control_mode_expectation", None)
+        if expectation is None or expectation.mode not in {
+            SECONDARY_MODE_CHARGE,
+            SECONDARY_MODE_SBU,
+        }:
+            return
+        self._invalidate_secondary_mode_lock(
+            reason,
+            advance_planning_authority=True,
+        )
 
     @callback
     def secondary_control_mode_finished(
@@ -1266,15 +1680,17 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             or not cfg.secondary_storage.control_enabled
             or not hardware_writes_allowed(live.degraded_mode)
             or live.secondary_storage.soc_pct is None
+            or not math.isfinite(live.secondary_storage.soc_pct)
             or not 0.0 <= live.secondary_storage.soc_pct <= 100.0
             or live.secondary_storage.load_power_w is None
+            or not math.isfinite(live.secondary_storage.load_power_w)
             or live.secondary_storage.load_power_w < 0.0
         ):
             return
 
         new_lock = _SecondaryCurrentSlotModeLock(
-            slot_start=slot_start,
-            slot_end=slot_end,
+            slot_start=utc_key(slot_start),
+            slot_end=utc_key(slot_end),
             mode=mode,
         )
         if getattr(self, "_secondary_current_slot_mode_lock", None) == new_lock:
@@ -1290,6 +1706,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             current_rec.secondary_storage_mode
             if current_rec is not None
             and utc_key(current_rec.start) == utc_key(slot_start)
+            and utc_key(current_rec.end) == utc_key(slot_end)
             else None
         )
         refresh_required = self._update_lock.locked() or accepted_mode != mode
@@ -1349,67 +1766,22 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             or not cfg.secondary_storage.control_enabled
             or not hardware_writes_allowed(live.degraded_mode)
             or live.secondary_storage.soc_pct is None
+            or not math.isfinite(live.secondary_storage.soc_pct)
             or not 0.0 <= live.secondary_storage.soc_pct <= 100.0
             or live.secondary_storage.load_power_w is None
+            or not math.isfinite(live.secondary_storage.load_power_w)
             or live.secondary_storage.load_power_w < 0.0
         ):
             return None
 
-        soc_pct = live.secondary_storage.soc_pct
-        if (
-            lock.mode == SECONDARY_MODE_SBU
-            and soc_pct <= cfg.secondary_storage.min_soc_pct + 0.1
-        ):
-            return SECONDARY_MODE_UTILITY
-        if (
-            lock.mode == SECONDARY_MODE_CHARGE
-            and soc_pct >= cfg.secondary_storage.max_soc_pct - 0.1
-        ):
-            return SECONDARY_MODE_UTILITY
-
-        remaining_hours = max(
-            (utc_key(lock.slot_end) - utc_key(now)).total_seconds() / 3600.0,
-            0.0,
+        return _secondary_runtime_safe_mode(
+            cfg,
+            lock.mode,
+            lock.slot_end,
+            now,
+            soc_pct=live.secondary_storage.soc_pct,
+            load_power_w=live.secondary_storage.load_power_w,
         )
-        capacity_kwh = max(cfg.secondary_storage.capacity_kwh, 0.0)
-        if lock.mode == SECONDARY_MODE_SBU:
-            available_kwh = (
-                capacity_kwh
-                * max(
-                    soc_pct - cfg.secondary_storage.min_soc_pct,
-                    0.0,
-                )
-                / 100.0
-            )
-            required_kwh = (
-                live.secondary_storage.load_power_w
-                * remaining_hours
-                / 1000.0
-                / clamp_efficiency(cfg.secondary_storage.discharge_efficiency_pct)
-                + max(cfg.secondary_storage.inverter_standby_power_w, 0.0)
-                * remaining_hours
-                / 1000.0
-            )
-            if available_kwh + 1e-9 < required_kwh:
-                return SECONDARY_MODE_UTILITY
-        elif lock.mode == SECONDARY_MODE_CHARGE:
-            headroom_kwh = (
-                capacity_kwh
-                * max(
-                    cfg.secondary_storage.max_soc_pct - soc_pct,
-                    0.0,
-                )
-                / 100.0
-            )
-            minimum_step_kwh = (
-                max(cfg.secondary_storage.nominal_voltage_v, 0.0)
-                * max(cfg.secondary_storage.min_charge_current_a, 0.0)
-                * remaining_hours
-                / 1000.0
-            )
-            if headroom_kwh + 1e-9 < minimum_step_kwh:
-                return SECONDARY_MODE_UTILITY
-        return lock.mode
 
     def _secondary_control_write_matches(
         self,
@@ -1455,6 +1827,13 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         Call this once after the coordinator is created (from
         :func:`~custom_components.hsem.__init__.async_setup_entry`).
         """
+        # Restore diagnostics before the first cycle so a config-entry reload
+        # does not restart the prediction scorecard warm-up window.
+        try:
+            await self._init_prediction_tracker()
+        except Exception as e:
+            async_log("error", "Failed to initialise prediction tracker: %s", e)
+
         # Initialise the financial tracker — lazy load from disk on first access.
         # This must happen before the first update cycle so the tracker
         # is available when accumulation runs.
@@ -1598,29 +1977,40 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
 
         raw_entity_id = event.data.get("entity_id")
         new_state = event.data.get("new_state")
-        if not isinstance(raw_entity_id, str) or not raw_entity_id or new_state is None:
+        if not isinstance(raw_entity_id, str) or not raw_entity_id:
             return
         entity_id = raw_entity_id
+        new_value = new_state.state if new_state is not None else None
 
         material = False
+        secondary_numeric_value: float | None = None
+        secondary_numeric_event = entity_id in {cfg.soc_entity, cfg.load_power_entity}
         if entity_id == cfg.soc_entity:
             try:
-                value = float(new_state.state)
+                secondary_numeric_value = float(cast(str, new_value))
             except TypeError, ValueError:
-                return
-            baseline = self._last_plan_secondary_soc_pct
-            material = baseline is None or abs(value - baseline) >= (
-                SECONDARY_STORAGE_SOC_REPLAN_DELTA_PCT
-            )
+                material = True
+            else:
+                baseline = self._last_plan_secondary_soc_pct
+                material = (
+                    not math.isfinite(secondary_numeric_value)
+                    or baseline is None
+                    or abs(secondary_numeric_value - baseline)
+                    >= SECONDARY_STORAGE_SOC_REPLAN_DELTA_PCT
+                )
         elif entity_id == cfg.load_power_entity:
             try:
-                value = float(new_state.state)
+                secondary_numeric_value = float(cast(str, new_value))
             except TypeError, ValueError:
-                return
-            baseline = self._last_plan_secondary_load_power_w
-            material = baseline is None or abs(value - baseline) >= (
-                SECONDARY_STORAGE_LOAD_REPLAN_DELTA_W
-            )
+                material = True
+            else:
+                baseline = self._last_plan_secondary_load_power_w
+                material = (
+                    not math.isfinite(secondary_numeric_value)
+                    or baseline is None
+                    or abs(secondary_numeric_value - baseline)
+                    >= SECONDARY_STORAGE_LOAD_REPLAN_DELTA_W
+                )
         elif entity_id in {
             cfg.output_source_priority_entity,
             cfg.charger_source_priority_entity,
@@ -1633,18 +2023,18 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 return
             old_state = event.data.get("old_state")
             if old_state is not None and _secondary_control_values_match(
-                old_state.state, new_state.state
+                old_state.state, new_value
             ):
                 return
             if self._secondary_control_write_matches(
                 entity_id,
-                new_state.state,
+                new_value,
                 mark_suppressed=True,
             ):
                 return
             delayed = self._secondary_control_delayed_echoes.pop(entity_id, None)
             if delayed is not None and _secondary_control_values_match(
-                new_state.state, delayed
+                new_value, delayed
             ):
                 return
             self._invalidate_secondary_mode_lock(
@@ -1653,8 +2043,77 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             )
             material = True
 
-        if not material:
+        expectation = getattr(self, "_secondary_control_mode_expectation", None)
+        verified_lock = getattr(self, "_secondary_current_slot_mode_lock", None)
+        active_live = self._live
+        safety_now = hsem_now()
+        event_soc_pct = (
+            secondary_numeric_value
+            if entity_id == cfg.soc_entity
+            else (
+                active_live.secondary_storage.soc_pct
+                if active_live is not None
+                else None
+            )
+        )
+        event_load_power_w = (
+            secondary_numeric_value
+            if entity_id == cfg.load_power_entity
+            else (
+                active_live.secondary_storage.load_power_w
+                if active_live is not None
+                else None
+            )
+        )
+        in_flight_safety_changed = (
+            secondary_numeric_event
+            and active_live is not None
+            and expectation is not None
+            and expectation.mode in {SECONDARY_MODE_CHARGE, SECONDARY_MODE_SBU}
+            and _secondary_runtime_safe_mode(
+                self._cfg,
+                expectation.mode,
+                expectation.slot_end,
+                safety_now,
+                soc_pct=event_soc_pct,
+                load_power_w=event_load_power_w,
+            )
+            != expectation.mode
+        )
+        verified_lock_safety_changed = (
+            secondary_numeric_event
+            and active_live is not None
+            and verified_lock is not None
+            and verified_lock.mode in {SECONDARY_MODE_CHARGE, SECONDARY_MODE_SBU}
+            and slot_contains(
+                verified_lock.slot_start,
+                verified_lock.slot_end,
+                safety_now,
+            )
+            and _secondary_runtime_safe_mode(
+                self._cfg,
+                verified_lock.mode,
+                verified_lock.slot_end,
+                safety_now,
+                soc_pct=event_soc_pct,
+                load_power_w=event_load_power_w,
+            )
+            != verified_lock.mode
+        )
+        immediate_safety_changed = (
+            in_flight_safety_changed or verified_lock_safety_changed
+        )
+        if not material and not immediate_safety_changed:
             return
+        if immediate_safety_changed:
+            # Revoke before the debounced planner cycle. This stops an old
+            # verifier from issuing its final enable and prevents a verified
+            # current-slot lock from hiding a sub-threshold reserve/headroom
+            # crossing until the next periodic coordinator update.
+            self._invalidate_secondary_mode_lock(
+                f"secondary safety telemetry changed on {entity_id}",
+                advance_planning_authority=True,
+            )
         self._queue_secondary_storage_update()
 
     async def _async_secondary_storage_update_debounced(self) -> None:
@@ -1823,10 +2282,6 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             window_hys_previous_rec=self._window_hys_previous_rec,
             window_hys_previous_slot_start=self._window_hys_previous_slot_start,
             window_hysteresis_expiry=self._window_hysteresis_expiry,
-            current_slot_start=self._current_slot_start,
-            current_slot_price_actionable=self._current_slot_price_actionable,
-            current_slot_ev_power_w=self._current_slot_ev_power_w,
-            current_slot_ev_second_power_w=self._current_slot_ev_second_power_w,
             current_required_battery=self._current_required_battery,
             plan_explanation=self._plan_explanation,
             data_quality=self._data_quality,
@@ -1852,10 +2307,6 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             self._cancel_window_hysteresis_expiry()
             if state.window_hysteresis_expiry is not None:
                 self._schedule_window_hysteresis_expiry(state.window_hysteresis_expiry)
-        self._current_slot_start = state.current_slot_start
-        self._current_slot_price_actionable = state.current_slot_price_actionable
-        self._current_slot_ev_power_w = state.current_slot_ev_power_w
-        self._current_slot_ev_second_power_w = state.current_slot_ev_second_power_w
         self._current_required_battery = state.current_required_battery
         self._plan_explanation = state.plan_explanation
         self._data_quality = state.data_quality
@@ -2308,7 +2759,13 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             # -----------------------------------------------------------------------
             # Every cycle, accumulate actual PV and load energy into the current
             # slot based on instantaneous power readings and elapsed time.
-            self._accumulate_forecast_actuals(now, live)
+            prediction_record_added = self._accumulate_forecast_actuals(now, live)
+            if (
+                prediction_record_added
+                and self._prediction_tracker.history_file
+                and not await self._prediction_tracker.save_history()
+            ):
+                async_log("warning", "Failed to persist prediction tracker state")
 
             if (
                 live.force_working_mode_state == "auto"
@@ -2655,12 +3112,6 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                             self._window_hys_previous_slot_start = s.start
                             break
 
-                # Freeze the current slot's per-EV charger power before
-                # copying planner output to hourly recommendations. This keeps
-                # the charger command stable across replans inside the same
-                # 15-minute slot (issue #738).
-                self._freeze_ev_charger_power_for_current_slot(planner_output, now)
-
                 # Apply planner output (with hysteresis-applied slots) to
                 # hourly_recommendations so the current slot resolution in
                 # step 9 sees the held recommendation.
@@ -2677,32 +3128,26 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 if auto_full_enabled:
                     now_slot = next(
                         (
-                            r
-                            for r in self._hourly_recommendations
-                            if slot_contains(r.start, r.end, now)
+                            item
+                            for item in self._hourly_recommendations
+                            if slot_contains(item.start, item.end, now)
                         ),
                         None,
                     )
                     if _auto_full_negative_price_allowed(live, now_slot):
-                        assert now_slot is not None
-                        now_slot.recommendation = Recommendations.EVSmartCharging.value
-                        pwr_kw = float(
-                            get_config_value(
-                                self._config_entry,
-                                "hsem_ev_planned_load_charger_power_kw",
-                            )
-                            or 0.0
-                        )
-                        now_slot.ev_charger_calculated_power = (
-                            round(pwr_kw * 1000) if pwr_kw > 0 else 0.0
-                        )
-                        async_log(
-                            "debug",
-                            "[coordinator] Auto-Full EV: negative price (%.4f) "
-                            "→ overriding current slot to ev_smart_charging "
-                            "at %dW",
-                            live.import_electricity_price,
-                            now_slot.ev_charger_calculated_power,
+                        _apply_current_ev_power_override(
+                            config_entry=self._config_entry,
+                            hourly_recommendations=self._hourly_recommendations,
+                            ev_plan=self._ev_charging_plan,
+                            ev_second_plan=self._ev_second_charging_plan,
+                            now=now,
+                            override_primary=True,
+                            override_second=False,
+                            live=live,
+                            reason=(
+                                "Auto-Full EV at negative price "
+                                f"{live.import_electricity_price:.4f}"
+                            ),
                         )
 
                 # 8c. Force-charge-now override: when the user toggles the
@@ -2718,6 +3163,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                     ev_plan=self._ev_charging_plan,
                     ev_second_plan=self._ev_second_charging_plan,
                     now=now,
+                    live=live,
                 )
 
                 # 9. Find the current time-slot recommendation.
@@ -3535,95 +3981,6 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             )
             self._secondary_mode_lock_replan_pending = False
 
-    def _freeze_ev_charger_power_for_current_slot(
-        self, output: PlannerOutput, now: datetime
-    ) -> None:
-        """Freeze per-EV charger power for the current slot across replans.
-
-        The EV planner recomputes ``ev_charger_calculated_power`` from live
-        data whenever the planner reruns. Without freezing, the charger
-        command oscillates inside a single 15-minute slot as clouds pass or
-        the EV itself toggles on/off. We store the value computed at slot
-        start and rewrite the current slot with that stored value on every
-        subsequent replan until the next slot begins.
-
-        Explicit overrides (force-charge-now, auto-full-EV) are applied
-        after this freeze, so they can still change the current slot's
-        command for as long as they remain active. When an override ends,
-        the freeze restores the originally planned slot-start value.
-
-        Args:
-            output: Planner output whose current slot will be rewritten in
-                place when we are still inside the same slot.
-            now: Timezone-aware current datetime used to locate the current
-                slot and compare against the stored slot-start time.
-        """
-        if now.tzinfo is None:
-            return
-
-        for slot in output.slots:
-            s_start = as_tz(slot.start, now.tzinfo)
-            if not slot_contains(slot.start, slot.end, now):
-                continue
-
-            price_actionable = bool(slot.price_actionable)
-            new_slot = self._current_slot_start is None or utc_key(
-                self._current_slot_start
-            ) != utc_key(s_start)
-            authority_changed = (
-                getattr(self, "_current_slot_price_actionable", None)
-                is not price_actionable
-            )
-            if new_slot or authority_changed:
-                # A new slot or same-slot price-authority transition captures
-                # fresh planner power. This prevents withdrawal from restoring
-                # an old optional-EV command while preserving fixed-session
-                # load that the nonactionable plan still publishes.
-                self._current_slot_start = s_start
-                self._current_slot_price_actionable = price_actionable
-                self._current_slot_ev_power_w = slot.ev_charger_calculated_power
-                self._current_slot_ev_second_power_w = (
-                    slot.ev_second_charger_calculated_power
-                )
-                async_log(
-                    "debug",
-                    "[freeze] New EV power baseline for slot %s "
-                    "(price_actionable=%s): primary=%dW second=%dW",
-                    s_start.isoformat(),
-                    price_actionable,
-                    self._current_slot_ev_power_w,
-                    self._current_slot_ev_second_power_w,
-                )
-            else:
-                # Same slot — restore the frozen baseline so the charger
-                # command does not chase live conditions.
-                if (
-                    abs(
-                        slot.ev_charger_calculated_power - self._current_slot_ev_power_w
-                    )
-                    > 1e-9
-                    or abs(
-                        slot.ev_second_charger_calculated_power
-                        - self._current_slot_ev_second_power_w
-                    )
-                    > 1e-9
-                ):
-                    async_log(
-                        "debug",
-                        "[freeze] Restoring frozen EV power for slot %s: "
-                        "primary %dW→%dW, second %dW→%dW",
-                        s_start.isoformat(),
-                        slot.ev_charger_calculated_power,
-                        self._current_slot_ev_power_w,
-                        slot.ev_second_charger_calculated_power,
-                        self._current_slot_ev_second_power_w,
-                    )
-                slot.ev_charger_calculated_power = self._current_slot_ev_power_w
-                slot.ev_second_charger_calculated_power = (
-                    self._current_slot_ev_second_power_w
-                )
-            break
-
     def _apply_planner_output(self, output: PlannerOutput) -> None:
         """Write :class:`PlannerOutput` decisions back into the recommendation list.
 
@@ -3729,7 +4086,7 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
     # Forecast-vs-actual tracking (issue #373)
     # ------------------------------------------------------------------
 
-    def _accumulate_forecast_actuals(self, now: datetime, live: LiveState) -> None:
+    def _accumulate_forecast_actuals(self, now: datetime, live: LiveState) -> bool:
         """Accumulate measured energy and close eligible forecast baselines.
 
         The prior power sample represents ``[previous_timestamp, now)``.  The
@@ -3739,8 +4096,13 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         Args:
             now: Current time (timezone-aware).
             live: The live HA entity state snapshot.
+
+        Returns:
+            True when at least one prediction record was appended and the
+            bounded persistence file therefore needs refreshing.
         """
         now_key = utc_key(now)
+        prediction_record_added = False
 
         if self._hourly_recommendations and (
             self._forecast_tracker.reconcile_unfinalised_layout(
@@ -3931,17 +4293,21 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             forecast_action = frec.forecast_action
             assert forecast_soc_pct is not None
             assert forecast_action is not None
-            self._prediction_tracker.add_record(
-                predicted_soc=forecast_soc_pct,
-                actual_soc=actual_soc,
-                predicted_pv=frec.forecast_pv_kwh,
-                actual_pv=frec.actual_pv_kwh,
-                predicted_load=frec.forecast_load_kwh,
-                actual_load=frec.actual_load_kwh,
-                action=forecast_action,
-                slot_start=frec.start,
+            prediction_record_added = (
+                self._prediction_tracker.add_record(
+                    predicted_soc=forecast_soc_pct,
+                    actual_soc=actual_soc,
+                    predicted_pv=frec.forecast_pv_kwh,
+                    actual_pv=frec.actual_pv_kwh,
+                    predicted_load=frec.forecast_load_kwh,
+                    actual_load=frec.actual_load_kwh,
+                    action=forecast_action,
+                    slot_start=frec.start,
+                )
+                or prediction_record_added
             )
         prediction_restore_excluded.difference_update(newly_finalised_keys)
+        return prediction_record_added
 
     def _register_forecasts_from_planner(
         self, output: PlannerOutput, now: datetime
@@ -4090,6 +4456,11 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
             data = await asyncio.to_thread(FinancialTracker._read_history_file, path)
             if data is not None:
                 loaded = FinancialTracker.from_dict(data)
+                # history_file is runtime state and is intentionally not
+                # serialised into the JSON payload. Preserve the configured
+                # path when replacing the tracker so subsequent cycles can
+                # continue to persist it.
+                loaded.history_file = str(path)
                 self._financial_tracker = loaded
         except Exception:
             async_log("error", "Failed to load financial tracker history")
@@ -4111,8 +4482,9 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         """Accumulate import cost and export income into the financial tracker.
 
         Called each coordinator cycle after plan-vs-actual accumulation.
-        Handles day rollover (snapshotting yesterday's totals) before
-        accumulating the live cost deltas from the energy meters.
+        Prices the live meter interval first, then handles day rollover. This
+        keeps an interval ending at local midnight in the day during which the
+        energy was consumed/exported.
 
         Args:
             now: Current datetime (timezone-aware).
@@ -4121,18 +4493,47 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
         await self._init_financial_tracker()
         tracker = self._financial_tracker
 
-        # Check and handle day rollover first.
-        tracker.check_day_rollover(now)
+        effective_interval = getattr(self, "_timer_interval", None)
+        if isinstance(effective_interval, timedelta):
+            cadence_seconds = effective_interval.total_seconds()
+        else:
+            cadence_seconds = float(self._cfg.update_interval) * 60.0
+        max_gap_seconds = 2.0 * max(cadence_seconds, 60.0)
+        had_meter_baseline = (
+            tracker._last_import_energy_kwh is not None
+            or tracker._last_export_energy_kwh is not None
+        )
 
-        # Accumulate cost deltas from live meter readings.
-        tracker.accumulate(
+        # Accumulate only a contiguous meter interval. A legacy persistence
+        # file, long HA outage, or stale snapshot must be re-baselined instead
+        # of pricing hours or days of energy at one current spot price.
+        contiguous = tracker.accumulate(
             grid_import_energy_kwh=live.grid_import_energy_kwh,
             grid_export_energy_kwh=live.grid_export_energy_kwh,
             import_price=live.import_electricity_price,
             export_price=live.export_electricity_price,
             import_price_available=live.import_electricity_price_available,
             export_price_available=live.export_electricity_price_available,
+            sample_time=now,
+            max_gap_seconds=max_gap_seconds,
         )
+        if not contiguous and had_meter_baseline:
+            async_log(
+                "warning",
+                "Financial meter baseline was stale; skipped replaying the "
+                "unpriced gap and resumed from the current readings.",
+            )
+
+        # The just-finished physical interval belongs to the previous tracking
+        # day when its endpoint is local midnight. Snapshot only after it has
+        # been priced at the prior endpoint's tariff.
+        tracker.check_day_rollover(now)
+
+        # The tracker contains cumulative money and meter baselines. Persist
+        # every sample, not only at midnight; otherwise a daytime reload would
+        # replay the whole day at one price.
+        if not await self._persist_financial_tracker():
+            async_log("warning", "Failed to persist financial tracker state")
 
     async def _accumulate_savings(
         self,
@@ -4339,6 +4740,16 @@ class HSEMDataUpdateCoordinator(DataUpdateCoordinator[CoordinatorData]):
                 "(savings sensor will be unavailable)",
             )
             self._savings_tracker_initialized = True  # don't retry
+
+    async def _init_prediction_tracker(self) -> None:
+        """Restore the rolling prediction scorecard from bounded JSON history."""
+        if self._prediction_tracker.history_file:
+            return
+        config_dir = self.hass.config.config_dir
+        self._prediction_tracker.history_file = str(
+            Path(config_dir) / ".storage" / "hsem_prediction_history.json"
+        )
+        await self._prediction_tracker.load_history()
 
     async def _init_daily_tracker(self) -> None:
         """Lazily initialise the daily plan-vs-actual tracker.

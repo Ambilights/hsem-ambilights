@@ -36,6 +36,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -86,6 +90,7 @@ from custom_components.hsem.custom_sensors.working_mode_sensor import (
 from custom_components.hsem.models.hourly_recommendation import HourlyRecommendation
 from custom_components.hsem.models.live_state import LiveState
 from custom_components.hsem.models.sensor_config import SensorConfig
+from custom_components.hsem.planner.milp_optimizer import is_scipy_available
 from custom_components.hsem.utils.datetime_utils import utc_key
 from custom_components.hsem.utils.degraded_mode import DegradedMode
 
@@ -140,6 +145,10 @@ def make_fake_hass(entity_states: dict[str, str | dict]) -> MagicMock:
 
     hass = MagicMock()
     hass.states = FakeStates(fake_states)
+    config_dir = TemporaryDirectory(prefix="hsem-ha-mock-")
+    hass.config = SimpleNamespace(config_dir=config_dir.name)
+    # Keep the temporary directory alive for as long as the fake HA instance.
+    hass._hsem_config_dir = config_dir
     hass.async_create_task = MagicMock()
     hass.services = MagicMock()
     hass.services.async_call = AsyncMock()
@@ -243,11 +252,6 @@ def make_bare_coordinator(
     coord._force_discharge_excess_slot_start = None
     coord._force_discharge_replanned_slot_start = None
     coord._force_discharge_live_replan_pending_slot = None
-    # Issue #738: per-slot EV charger power freeze state.
-    coord._current_slot_start = None
-    coord._current_slot_price_actionable = None
-    coord._current_slot_ev_power_w = 0.0
-    coord._current_slot_ev_second_power_w = 0.0
     # Planner hysteresis state (issue #372).  Reached whenever the mock cycle
     # is only Degraded rather than Error, which is now the common case.
     coord._previous_planner_winner_name = None
@@ -867,6 +871,9 @@ class TestDryRunCycle:
         data = captured[0]
         assert isinstance(data, CoordinatorData)
         assert data.last_updated is not None
+        history_path = Path(coord._financial_tracker.history_file)
+        assert history_path.is_relative_to(Path(hass.config.config_dir))
+        assert history_path.name == "hsem_financial_history.json"
 
     @pytest.mark.asyncio
     async def test_boundary_price_burst_runs_one_full_cycle(self) -> None:
@@ -1062,10 +1069,6 @@ class TestDryRunCycle:
             assert coord._previous_planner_winner_score == pytest.approx(7.0)
             assert coord._window_hys_previous_rec is None
             assert coord._window_hys_previous_slot_start is None
-            assert coord._current_slot_start is None
-            assert coord._current_slot_price_actionable is None
-            assert coord._current_slot_ev_power_w == pytest.approx(0.0)
-            assert coord._current_slot_ev_second_power_w == pytest.approx(0.0)
             assert len(planner_inputs) == 2
             assert planner_inputs[1].previous_winner_name == "accepted"
             assert planner_inputs[1].previous_winner_score == pytest.approx(7.0)
@@ -1140,9 +1143,6 @@ class TestDryRunCycle:
         coord._last_planner_output = accepted_output
         coord._last_plan_slot_start = accepted_current_slot.start
         coord._ev_charging_plan = accepted_ev_plan
-        coord._current_slot_start = accepted_current_slot.start
-        coord._current_slot_price_actionable = True
-        coord._current_slot_ev_power_w = 1111.0
         coord._should_replan = MagicMock(return_value=False)  # type: ignore[method-assign]
 
         captured: list[CoordinatorData] = []
@@ -1198,8 +1198,8 @@ class TestDryRunCycle:
             stale_cycle = asyncio.create_task(coord._async_handle_update())
             await asyncio.wait_for(tracker_reached.wait(), timeout=5.0)
 
-            # Reuse applies EV freezing and force-charge overrides before this
-            # tracker await. Those mutations must be isolated from the cache.
+            # Runtime EV overrides run before this tracker await. Those
+            # recommendation mutations must remain isolated from the cache.
             assert accepted_current_slot.ev_charger_calculated_power == pytest.approx(
                 9999.0
             )
@@ -1303,10 +1303,6 @@ class TestDryRunCycle:
         assert coord._previous_planner_winner_score == pytest.approx(7.0)
         assert coord._window_hys_previous_rec is None
         assert coord._window_hys_previous_slot_start is None
-        assert coord._current_slot_start is None
-        assert coord._current_slot_price_actionable is None
-        assert coord._current_slot_ev_power_w == pytest.approx(0.0)
-        assert coord._current_slot_ev_second_power_w == pytest.approx(0.0)
         assert coord._plan_explanation is accepted_explanation
         assert coord._data_quality is accepted_quality
         assert coord._hourly_recommendation is None
@@ -1397,10 +1393,6 @@ class TestDryRunCycle:
         assert coord._previous_planner_winner_score == pytest.approx(7.0)
         assert coord._window_hys_previous_rec is None
         assert coord._window_hys_previous_slot_start is None
-        assert coord._current_slot_start is None
-        assert coord._current_slot_price_actionable is None
-        assert coord._current_slot_ev_power_w == pytest.approx(0.0)
-        assert coord._current_slot_ev_second_power_w == pytest.approx(0.0)
         assert coord._current_required_battery == pytest.approx(4.2)
         assert coord._plan_explanation is accepted_explanation
         assert coord._data_quality is accepted_quality
@@ -1658,7 +1650,7 @@ class TestDryRunCycle:
         - flip the plan state from ``smart_charging_disabled`` to
           ``charging`` so the plan sensor reflects the forced charge.
         """
-        from datetime import UTC, datetime, timedelta
+        from datetime import UTC, datetime
 
         from custom_components.hsem.coordinator import _apply_force_charge_now
         from custom_components.hsem.models.hourly_recommendation import (
@@ -3394,6 +3386,9 @@ class TestApplyPlannerOutputEvLoad:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    not is_scipy_available(), reason="scipy not available in this environment"
+)
 class TestEvFieldsEndToEnd:
     """Full pipeline test: run_planner with base_load_includes_ev=True then
     _apply_planner_output — proves the three EV load fields propagate all
@@ -3716,7 +3711,7 @@ class TestEvSlotKeyNormalisation:
         )
 
 
-class TestForceChargeRescuesEveryNonChargingState:
+class TestForceChargeRescuesEligibleNonChargingState:
     """A forced charge must override a deferred plan, not just a disabled one.
 
     Charge automations gate on ``sensor.hsem_ev_optimal_charging_plan``'s
@@ -3778,9 +3773,9 @@ class TestForceChargeRescuesEveryNonChargingState:
 
     @pytest.mark.parametrize(
         "plan_state",
-        ["waiting", "smart_charging_disabled", "not_connected", "fully_charged"],
+        ["waiting", "smart_charging_disabled", "fully_charged"],
     )
-    def test_non_charging_states_are_rescued(self, plan_state: str) -> None:
+    def test_eligible_non_charging_states_are_rescued(self, plan_state: str) -> None:
         plan, rec = self._force(plan_state)
 
         assert plan.state == "charging"  # type: ignore[attr-defined]
@@ -3790,3 +3785,300 @@ class TestForceChargeRescuesEveryNonChargingState:
         plan, _ = self._force("charging")
 
         assert plan.state == "charging"  # type: ignore[attr-defined]
+
+
+class TestCoherentCurrentEvOverrides:
+    """Runtime EV switches preserve fuse, energy, grid, cost, and plan parity."""
+
+    @staticmethod
+    def _recommendation(now: datetime, *, import_price: float) -> HourlyRecommendation:
+        return HourlyRecommendation(
+            start=now - timedelta(minutes=45),
+            end=now + timedelta(minutes=15),
+            avg_house_consumption_kwh=0.0,
+            avg_house_consumption_1d_kwh=0.0,
+            avg_house_consumption_3d_kwh=0.0,
+            avg_house_consumption_7d_kwh=0.0,
+            avg_house_consumption_14d_kwh=0.0,
+            batteries_charged_kwh=0.0,
+            batteries_discharged_kwh=0.0,
+            estimated_battery_capacity_kwh=5.0,
+            estimated_battery_soc_pct=50.0,
+            estimated_cost_currency=0.0,
+            estimated_net_consumption_kwh=0.0,
+            export_price=0.0,
+            grid_export_kwh=0.0,
+            grid_import_kwh=0.0,
+            import_price=import_price,
+            recommendation="batteries_wait_mode",
+            solcast_pv_estimate_kwh=0.0,
+            price_actionable=True,
+        )
+
+    @staticmethod
+    def _entry(**overrides: object) -> MagicMock:
+        entry = MagicMock()
+        entry.options = {
+            "hsem_main_fuse_amps": 2,
+            "hsem_main_fuse_phases": 3,
+            "hsem_house_power_includes_ev_charger_power": False,
+            "hsem_ev_planned_load_charger_power_kw": 11.0,
+            "hsem_ev_planned_load_charger_min_power_w": 1380.0,
+            "hsem_ev_planned_load_charger_efficiency": 100.0,
+            "hsem_export_electricity_min_price": 0.0,
+            **overrides,
+        }
+        entry.data = {}
+        return entry
+
+    def test_force_charge_is_fuse_capped_and_fully_accounted(self) -> None:
+        from datetime import UTC, datetime
+
+        from custom_components.hsem.coordinator import _apply_force_charge_now
+        from custom_components.hsem.planner.ev_planner import EVChargingPlan
+
+        now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+        rec = self._recommendation(now, import_price=0.20)
+        plan = EVChargingPlan(state="waiting", total_kwh_needed=5.0)
+        _apply_force_charge_now(
+            config_entry=self._entry(hsem_ev_force_charge_now=True),
+            hourly_recommendations=[rec],
+            ev_plan=plan,
+            ev_second_plan=None,
+            now=now,
+            live=LiveState(),
+        )
+
+        assert rec.ev_charger_calculated_power == pytest.approx(1380.0)
+        assert rec.ev_total_planned_load_kwh == pytest.approx(0.345)
+        assert rec.ev_planned_load_kwh == pytest.approx(0.345)
+        assert rec.grid_import_kwh == pytest.approx(0.345)
+        assert rec.grid_export_kwh == pytest.approx(0.0)
+        assert rec.estimated_cost_currency == pytest.approx(0.069)
+        assert rec.estimated_net_consumption_kwh == pytest.approx(0.345)
+        assert plan.state == "charging"
+        assert plan.current_slot_planned_load_kwh == pytest.approx(0.345)
+        assert plan.charging_slots[0].ac_load_kwh == pytest.approx(0.345)
+
+    def test_auto_full_negative_price_uses_same_safe_accounting(self) -> None:
+        from datetime import UTC, datetime
+
+        from custom_components.hsem.coordinator import (
+            _apply_current_ev_power_override,
+        )
+        from custom_components.hsem.planner.ev_planner import EVChargingPlan
+
+        now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+        rec = self._recommendation(now, import_price=-1.0)
+        plan = EVChargingPlan(state="waiting", total_kwh_needed=5.0)
+        _apply_current_ev_power_override(
+            config_entry=self._entry(),
+            hourly_recommendations=[rec],
+            ev_plan=plan,
+            ev_second_plan=None,
+            now=now,
+            override_primary=True,
+            override_second=False,
+            live=LiveState(import_electricity_price=-1.0),
+            reason="Auto-Full EV at negative price",
+        )
+
+        assert rec.ev_charger_calculated_power == pytest.approx(1380.0)
+        assert rec.ev_total_planned_load_kwh == pytest.approx(0.345)
+        assert rec.grid_import_kwh == pytest.approx(0.345)
+        assert rec.estimated_cost_currency == pytest.approx(-0.345)
+        assert plan.current_slot_planned_load_kwh == pytest.approx(0.345)
+
+    def test_override_cannot_consume_battery_discharge_or_export(self) -> None:
+        from datetime import UTC, datetime
+
+        from custom_components.hsem.coordinator import (
+            _apply_current_ev_power_override,
+        )
+
+        now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+        rec = self._recommendation(now, import_price=-1.0)
+        rec.batteries_discharged_kwh = 1.0
+        rec.grid_export_kwh = 1.0
+        _apply_current_ev_power_override(
+            config_entry=self._entry(),
+            hourly_recommendations=[rec],
+            ev_plan=None,
+            ev_second_plan=None,
+            now=now,
+            override_primary=True,
+            override_second=False,
+            live=LiveState(import_electricity_price=-1.0),
+            reason="Auto-Full EV at negative price",
+        )
+
+        assert rec.ev_charger_calculated_power == pytest.approx(0.0)
+        assert rec.ev_total_planned_load_kwh == pytest.approx(0.0)
+        assert rec.grid_export_kwh == pytest.approx(1.0)
+
+    def test_force_charge_never_energises_an_explicitly_disconnected_ev(self) -> None:
+        from datetime import UTC, datetime
+
+        from custom_components.hsem.coordinator import _apply_force_charge_now
+        from custom_components.hsem.planner.ev_planner import EVChargingPlan
+
+        now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+        rec = self._recommendation(now, import_price=-1.0)
+        plan = EVChargingPlan(state="not_connected", total_kwh_needed=5.0)
+        live = LiveState()
+        live.ev.is_connected = False
+        _apply_force_charge_now(
+            config_entry=self._entry(
+                hsem_ev_force_charge_now=True,
+                hsem_ev_smart_charging=False,
+            ),
+            hourly_recommendations=[rec],
+            ev_plan=plan,
+            ev_second_plan=None,
+            now=now,
+            live=live,
+        )
+
+        assert rec.ev_charger_calculated_power == pytest.approx(0.0)
+        assert rec.ev_total_planned_load_kwh == pytest.approx(0.0)
+        assert rec.grid_import_kwh == pytest.approx(0.0)
+        assert plan.state == "not_connected"
+
+    def test_force_charge_overrides_smart_disabled_for_connected_ev(self) -> None:
+        from datetime import UTC, datetime
+
+        from custom_components.hsem.coordinator import _apply_force_charge_now
+        from custom_components.hsem.planner.ev_planner import EVChargingPlan
+
+        now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+        rec = self._recommendation(now, import_price=0.20)
+        plan = EVChargingPlan(state="smart_charging_disabled", total_kwh_needed=5.0)
+        live = LiveState()
+        live.ev.is_connected = True
+        _apply_force_charge_now(
+            config_entry=self._entry(
+                hsem_ev_force_charge_now=True,
+                hsem_ev_smart_charging=False,
+            ),
+            hourly_recommendations=[rec],
+            ev_plan=plan,
+            ev_second_plan=None,
+            now=now,
+            live=live,
+        )
+
+        assert rec.ev_charger_calculated_power == pytest.approx(1380.0)
+        assert rec.ev_total_planned_load_kwh == pytest.approx(0.345)
+        assert plan.state == "charging"
+
+    @pytest.mark.parametrize(
+        ("phase_power_w", "expected_power_w"),
+        [
+            ((3400.0, 0.0, 0.0), 0.0),
+            ((2000.0, 2000.0, 2000.0), 1680.0),
+        ],
+    )
+    def test_runtime_override_honours_tightest_phase_headroom(
+        self,
+        phase_power_w: tuple[float, float, float],
+        expected_power_w: float,
+    ) -> None:
+        from datetime import UTC, datetime
+
+        from custom_components.hsem.coordinator import _apply_force_charge_now
+
+        now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+        rec = self._recommendation(now, import_price=-1.0)
+        live = LiveState(grid_phase_power_w=phase_power_w)
+        live.ev.is_connected = True
+        _apply_force_charge_now(
+            config_entry=self._entry(
+                hsem_main_fuse_amps=16,
+                hsem_phase_aware_charging_enabled=True,
+                hsem_ev_force_charge_now=True,
+            ),
+            hourly_recommendations=[rec],
+            ev_plan=None,
+            ev_second_plan=None,
+            now=now,
+            live=live,
+        )
+
+        assert rec.ev_charger_calculated_power == pytest.approx(expected_power_w)
+        assert max(phase_power_w) + expected_power_w <= 16 * 230
+
+    def test_phase_headroom_cannot_be_borrowed_from_unplanned_live_ev2(self) -> None:
+        from datetime import UTC, datetime
+
+        from custom_components.hsem.coordinator import _apply_force_charge_now
+
+        now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+        rec = self._recommendation(now, import_price=-1.0)
+        rec.ev_planned_load_kwh = 0.75
+        rec.ev_total_planned_load_kwh = 0.75
+        rec.estimated_net_consumption_kwh = 0.75
+        rec.grid_import_kwh = 0.75
+        live = LiveState(grid_phase_power_w=(3580.0, 0.0, 0.0))
+        live.ev.is_connected = True
+        live.ev_second.power_w = 3000.0
+        _apply_force_charge_now(
+            config_entry=self._entry(
+                hsem_main_fuse_amps=16,
+                hsem_phase_aware_charging_enabled=True,
+                hsem_ev_force_charge_now=True,
+                hsem_ev_planned_load_charger_min_power_w=0.0,
+            ),
+            hourly_recommendations=[rec],
+            ev_plan=None,
+            ev_second_plan=None,
+            now=now,
+            live=live,
+        )
+
+        assert rec.ev_charger_calculated_power == pytest.approx(100.0)
+        assert rec.ev_second_charger_calculated_power == pytest.approx(0.0)
+        assert rec.ev_total_planned_load_kwh == pytest.approx(0.775)
+        assert rec.ev_planned_load_kwh == pytest.approx(0.775)
+        assert rec.grid_import_kwh == pytest.approx(0.775)
+        assert rec.estimated_cost_currency == pytest.approx(-0.775)
+        assert 3580.0 + rec.ev_charger_calculated_power <= 16 * 230
+
+    def test_planned_ev2_reserves_phase_headroom_before_it_starts(self) -> None:
+        """A not-yet-live EV2 command cannot be lent to forced primary EV."""
+        from datetime import UTC, datetime
+
+        from custom_components.hsem.coordinator import _apply_force_charge_now
+
+        now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+        rec = self._recommendation(now, import_price=-1.0)
+        rec.ev_second_charger_calculated_power = 3000.0
+        rec.ev_planned_load_kwh = 0.75
+        rec.ev_total_planned_load_kwh = 0.75
+        rec.estimated_net_consumption_kwh = 0.75
+        rec.grid_import_kwh = 0.75
+        live = LiveState(grid_phase_power_w=(0.0, 0.0, 0.0))
+        live.ev.is_connected = True
+        live.ev_second.power_w = 0.0
+
+        _apply_force_charge_now(
+            config_entry=self._entry(
+                hsem_main_fuse_amps=16,
+                hsem_phase_aware_charging_enabled=True,
+                hsem_ev_force_charge_now=True,
+                hsem_ev_planned_load_charger_min_power_w=0.0,
+            ),
+            hourly_recommendations=[rec],
+            ev_plan=None,
+            ev_second_plan=None,
+            now=now,
+            live=live,
+        )
+
+        assert rec.ev_charger_calculated_power == pytest.approx(680.0)
+        assert rec.ev_second_charger_calculated_power == pytest.approx(3000.0)
+        assert rec.ev_total_planned_load_kwh == pytest.approx(0.92)
+        assert rec.grid_import_kwh == pytest.approx(0.92)
+        assert (
+            rec.ev_charger_calculated_power + rec.ev_second_charger_calculated_power
+            <= 16 * 230
+        )

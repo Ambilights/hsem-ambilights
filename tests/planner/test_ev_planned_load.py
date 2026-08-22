@@ -3267,3 +3267,43 @@ class TestEvChargerPowerFields:
         plan = build_ev_charging_plan(inp, starts, ends, surplus, prices)
         assert plan.state == "fully_charged"
         assert len(plan.charging_slots) == 0
+
+
+@pytest.mark.parametrize(("import_price", "expected_cost"), [(0.5, 0.5), (-0.5, -0.5)])
+def test_rebuilt_ev_plan_costs_only_grid_funded_ac_at_signed_price(
+    import_price: float,
+    expected_cost: float,
+) -> None:
+    """PV-fed EV energy is free while the residual grid share keeps its sign."""
+    from custom_components.hsem.utils.prices import SlotPrice
+
+    start = _dt(6)
+    original = EVChargingPlan(
+        state="waiting",
+        ev_connected=True,
+        total_kwh_needed=1.6,
+    )
+    slot = PlannedSlot(
+        start=start,
+        end=start + timedelta(hours=1),
+        price=SlotPrice(import_price, 0.0),
+        price_actionable=True,
+        solcast_pv_estimate_kwh=3.0,
+        avg_house_consumption_kwh=2.0,
+        ev_charger_calculated_power=2000.0,
+    )
+
+    rebuilt = rebuild_ev_plan_from_slots(
+        original,
+        [slot],
+        start,
+        charger_efficiency_pct=80.0,
+    )
+
+    assert len(rebuilt.charging_slots) == 1
+    charged = rebuilt.charging_slots[0]
+    assert charged.ac_load_kwh == pytest.approx(2.0)
+    assert charged.estimated_charged_kwh == pytest.approx(1.6)
+    assert charged.solar_surplus_kwh == pytest.approx(0.8)
+    assert charged.import_needed_kwh == pytest.approx(0.8)
+    assert charged.estimated_cost == pytest.approx(expected_cost)

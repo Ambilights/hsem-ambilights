@@ -13,6 +13,106 @@ if TYPE_CHECKING:
     from custom_components.hsem.models.planned_slot import PlannedSlot
 
 
+_POSTWRITE_INVENTORY_TOLERANCE_KWH = 1e-6
+_POSTWRITE_PHASE_TOLERANCE_KWH = 1e-3
+
+
+def _validate_primary_postwrite_inventory(
+    slots: list[PlannedSlot],
+    future_idx: list[int],
+    *,
+    current_kwh: float,
+    usable_kwh: float,
+) -> dict[str, object]:
+    """Validate cumulative primary inventory from executable slot energies.
+
+    The solver constraints apply to raw floating-point variables, while the
+    coordinator executes the three-decimal charge/discharge fields written to
+    ``PlannedSlot``.  Validate that published trajectory independently so a
+    future writeback change cannot manufacture energy or silently rely on the
+    downstream SoC display clamp.
+
+    An already-invalid initial reading remains admissible only up to its
+    initial violation: over-capacity state may not exceed ``current_kwh`` and
+    below-floor state may not fall below it.
+    """
+    initial = float(current_kwh)
+    capacity = float(usable_kwh)
+    if not math.isfinite(initial) or not math.isfinite(capacity) or capacity < 0.0:
+        return {
+            "valid": False,
+            "reason": "invalid_inventory_bounds",
+            "initial_kwh": initial,
+            "usable_kwh": capacity,
+        }
+
+    lower_bound = min(initial, 0.0)
+    upper_bound = max(initial, capacity)
+    running = initial
+    observed_min = initial
+    observed_max = initial
+
+    for sequence, slot_i in enumerate(future_idx):
+        slot = slots[slot_i]
+        try:
+            charge = float(slot.batteries_charged_kwh)
+            discharge = float(slot.batteries_discharged_kwh)
+        except TypeError, ValueError:
+            return {
+                "valid": False,
+                "reason": "non_numeric_primary_energy",
+                "slot": sequence,
+                "slot_index": slot_i,
+            }
+        if (
+            not math.isfinite(charge)
+            or not math.isfinite(discharge)
+            or charge < 0.0
+            or discharge < 0.0
+        ):
+            return {
+                "valid": False,
+                "reason": "invalid_primary_energy",
+                "slot": sequence,
+                "slot_index": slot_i,
+                "charge_kwh": charge,
+                "discharge_kwh": discharge,
+            }
+
+        running += charge - discharge
+        observed_min = min(observed_min, running)
+        observed_max = max(observed_max, running)
+        if running < lower_bound - _POSTWRITE_INVENTORY_TOLERANCE_KWH:
+            return {
+                "valid": False,
+                "reason": "primary_inventory_below_floor",
+                "slot": sequence,
+                "slot_index": slot_i,
+                "inventory_kwh": round(running, 6),
+                "lower_bound_kwh": round(lower_bound, 6),
+            }
+        if running > upper_bound + _POSTWRITE_INVENTORY_TOLERANCE_KWH:
+            return {
+                "valid": False,
+                "reason": "primary_inventory_above_ceiling",
+                "slot": sequence,
+                "slot_index": slot_i,
+                "inventory_kwh": round(running, 6),
+                "upper_bound_kwh": round(upper_bound, 6),
+            }
+
+    return {
+        "valid": True,
+        "reason": "ok",
+        "initial_kwh": round(initial, 6),
+        "final_kwh": round(running, 6),
+        "minimum_kwh": round(observed_min, 6),
+        "maximum_kwh": round(observed_max, 6),
+        "lower_bound_kwh": round(lower_bound, 6),
+        "upper_bound_kwh": round(upper_bound, 6),
+    }
+
+
 def _build_solve_and_finalize(
     scope: dict[str, Any],
 ) -> tuple[list[PlannedSlot], dict[str, Any]] | None:
@@ -243,6 +343,37 @@ def _build_solve_and_finalize(
             now=now,
         )
 
+    from custom_components.hsem.utils.datetime_utils import slot_contains
+    from custom_components.hsem.utils.units import slot_duration_hours
+
+    available_slot_hours = np.asarray(
+        [
+            (
+                slot_duration_hours(now, slots[slot_i].end)
+                if slot_contains(slots[slot_i].start, slots[slot_i].end, now)
+                else slot_duration_hours(slots[slot_i].start, slots[slot_i].end)
+            )
+            for slot_i in future_idx
+        ],
+        dtype=float,
+    )
+    session_slot_hours = np.zeros(m)
+    session_hours_remaining = 2.0 if session_ev_indices else 0.0
+    for t, available_hours in enumerate(available_slot_hours):
+        if session_hours_remaining <= 1e-9:
+            break
+        # Commands are slot-constant. Include the whole slot that crosses the
+        # two-hour certainty boundary so fixed energy still maps back to the
+        # observed session power instead of a diluted partial-slot command.
+        allocated_hours = float(available_hours)
+        session_slot_hours[t] = allocated_hours
+        session_hours_remaining -= allocated_hours
+    session_slots_set = {
+        t for t, hours in enumerate(session_slot_hours) if hours > 1e-9
+    }
+    session_slots = len(session_slots_set)
+    has_session_demand = bool(session_slots_set)
+
     bounds_builder = MilpBoundsBuilder(column_layout)
     constraints = _build_constraints(
         m,
@@ -277,6 +408,8 @@ def _build_solve_and_finalize(
         session_ev_indices,
         session_slots,
         slot_hours,
+        available_slot_hours,
+        session_slot_hours,
         has_session_demand,
         bounds_builder,
         max_grid_export_per_slot_kwh=max_grid_export_per_slot_kwh,
@@ -400,6 +533,31 @@ def _build_solve_and_finalize(
         secondary_storage=secondary_storage,
     )
 
+    if fuse_active:
+        from custom_components.hsem.planner.milp._constraints import (
+            _add_hard_aggregate_fuse_constraints,
+        )
+
+        constraints = _add_hard_aggregate_fuse_constraints(
+            constraints,
+            n_vars=n_vars,
+            m=m,
+            slots=slots,
+            future_idx=future_idx,
+            base_load=base_load,
+            pv_avail=pv_avail,
+            gi_off=gi_off,
+            max_grid_import_per_slot_kwh=max_grid_import_per_slot_kwh,
+            active_evs=active_evs,
+            session_ev_indices=session_ev_indices,
+            slot_hours=slot_hours,
+            available_slot_hours=available_slot_hours,
+            session_slot_hours=session_slot_hours,
+            ev_var_offsets=ev_var_offsets,
+            secondary_layout=secondary_layout,
+            secondary_storage=secondary_storage,
+        )
+
     if integrality is None:
         integrality = np.zeros(n_vars, dtype=int)
     integrality[export_source_mode_off : export_source_mode_off + m] = 1
@@ -434,6 +592,9 @@ def _build_solve_and_finalize(
             ge_off=ge_off,
             main_fuse_amps=main_fuse_amps,
             phase_power_imbalance_w=phase_power_imbalance_w,
+            active_evs=active_evs,
+            ev_var_offsets=ev_var_offsets,
+            session_slots_set=session_slots_set,
             secondary_layout=secondary_layout,
             secondary_storage=secondary_storage,
             now=now,
@@ -693,6 +854,101 @@ def _build_solve_and_finalize(
     )
 
     # Write MILP decision variables into output slots
+    hard_import_cap = constraints.get("hard_grid_import_cap_per_slot_kwh")
+    if hard_import_cap is None:
+        writeback_import_cap = grid_import_ub_per_slot
+    else:
+        writeback_import_cap = np.minimum(
+            np.asarray(hard_import_cap, dtype=float),
+            grid_import_ub_per_slot,
+        )
+    secondary_site_consumption_ac_per_slot = np.zeros(m)
+    if secondary_active:
+        from custom_components.hsem.utils.misc import clamp_efficiency
+
+        assert secondary_layout is not None
+        assert secondary_storage is not None
+        secondary_charge_eff = clamp_efficiency(secondary_storage.charge_efficiency_pct)
+        secondary_charge_off = secondary_layout["charge"]
+        secondary_site_consumption_ac_per_slot = (
+            result.x[secondary_charge_off : secondary_charge_off + m]
+            / secondary_charge_eff
+        )
+        if not secondary_storage.base_load_includes_dedicated_load:
+            secondary_sbu_off = secondary_layout["sbu_mode"]
+            for t, slot_i in enumerate(future_idx):
+                if float(result.x[secondary_sbu_off + t]) <= 0.5:
+                    # Utility supplies a dedicated load that is absent from
+                    # base_load, so it consumes the same PV pool as EV and
+                    # PowMr charging. SBU supplies that load locally instead.
+                    secondary_site_consumption_ac_per_slot[t] += max(
+                        slots[slot_i].secondary_storage_load_kwh,
+                        0.0,
+                    )
+
+    raw_phase_imports: list[tuple[float, float, float]] | None = None
+    phase_import_limits: list[tuple[float, float, float]] | None = None
+    phase_extra_ac_per_slot_kwh = None
+    if phase_fuse_active:
+        from custom_components.hsem.planner.milp._phase_fuse import (
+            _full_slot_power_scale,
+            _phase_import_limits_kwh,
+            _phase_imports_from_solution_kwh,
+        )
+
+        assert main_fuse_amps is not None
+        assert phase_power_imbalance_w is not None
+        raw_phase_imports = _phase_imports_from_solution_kwh(
+            result_x=result.x,
+            m=m,
+            slots=slots,
+            future_idx=future_idx,
+            gi_off=gi_off,
+            ge_off=ge_off,
+            phase_power_imbalance_w=phase_power_imbalance_w,
+            active_evs=active_evs,
+            ev_var_offsets=ev_var_offsets,
+            secondary_layout=secondary_layout,
+            secondary_storage=secondary_storage,
+            now=now,
+        )
+        phase_import_limits = _phase_import_limits_kwh(
+            slots=slots,
+            future_idx=future_idx,
+            base_load=base_load,
+            pv_avail=pv_avail,
+            main_fuse_amps=main_fuse_amps,
+            phase_power_imbalance_w=phase_power_imbalance_w,
+            active_evs=active_evs,
+            session_slots_set=session_slots_set,
+            secondary_storage=secondary_storage,
+            now=now,
+        )
+        # Charger phase topology is not configured.  Every phase row therefore
+        # treats the full EV command as if it landed on that phase.  The
+        # tightest raw slack is already aggregate EV AC energy; do not multiply
+        # it by three when bounding minimum-power redistribution.
+        phase_extra_ac_per_slot_kwh = np.asarray(
+            [
+                max(
+                    min(
+                        limit - raw
+                        for raw, limit in zip(raw_phases, limit_phases, strict=True)
+                    )
+                    / max(
+                        _full_slot_power_scale(slots[future_idx[t]], now),
+                        1.0,
+                    ),
+                    0.0,
+                )
+                for t, (raw_phases, limit_phases) in enumerate(
+                    zip(raw_phase_imports, phase_import_limits, strict=True)
+                )
+            ],
+            dtype=float,
+        )
+
+    ev_writeback_diagnostics: dict[str, dict[str, object]] = {}
     out_slots = _write_milp_results_to_slots(
         slots,
         future_idx,
@@ -715,11 +971,39 @@ def _build_solve_and_finalize(
         current_kwh,
         usable_kwh,
         curt_sol_full,
+        gi_off=gi_off,
+        grid_import_cap_per_slot_kwh=writeback_import_cap,
+        phase_extra_ac_per_slot_kwh=phase_extra_ac_per_slot_kwh,
+        secondary_site_consumption_ac_per_slot=(secondary_site_consumption_ac_per_slot),
+        ev_writeback_diagnostics=ev_writeback_diagnostics,
         session_ev_indices=session_ev_indices,
         _min_action_kwh=min_action_kwh,
     )
 
     diagnostics = dict(attempt)
+
+    primary_inventory_validation = _validate_primary_postwrite_inventory(
+        out_slots,
+        future_idx,
+        current_kwh=current_kwh,
+        usable_kwh=usable_kwh,
+    )
+    if not bool(primary_inventory_validation["valid"]):
+        sync_attempt_diagnostics(
+            attempt,
+            attempt_diagnostics,
+            solver_status="postwrite_invariant_failed",
+            result_available=False,
+            fallback_reason="primary_postwrite_inventory_failed",
+            primary_postwrite_inventory_validation=primary_inventory_validation,
+        )
+        log_planner(
+            "warning",
+            "[milp] Rejected published primary inventory trajectory: %s",
+            primary_inventory_validation,
+        )
+        return None
+    diagnostics["primary_postwrite_inventory_validation"] = primary_inventory_validation
 
     diagnostics["phase_fuse_active"] = phase_fuse_active
 
@@ -747,25 +1031,9 @@ def _build_solve_and_finalize(
             (f"{min_checkpoint_soc:.3f}" if min_checkpoint_soc is not None else "n/a"),
         )
     if phase_fuse_active:
-        from custom_components.hsem.planner.milp._phase_fuse import (
-            _phase_imports_from_solution_kwh,
-        )
-
-        assert phase_power_imbalance_w is not None
-        phase_imports = _phase_imports_from_solution_kwh(
-            result_x=result.x,
-            m=m,
-            slots=slots,
-            future_idx=future_idx,
-            gi_off=gi_off,
-            ge_off=ge_off,
-            phase_power_imbalance_w=phase_power_imbalance_w,
-            secondary_layout=secondary_layout,
-            secondary_storage=secondary_storage,
-            now=now,
-        )
+        assert raw_phase_imports is not None
         diagnostics["max_phase_import_kwh"] = round(
-            max(value for phases in phase_imports for value in phases),
+            max(value for phases in raw_phase_imports for value in phases),
             6,
         )
 
@@ -790,6 +1058,7 @@ def _build_solve_and_finalize(
             future_idx=future_idx,
             minimum_action_kwh=min_action_kwh,
             now=now,
+            export_min_price=min_export_price,
             battery_export_min_price=max(
                 min_export_price,
                 battery_export_min_price,
@@ -824,6 +1093,74 @@ def _build_solve_and_finalize(
         primary_export_dc=primary_export_sol,
         discharge_eff=discharge_eff,
     )
+
+    if phase_fuse_active:
+        from custom_components.hsem.planner.milp._phase_fuse import (
+            _phase_imports_from_published_slots_kwh,
+        )
+
+        assert phase_power_imbalance_w is not None
+        assert phase_import_limits is not None
+        published_phase_imports = _phase_imports_from_published_slots_kwh(
+            slots=out_slots,
+            future_idx=future_idx,
+            phase_power_imbalance_w=phase_power_imbalance_w,
+            active_evs=active_evs,
+            session_slots_set=session_slots_set,
+            secondary_storage=secondary_storage,
+            now=now,
+        )
+        phase_violations = [
+            max(published - limit, 0.0)
+            for published_phases, limit_phases in zip(
+                published_phase_imports,
+                phase_import_limits,
+                strict=True,
+            )
+            for published, limit in zip(
+                published_phases,
+                limit_phases,
+                strict=True,
+            )
+        ]
+        max_phase_violation = max(phase_violations, default=0.0)
+        published_max_phase_import = max(
+            value for phases in published_phase_imports for value in phases
+        )
+        phase_postwrite_validation = {
+            "valid": max_phase_violation <= _POSTWRITE_PHASE_TOLERANCE_KWH,
+            "raw_max_phase_import_kwh": diagnostics["max_phase_import_kwh"],
+            "published_max_phase_import_kwh": round(
+                published_max_phase_import,
+                6,
+            ),
+            "max_violation_kwh": round(max_phase_violation, 6),
+            "tolerance_kwh": _POSTWRITE_PHASE_TOLERANCE_KWH,
+        }
+        diagnostics["published_max_phase_import_kwh"] = round(
+            published_max_phase_import,
+            6,
+        )
+        diagnostics["phase_postwrite_max_violation_kwh"] = round(
+            max_phase_violation,
+            6,
+        )
+        diagnostics["phase_postwrite_validation"] = phase_postwrite_validation
+        if not bool(phase_postwrite_validation["valid"]):
+            sync_attempt_diagnostics(
+                attempt,
+                attempt_diagnostics,
+                solver_status="postwrite_invariant_failed",
+                result_available=False,
+                fallback_reason="phase_postwrite_invariant_failed",
+                phase_postwrite_validation=phase_postwrite_validation,
+            )
+            log_planner(
+                "warning",
+                "[milp] Rejected published phase trajectory: %s",
+                phase_postwrite_validation,
+            )
+            return None
 
     # Publish the objective terms from the same three-decimal executable
     # flows consumed by score_plan. Exact action binaries ensure this is only
@@ -882,6 +1219,8 @@ def _build_solve_and_finalize(
             _min_action_kwh=min_action_kwh,
         )
     )
+    if ev_writeback_diagnostics:
+        diagnostics["ev"] = ev_writeback_diagnostics
     if terminal_cost_to_go is None:
         terminal_source = "legacy_scalar"
         terminal_boundary = None

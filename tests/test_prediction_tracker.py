@@ -12,7 +12,8 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -539,3 +540,82 @@ class TestEmptyTracker:
         tracker.compute_metrics()
         assert tracker.soc_mae_7d is None
         assert tracker.solar_mape is None
+
+
+class TestPredictionTrackerPersistence:
+    """Tests for bounded reload-safe scorecard history."""
+
+    @pytest.mark.asyncio
+    async def test_history_roundtrip_avoids_second_warmup(self, tmp_path: Path) -> None:
+        """A config reload restores metrics and accepts the next completed slot."""
+        history_path = tmp_path / "prediction.json"
+        original = PredictionTracker(
+            max_records=10,
+            history_file=str(history_path),
+            _warmup_slots=0,
+        )
+        original.add_record(**_make_record_args(hour=1))
+        assert await original.save_history() is True
+
+        restored = PredictionTracker(
+            max_records=10,
+            history_file=str(history_path),
+            _warmup_slots=4,
+        )
+        await restored.load_history()
+
+        assert len(restored.records) == 1
+        assert restored.soc_mae_7d == pytest.approx(original.soc_mae_7d)
+        restored.add_record(
+            **{
+                **_make_record_args(hour=1),
+                "slot_start": _slot_start(hour=1) + timedelta(minutes=15),
+            }
+        )
+        assert len(restored.records) == 2
+
+    def test_load_rejects_malformed_records(self) -> None:
+        """Invalid persisted values cannot poison diagnostic metrics."""
+        tracker = PredictionTracker(_warmup_slots=0)
+        tracker.load_from_dict(
+            {
+                "records": [
+                    {
+                        "slot_start": "not-a-date",
+                        "predicted_soc_pct": "nan",
+                        "action": "charge",
+                    }
+                ]
+            }
+        )
+
+        assert tracker.records == []
+        assert tracker._slots_seen == 0
+        assert tracker.soc_mae_7d is None
+
+    def test_append_reports_change_after_bounded_buffer_prunes(self) -> None:
+        """Persistence can detect an append even when record count stays flat."""
+        tracker = PredictionTracker(max_records=1, _warmup_slots=0)
+        next_slot = _slot_start(hour=1) + timedelta(minutes=15)
+
+        assert tracker.add_record(**_make_record_args(hour=1)) is True
+        assert len(tracker.records) == 1
+        assert (
+            tracker.add_record(
+                **{
+                    **_make_record_args(hour=1),
+                    "slot_start": next_slot,
+                }
+            )
+            is True
+        )
+        assert len(tracker.records) == 1
+        assert (
+            tracker.add_record(
+                **{
+                    **_make_record_args(hour=1),
+                    "slot_start": next_slot,
+                }
+            )
+            is False
+        )

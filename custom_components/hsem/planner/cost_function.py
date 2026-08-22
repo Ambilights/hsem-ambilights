@@ -20,10 +20,9 @@ The cost function aggregates eight independently-tunable terms:
 
 Money terms (sum to ``total_cost``):
 
-1. **Import cost** — energy imported from the grid × the sanitised
-   (non-negative) import price.  Negative spot prices are clamped to 0 for
-   this term — mirrors ``milp_optimizer.py``'s ``p_imp_obj`` clamp, so a
-   negative price is never scored as a profit for importing (issue #655).
+1. **Import cost** — energy imported from the grid × the finite authoritative
+   import price. Negative spot prices remain negative money cost: being paid
+   to consume is represented in both the MILP and auditable accounting.
 2. **Export revenue** — energy exported to the grid × export price
    (negative contribution, i.e. revenue reduces total cost).
 3. **Battery conversion-loss compatibility field** — always zero. Physical
@@ -77,6 +76,7 @@ from custom_components.hsem.models.terminal_cost_to_go import TerminalCostToGo
 from custom_components.hsem.planner.cost_helpers import (
     PRIMARY_ACTION_TIEBREAK_COST,
     _resolve_cycle_cost,
+    resolve_slot_money_prices,
 )
 from custom_components.hsem.planner.cost_types import (  # noqa: F401
     CostWeights,
@@ -294,33 +294,16 @@ def score_plan(
         else:
             discount = 1.0
 
-        imp_price = slot.price.import_price
-        exp_price = slot.price.export_price
-
-        # Treat all non-finite values as zero.  Directly constructed planner
-        # inputs must fail closed just like source-populated inputs.
-        if not math.isfinite(imp_price):
-            imp_price = 0.0
-        if not math.isfinite(exp_price):
-            exp_price = 0.0
-
-        # A numeric value outside the contiguous published-price prefix is
-        # diagnostic data, not economic authority.  Neutralise every monetary
-        # use while leaving physical cycle, SoC, and grid penalties intact.
+        raw_exp_price = slot.price.export_price
+        imp_price, effective_exp_price = resolve_slot_money_prices(
+            slot.price.import_price,
+            raw_exp_price,
+            price_actionable=slot.price_actionable,
+            export_min_price=weights.export_min_price,
+        )
+        exp_price = raw_exp_price if math.isfinite(raw_exp_price) else 0.0
         if not slot.price_actionable:
-            imp_price = 0.0
             exp_price = 0.0
-
-        # Sanitised (non-negative) import price — mirrors milp_optimizer.py's
-        # p_imp_obj clamp.  A negative spot price must never be scored as a
-        # profit for importing or for lossy conversion: the MILP's own
-        # objective never rewards grid import at those prices (its gi[t]
-        # coefficient uses p_imp_obj = max(p_imp, 0)), so the selector must
-        # value the identical physical decisions the same way, or its score
-        # no longer matches what the LP actually optimised for (issue #655).
-        # The raw (possibly negative) imp_price is still used for export
-        # clamping logic elsewhere and is unaffected by this sanitisation.
-        imp_price_obj = max(imp_price, 0.0)
 
         # Production plans carry an explicit source split. Keep a bounded
         # fallback for older callers that construct aggregate-only slots.
@@ -353,18 +336,12 @@ def score_plan(
         #    needed to store energy through the charge efficiency (i.e. the
         #    simulation writes grid_import_kwh = charge_stored / charge_eff).
         if slot.grid_import_kwh > 1e-9:
-            cost = slot.grid_import_kwh * imp_price_obj
+            cost = slot.grid_import_kwh * imp_price
             import_cost += cost
             import_cost_disc += cost * discount
 
-        # 2. Export revenue. The site floor applies to both sources; the
-        # battery floor applies only to intentional primary-battery export.
-        effective_exp_price = exp_price
-        if (
-            weights.export_min_price > 1e-9
-            and effective_exp_price < weights.export_min_price
-        ):
-            effective_exp_price = 0.0
+        # 2. The site floor applies to both sources; the battery-specific floor
+        # applies only to battery-origin export, never direct PV export.
         battery_exp_price = effective_exp_price
         if (
             weights.battery_export_min_price > 1e-9

@@ -22,7 +22,7 @@ The HSEM planner relies on three categories of forecast data to make decisions:
 2. **House load consumption** — from weighted historical averages of recent days.
 3. **Electricity prices** — from Energi Data Service, firm for today and increasingly uncertain for future days.
 
-These forecasts are never perfect. For multi-day horizons (up to 48 hours), the confidence in future-day predictions decays significantly. Using Day+2 PV and load forecasts with the same weight as current-hour data would lead the planner to make confident decisions based on highly uncertain inputs.
+These forecasts are never perfect. For multi-day horizons (up to 72 hours), the confidence in future-day predictions decays significantly. Using Day+2 PV and load forecasts with the same weight as current-hour data would lead the planner to make confident decisions based on highly uncertain inputs.
 
 Additionally, the system had no mechanism to track forecast accuracy over time — no way to answer "how wrong was our PV prediction yesterday?" This made it impossible to detect systematic bias (e.g., Solcast consistently over-forecasts by 15 %) or to feed accuracy metrics back into the planning process.
 
@@ -64,7 +64,7 @@ pv_decayed[t] = pv_raw[t] × decay_factor[day_offset]
 A separate `ForecastTracker` system (`utils/forecast_tracker.py`) stores per-slot forecast and actual values, computes error metrics, and exposes them via a diagnostic HA sensor. Key properties:
 
 1. **Purely diagnostic** — the tracker never modifies planner behaviour, candidate selection, or cost calculation.
-2. **Ring-buffer storage** — holds at most 192 records (~48 hours of 15-min slots), automatically pruning older records.
+2. **Ring-buffer storage** — holds at most 2880 records (~30 days of 15-min slots), automatically pruning older records.
 3. **Accumulation-based actuals** — instantaneous power readings from the coordinator are converted to energy (kWh) and accumulated per slot.
 4. **Idempotent finalisation** — once a slot's end time passes, the record is frozen and error metrics are computed.
 5. **Reboot persistence** — serialised tracker data is stored in HA entity attributes and restored via `RestoreEntity` so long-term accuracy trends survive restarts.
@@ -109,7 +109,7 @@ We deliberately chose **not** to feed accuracy metrics back into the planner for
 - **Forecast errors are ignored by the planner:** If Solcast consistently over-forecasts by 30 %, the planner will see optimistic PV values that never materialise. The tracker reports this error but does nothing about it. Users must manually adjust their Solcast configuration.
 - **Fixed decay factors are not adaptive:** If a particular season has unusually inaccurate Day+1 forecasts, the 0.90 decay factor is still applied. An adaptive system could theoretically do better — but at the cost of stability (see above).
 - **Load forecasts are not decayed:** If the weighted-average load model is systematically wrong (e.g., holiday week vs normal week), the planner may over- or under-estimate consumption. The tracker reports this but does not compensate.
-- **Memory overhead:** Each slot record stores ~10 floats plus metadata. At 192 records this is ~30 KB total — negligible for HA, but non-zero.
+- **Memory overhead:** Each slot record stores ~10 floats plus metadata. At 2880 records this remains modest for HA, but non-zero.
 
 ### Mitigations
 

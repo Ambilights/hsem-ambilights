@@ -32,6 +32,9 @@ import pytest
 from custom_components.hsem.custom_sensors.applier import (
     async_apply_battery_settings,
 )
+from custom_components.hsem.custom_sensors.phase_charge_limiter import (
+    build_phase_aware_charge_commands,
+)
 from custom_components.hsem.custom_sensors.state_collector import _negate_optional
 from custom_components.hsem.models.hourly_recommendation import HourlyRecommendation
 from custom_components.hsem.models.live_state import LiveState
@@ -291,3 +294,37 @@ class TestUnusableTelemetryFallback:
         ]
 
         assert charge_writes == [700.0]
+
+
+@pytest.mark.asyncio
+async def test_normal_builder_lowers_a_stale_positive_grid_charge_limit() -> None:
+    """Aggregate-fuse execution writes the MILP-derived Huawei DC cap."""
+    cfg = _config(phase_aware=False)
+    live = TestUnusableTelemetryFallback._armed_live()
+    rec = _recommendation(0.4)
+    commands = build_phase_aware_charge_commands(cfg, live, rec)
+    assert commands.primary_grid_charge_power_w == pytest.approx(1600.0)
+
+    sensor = MagicMock()
+    sensor.hass = MagicMock()
+    with patch(
+        "custom_components.hsem.custom_sensors.applier.async_write_and_verify",
+        new_callable=AsyncMock,
+        side_effect=_ok,
+    ) as verifier:
+        await async_apply_battery_settings(
+            sensor,
+            cfg,
+            live,
+            commands.recommendation,
+            current_required_battery_kwh=5.0,
+            grid_charge_power_limit_w=commands.primary_grid_charge_power_w,
+            now=rec.start,
+        )
+
+    charge_writes = [
+        call.kwargs["desired"]
+        for call in verifier.await_args_list
+        if call.kwargs["entity_id"] == CHARGE_ENTITY
+    ]
+    assert charge_writes == pytest.approx([1600.0])
